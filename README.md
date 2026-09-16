@@ -44,7 +44,7 @@ stashbox/
 │   ├── openapi.yaml
 │   └── generated/       # 自动生成的客户端 SDK
 ├── infra/               # 部署
-│   ├── docker/          # Docker 镜像
+│   ├── docker/          # 暂不启用：本仓库不部署 Docker（Hornet 拍板）
 │   ├── k8s/             # ACK 集群 manifest（CP1.1 后）
 │   └── terraform/       # 阿里云 IaC（CP1.2 后）
 └── docs/                # 设计文档
@@ -70,13 +70,29 @@ stashbox/
 
 ## 快速开始（开发者）
 
-```bash
-# 后端（4 服务 + 依赖）
-cd backend
-docker-compose -f ../infra/docker/docker-compose.dev.yml up -d
-poetry install
-cd api-gateway && poetry run uvicorn main:app --reload --port 8000
+> ⚠️ 本仓库**不部署 Docker / K8s**（Hornet 2026-09-16 拍板）：本地直接 `uvicorn` 启动各服务，容器化方案留到 CP1.x 末段单独任务包再定。
 
+```bash
+# 1. 安装依赖（Python ≥ 3.11）
+cd backend
+python -m venv .venv && source .venv/bin/activate
+poetry install
+# 各服务也可独立安装：cd <service> && pip install -r requirements.txt（CP1.4 起）
+
+# 2. 一键启动 4 个服务（api-gateway 8000 / user 8001 / content 8002 / ai 8003）
+bash run_dev.sh          # CP1.4 提供，内部各起一个 uvicorn 进程
+
+# 3. 或手动各起一个 uvicorn 进程
+cd api-gateway      && uvicorn main:app --reload --port 8000 &
+cd user-service     && uvicorn main:app --reload --port 8001 &
+cd content-service  && uvicorn main:app --reload --port 8002 &
+cd ai-service       && uvicorn main:app --reload --port 8003 &
+
+# 4. 健康检查（四个端口都应返回 {"status":"ok",...}）
+curl localhost:8000/health
+```
+
+```bash
 # Android（待 CP4.2 启动后补全）
 cd android
 ./gradlew assembleDebug
