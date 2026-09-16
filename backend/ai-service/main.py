@@ -12,9 +12,10 @@ from datetime import datetime, timezone
 import redis.asyncio as redis
 from fastapi import BackgroundTasks, Depends, FastAPI
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from stashbox.backend.common import cache_service, quota_service
 from stashbox.backend.common.auth import require_user
 from stashbox.backend.common.config import settings
 from stashbox.backend.common.database import AsyncSessionLocal, get_db
@@ -45,8 +46,12 @@ def _new_task_id() -> str:
     return f"dst_{uuid.uuid4().hex[:24]}"
 
 
-async def _run_pipeline(task_id: str) -> None:
-    """mock 4 步蒸馏流水线，结果写回 distilled_articles。"""
+async def _run_pipeline(task_id: str, simulate_failure: bool = False) -> None:
+    """mock 4 步蒸馏流水线，结果写回 distilled_articles。
+
+    CP1.6：simulate_failure=True 时走失败分支 → failed + 退还配额。
+    真实蒸馏失败（CP3 接 LLM/TTS 后）走同一条退还路径。
+    """
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(DistilledArticle).where(DistilledArticle.id == task_id)
@@ -59,6 +64,17 @@ async def _run_pipeline(task_id: str) -> None:
 
         for _step_key, _step_name, _progress in _STEPS:
             await asyncio.sleep(2)
+
+        if simulate_failure:
+            da.status = "failed"
+            await session.commit()
+            # 蒸馏失败 → 退还配额（quota_used-1, quota_version+1）+ 缓存失效
+            result = await session.execute(select(Article).where(Article.id == da.article_id))
+            art = result.scalar_one_or_none()
+            if art is not None:
+                await quota_service.refund(session, int(art.user_id))
+                await cache_service.clear_article_quota(da.article_id)  # 退还后允许重扣
+            return
 
         da.status = "done"
         da.audio_url = (
@@ -119,6 +135,64 @@ async def distill_start(
     await db.commit()
     background_tasks.add_task(_run_pipeline, task_id)
     return DistillStartResponse(task_id=task_id, article_id=req.article_id, status="queued")
+
+
+@app.post("/api/v1/articles/{article_id}/distill")
+async def distill_article(
+    article_id: str,
+    background_tasks: BackgroundTasks,
+    simulate_failure: bool = False,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """开始蒸馏（v1 §3.2）：未在该文章上扣过配额则再扣一次 → 建任务 → 后台跑流水线。
+
+    - 已在 content-service POST /articles 扣过的文章不会重复扣（幂等：按 article 判断）
+    - simulate_failure=True 用于验证「蒸馏失败 → 退还」
+    """
+    uid = int(user["sub"])
+    art_result = await db.execute(select(Article).where(Article.id == article_id))
+    art = art_result.scalar_one_or_none()
+    if art is None:
+        raise NotFound(message=f"article {article_id} not found")
+    if art.user_id != uid:
+        raise Forbidden(message="not the owner of this article")
+
+    # 幂等：该文章已有蒸馏任务 → 不再扣配额
+    existed = await db.scalar(
+        select(func.count()).select_from(DistilledArticle).where(
+            DistilledArticle.article_id == article_id
+        )
+    )
+    already_charged = existed > 0 or await cache_service.has_article_quota(article_id)
+    quota_used = None
+    if not already_charged:
+        quota = await quota_service.consume(db, uid)  # 用尽抛 3001
+        quota_used = quota["quota_used"]
+        await cache_service.mark_article_quota(article_id)
+
+    task_id = _new_task_id()
+    da = DistilledArticle(
+        id=task_id,
+        article_id=article_id,
+        status="queued",
+        audio_url=None,
+        script_text=None,
+    )
+    db.add(da)
+    art.status = "distilling"
+    await db.commit()
+    background_tasks.add_task(_run_pipeline, task_id, simulate_failure)
+
+    if quota_used is None:
+        quota_used = (await quota_service.get_quota(db, uid))["quota_used"]
+    return {
+        "article_id": article_id,
+        "task_id": task_id,
+        "status": "started",
+        "quota_consumed": not already_charged,
+        "quota_used": quota_used,
+    }
 
 
 @app.get("/api/v1/distill/{task_id}")

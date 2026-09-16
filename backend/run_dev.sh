@@ -50,5 +50,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# CP1.6：配额月度重置定时器由 user-service 在 startup 时拉起
+#   （quota_service.quota_reset_loop，每小时检查一次，跨月则 quota_used=0；CP7 换 apscheduler）
+#   手动触发：POST http://localhost:8101/api/v1/users/me/quota/reset-monthly（需 JWT）
+
 echo "✅ 4 个服务已启动（Ctrl+C 退出）"
 wait

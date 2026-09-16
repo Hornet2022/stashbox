@@ -19,10 +19,19 @@ from stashbox.backend.common.exceptions import (
 )
 from stashbox.backend.common.logging import setup_logging
 from stashbox.backend.common.models import User
+from stashbox.backend.common import quota_service
 
 setup_logging()
 app = FastAPI(title="stashbox-user-service", version="0.2.0")
 register_exception_handlers(app)
+
+
+@app.on_event("startup")
+async def _start_quota_reset_loop():
+    """CP1.6：拉起月度配额重置定时器（每小时检查一次，CP7 换 apscheduler）。"""
+    import asyncio
+
+    asyncio.create_task(quota_service.quota_reset_loop())
 
 
 class WechatLoginRequest(BaseModel):
@@ -95,12 +104,36 @@ async def get_user(user: dict = Depends(require_user), db: AsyncSession = Depend
     )
 
 
-@app.get("/api/v1/user/quota", response_model=QuotaInfo)
-async def get_quota(user: dict = Depends(require_user)):
-    # mock（CP1.6 接真实配额扣减事务）
-    total = 5
-    used = 0
-    return QuotaInfo(plan="free", total=total, used=used, remaining=total - used)
+async def _quota_payload(uid: int, db: AsyncSession) -> dict:
+    """CP1.6：走 Redis 缓存（miss 查 DB + 回填）。"""
+    q = await quota_service.get_quota(db, uid)
+    return {
+        "user_id": str(uid),
+        "monthly_quota": q["monthly_quota"],
+        "quota_used": q["quota_used"],
+        "remaining": q["monthly_quota"] - q["quota_used"],
+        "version": q["version"],
+        "reset_at": q.get("reset_at"),
+        "cached": bool(q.get("cached")),
+    }
+
+
+@app.get("/api/v1/user/quota")
+async def get_quota(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
+    return await _quota_payload(int(user["sub"]), db)
+
+
+@app.get("/api/v1/users/me/quota")
+async def get_my_quota(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
+    """CP1.6：`GET /users/me/quota`（v1 §3.3 语义同 /user/quota）。"""
+    return await _quota_payload(int(user["sub"]), db)
+
+
+@app.post("/api/v1/users/me/quota/reset-monthly")
+async def reset_quota_monthly(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
+    """手动触发月度重置（定时器见 quota_service.quota_reset_loop）。"""
+    n = await quota_service.reset_monthly(db)
+    return {"reset_users": n}
 
 
 @app.get("/api/v1/subscription/plans")

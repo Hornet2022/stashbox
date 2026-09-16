@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from stashbox.backend.common import cache_service, quota_service
 from stashbox.backend.common.auth import require_user
 from stashbox.backend.common.config import settings
 from stashbox.backend.common.database import get_db
@@ -110,6 +111,7 @@ async def _create_article(
     db.add(art)
     await db.commit()
     await db.refresh(art)
+    await cache_service.invalidate_pending(user_id)  # 待听列表缓存失效
     return art
 
 
@@ -121,19 +123,47 @@ async def add_article(
     return _to_response(art)
 
 
+@app.post("/api/v1/articles")
+async def submit_article(
+    req: AddArticleRequest, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+):
+    """提交链接（v1 §3.1）：扣 1 次配额 → 建文章 → 配额/待听缓存失效。
+
+    扣减走 quota_service 乐观锁（含 Redis Lua 原子失效），配额用尽抛 3001。
+    """
+    uid = int(user["sub"])
+    quota = await quota_service.consume(db, uid)  # 用尽抛 QuotaExceededError(3001)
+    art = await _create_article(req.url, uid, req.source, None, db)
+    await cache_service.mark_article_quota(art.id)  # 打标：该文章已扣过配额
+    return {
+        "article_id": art.id,
+        "url": art.url,
+        "status": art.status,
+        "quota_used": quota["quota_used"],
+        "monthly_quota": quota["monthly_quota"],
+        "remaining": quota["monthly_quota"] - quota["quota_used"],
+    }
+
+
 @app.get("/api/v1/articles/pending")
 async def list_pending(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
+    uid = int(user["sub"])
+    cached = await cache_service.get_pending(uid)
+    if cached is not None:
+        return {"articles": cached, "count": len(cached), "cached": True}
+
     result = await db.execute(
         select(Article).where(
-            Article.user_id == int(user["sub"]),
+            Article.user_id == uid,
             Article.status.in_(["pending", "distilling", "ready"]),
             Article.skip.is_(False),
             Article.deleted_at.is_(None),
         )
     )
     items = result.scalars().all()
-    items = [_to_response(a) for a in items]
-    return {"articles": items, "count": len(items)}
+    items = [_to_response(a).model_dump() for a in items]
+    await cache_service.set_pending(uid, items)  # 回填（ttl 60s）
+    return {"articles": items, "count": len(items), "cached": False}
 
 
 @app.get("/api/v1/articles/listened")
@@ -154,8 +184,14 @@ async def list_listened(user: dict = Depends(require_user), db: AsyncSession = D
 async def get_article(
     article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
 ):
+    cached = await cache_service.get_article(article_id)
+    if cached:
+        return cached
+
     art = await _get_owned(article_id, int(user["sub"]), db)
-    return _to_response(art)
+    payload = _to_response(art).model_dump()
+    await cache_service.set_article(article_id, payload)  # ttl 300s
+    return payload
 
 
 @app.post("/api/v1/articles/{article_id}/mark-listened")
