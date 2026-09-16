@@ -1,0 +1,156 @@
+{
+  "uid": "stashbox-distill-pipeline",
+  "title": "Stashbox · 蒸馏流水线（distill_pipeline）",
+  "description": "Arq 蒸馏任务 / 各 step 耗时 / 失败率 / LLM token 与成本（CP6.4-pre-2）。注：面板依赖 ai-service 后续接入的业务指标，CP3.5-pre-3 之前无数据属正常。",
+  "tags": ["stashbox", "distill", "llm"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "annotations": { "list": [] },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "蒸馏任务 QPS（by status）",
+      "description": "依赖 ai-service 后续埋点 metric: distill_tasks_total{status}",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "sum(rate(distill_tasks_total[5m])) by (status)",
+          "legendFormat": "{{status}}",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "蒸馏队列长度（Arq）",
+      "description": "arq_jobs_in_queue —— 与 DistillTaskBacklog 告警同源，> 100 触发告警",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "arq_jobs_in_queue",
+          "legendFormat": "{{queue}}",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "蒸馏 P50 耗时（by step）",
+      "description": "依赖 ai-service 后续埋点 histogram: distill_step_duration_seconds_bucket{step}",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "histogram_quantile(0.50, sum(rate(distill_step_duration_seconds_bucket[5m])) by (step, le))",
+          "legendFormat": "P50 · {{step}}",
+          "interval": ""
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(distill_step_duration_seconds_bucket[5m])) by (step, le))",
+          "legendFormat": "P95 · {{step}}",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "蒸馏失败率",
+      "description": "failed / total —— v1 §11.6 目标成功率 ≥ 90%",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "sum(rate(distill_tasks_total{status=\"failed\"}[5m]))\n  /\nsum(rate(distill_tasks_total[5m]))",
+          "legendFormat": "failed rate",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "LLM token 使用（by model）",
+      "description": "依赖 llm_tokens_total{model} —— ai-service LLM Client 埋点（CP3.5-pre-1 之后）",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10, "stacking": { "mode": "normal" } } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "sum(rate(llm_tokens_total[5m])) by (model)",
+          "legendFormat": "{{model}}",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "LLM 成本（by model，USD）",
+      "description": "依赖 llm_cost_usd_total{model} —— 与 LLMCostSpike 告警同源",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": {
+        "defaults": { "unit": "currencyUSD", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10, "stacking": { "mode": "normal" } } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "sum(rate(llm_cost_usd_total[5m])) by (model)",
+          "legendFormat": "{{model}}",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    }
+  ]
+}

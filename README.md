@@ -44,7 +44,7 @@ stashbox/
 │   ├── openapi.yaml
 │   └── generated/       # 自动生成的客户端 SDK
 ├── infra/               # 部署
-│   ├── docker/          # docker-compose.dev.yml：本地起 PG + Redis（仅开发用，不部署生产）
+│   ├── docker/          # docker-compose.dev.yml（PG + Redis）+ docker-compose.observability.yml（Prometheus/Grafana/Alertmanager），仅本地开发用
 │   ├── k8s/             # ACK 集群 manifest（CP1.1 后）
 │   └── terraform/       # 阿里云 IaC（CP1.2 后）
 └── docs/                # 设计文档
@@ -99,7 +99,36 @@ cd ai-service       && uvicorn main:app --reload --port 8103 &
 curl localhost:8100/health
 ```
 
-### Android（CP4.2 已初始化）
+### Observability（Prometheus + Grafana + Alertmanager，CP6.4-pre-2）
+
+4 服务已通过 CP6.4-pre 暴露 `/healthz` `/readyz` `/metrics`，本地用 docker compose 起采集 + 可视化栈：
+
+| 组件 | 地址 | 说明 |
+|---|---|---|
+| Prometheus | http://localhost:9090 | `/targets` 看 4 服务 scrape 状态，保留 7 天 |
+| Grafana | http://localhost:3000 | `admin` / `stashbox_dev`，自动加载 2 个 dashboard |
+| Alertmanager | http://localhost:9093 | 告警路由；飞书 webhook 是占位 token（CP1.8 才接真） |
+
+```bash
+# ⚠️ 顺序要求：先起 4 服务，再起 observability，否则 /targets 里全是 DOWN
+bash backend/run_dev.sh    # 已在跑就不用重启
+make obs-up                # 等价于 docker compose -f infra/docker/docker-compose.observability.yml up -d
+
+make obs-logs              # 看日志
+make obs-down              # 停容器（prometheus_data / grafana_data volume 保留）
+make obs-test              # 离线校验配置：YAML / PromQL / dashboard JSON
+```
+
+Prometheus 通过 `host.docker.internal` 抓宿主机端口（8100-8103 + 8104 ai-worker 预留）。
+Grafana 数据源和 dashboard 都是 provisioning 自动加载，不需要手工 import：
+
+- `request_overview` —— 4 服务 QPS / 4xx-5xx 错误率 / P50-P95-P99 延迟 / UP 状态
+- `distill_pipeline` —— 蒸馏队列长度 + 失败率 + LLM token/成本（后 4 个面板依赖 ai-service 后续埋点，暂时 No data 属正常）
+
+告警规则在 `infra/docker/prometheus/rules/alerts.yml`，8 条，按 v1 §10.5：`HighErrorRate` `HighClientErrorRate` `HighP95Latency` `ServiceDown` `ReadinessCheckFailing` `DistillTaskBacklog` `LLMCostSpike` `RedisConnectionFailing`。
+其中 `ReadinessCheckFailing` 依赖 blackbox_exporter、`RedisConnectionFailing` 依赖 redis_exporter，本机未部署，规则先写着（空转不触发）。
+
+> `docker-compose.dev.yml` 已 `include` observability.yml（需 Compose ≥ 2.20）；只要 PG + Redis 的话注释掉那段 include 即可。
 
 环境要求：JDK 17、Android SDK（compileSdk 35 / build-tools 35.0.0）。
 

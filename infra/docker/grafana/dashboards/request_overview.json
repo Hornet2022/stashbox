@@ -1,0 +1,128 @@
+{
+  "uid": "stashbox-request-overview",
+  "title": "Stashbox · 请求总览（request_overview）",
+  "description": "4 服务请求 QPS / 错误率 / 延迟 / up 状态（CP6.4-pre-2）",
+  "tags": ["stashbox", "request"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "annotations": { "list": [] },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "请求 QPS（by service）",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "sum(rate(http_requests_total{service=~\"api-gateway|user-service|content-service|ai-service\"}[5m])) by (service)",
+          "legendFormat": "{{service}}",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "错误率（4xx / 5xx，by service）",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "sum(rate(http_requests_total{service=~\"api-gateway|user-service|content-service|ai-service\",status=~\"5..\"}[5m])) by (service)\n  /\nsum(rate(http_requests_total{service=~\"api-gateway|user-service|content-service|ai-service\"}[5m])) by (service)",
+          "legendFormat": "5xx · {{service}}",
+          "interval": ""
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "sum(rate(http_requests_total{service=~\"api-gateway|user-service|content-service|ai-service\",status=~\"4..\"}[5m])) by (service)\n  /\nsum(rate(http_requests_total{service=~\"api-gateway|user-service|content-service|ai-service\"}[5m])) by (service)",
+          "legendFormat": "4xx · {{service}}",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "延迟 P50 / P95 / P99（by service）",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{service=~\"api-gateway|user-service|content-service|ai-service\"}[5m])) by (service, le))",
+          "legendFormat": "P50 · {{service}}",
+          "interval": ""
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service=~\"api-gateway|user-service|content-service|ai-service\"}[5m])) by (service, le))",
+          "legendFormat": "P95 · {{service}}",
+          "interval": ""
+        },
+        {
+          "refId": "C",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{service=~\"api-gateway|user-service|content-service|ai-service\"}[5m])) by (service, le))",
+          "legendFormat": "P99 · {{service}}",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "服务 UP 状态",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red", "index": 0 }, "1": { "text": "UP", "color": "green", "index": 1 } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "up{job=~\"api-gateway|user-service|content-service|ai-service\"}",
+          "legendFormat": "{{job}}",
+          "interval": ""
+        }
+      ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background", "graphMode": "none", "textMode": "auto" }
+    }
+  ]
+}

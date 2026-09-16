@@ -1,0 +1,102 @@
+# v1 §10.5 8 条核心告警规则（CP6.4-pre-2）。
+#
+# 说明：
+#   - service label 来自 prometheus.yml static_configs（api-gateway / user-service / content-service / ai-service）
+#   - ReadinessCheckFailing 依赖 blackbox_exporter 的 probe_success（未部署 → 空转）
+#   - RedisConnectionFailing 依赖 redis_exporter 的 redis_up（未部署 → 空转）
+#   - DistillTaskBacklog / LLMCostSpike 依赖 ai-service 后续接入的业务指标（CP3.5-pre-3+）
+groups:
+  - name: stashbox-core
+    interval: 30s
+    rules:
+      # 1. API 5xx 错误率 > 1%
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{service=~"api-gateway|user-service|content-service|ai-service",status=~"5.."}[5m]))
+            /
+          sum(rate(http_requests_total{service=~"api-gateway|user-service|content-service|ai-service"}[5m]))
+            > 0.01
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "API 5xx 错误率 > 1%"
+          description: "服务 {{ $labels.service }} 5xx 错误率 {{ $value | humanizePercentage }} 持续 2 分钟"
+
+      # 2. API 4xx 错误率 > 5%
+      - alert: HighClientErrorRate
+        expr: |
+          sum(rate(http_requests_total{service=~"api-gateway|user-service|content-service|ai-service",status=~"4.."}[5m]))
+            /
+          sum(rate(http_requests_total{service=~"api-gateway|user-service|content-service|ai-service"}[5m]))
+            > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API 4xx 错误率 > 5%"
+          description: "4xx 错误率 {{ $value | humanizePercentage }} 持续 5 分钟"
+
+      # 3. P95 延迟 > 1s
+      - alert: HighP95Latency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket{service=~"api-gateway|user-service|content-service|ai-service"}[5m])) by (service, le)
+          ) > 1.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} P95 延迟 > 1s"
+          description: "{{ $labels.service }} P95 延迟 {{ $value }}s 持续 5 分钟（目标 < 1s）"
+
+      # 4. 服务不可达（scrape 失败）
+      - alert: ServiceDown
+        expr: up{job=~"api-gateway|user-service|content-service|ai-service"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} 服务不可达"
+          description: "Prometheus 连续 1 分钟抓不到 {{ $labels.instance }} 的 /metrics"
+
+      # 5. 服务 readyz 失败（依赖 blackbox_exporter）
+      - alert: ReadinessCheckFailing
+        expr: probe_success{job=~"api-gateway|user-service|content-service|ai-service"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} readyz 检查失败"
+          description: "/readyz 返回非 200（PG / Redis 依赖异常）持续 2 分钟"
+
+      # 6. 蒸馏任务积压（AI queue 长度）
+      - alert: DistillTaskBacklog
+        expr: arq_jobs_in_queue{queue="stashbox:distill"} > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "蒸馏队列积压 {{ $value }} 个任务"
+          description: "Arq 蒸馏队列长度 > 100 持续 5 分钟（阈值取 v1 §10.5）"
+
+      # 7. LLM 调用成本飙升
+      - alert: LLMCostSpike
+        expr: |
+          sum(rate(llm_cost_usd_total[1h])) > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM 成本 1 小时 > $100"
+          description: "按当前速率，1 小时 LLM 花费 {{ $value }} USD"
+
+      # 8. Redis 连接失败（依赖 redis_exporter）
+      - alert: RedisConnectionFailing
+        expr: redis_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis 连接失败"
+          description: "Redis exporter 探测失败持续 2 分钟（队列 / 缓存不可用）"

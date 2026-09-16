@@ -1,0 +1,15 @@
+# Grafana dashboard provider —— 自动加载 dashboards 目录下所有 JSON（CP6.4-pre-2）。
+# 无需手工 import；改 JSON 后 Grafana 重启即重载（allowUiUpdates: false 保证文件为准）。
+apiVersion: 1
+
+providers:
+  - name: Stashbox Dashboards
+    orgId: 1
+    folder: Stashbox
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

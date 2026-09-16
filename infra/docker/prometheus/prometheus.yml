@@ -1,0 +1,60 @@
+# Prometheus scrape 配置（CP6.4-pre-2）。
+# 4 服务本机宿主机直跑 → 用 host.docker.internal:<port>。
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: stashbox-dev
+
+rule_files:
+  - "rules/*.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # Prometheus 自身
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # 4 个服务（CP6.4-pre 暴露 /metrics：http_requests_total / http_request_duration_seconds / http_request_errors_total）
+  # 注意：static_configs 里的 service label 会覆盖 exporter 自带的 service label（honor_labels 默认 false），
+  # 所以这里统一命名 api-gateway / user-service / ... ，告警规则和 dashboard 都按这套名字过滤。
+  - job_name: api-gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8100"]
+        labels:
+          service: api-gateway
+
+  - job_name: user-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8101"]
+        labels:
+          service: user-service
+
+  - job_name: content-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8102"]
+        labels:
+          service: content-service
+
+  - job_name: ai-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8103"]
+        labels:
+          service: ai-service
+
+  # Arq worker（CP3.5-pre-3 还没暴露 /metrics，target 先配着，抓不到只是 DOWN）
+  - job_name: ai-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8104"]
+        labels:
+          service: ai-worker

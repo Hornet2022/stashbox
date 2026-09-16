@@ -1,0 +1,70 @@
+# Prometheus + Grafana + Alertmanager 本地可观测栈（CP6.4-pre-2）。
+#
+# 用法:
+#   make obs-up      # 起
+#   make obs-logs    # 看日志
+#   make obs-down    # 停
+# 或:
+#   docker compose -f docker-compose.observability.yml up -d
+#
+# 访问入口:
+#   Prometheus UI   http://localhost:9090   (/targets 看 scrape 状态)
+#   Grafana         http://localhost:3000   (admin / stashbox_dev)
+#   Alertmanager    http://localhost:9093
+#
+# ⚠️ 顺序要求：先起 4 个服务（bash backend/run_dev.sh），再 make obs-up，
+#    否则 /targets 里 api-gateway / user-service / content-service / ai-service 全是 DOWN。
+#   本机 4 服务是宿主机直跑，Prometheus 走 host.docker.internal 抓宿主机端口。
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: stashbox_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle" # 允许 curl -X POST localhost:9090/-/reload 热加载
+    restart: unless-stopped
+    # macOS Docker Desktop：host-gateway 映射到宿主机，让容器能抓 host.docker.internal:8100-8103
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: stashbox_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=stashbox_dev # 本地开发用，生产留 CP1.8
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: stashbox_alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  grafana_data:

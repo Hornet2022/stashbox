@@ -6,6 +6,14 @@
 #   docker compose -f docker-compose.dev.yml ps      # 看 healthy
 #   docker compose -f docker-compose.dev.yml down    # 停
 #
+# ⚠️ observability（Prometheus 9090 / Grafana 3000 / Alertmanager 9093）见下面 include。
+#    只需 PG + Redis 的话注释掉 include 即可。
+#    单独管理 observability：make obs-up / obs-down（仓库根目录）
+
+include:
+  # Compose ≥ 2.20 支持 include；老版本把这 3 行注释掉即可
+  - docker-compose.observability.yml
+
 # 默认账号/库（与 backend/common/config.py 一致）:
 #   POSTGRES_USER=stashbox  POSTGRES_PASSWORD=stashbox_dev  POSTGRES_DB=stashbox
 #   redis 无密码，端口 6379
