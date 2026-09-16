@@ -4,59 +4,62 @@ content-service（端口 8102） - 文章 CRUD + 待听/听过/收藏/跳过 + �
 CP1.5：全部走真实 PostgreSQL（articles 表）。
 数据隔离：文章按 user_id 归属，非 owner 访问详情/操作返回 403。
 软删除：删除走 updated deleted_at（本服务不直接删除，CP1.6 再加）。
+
+CP1.7：D9 端到端 —— 不要求登录态 → 建文章 → 自动触发 ai-service 蒸馏 →
+客户端轮询 status / audio-url 拿音频。
 """
+import sys
+import time
 import uuid
-from datetime import datetime
-from fastapi import Depends, FastAPI, HTTPException, status
-from pydantic import BaseModel
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, Header
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# content-service 目录名带连字符，不能当包导入，故把自身目录加入 sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # noqa: E402
+
+from clients.ai_client import get_ai_client  # noqa: E402
+from schemas import (  # noqa: E402
+    AddArticleRequest,
+    ArticleResponse,
+    ArticleStatusResponse,
+    AudioUrlResponse,
+    ClawBotMessageRequest,
+    D9AddRequest,
+    D9AddResponse,
+)
+
 from stashbox.backend.common import cache_service, quota_service
-from stashbox.backend.common.auth import require_user
-from stashbox.backend.common.config import settings
+from stashbox.backend.common.auth import create_access_token, require_user, require_user_optional
 from stashbox.backend.common.database import get_db
 from stashbox.backend.common.exceptions import (
+    BizException,
     Forbidden,
     NotFound,
     register_exception_handlers,
 )
 from stashbox.backend.common.logging import setup_logging
-from stashbox.backend.common.models import Article, User
+from stashbox.backend.common.models import Article, DistilledArticle, User
 
 setup_logging()
-app = FastAPI(title="stashbox-content-service", version="0.2.0")
+app = FastAPI(title="stashbox-content-service", version="0.3.0")
 register_exception_handlers(app)
 
+class InvalidRequest(BizException):
+    """参数 / 身份类错误（HTTP 400，业务码按场景传）。"""
 
-# ---------------------------------------------------------------------------
-# Schemas
-# ---------------------------------------------------------------------------
-class AddArticleRequest(BaseModel):
-    url: str
-    source: str = "web"  # wechat | douyin | web | pdf | d9 | clawbot
+    http_status = 400
 
 
-class ArticleResponse(BaseModel):
-    id: str
-    url: str
-    source: str
-    title: str | None = None
-    owner_id: str
-    status: str  # pending | distilling | ready | listened | failed
-    favorite: bool
-    skip: bool
-    created_at: str
-
-
-class D9AddRequest(BaseModel):
-    url: str
-    title: str | None = None
-
-
-class ClawBotMessageRequest(BaseModel):
-    text: str
-    user_id: str | None = None
+ANONYMOUS_USER_ID = 0  # 匿名文章归属（v1 §4.3.1 无 device_id 列，本期用 user_id=0 标记）
+ANONYMOUS_OPEN_ID = "__anonymous__"
+AUDIO_URL_TTL_SEC = 3600
+OSS_AUDIO_BASE = "https://stashbox-audio.oss-cn-hangzhou.aliyuncs.com"
 
 
 def _new_article_id() -> str:
@@ -85,6 +88,57 @@ async def _get_owned(article_id: str, user_id: int, db: AsyncSession) -> Article
     if art.user_id != user_id:
         raise Forbidden(message="not the owner of this article")
     return art
+
+
+async def _get_owned_with_task(
+    article_id: str, user_id: int, db: AsyncSession
+) -> tuple[Article, DistilledArticle | None]:
+    """articles LEFT JOIN distilled_articles（pending 时还没有蒸馏任务）。"""
+    row = (
+        await db.execute(
+            select(Article, DistilledArticle)
+            .outerjoin(DistilledArticle, DistilledArticle.article_id == Article.id)
+            .where(Article.id == article_id)
+        )
+    ).first()
+    if row is None:
+        raise NotFound(message=f"article {article_id} not found")
+    art, task = row
+    if art.user_id != user_id:
+        raise Forbidden(message="not the owner of this article")
+    return art, task
+
+
+def _derive_status(art: Article, task: DistilledArticle | None) -> str:
+    """ai-service 只更新 distilled_articles，articles.status 会停在 distilling，故按任务派生。"""
+    if task is None:
+        return art.status
+    if task.status == "done":
+        return "ready"
+    if task.status == "failed":
+        return "failed"
+    return art.status
+
+
+def _validate_url(url: str) -> None:
+    if not url.startswith(("http://", "https://")):
+        raise InvalidRequest(message=f"unsupported url scheme: {url}", code=2001)
+
+
+async def _ensure_anonymous_user(db: AsyncSession) -> None:
+    """匿名哨兵用户（id=0）：articles.user_id 有 FK，匿名文章落库前必须存在该行。"""
+    await db.execute(
+        insert(User)
+        .values(
+            id=ANONYMOUS_USER_ID,
+            open_id=ANONYMOUS_OPEN_ID,
+            nickname="anonymous",
+            tier="free",
+            monthly_quota=0,
+        )
+        .on_conflict_do_nothing()
+    )
+    await db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -224,13 +278,85 @@ async def skip(
     return {"id": article_id, "skip": True}
 
 
-@app.post("/api/v1/callback/d9-add-article", response_model=ArticleResponse)
+@app.post("/api/v1/callback/d9-add-article", response_model=D9AddResponse)
 async def d9_add_article(
-    req: D9AddRequest, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+    req: D9AddRequest,
+    user: dict | None = Depends(require_user_optional),
+    device_id: Annotated[str | None, Header()] = None,
+    db: AsyncSession = Depends(get_db),
 ):
-    """D9 入口（核心）：微信「更多打开方式」→ 听匣，加入文章。"""
-    art = await _create_article(req.url, int(user["sub"]), "d9", req.title, db)
-    return _to_response(art)
+    """D9 入口（v1 §3.5）：微信「更多打开方式」→ 听匣，不要求登录态。
+
+    1. 解析 caller：已登录用 user_id，未登录用 device_id（两者都没有 → 4001）
+    2. 配额预扣（仅已登录；匿名不计费）
+    3. 建 articles 行（status=pending）
+    4. 触发 ai-service 蒸馏（失败只 log，不影响 D9 返回）
+    """
+    if user is None and not device_id:
+        raise InvalidRequest(message="device_id required for anonymous D9", code=4001)
+    _validate_url(req.url)
+
+    if user is not None:
+        uid = int(user["sub"])
+        await quota_service.consume(db, uid)  # 用尽抛 QuotaExceededError(3001)
+    else:
+        uid = ANONYMOUS_USER_ID
+        await _ensure_anonymous_user(db)
+
+    art = await _create_article(req.url, uid, req.source, req.title, db)
+    # 打标：该文章已扣过配额（匿名不计费也算），避免 ai-service 蒸馏时重复扣
+    await cache_service.mark_article_quota(art.id)
+
+    task = await get_ai_client().trigger_distill(art.id, auth_token=create_access_token(str(uid)))
+    return D9AddResponse(
+        article_id=art.id,
+        task_id=(task or {}).get("task_id"),
+        status="distilling" if task else art.status,
+        device_id=device_id,
+    )
+
+
+@app.get("/api/v1/articles/{article_id}/status", response_model=ArticleStatusResponse)
+async def article_status(
+    article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+):
+    """文章 + 蒸馏任务聚合状态（v1 §11.4 CP1.7）：客户端轮询这个端点等 ready。"""
+    art, task = await _get_owned_with_task(article_id, int(user["sub"]), db)
+    return ArticleStatusResponse(
+        article_id=art.id,
+        status=_derive_status(art, task),
+        task_id=task.id if task else None,
+        task_status=task.status if task else None,
+        error=art.error,
+        audio_url=task.audio_url if task else None,
+        audio_duration_sec=task.duration_sec if task else None,
+        tags=task.tags if task else None,
+        quality_score=task.quality_score if task else None,
+        created_at=art.created_at.isoformat() if art.created_at else "",
+        updated_at=art.updated_at.isoformat() if art.updated_at else "",
+    )
+
+
+@app.get("/api/v1/articles/{article_id}/audio-url", response_model=AudioUrlResponse)
+async def article_audio_url(
+    article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+):
+    """取音频播放地址：仅 status=ready 可用，其余 404。
+
+    OSS 签名本期 mock（CP1.8+ 接真签名，依赖阿里云 RAM 配置）。
+    """
+    art, task = await _get_owned_with_task(article_id, int(user["sub"]), db)
+    if _derive_status(art, task) != "ready":
+        raise NotFound(message=f"audio not ready for article {article_id}")
+
+    expires_ts = int(time.time()) + AUDIO_URL_TTL_SEC
+    base = (task.audio_url if task else None) or f"{OSS_AUDIO_BASE}/{art.id}.m4a"
+    return AudioUrlResponse(
+        article_id=art.id,
+        audio_url=f"{base}?Expires={expires_ts}&OSSAccessKeyId=mock&Signature=mock",
+        expires_at=datetime.fromtimestamp(expires_ts, timezone.utc).isoformat(),
+        duration_sec=(task.duration_sec if task else None) or 0,
+    )
 
 
 @app.post("/api/v1/callback/clawbot-message")
