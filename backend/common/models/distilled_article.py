@@ -27,8 +27,10 @@ class DistilledArticle(Base, TimestampMixin):
         String(32), ForeignKey("articles.id"), nullable=False, unique=True
     )
     status: Mapped[str] = mapped_column(
-        String(16), default="queued", nullable=False
-    )  # queued/running/done/failed
+        String(32), default="queued", nullable=False
+    )  # queued/running/done/failed + CP3.5-pre-2 细粒度
+    #   step1_structuring / step2_rewriting / step3_ttsing / step4_concatenating
+    #   （CP3.5-pre-3 起由 Arq worker 写库，最长 19 字符，VARCHAR(16) 装不下，见 0003 迁移）
     script_text: Mapped[str | None] = mapped_column(Text, nullable=True)  # 听感稿全文
     audio_url: Mapped[str | None] = mapped_column(
         String(512), nullable=True

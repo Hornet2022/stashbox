@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timezone
 
 import redis.asyncio as redis
-from fastapi import BackgroundTasks, Depends, FastAPI
+from fastapi import Depends, FastAPI
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,11 +30,19 @@ from stashbox.backend.common.models import Article, DistilledArticle
 from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common.redis_client import get_redis_pool
 
+from dispatcher import get_dispatcher, shutdown_dispatcher
+
 setup_logging("ai-service")
 app = FastAPI(title="stashbox-ai-service", version="0.2.0")
 register_exception_handlers(app)
 app.add_middleware(RequestIDMiddleware)
 install_health_endpoints(app)
+
+
+@app.on_event("shutdown")
+async def _shutdown_dispatcher():
+    """关掉 Arq 连接池（否则 uvicorn 退出时 redis 连接会挂 warning）。"""
+    await shutdown_dispatcher()
 
 
 # mock 4 步蒸馏流水线（本期不落库每一步，仅用其耗时模拟）
@@ -55,6 +63,9 @@ async def _run_pipeline(task_id: str, simulate_failure: bool = False) -> None:
 
     CP1.6：simulate_failure=True 时走失败分支 → failed + 退还配额。
     真实蒸馏失败（CP3 接 LLM/TTS 后）走同一条退还路径。
+
+    CP3.5-pre-3：端点已改用 Arq（见 dispatcher.enqueue_distill / tasks.distill_task），
+    本函数保留作 sync fallback（紧急回滚可临时切回 BackgroundTasks，单测也直接用它）。
     """
     async with AsyncSessionLocal() as session:
         result = await session.execute(
@@ -103,6 +114,7 @@ class DistillStartResponse(BaseModel):
     task_id: str
     article_id: str
     status: str
+    job_id: str = ""  # CP3.5-pre-3：Arq job_id（BackgroundTasks 时代没有）
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +136,6 @@ async def health():
 @app.post("/api/v1/distill/start", response_model=DistillStartResponse)
 async def distill_start(
     req: DistillStartRequest,
-    background_tasks: BackgroundTasks,
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -138,22 +149,32 @@ async def distill_start(
     )
     db.add(da)
     await db.commit()
-    background_tasks.add_task(_run_pipeline, task_id)
-    return DistillStartResponse(task_id=task_id, article_id=req.article_id, status="queued")
+    # CP3.5-pre-3：BackgroundTasks.add_task → Arq 队列（独立 worker 进程消费）
+    job_id = await get_dispatcher().enqueue_distill(
+        task_id=task_id,
+        article_id=req.article_id,
+        user_id=int(user["sub"]),
+        url=req.url,
+        title=req.title,
+    )
+    return DistillStartResponse(
+        task_id=task_id, article_id=req.article_id, status="queued", job_id=job_id
+    )
 
 
 @app.post("/api/v1/articles/{article_id}/distill")
 async def distill_article(
     article_id: str,
-    background_tasks: BackgroundTasks,
     simulate_failure: bool = False,
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """开始蒸馏（v1 §3.2）：未在该文章上扣过配额则再扣一次 → 建任务 → 后台跑流水线。
+    """开始蒸馏（v1 §3.2）：未在该文章上扣过配额则再扣一次 → 建任务 → 入 Arq 队列。
 
     - 已在 content-service POST /articles 扣过的文章不会重复扣（幂等：按 article 判断）
     - simulate_failure=True 用于验证「蒸馏失败 → 退还」
+    - CP3.5-pre-3：任务不再在请求线程里跑（BackgroundTasks），而是塞进 Arq 队列由
+      独立 worker 进程消费；端点签名不变，只多返一个 job_id
     """
     uid = int(user["sub"])
     art_result = await db.execute(select(Article).where(Article.id == article_id))
@@ -187,13 +208,22 @@ async def distill_article(
     db.add(da)
     art.status = "distilling"
     await db.commit()
-    background_tasks.add_task(_run_pipeline, task_id, simulate_failure)
+
+    job_id = await get_dispatcher().enqueue_distill(
+        task_id=task_id,
+        article_id=article_id,
+        user_id=uid,
+        url=art.url,
+        title=art.title,
+        simulate_failure=simulate_failure,
+    )
 
     if quota_used is None:
         quota_used = (await quota_service.get_quota(db, uid))["quota_used"]
     return {
         "article_id": article_id,
         "task_id": task_id,
+        "job_id": job_id,
         "status": "started",
         "quota_consumed": not already_charged,
         "quota_used": quota_used,

@@ -15,3 +15,5 @@ prometheus-client>=0.21
 structlog>=24.1
 # CP3.5-pre-1 LLM Client 抽象层
 httpx>=0.28
+# CP3.5-pre-3 Arq 异步队列（替换 BackgroundTasks）
+arq>=0.26

@@ -22,6 +22,7 @@ python-multipart = "^0.0.20"
 loguru = "^0.7.2"
 prometheus-client = "^0.21.0"
 structlog = "^24.1.0"
+arq = "^0.26.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"

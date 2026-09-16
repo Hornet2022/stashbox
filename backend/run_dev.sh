@@ -40,6 +40,18 @@ start_service user-service 8101
 start_service content-service 8102
 start_service ai-service 8103
 
+# CP3.5-pre-3：ai-service 的蒸馏任务走 Arq 队列，需要独立 worker 进程消费。
+#   ai-service 目录名带连字符（不是合法包名），worker 是顶层模块 —— 必须 cd 进去
+#   用 `python -m arq`（-m 会把 cwd 加进 sys.path），否则 import 不到 worker。
+#   日志单独落文件（默认 /tmp/worker.log），跟 4 个 uvicorn 的 stdout 分开好看。
+AI_WORKER_LOG="${AI_WORKER_LOG:-/tmp/worker.log}"
+(
+  cd "$REPO_ROOT/backend/ai-service" \
+    && exec "$PYTHON_BIN" -m arq worker.WorkerSettings
+) >> "$AI_WORKER_LOG" 2>&1 &
+PIDS+=("$!")
+echo "▶ ai-worker 启动 (arq, pid $!, log $AI_WORKER_LOG)"
+
 cleanup() {
   echo ""
   echo "■ 停止 4 个服务…"
