@@ -83,3 +83,4 @@ docker-compose.override.yml
 # ===========================================
 .aliyun/
 *.icp-record
+.workbuddy/

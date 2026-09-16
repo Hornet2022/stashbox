@@ -6,7 +6,7 @@
 
 | 维度 | 状态 |
 |---|---|
-| 方案 | v1 r13 / v2 r13（已定版，详见 `docs/v1.md` / `docs/v2.md`）|
+| 方案 | v1 r13 / v2 r13（已定版，详见 [`docs/技术方案_v1.md`](./docs/技术方案_v1.md) / [`docs/技术方案_v2.md`](./docs/技术方案_v2.md)）|
 | 决策点 | D1-D53，53/53 ✅ |
 | 域名 | `stashbox.cn`（个人备案，备案审核中）|
 | 当前阶段 | **CP1.4 后端骨架**（一人 vibecoding 节奏）|
@@ -47,10 +47,11 @@ stashbox/
 │   ├── docker/          # Docker 镜像
 │   ├── k8s/             # ACK 集群 manifest（CP1.1 后）
 │   └── terraform/       # 阿里云 IaC（CP1.2 后）
-└── docs/                # 文档 + 决策记录
-    ├── v1.md            # 技术方案 v1
-    ├── v2.md            # 产品方案 v2
-    └── decisions/       # ADR（架构决策记录）
+└── docs/                # 设计文档
+    ├── README.md        # 设计文档总入口
+    ├── 技术方案_v1.md    # 技术视角（CP1-CP8）
+    ├── 技术方案_v2.md    # 产品视角
+    └── decisions/       # ADR（架构决策记录，未来用）
 ```
 
 ## 关键技术选型（v1 §0b.1）
