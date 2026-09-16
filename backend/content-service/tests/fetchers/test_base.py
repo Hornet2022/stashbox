@@ -66,8 +66,12 @@ def test_all_fetchers_inherit_abstract_base():
 
 
 async def test_fetch_placeholder_raises():
-    """CP2.1 占位：所有 fetcher.fetch 都抛 FetcherError(UNSUPPORTED)。"""
-    for cls in ALL_FETCHER_CLASSES:
+    """CP2.1 占位：wechat / douyin 的 fetch 抛 FetcherError(UNSUPPORTED)。
+
+    CP2.4 起 GenericURLFetcher 已经真实现（不再占位），它的 fetch 行为
+    由 tests/fetchers/test_generic_url.py 覆盖，所以这里只剩 2 个占位 fetcher。
+    """
+    for cls in [WechatFetcher, DouyinFetcher]:
         with pytest.raises(FetcherError) as exc_info:
             await cls().fetch("https://example.com")
         assert exc_info.value.code == FetcherErrorCode.UNSUPPORTED

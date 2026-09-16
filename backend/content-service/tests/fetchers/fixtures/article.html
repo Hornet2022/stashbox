@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>为什么我们需要一个「稍后听」的盒子</title>
+<meta property="og:title" content="听匣专栏：为什么我们需要一个「稍后听」的盒子">
+<meta name="description" content="信息进来的速度永远比我们消耗它的速度快，这篇文章聊聊「稍后听」产品到底在解决什么问题。">
+<meta name="author" content="林承宇">
+<meta property="article:published_time" content="2026-09-01T08:30:00+08:00">
+<meta property="og:image" content="https://cdn.example.com/og-cover.jpg">
+<link rel="stylesheet" href="/static/site.css">
+</head>
+<body>
+<header class="site-header">
+  <p><a href="/">听匣</a> · <a href="/columns">专栏</a> · <a href="/about">关于</a></p>
+</header>
+
+<div class="sidebar" id="sidebar">
+  <p><a href="/tag/podcast">播客</a><span class="sep">·</span><a href="/tag/ai">人工智能</a><span class="sep">·</span><a href="/tag/reading">深度阅读</a></p>
+  <p><a href="/tag/product">产品设计</a><span class="sep">·</span><a href="/tag/audio">音频</a><span class="sep">·</span><a href="/tag/notes">笔记</a></p>
+  <p><a href="/rank/day">今日榜</a><span class="sep">·</span><a href="/rank/week">本周榜</a><span class="sep">·</span><a href="/rank/month">本月榜</a></p>
+  <p><a href="/u/1024">承宇</a><span class="sep">·</span><a href="/u/2048">编辑部</a><span class="sep">·</span><a href="/u/4096">投稿</a></p>
+  <p><a href="/app/ios">iOS</a><span class="sep">·</span><a href="/app/android">Android</a><span class="sep">·</span><a href="/app/web">网页版</a></p>
+</div>
+
+<article class="post" id="post-1024">
+  <h1>为什么我们需要一个「稍后听」的盒子</h1>
+  <script type="text/javascript">
+    window.__POST_ID__ = 1024;
+    // 这段脚本里的中文绝对不能出现在正文里：SCRIPT_MARKER_不应被抽中
+    window.__TIPS__ = "脚本内容不是正文，密度启发式必须跳过它";
+  </script>
+
+  <p>每天早上打开手机，未读的数字总会先跳出来：二十七个公众号推送、十几条群聊里甩过来的链接、还有昨晚睡前刷到但没点开的那几条视频。信息进来的速度永远比我们消耗它的速度快，而人的注意力在同一时刻只能交给一件事。这就是「稍后听」这件事存在的根本理由：它不是拖延，而是给内容一个排队的地方。</p>
+
+  <p>真正的问题从来不是「没有时间读」，而是「不知道该先读哪一个」。收藏夹之所以会变成数字废墟，是因为它只有存的能力，没有排序的能力。一个能用的稍后听工具，必须在你按下收藏的那一刻就完成分类：这是十分钟能听完的短评，还是需要四十分钟沉浸的长文；是纯文字，还是必须看图才成立的图表分析。</p>
+
+  <p>音频是其中最容易被忽略的一层。通勤、洗碗、遛狗这些场景里，眼睛被占住了，耳朵却空着。把一篇三千字的文章转成十二分钟的语音，成本正在变得极低，但真正难的是转述的语气——机器读出来的东西如果像导航播报，人三分钟就会走神。所以我们把它当成一次「再创作」而不是「朗读」：先理解结构，再决定哪里该快进、哪里该停一停。</p>
+
+  <figure class="cover">
+    <img src="https://cdn.example.com/fig-cover.png" alt="稍后听的使用场景示意图">
+    <figcaption>通勤路上的十二分钟，是最典型的稍后听场景。</figcaption>
+  </figure>
+
+  <p>第二层难点是「回到原文」。听完之后如果想引用一段，或者想把某句话发给朋友，你必须能一秒钟跳回原文的那个段落。这意味着存储的粒度不能止于整篇文章，而要下沉到段落与时间戳的对应关系。我们为此在数据库里给每个段落留了偏移标记，前端点一下语音进度条，正文就会滚到对应的位置。</p>
+
+  <p>最后一层是取舍。做产品的都知道，功能列表每加一项，学习成本就高一分。这一版我们 deliberately 砍掉了分享卡片、砍掉了评论、也砍掉了社区推荐，只留下「存下来、听进去、找得回」这三件事。等这三件事足够顺了，再谈别的。毕竟一个装不下东西的盒子，再漂亮也只是个摆设。</p>
+
+  <img src="/static/fig1.png" alt="段落与音频时间戳的对应关系">
+  <img src="/static/fig2.png" alt="v1 版本的功能取舍表">
+  <p class="meta"><time datetime="2026-09-01T08:30:00+08:00">2026 年 9 月 1 日</time></p>
+</article>
+
+<footer class="site-footer">
+  <p><a href="/terms">服务条款</a> · <a href="/privacy">隐私政策</a> · <a href="/contact">联系我们</a></p>
+</footer>
+</body>
+</html>

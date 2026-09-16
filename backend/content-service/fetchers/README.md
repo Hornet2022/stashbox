@@ -41,7 +41,7 @@ v1 §3.x 的 `biz_code` 体系** —— 对外暴露时由上层（CP2.5）映�
 |---|---|---|---|
 | `WechatFetcher` | `wechat_mp` | `mp.weixin.qq.com` | CP2.1 占位（fetch 抛 UNSUPPORTED） |
 | `DouyinFetcher` | `douyin` | `douyin.com` / `iesdouyin.com`（含 `v.douyin.com` 短链） | CP2.1 占位 |
-| `GenericURLFetcher` | `generic_url` | 恒 `True`（catch-all） | CP2.1 占位 |
+| `GenericURLFetcher` | `generic_url` | 恒 `True`（catch-all） | **CP2.4 实现**（httpx + stdlib HTMLParser） |
 | `MockFetcher` | — | — | **本期不写**，留给 CP2.7 集成测（10 个真实 URL 里垫刀用） |
 
 路线：
@@ -96,3 +96,67 @@ except FetcherError as e:
 ```
 
 CP2.5 之前**不要**在主流程里调 `get_fetcher()` —— 本期只是抽象层，没接进 `main.py`。
+
+## 5. GenericURLFetcher 当前能力（CP2.4）
+
+`generic_url.py`：`httpx.AsyncClient` 抓 HTML + 5 个 stdlib `HTMLParser` 解析，**不装
+beautifulsoup4 / readability-lxml / lxml**（依赖只有已有的 httpx 0.28.1）。
+
+```
+fetch(url)
+├── scheme 不是 http/https        → FetcherError(UNSUPPORTED)
+├── 超时 / 传输层异常              → FetcherError(NETWORK)
+├── 404 / 410                     → FetcherError(NOT_FOUND)
+├── 其它 >= 400                    → FetcherError(NETWORK, "http {status}")
+├── content-type 不是 html/xhtml  → FetcherError(PARSE)
+├── 抽不出任何正文                 → FetcherError(PARSE, "no article content extracted")
+└── FetchResult（source="generic_url"）
+```
+
+| 解析器 | 抽什么 |
+|---|---|
+| `_TitleExtractor` | `og:title` 优先，退回 `<title>` |
+| `_AuthorExtractor` | `meta[name=author]` → `article:author` → `twitter:creator` |
+| `_TimeExtractor` | `article:published_time` → `pubdate` → `<time datetime>`（ISO 8601 / RFC 822，无时区按 UTC） |
+| `_MediaExtractor` | `og:image` / `og:video` + `<img src>`，`urljoin(base_url, src)` 转绝对（base 用**redirect 之后**的最终 URL） |
+| `_ContentExtractor` | readability 简化：密度最高的正文段落 |
+
+**密度启发式**（阈值都是模块常量，可直接调）：
+
+- 候选标签 `<p>` / `<div>` / `<article>` / `<section>`；**只保留叶子段**——包着别的候选段的
+  容器（`<article>`、外层 `<div>`）不参与竞争，否则整页会作为一段胜出。
+- 密度 = `纯文本长度 / 原始 HTML 长度`；丢弃 `< 3` 字符的段，丢弃密度 `< 0.25` 的段
+  （导航/侧栏那种塞满 `<a>` 的段密度通常在 0.1 上下，正文在 0.9 上下）。
+- 取密度最高的 **10 段**，再按文档顺序输出；`content_text` 用空行拼接，`content_html`
+  是这些段落的原始 HTML 片段拼接。
+- 防爆：单段原始 HTML > 100KB 丢弃、单段文本截到 20KB、`content_text` 截到 50KB、
+  `content_html` 按整段累加到 200KB（不切断标签）、解析前 HTML 截到 2MB。
+- 跳过 `<script>` / `<style>` / `<noscript>` / `<template>` / `<svg>` / `<iframe>` 的内容；
+  `<nav>` / `<header>` / `<footer>` / `<aside>` / `<form>` 里的候选段直接判为样板丢弃。
+
+**已知限制**：
+
+- JS 渲染页（React/Vue SPA、正文由接口异步注入）拿不到正文 —— 拿到的只有空壳 HTML，
+  会抛 `PARSE: no article content extracted`。
+- 很简单的 HTML（正文就一句话、或者整页只有一个 `<div>`）会被密度阈值误判为导航而丢空。
+- 正文在 `<span>` / `<li>` / `<td>` 里的页面抽不到（候选标签只认 4 个块级标签）。
+- 编码只认 HTTP header 的 charset，`<meta charset>` 声明的 GBK 类页面可能乱码
+  （`response.text` 的 httpx 默认行为）。
+- 懒加载图片的 `data-src` 不收，只收 `<img src>`。
+
+**CP2.7 集成测怎么用**：10 个真实 URL 里，公众号/抖音走各自 fetcher，剩下的（知乎、少数派、
+个人博客、新闻站之类）都兜底到 `GenericURLFetcher`：
+
+```python
+from fetchers import get_fetcher
+
+fetcher = get_fetcher(url)              # 非公众号/抖音 → GenericURLFetcher
+try:
+    result = await fetcher.fetch(url, timeout=30.0)
+except FetcherError as e:               # [generic_url] code: message
+    ...
+```
+
+建议 5 个 URL 里至少含 1 个 JS 渲染站（验证 PARSE 兜底）+ 1 个带分页/侧栏的长文
+（验证密度启发式）。抽完打印 `result.raw_metadata`：`paragraph_count` 是最终选中段数、
+`candidate_count` 是通过阈值的候选段数，两者差太多说明阈值要调。
