@@ -15,7 +15,6 @@ api-gateway（端口 8100） - 听匣统一入口 + JWT 签发 + 路由分发。
   未匹配                                          -> 404
 """
 from contextlib import asynccontextmanager
-from functools import partial
 from pathlib import Path
 import sys
 
@@ -120,12 +119,26 @@ async def proxy_d9(request: Request) -> Response:
 
 # 按路由表动态注册（必须在下面的 /api/v1/{path:path} 兜底路由之前 —— Starlette
 # 按注册顺序匹配，兜底路由放在后面才不会把精确路由吃掉）。
+#
+# CP1.7.3：这里早先用 functools.partial(proxy, route=_route) 绑定 route —— fastapi
+# 0.141.1 不再解 partial 的签名，会把 Route 的字段（method / path / target_service）
+# 当成 request body 模型去校验，POST 带 JSON body 一律 422（"missing field 'method'"）。
+# 改用闭包工厂：注册的是普通 async 函数，签名里只剩 request，无 partial 解析问题。
+def make_proxy(route: Route):
+    """闭包工厂：捕获 route 变量，避开 functools.partial 的 fastapi 解析问题。"""
+
+    async def _proxy(request: Request) -> Response:
+        return await proxy(request, route)
+
+    return _proxy
+
+
 for _route in ROUTES:
     if _route.special == "d9":
         continue  # D9 单独挂（见下）：不要求登录态
     app.add_api_route(
         _route.path,
-        partial(proxy, route=_route),
+        make_proxy(_route),  # ← 普通函数，无 partial 解析问题
         methods=[_route.method],
         name=f"proxy_{_route.method.lower()}_{_route.path}",
     )

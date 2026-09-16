@@ -154,7 +154,11 @@ async def reset_monthly(session: AsyncSession) -> int:
         .values(
             quota_used=0,
             quota_version=User.quota_version + 1,
-            quota_reset_at=_next_month_start(_now()),
+            # CP1.7.3：alembic 0002 里 quota_reset_at 是 TIMESTAMP WITHOUT TIME ZONE，
+            # 而 _now() 是 tz-aware —— asyncpg 写 tz-aware datetime 到 naive 列会抛
+            # DataError（"can't subtract offset-naive and offset-aware datetimes"）→ 500。
+            # 写入前 strip tzinfo；列类型要不要改成 TIMESTAMPTZ 留 CP1.8+ 决定。
+            quota_reset_at=_next_month_start(_now()).replace(tzinfo=None),
         )
         .returning(User.id, User.quota_version)
     )
