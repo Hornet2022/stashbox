@@ -64,3 +64,12 @@ class AudioUrlResponse(BaseModel):
 class ClawBotMessageRequest(BaseModel):
     text: str
     user_id: str | None = None
+
+
+class WechatMpMessageRequest(BaseModel):
+    """微信公众号服务号回调消息（v1 §11.2 CP2.5）。"""
+
+    from_user: str  # 公众号 openid（本期不用，纯接收）
+    text: str  # 用户发的文本（可能含 URL）
+    create_time: int  # 消息时间戳
+    msg_id: str | None = None  # 消息 ID（幂等用，本期不实现）

@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+from stashbox.backend.common.exceptions import BizException
+
 from .base import Fetcher, FetcherError, FetcherErrorCode, FetchResult
 from .douyin import DouyinFetcher
 from .generic_url import GenericURLFetcher
@@ -31,6 +33,25 @@ def get_fetcher(url: str) -> Fetcher | None:
     return None
 
 
+def map_fetcher_error(exc: FetcherError) -> BizException:
+    """FetcherError → BizException（v1 §3.x 文章模块错误码）。
+
+    fetcher 私有错误码（fetcher.*）→ 业务错误码的**唯一映射点**，不散在 Handler 里：
+    - UNSUPPORTED → 2001（URL 不支持，HTTP 400）
+    - NETWORK/PARSE/NOT_FOUND/AUTH/RATE_LIMIT → 2002（抓取失败，HTTP 502）
+    - INTERNAL → 2002（抓取失败，HTTP 500）
+    """
+    if exc.code == FetcherErrorCode.UNSUPPORTED:
+        return BizException(code=2001, message=f"url not supported: {exc.message}")
+
+    biz = BizException(
+        code=2002,
+        message=f"fetch failed [{exc.source}/{exc.code.value}]: {exc.message}",
+    )
+    biz.http_status = 500 if exc.code == FetcherErrorCode.INTERNAL else 502
+    return biz
+
+
 __all__ = [
     "Fetcher",
     "FetchResult",
@@ -40,4 +61,5 @@ __all__ = [
     "DouyinFetcher",
     "GenericURLFetcher",
     "get_fetcher",
+    "map_fetcher_error",
 ]

@@ -8,12 +8,14 @@ CP1.5：全部走真实 PostgreSQL（articles 表）。
 CP1.7：D9 端到端 —— 不要求登录态 → 建文章 → 自动触发 ai-service 蒸馏 →
 客户端轮询 status / audio-url 拿音频。
 """
+import re
 import sys
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header
 from sqlalchemy import func, select
@@ -24,6 +26,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # noqa: E402
 
 from clients.ai_client import get_ai_client  # noqa: E402
+from fetchers import (  # noqa: E402
+    FetcherError,
+    get_fetcher,
+    map_fetcher_error,
+)
 from schemas import (  # noqa: E402
     AddArticleRequest,
     ArticleResponse,
@@ -32,6 +39,7 @@ from schemas import (  # noqa: E402
     ClawBotMessageRequest,
     D9AddRequest,
     D9AddResponse,
+    WechatMpMessageRequest,
 )
 
 from stashbox.backend.common import cache_service, quota_service
@@ -127,6 +135,30 @@ def _derive_status(art: Article, task: DistilledArticle | None) -> str:
 def _validate_url(url: str) -> None:
     if not url.startswith(("http://", "https://")):
         raise InvalidRequest(message=f"unsupported url scheme: {url}", code=2001)
+
+
+# 公众号文本里的 URL：纯文本或 <a href> 包裹，够用即可（不引 lxml / bs4）
+_URL_RE = re.compile(r'https?://[^\s<>"\'`]+')
+# 消息里 URL 常紧跟中文/英文标点（"看这个 https://x.com/a。"），末尾要 trim
+_TRAILING_PUNCT = "。，、；：！？）】》」』…“”‘’.,;:!?)\"'"
+
+
+def _extract_url(text: str) -> str | None:
+    """从公众号文本里抽第一条 URL（末尾标点 trim 掉），没有返回 None。"""
+    match = _URL_RE.search(text or "")
+    if match is None:
+        return None
+    url = match.group(0).rstrip(_TRAILING_PUNCT)
+    return url or None
+
+
+def _is_valid_url(url: str) -> bool:
+    """URL 合法性：scheme 必须 http/https（顺带挡掉 javascript: 这类 XSS）+ 有 host。"""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
 async def _ensure_anonymous_user(db: AsyncSession) -> None:
@@ -372,6 +404,49 @@ async def clawbot_message(
     if "http" in req.text:
         art = await _create_article(req.text, int(user["sub"]), "clawbot", None, db)
     return {"received": True, "article": _to_response(art) if art else None}
+
+
+@app.post("/api/v1/callback/wechat-mp-message")
+async def wechat_mp_message(
+    req: WechatMpMessageRequest, db: AsyncSession = Depends(get_db)
+):
+    """微信公众号服务号回调（v1 §11.2 CP2.5）。
+
+    接收用户发给服务号的 URL → 路由 fetcher 抓正文 → 建文章 → 触发蒸馏。
+
+    - 不需要 JWT（公众号回调，公众号已认证用户身份）
+    - 不扣配额（匿名入口，等客户端登录后再扣）
+    - 失败抛 BizException(2001=URL 不支持 / 2002=抓取失败)
+    """
+    url = _extract_url(req.text)
+    if url is None:
+        raise InvalidRequest(message="no url found", code=2001)
+    if not _is_valid_url(url):
+        raise InvalidRequest(message=f"url invalid: {url}", code=2001)
+
+    fetcher = get_fetcher(url)
+    if fetcher is None:  # 理论不会发生（generic_url 兜底），留着防回归
+        raise InvalidRequest(message="no fetcher matched", code=2001)
+
+    try:
+        result = await fetcher.fetch(url)
+    except FetcherError as exc:
+        raise map_fetcher_error(exc) from exc
+
+    await _ensure_anonymous_user(db)
+    art = await _create_article(
+        url, ANONYMOUS_USER_ID, "wechat_mp", result.title or None, db
+    )
+    task = await get_ai_client().trigger_distill(
+        art.id, auth_token=create_access_token(str(ANONYMOUS_USER_ID))
+    )
+    return {
+        "received": True,
+        "article_id": art.id,
+        "task_id": (task or {}).get("task_id"),
+        "title": art.title,
+        "source": art.source,
+    }
 
 
 @app.get("/api/v1/tags")
