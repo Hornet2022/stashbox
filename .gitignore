@@ -41,6 +41,13 @@ build/
 .gradle/
 build/
 local.properties
+android/local.properties
+android/.gradle/
+android/app/build/
+android/.idea/
+android/captures/
+android/.externalNativeBuild/
+android/.cxx/
 *.apk
 *.aab
 *.ap_

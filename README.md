@@ -99,11 +99,27 @@ cd ai-service       && uvicorn main:app --reload --port 8103 &
 curl localhost:8100/health
 ```
 
+### Android（CP4.2 已初始化）
+
+环境要求：JDK 17、Android SDK（compileSdk 35 / build-tools 35.0.0）。
+
 ```bash
-# Android（待 CP4.2 启动后补全）
+# 1. 配置 SDK 路径（local.properties，已 gitignore，不提交）
 cd android
-./gradlew assembleDebug
+echo "sdk.dir=/opt/homebrew/share/android-commandlinetools" > local.properties
+
+# 2. 构建 debug APK（用 Gradle Wrapper，不要系统 gradle）
+export JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
+export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
+./gradlew assembleDebug          # 产物：app/build/outputs/apk/debug/app-debug.apk
+
+# 3. 静态检查 + 单测
+./gradlew lint
+./gradlew testDebugUnitTest
 ```
+
+技术栈：Kotlin 2.0.21 / Gradle 8.10.2 / AGP 8.7.2 / Compose BOM 2024.10.01 / Hilt 2.52 + KSP。
+包名 `com.tingxia.audio`（debug 包名加 `.debug` 后缀）。Media3（ExoPlayer + MediaSession）与 Retrofit 已留位，CP4.4 / CP4.6 才接入。
 
 ## 许可
 
