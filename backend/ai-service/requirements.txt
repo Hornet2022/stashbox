@@ -13,3 +13,5 @@ python-multipart>=0.0.20
 # CP6.4-pre 可观测性
 prometheus-client>=0.21
 structlog>=24.1
+# CP3.5-pre-1 LLM Client 抽象层
+httpx>=0.28
