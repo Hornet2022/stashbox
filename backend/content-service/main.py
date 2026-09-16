@@ -44,11 +44,15 @@ from stashbox.backend.common.exceptions import (
     register_exception_handlers,
 )
 from stashbox.backend.common.logging import setup_logging
+from stashbox.backend.common.middleware import RequestIDMiddleware
 from stashbox.backend.common.models import Article, DistilledArticle, User
+from stashbox.backend.common.observability import install_health_endpoints
 
-setup_logging()
+setup_logging("content-service")
 app = FastAPI(title="stashbox-content-service", version="0.3.0")
 register_exception_handlers(app)
+app.add_middleware(RequestIDMiddleware)
+install_health_endpoints(app)
 
 class InvalidRequest(BizException):
     """参数 / 身份类错误（HTTP 400，业务码按场景传）。"""

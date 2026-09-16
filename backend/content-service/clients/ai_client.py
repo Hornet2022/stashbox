@@ -43,18 +43,17 @@ class AIServiceClient:
                 # 4xx/5xx 是确定性结果，重试无意义
                 log.error(
                     "ai_service_distill_failed",
-                    extra={
-                        "article_id": article_id,
-                        "status": e.response.status_code,
-                        "error": str(e),
-                    },
+                    article_id=article_id,
+                    status=e.response.status_code,
+                    error=str(e),
                 )
                 return None
             except (httpx.TransportError, httpx.TimeoutException) as e:
                 if attempt == self.max_retries - 1:
                     log.error(
                         "ai_service_distill_failed",
-                        extra={"article_id": article_id, "error": str(e)},
+                        article_id=article_id,
+                        error=str(e),
                     )
                     return None
 

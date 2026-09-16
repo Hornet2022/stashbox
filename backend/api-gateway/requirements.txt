@@ -11,3 +11,6 @@ redis>=5.2
 alembic>=1.14
 passlib[bcrypt]>=1.7
 python-multipart>=0.0.20
+# CP6.4-pre 可观测性
+prometheus-client>=0.21
+structlog>=24.1

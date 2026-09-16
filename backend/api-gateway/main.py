@@ -25,8 +25,10 @@ from stashbox.backend.common.auth import create_access_token
 from stashbox.backend.common.config import settings
 from stashbox.backend.common.exceptions import register_exception_handlers
 from stashbox.backend.common.logging import setup_logging
+from stashbox.backend.common.middleware import RequestIDMiddleware
+from stashbox.backend.common.observability import install_health_endpoints
 
-setup_logging()
+setup_logging("api-gateway")
 
 
 @asynccontextmanager
@@ -38,6 +40,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="stashbox-api-gateway", version="0.1.0", lifespan=lifespan)
 register_exception_handlers(app)
+app.add_middleware(RequestIDMiddleware)
+install_health_endpoints(app)
 
 
 class TokenRequest(BaseModel):

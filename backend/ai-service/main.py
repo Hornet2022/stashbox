@@ -25,12 +25,16 @@ from stashbox.backend.common.exceptions import (
     register_exception_handlers,
 )
 from stashbox.backend.common.logging import setup_logging
+from stashbox.backend.common.middleware import RequestIDMiddleware
 from stashbox.backend.common.models import Article, DistilledArticle
+from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common.redis_client import get_redis_pool
 
-setup_logging()
+setup_logging("ai-service")
 app = FastAPI(title="stashbox-ai-service", version="0.2.0")
 register_exception_handlers(app)
+app.add_middleware(RequestIDMiddleware)
+install_health_endpoints(app)
 
 
 # mock 4 步蒸馏流水线（本期不落库每一步，仅用其耗时模拟）
@@ -106,6 +110,7 @@ class DistillStartResponse(BaseModel):
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
+    """遗留别名（CP1.6 在用）：CP6.4 起新增 /healthz /readyz，本端点保持不动。"""
     redis_status = "ok"
     try:
         client = redis.Redis(connection_pool=get_redis_pool())

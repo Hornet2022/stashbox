@@ -18,12 +18,16 @@ from stashbox.backend.common.exceptions import (
     register_exception_handlers,
 )
 from stashbox.backend.common.logging import setup_logging
+from stashbox.backend.common.middleware import RequestIDMiddleware
 from stashbox.backend.common.models import User
+from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common import quota_service
 
-setup_logging()
+setup_logging("user-service")
 app = FastAPI(title="stashbox-user-service", version="0.2.0")
 register_exception_handlers(app)
+app.add_middleware(RequestIDMiddleware)
+install_health_endpoints(app)
 
 
 @app.on_event("startup")
