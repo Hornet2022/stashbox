@@ -1,59 +1,31 @@
 """
-content-service（端口 8002） - 文章 CRUD + 待听/听过/收藏/跳过 + 标签 + D9 回调（mock）。
+content-service（端口 8102） - 文章 CRUD + 待听/听过/收藏/跳过 + 标签 + D9 回调。
 
-本期为 in-memory dict 存储，**不连真实 DB**（CP1.5 才接 PostgreSQL）。
-数据隔离：文章按 owner_id 归属，非 owner 访问详情返回 403。
+CP1.5：全部走真实 PostgreSQL（articles 表）。
+数据隔离：文章按 user_id 归属，非 owner 访问详情/操作返回 403。
+软删除：删除走 updated deleted_at（本服务不直接删除，CP1.6 再加）。
 """
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-# 让 `import stashbox.backend.common` 可用：仓库根目录的父目录需加入 sys.path
-_REPO_PARENT = str(Path(__file__).resolve().parents[3])
-if _REPO_PARENT not in sys.path:
-    sys.path.insert(0, _REPO_PARENT)
-
+import uuid
+from datetime import datetime
 from fastapi import Depends, FastAPI, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from stashbox.backend.common.auth import require_user
 from stashbox.backend.common.config import settings
+from stashbox.backend.common.database import get_db
 from stashbox.backend.common.exceptions import (
     Forbidden,
     NotFound,
     register_exception_handlers,
 )
 from stashbox.backend.common.logging import setup_logging
+from stashbox.backend.common.models import Article, User
 
 setup_logging()
-app = FastAPI(title="stashbox-content-service", version="0.1.0")
+app = FastAPI(title="stashbox-content-service", version="0.2.0")
 register_exception_handlers(app)
-
-
-# ---------------------------------------------------------------------------
-# in-memory 存储
-# ---------------------------------------------------------------------------
-_articles: dict[str, dict] = {}
-_counter = 0
-
-
-def _next_id() -> str:
-    global _counter
-    _counter += 1
-    return f"art_{_counter:06d}"
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _get_owned(article_id: str, user_id: str) -> dict:
-    art = _articles.get(article_id)
-    if art is None:
-        raise NotFound(message=f"article {article_id} not found")
-    if art["owner_id"] != user_id:
-        raise Forbidden(message="not the owner of this article")
-    return art
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +33,7 @@ def _get_owned(article_id: str, user_id: str) -> dict:
 # ---------------------------------------------------------------------------
 class AddArticleRequest(BaseModel):
     url: str
-    source: str = "web"  # wechat | douyin | web | pdf | d9
+    source: str = "web"  # wechat | douyin | web | pdf | d9 | clawbot
 
 
 class ArticleResponse(BaseModel):
@@ -70,7 +42,7 @@ class ArticleResponse(BaseModel):
     source: str
     title: str | None = None
     owner_id: str
-    status: str  # pending | listened
+    status: str  # pending | distilling | ready | listened | failed
     favorite: bool
     skip: bool
     created_at: str
@@ -86,6 +58,34 @@ class ClawBotMessageRequest(BaseModel):
     user_id: str | None = None
 
 
+def _new_article_id() -> str:
+    return f"art_{uuid.uuid4().hex[:24]}"
+
+
+def _to_response(a: Article) -> ArticleResponse:
+    return ArticleResponse(
+        id=a.id,
+        url=a.url,
+        source=a.source,
+        title=a.title,
+        owner_id=str(a.user_id),
+        status=a.status,
+        favorite=a.favorite,
+        skip=a.skip,
+        created_at=a.created_at.isoformat() if a.created_at else "",
+    )
+
+
+async def _get_owned(article_id: str, user_id: int, db: AsyncSession) -> Article:
+    result = await db.execute(select(Article).where(Article.id == article_id))
+    art = result.scalar_one_or_none()
+    if art is None:
+        raise NotFound(message=f"article {article_id} not found")
+    if art.user_id != user_id:
+        raise Forbidden(message="not the owner of this article")
+    return art
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -94,87 +94,118 @@ async def health():
     return {"status": "ok", "service": "content-service"}
 
 
-def _create_article(url: str, owner_id: str, source: str, title: str | None) -> dict:
-    aid = _next_id()
-    art = {
-        "id": aid,
-        "url": url,
-        "source": source,
-        "title": title,
-        "owner_id": owner_id,
-        "status": "pending",
-        "favorite": False,
-        "skip": False,
-        "created_at": _now(),
-    }
-    _articles[aid] = art
+async def _create_article(
+    url: str, user_id: int, source: str, title: str | None, db: AsyncSession
+) -> Article:
+    art = Article(
+        id=_new_article_id(),
+        user_id=user_id,
+        url=url,
+        source=source,
+        title=title,
+        status="pending",
+        favorite=False,
+        skip=False,
+    )
+    db.add(art)
+    await db.commit()
+    await db.refresh(art)
     return art
 
 
 @app.post("/api/v1/articles/add", response_model=ArticleResponse)
-async def add_article(req: AddArticleRequest, user: dict = Depends(require_user)):
-    art = _create_article(req.url, user["sub"], req.source, None)
-    return art
+async def add_article(
+    req: AddArticleRequest, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+):
+    art = await _create_article(req.url, int(user["sub"]), req.source, None, db)
+    return _to_response(art)
 
 
 @app.get("/api/v1/articles/pending")
-async def list_pending(user: dict = Depends(require_user)):
-    items = [
-        a for a in _articles.values()
-        if a["owner_id"] == user["sub"] and a["status"] == "pending" and not a["skip"]
-    ]
+async def list_pending(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Article).where(
+            Article.user_id == int(user["sub"]),
+            Article.status.in_(["pending", "distilling", "ready"]),
+            Article.skip.is_(False),
+            Article.deleted_at.is_(None),
+        )
+    )
+    items = result.scalars().all()
+    items = [_to_response(a) for a in items]
     return {"articles": items, "count": len(items)}
 
 
 @app.get("/api/v1/articles/listened")
-async def list_listened(user: dict = Depends(require_user)):
-    items = [
-        a for a in _articles.values()
-        if a["owner_id"] == user["sub"] and a["status"] == "listened"
-    ]
+async def list_listened(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Article).where(
+            Article.user_id == int(user["sub"]),
+            Article.status == "listened",
+            Article.deleted_at.is_(None),
+        )
+    )
+    items = result.scalars().all()
+    items = [_to_response(a) for a in items]
     return {"articles": items, "count": len(items)}
 
 
 @app.get("/api/v1/articles/{article_id}", response_model=ArticleResponse)
-async def get_article(article_id: str, user: dict = Depends(require_user)):
-    return _get_owned(article_id, user["sub"])
+async def get_article(
+    article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+):
+    art = await _get_owned(article_id, int(user["sub"]), db)
+    return _to_response(art)
 
 
 @app.post("/api/v1/articles/{article_id}/mark-listened")
-async def mark_listened(article_id: str, user: dict = Depends(require_user)):
-    art = _get_owned(article_id, user["sub"])
-    art["status"] = "listened"
+async def mark_listened(
+    article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+):
+    art = await _get_owned(article_id, int(user["sub"]), db)
+    art.status = "listened"
+    await db.commit()
     return {"id": article_id, "status": "listened"}
 
 
 @app.post("/api/v1/articles/{article_id}/favorite")
-async def favorite(article_id: str, user: dict = Depends(require_user)):
-    art = _get_owned(article_id, user["sub"])
-    art["favorite"] = True
+async def favorite(
+    article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+):
+    art = await _get_owned(article_id, int(user["sub"]), db)
+    art.favorite = True
+    await db.commit()
     return {"id": article_id, "favorite": True}
 
 
 @app.post("/api/v1/articles/{article_id}/skip")
-async def skip(article_id: str, user: dict = Depends(require_user)):
-    art = _get_owned(article_id, user["sub"])
-    art["skip"] = True
+async def skip(
+    article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+):
+    art = await _get_owned(article_id, int(user["sub"]), db)
+    art.skip = True
+    await db.commit()
     return {"id": article_id, "skip": True}
 
 
 @app.post("/api/v1/callback/d9-add-article", response_model=ArticleResponse)
-async def d9_add_article(req: D9AddRequest, user: dict = Depends(require_user)):
+async def d9_add_article(
+    req: D9AddRequest, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+):
     """D9 入口（核心）：微信「更多打开方式」→ 听匣，加入文章。"""
-    art = _create_article(req.url, user["sub"], "d9", req.title)
-    return art
+    art = await _create_article(req.url, int(user["sub"]), "d9", req.title, db)
+    return _to_response(art)
 
 
 @app.post("/api/v1/callback/clawbot-message")
-async def clawbot_message(req: ClawBotMessageRequest, user: dict = Depends(require_user)):
+async def clawbot_message(
+    req: ClawBotMessageRequest, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+):
     """ClawBot 入口（mock）：接收消息，解析出 URL 则建文章。"""
     art = None
     if "http" in req.text:
-        art = _create_article(req.text, user["sub"], "clawbot", None)
-    return {"received": True, "article": art}
+        art = await _create_article(req.text, int(user["sub"]), "clawbot", None, db)
+    return {"received": True, "article": _to_response(art) if art else None}
 
 
 @app.get("/api/v1/tags")
@@ -189,18 +220,28 @@ async def list_tags(user: dict = Depends(require_user)):
 
 
 @app.get("/api/v1/admin/stats")
-async def admin_stats(user: dict = Depends(require_user)):
-    total = len(_articles)
-    pending = sum(1 for a in _articles.values() if a["status"] == "pending")
-    listened = sum(1 for a in _articles.values() if a["status"] == "listened")
+async def admin_stats(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
+    total_users = await db.scalar(select(func.count()).select_from(User))
+    total_articles = await db.scalar(select(func.count()).select_from(Article))
+    pending = await db.scalar(
+        select(func.count())
+        .select_from(Article)
+        .where(Article.status == "pending", Article.deleted_at.is_(None))
+    )
+    listened = await db.scalar(
+        select(func.count())
+        .select_from(Article)
+        .where(Article.status == "listened", Article.deleted_at.is_(None))
+    )
     return {
-        "total_articles": total,
-        "pending": pending,
-        "listened": listened,
+        "total_users": total_users or 0,
+        "total_articles": total_articles or 0,
+        "pending": pending or 0,
+        "listened": listened or 0,
     }
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8002)
+    uvicorn.run(app, host="0.0.0.0", port=8102)

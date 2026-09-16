@@ -1,8 +1,10 @@
-# content-service（端口 8002）
+# content-service（端口 8102）
 
 听匣业务层：文章 CRUD + 待听/听过/收藏/跳过 + 主题标签 + D9 回调入口。
-本期为 **in-memory dict 存储，不连真实 DB**（CP1.5 才接 PostgreSQL）。
+CP1.5 起已接 **PostgreSQL（articles 表）**，替换原 in-memory dict。
 **OSS 只被本服务写**（全局约束）。
+
+> 端口说明：CP1.5 起默认 **8102**（本机 8002 被其它项目占用，整体平移到 8100 段）。
 
 ## API
 

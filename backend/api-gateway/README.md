@@ -1,6 +1,9 @@
-# api-gateway（端口 8000）
+# api-gateway（端口 8100）
 
 听匣统一入口：健康检查 + JWT 签发 + 下游路由分发。
+
+> 端口说明：CP1.5 起默认 **8100**（本机 8000 被其它项目占用，整体平移到 8100 段）。
+> 下游地址默认 `http://localhost:8101|8102|8103`，可由环境变量 / run_dev.sh 覆盖。
 
 ## 职责
 
@@ -14,9 +17,9 @@
 
 | 前缀 | 转发到 |
 |---|---|
-| `/api/v1/user` `/api/v1/subscription` | `settings.user_service_url`（默认 `http://localhost:8001`）|
-| `/api/v1/articles` `/api/v1/tags` `/api/v1/callback` | `settings.content_service_url`（默认 `http://localhost:8002`）|
-| `/api/v1/distill` | `settings.ai_service_url`（默认 `http://localhost:8003`）|
+| `/api/v1/user` `/api/v1/subscription` | `settings.user_service_url`（默认 `http://localhost:8101`）|
+| `/api/v1/articles` `/api/v1/tags` `/api/v1/callback` | `settings.content_service_url`（默认 `http://localhost:8102`）|
+| `/api/v1/distill` | `settings.ai_service_url`（默认 `http://localhost:8103`）|
 | 其他 | 404 |
 
 > 本地开发通过环境变量覆盖下游地址：`USER_SERVICE_URL` / `CONTENT_SERVICE_URL` / `AI_SERVICE_URL`。

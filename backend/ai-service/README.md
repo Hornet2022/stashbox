@@ -1,7 +1,12 @@
-# ai-service（端口 8003）
+# ai-service（端口 8103）
 
 听匣 L4 蒸馏引擎（worker + 任务状态机）。本期为 **mock 流水线**：
 用 `asyncio.sleep(2)` 模拟每步耗时，不调真实 LLM / TTS（CP3 才接）。
+
+CP1.5 起蒸馏任务已落 **PostgreSQL（distilled_articles 表）**，状态机 `queued → running → done`。
+`/health` 额外返回 `redis` 连通状态（本服务是 Redis Stream 队列的未来消费者）。
+
+> 端口说明：CP1.5 起默认 **8103**（本机 8003 空闲，随整体平移到 8100 段）。
 
 ## API
 

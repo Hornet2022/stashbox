@@ -12,14 +12,10 @@ api-gateway（端口 8000） - 听匣统一入口 + JWT 签发 + 路由分发。
   /api/v1/distill     / /api/v1/admin/distill  -> ai_service_url
   未匹配                                              -> 404
 """
-import sys
 from contextlib import asynccontextmanager
-from pathlib import Path
 
-# 让 `import stashbox.backend.common` 可用：仓库根目录的父目录需加入 sys.path
-_REPO_PARENT = str(Path(__file__).resolve().parents[3])
-if _REPO_PARENT not in sys.path:
-    sys.path.insert(0, _REPO_PARENT)
+# 注意：本服务不再使用 sys.path hack。stashbox 包通过 PYTHONPATH（见 run_dev.sh）
+# 或 `pip install -e` 导入。直接 `uvicorn main:app` 时需保证仓库根父目录在 PYTHONPATH 中。
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -116,4 +112,4 @@ async def proxy(request: Request, path: str):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8100)

@@ -9,14 +9,14 @@
 | 方案 | v1 r13 / v2 r13（已定版，详见 [`docs/技术方案_v1.md`](./docs/技术方案_v1.md) / [`docs/技术方案_v2.md`](./docs/技术方案_v2.md)）|
 | 决策点 | D1-D53，53/53 ✅ |
 | 域名 | `stashbox.cn`（个人备案，备案审核中）|
-| 当前阶段 | **CP1.4 后端骨架**（一人 vibecoding 节奏）|
+| 当前阶段 | **CP1.5 基础数据层**（一人 vibecoding 节奏）|
 | 客户端 | iOS + Android 双端设计，**一期只做 Android** |
 
 ## Checkpoint 进度
 
 | CP | 名称 | 状态 |
 |---|---|---|
-| CP1 | 基础架构 + D9 集成 | ⏳ 域名/备案自动化跑 / 后端骨架进行中 |
+| CP1 | 基础架构 + D9 集成 | ⏳ CP1.4 骨架✅ / CP1.5 数据层✅ / D9 集成🔒 |
 | CP2 | 收集层 + 多源抓取 | 🔒 |
 | CP3 | L4 蒸馏引擎首篇 demo | 🔒 |
 | CP4 | App 端 v1（**只 Android**）| 🔒 |
@@ -44,7 +44,7 @@ stashbox/
 │   ├── openapi.yaml
 │   └── generated/       # 自动生成的客户端 SDK
 ├── infra/               # 部署
-│   ├── docker/          # 暂不启用：本仓库不部署 Docker（Hornet 拍板）
+│   ├── docker/          # docker-compose.dev.yml：本地起 PG + Redis（仅开发用，不部署生产）
 │   ├── k8s/             # ACK 集群 manifest（CP1.1 后）
 │   └── terraform/       # 阿里云 IaC（CP1.2 后）
 └── docs/                # 设计文档
@@ -70,26 +70,33 @@ stashbox/
 
 ## 快速开始（开发者）
 
-> ⚠️ 本仓库**不部署 Docker / K8s**（Hornet 2026-09-16 拍板）：本地直接 `uvicorn` 启动各服务，容器化方案留到 CP1.x 末段单独任务包再定。
+> ⚠️ **生产部署**不部署 Docker / K8s（Hornet 2026-09-16 拍板）。但**本地开发**用 `docker compose` 起 PostgreSQL + Redis 依赖（见下），比装原生 PG 简单。
+> 🔌 **默认端口 CP1.5 起改为 8100-8103**（本机 8000/8001/8002 已被其它项目占用）：api-gateway `:8100` / user `:8101` / content `:8102` / ai `:8103`。
 
 ```bash
 # 1. 安装依赖（Python ≥ 3.11）
 cd backend
 python -m venv .venv && source .venv/bin/activate
-poetry install
-# 各服务也可独立安装：cd <service> && pip install -r requirements.txt（CP1.4 起）
+pip install -r api-gateway/requirements.txt   # 各服务 requirements.txt 已含全部依赖
+# 或逐服务：cd <service> && pip install -r requirements.txt
 
-# 2. 一键启动 4 个服务（api-gateway 8000 / user 8001 / content 8002 / ai 8003）
-bash run_dev.sh          # CP1.4 提供，内部各起一个 uvicorn 进程
+# 2. 起本地依赖（PostgreSQL + Redis，需本机有 Docker）
+cd infra/docker
+docker compose -f docker-compose.dev.yml up -d
+cd ../../backend && alembic upgrade head       # 建表（users / articles / distilled_articles）
 
-# 3. 或手动各起一个 uvicorn 进程
-cd api-gateway      && uvicorn main:app --reload --port 8000 &
-cd user-service     && uvicorn main:app --reload --port 8001 &
-cd content-service  && uvicorn main:app --reload --port 8002 &
-cd ai-service       && uvicorn main:app --reload --port 8003 &
+# 3. 一键启动 4 个服务（端口 8100 / 8101 / 8102 / 8103）
+bash run_dev.sh          # 内部各起一个 uvicorn 进程，自动设置 PYTHONPATH 与端口
 
-# 4. 健康检查（四个端口都应返回 {"status":"ok",...}）
-curl localhost:8000/health
+# 4. 或手动各起一个 uvicorn 进程（注意 PYTHONPATH 指向仓库根父目录）
+export PYTHONPATH=/Users/hornet/work
+cd api-gateway      && uvicorn main:app --reload --port 8100 &
+cd user-service     && uvicorn main:app --reload --port 8101 &
+cd content-service  && uvicorn main:app --reload --port 8102 &
+cd ai-service       && uvicorn main:app --reload --port 8103 &
+
+# 5. 健康检查（四个端口都应返回 {"status":"ok",...}）
+curl localhost:8100/health
 ```
 
 ```bash

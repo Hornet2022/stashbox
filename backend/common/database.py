@@ -8,14 +8,11 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.orm import DeclarativeBase
+
+# 全局唯一 Base / metadata 来自 common.models.base，避免与 ORM 模型出现双 metadata。
+from stashbox.backend.common.models.base import Base  # noqa: E402
 
 from stashbox.backend.common.config import settings
-
-
-class Base(DeclarativeBase):
-    """所有 ORM model 的基类"""
-    pass
 
 
 # === 全局 engine（一个进程一个） ===

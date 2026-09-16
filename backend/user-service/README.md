@@ -1,6 +1,9 @@
-# user-service（端口 8001）
+# user-service（端口 8101）
 
-听匣用户层：登录（微信 mock）+ 配额 + 订阅定价。本期为 **in-memory mock**，不连真实 DB。
+听匣用户层：登录（微信 mock）+ 配额 + 订阅定价。
+
+> 端口说明：CP1.5 起默认 **8101**（本机 8001 被其它项目占用，整体平移到 8100 段）。
+> CP1.5：wechat-login / user 已接 **PostgreSQL（users 表）**；quota / plans 仍为 mock（CP1.6 接配额扣减事务）。
 
 ## API
 
@@ -16,8 +19,11 @@
 
 ```bash
 cd backend/user-service
-PYTHONPATH=/Users/hornet/work uvicorn main:app --reload --port 8001
+PYTHONPATH=/Users/hornet/work uvicorn main:app --reload --port 8101
 ```
+
+> 或用 `backend/run_dev.sh` 一键起 4 个服务（已自动设置 PYTHONPATH 与端口）。
+> 需先起本地依赖（PostgreSQL + Redis）：`docker compose -f infra/docker/docker-compose.dev.yml up -d`
 
 ## 复用
 

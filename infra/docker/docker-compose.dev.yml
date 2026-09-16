@@ -1,0 +1,43 @@
+# 起 postgres + redis，供 4 个服务本地开发用（仅本地，不部署生产）。
+#
+# 用法:
+#   cd infra/docker
+#   docker compose -f docker-compose.dev.yml up -d
+#   docker compose -f docker-compose.dev.yml ps      # 看 healthy
+#   docker compose -f docker-compose.dev.yml down    # 停
+#
+# 默认账号/库（与 backend/common/config.py 一致）:
+#   POSTGRES_USER=stashbox  POSTGRES_PASSWORD=stashbox_dev  POSTGRES_DB=stashbox
+#   redis 无密码，端口 6379
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: stashbox-postgres-dev
+    environment:
+      POSTGRES_USER: stashbox
+      POSTGRES_PASSWORD: stashbox_dev
+      POSTGRES_DB: stashbox
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stashbox"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: stashbox-redis-dev
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres-data:
