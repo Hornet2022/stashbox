@@ -6,6 +6,7 @@ LLM 响应按「JSON 优先、纯文本兜底」解析 —— mock client 与真
 import json
 
 from llm.types import ChatMessage, ChatRequest
+from observability.decorators import trace_distill_step
 
 from .prompts import STEP1_SYSTEM, STEP1_USER, STEP2_SYSTEM, STEP2_USER, STEP3_USER
 from .schemas import (
@@ -77,6 +78,9 @@ def _parse_rewrite(content: str) -> RewriteOutput:
     return RewriteOutput(hook=hook, body=body, outro=outro, word_count=len(body))
 
 
+# CP3.5-pre-4：装饰器只做 Langfuse 上报（trace_id / article_id / user_id），
+# LANGFUSE_ENABLED=false（默认）时薄壳一层，step 逻辑不变。
+@trace_distill_step("step1_structure")
 async def step1_structure(ctx: DistillContext, llm) -> None:
     """Step 1: 内容结构化（Qwen2.5-VL，v1 §5.2.2）。"""
     prompt = STEP1_USER.format(title=ctx.title or "(无标题)", raw_content=ctx.raw_content)
@@ -92,6 +96,7 @@ async def step1_structure(ctx: DistillContext, llm) -> None:
     ctx.structured = _parse_structured(resp.content)
 
 
+@trace_distill_step("step2_rewrite")
 async def step2_rewrite(ctx: DistillContext, llm) -> None:
     """Step 2: 听感改写（Claude 4 Sonnet，v1 §5.2.3）。"""
     if ctx.structured is None:
@@ -110,6 +115,7 @@ async def step2_rewrite(ctx: DistillContext, llm) -> None:
     ctx.rewrite = _parse_rewrite(resp.content)
 
 
+@trace_distill_step("step3_tts")
 async def step3_tts(ctx: DistillContext, tts_client) -> None:
     """Step 3: TTS 合成（豆包 TTS，v1 §5.2.4）。"""
     if ctx.rewrite is None:
@@ -120,6 +126,7 @@ async def step3_tts(ctx: DistillContext, tts_client) -> None:
     ctx.tts = TTSOutput(segments=list(segments))
 
 
+@trace_distill_step("step4_concat")
 async def step4_concat(ctx: DistillContext) -> None:
     """Step 4: 音频拼接（FFmpeg，v1 §5.2.5）。"""
     if ctx.tts is None:

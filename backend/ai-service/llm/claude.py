@@ -44,6 +44,15 @@ class ClaudeSonnetClient(LLMClient):
         )
 
     async def chat(self, req: ChatRequest) -> ChatResponse:
+        try:
+            resp = await self._anthropic_chat(req)
+            await self._maybe_trace(req, resp=resp)
+            return resp
+        except Exception as e:
+            await self._maybe_trace(req, error=e)
+            raise
+
+    async def _anthropic_chat(self, req: ChatRequest) -> ChatResponse:
         start = time.time()
         model = req.model or self.model
 
@@ -108,8 +117,12 @@ class ClaudeSonnetClient(LLMClient):
         raise LLMError(f"claude chat failed after {self.max_retries} attempts: {last_err}")
 
     async def stream(self, req: ChatRequest) -> AsyncIterator[str]:
-        # 真流式：CP3.5 接 SSE，本期只留接口
-        raise NotImplementedError("ClaudeSonnetClient.stream 留 CP3.5 接 SSE")
+        # 真流式：CP3.5 接 SSE，本期只留接口（未实现期间也走 _maybe_trace 的 error 分支）
+        try:
+            raise NotImplementedError("ClaudeSonnetClient.stream 留 CP3.5 接 SSE")
+        except Exception as e:
+            await self._maybe_trace(req, error=e)
+            raise
 
     async def count_tokens(self, text: str, model: str | None = None) -> int:
         # 真 token 计数：CP3.5 用 anthropic SDK 的 count_tokens

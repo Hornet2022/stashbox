@@ -63,6 +63,92 @@ def make_ctx(**overrides):
     return DistillContext(**base)
 
 
+@pytest.fixture(autouse=True)
+def _langfuse_singleton():
+    """每个用例前后清 LangfuseClient 单例（env 按用例切，不能跨泄漏）。"""
+    from observability.langfuse_client import LangfuseClient
+
+    LangfuseClient.reset()
+    yield
+    LangfuseClient.reset()
+
+
+@pytest.fixture
+def langfuse_disabled(monkeypatch):
+    """显式关掉 Langfuse（默认模式）。"""
+    monkeypatch.setenv("LANGFUSE_ENABLED", "false")
+    return None
+
+
+@pytest.fixture
+def fake_langfuse(monkeypatch):
+    """伪造 langfuse SDK，启用后所有上报落到内存对象上（不发真请求）。
+
+    返回 FakeLangfuse 实例；走近 langfuse_client.LangfuseClient.get() 的正常 init 路径。
+    """
+    monkeypatch.setenv("LANGFUSE_ENABLED", "true")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+    monkeypatch.setenv("LANGFUSE_HOST", "https://langfuse.test")
+
+    import sys
+    import types
+
+    from observability import langfuse_client as pkg
+
+    module = types.ModuleType("langfuse")
+    instances: list = []
+
+    class FakeSpan:
+        def __init__(self, name, **kwargs):
+            self.name = name
+            self.kwargs = kwargs
+            self.updates: list[dict] = []
+            self.generations: list = []
+
+        def generation(self, **kwargs):
+            gen = FakeSpan(kwargs.pop("name", ""), **kwargs)
+            self.generations.append(gen)
+            return gen
+
+        def update(self, **kwargs):
+            self.updates.append(kwargs)
+            return None
+
+    class FakeTrace(FakeSpan):
+        def __init__(self, name, **kwargs):
+            super().__init__(name, **kwargs)
+            self.spans: list = []
+
+        def span(self, **kwargs):
+            span = FakeSpan(kwargs.pop("name", ""), **kwargs)
+            self.spans.append(span)
+            return span
+
+    class FakeLangfuse:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.traces: list[dict] = []
+            self.trace_objects: list = []
+            instances.append(self)
+
+        def trace(self, **kwargs):
+            trace = FakeTrace(kwargs.pop("name", ""), **kwargs)
+            self.traces.append({**kwargs, "name": trace.name})
+            self.trace_objects.append(trace)
+            return trace
+
+        def flush(self):  # v2 SDK 有，留个桩
+            return None
+
+    module.Langfuse = FakeLangfuse
+    monkeypatch.setitem(sys.modules, "langfuse", module)
+
+    client = pkg.LangfuseClient.get()
+    assert client.enabled is True
+    return client._client
+
+
 @pytest.fixture
 def fake_llm_cls():
     """返回 FakeLLM 类（测试里自己传 content / raise_error）。"""

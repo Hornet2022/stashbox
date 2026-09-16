@@ -17,3 +17,5 @@ structlog>=24.1
 httpx>=0.28
 # CP3.5-pre-3 Arq 异步队列（替换 BackgroundTasks）
 arq>=0.26
+# CP3.5-pre-4 蒸馏调用跟踪（任务包 §3.1 用 v2 的 trace/span/generation API）
+langfuse>=2.57,<3

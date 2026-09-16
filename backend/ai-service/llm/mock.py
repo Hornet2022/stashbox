@@ -27,6 +27,15 @@ class MockLLMClient(LLMClient):
         self._closed = False
 
     async def chat(self, req: ChatRequest) -> ChatResponse:
+        try:
+            resp = await self._mock_chat(req)
+            await self._maybe_trace(req, resp=resp)
+            return resp
+        except Exception as e:
+            await self._maybe_trace(req, error=e)
+            raise
+
+    async def _mock_chat(self, req: ChatRequest) -> ChatResponse:
         start = time.time()
         await asyncio.sleep(self.latency_ms / 1000.0)
 
@@ -54,11 +63,18 @@ class MockLLMClient(LLMClient):
         )
 
     async def stream(self, req: ChatRequest) -> AsyncIterator[str]:
-        """mock 流式：按句号切块，每 50ms 吐一个 chunk。"""
-        chunks = (await self.chat(req)).content.split("。")
-        for chunk in chunks:
-            yield chunk + "。"
-            await asyncio.sleep(0.05)
+        """mock 流式：按句号切块，每 50ms 吐一个 chunk。
+
+        usage 已经在内部 chat() 里上报过，这里只在失败时标 ERROR，不重复计数。
+        """
+        try:
+            chunks = (await self.chat(req)).content.split("。")
+            for chunk in chunks:
+                yield chunk + "。"
+                await asyncio.sleep(0.05)
+        except Exception as e:
+            await self._maybe_trace(req, error=e)
+            raise
 
     async def count_tokens(self, text: str, model: str | None = None) -> int:
         return len(text) // 4

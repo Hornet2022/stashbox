@@ -18,6 +18,7 @@
 """
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
+from logging import getLogger
 
 from .types import ChatRequest, ChatResponse
 
@@ -61,6 +62,73 @@ class LLMClient(ABC):
         Mock 实现可以简单 len(text) // 4；真实现用 tiktoken 或官方 SDK。
         """
         ...
+
+    async def _maybe_trace(
+        self,
+        req: ChatRequest,
+        resp: ChatResponse | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        """Langfuse 上报 + 成本归因钩子（CP3.5-pre-4）。
+
+        具体实现（mock / claude / qwen_vl）在 chat/stream 的成功分支传 resp=，
+        异常分支传 error=。
+
+        LANGFUSE_ENABLED 默认 false —— 直接返回：不发 trace、不写 Redis，
+        行为与 CP3.5-pre-2 完全一致（任务包 §4.5 向后兼容要求）。
+
+        注：这里用顶层绝对 import（observability 与 llm 同级），同 distill/steps.py
+        的 `from llm.types import ...` 约定。
+        """
+        from observability.langfuse_client import LangfuseClient
+
+        client = LangfuseClient.get()
+        if not client.enabled:
+            return
+
+        trace = client.create_trace(
+            name="llm_chat",
+            metadata={"model": resp.model if resp else req.model},
+        )
+
+        if resp is not None:
+            messages = [m.model_dump() for m in req.messages]
+            span = client.create_span(trace, "llm_chat", input=messages)
+            client.create_generation(
+                span,
+                "llm_chat",
+                model=resp.model,
+                input=messages,
+                output=resp.content,
+                usage=resp.usage.model_dump(),
+            )
+            await self._record_cost(req, resp)
+        elif error is not None and trace is not None:
+            try:
+                trace.update(level="ERROR", status_message=str(error))
+            except Exception:  # 上报失败不能掩盖业务异常
+                pass
+
+    async def _record_cost(self, req: ChatRequest, resp: ChatResponse) -> None:
+        """把 usage 折成 USD 记进 Redis（失败只 log 不抛）。"""
+        from observability.cost_tracker import CostTracker
+
+        metadata = req.metadata or {}
+        user_id = metadata.get("user_id")
+        article_id = metadata.get("article_id")
+        if not user_id or not article_id:  # 蒸馏链路才归因（没有这两个 metadata 的裸调用跳过）
+            return
+
+        try:
+            await CostTracker().record_llm_usage(
+                user_id,
+                article_id,
+                resp.model,
+                resp.usage.prompt_tokens,
+                resp.usage.completion_tokens,
+            )
+        except Exception as exc:
+            getLogger(__name__).warning("成本归因失败（忽略）: %s", exc)
 
     async def __aenter__(self) -> "LLMClient":
         return self

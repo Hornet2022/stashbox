@@ -52,10 +52,18 @@ class QwenVLClient(LLMClient):
         )
 
     async def chat(self, req: ChatRequest) -> ChatResponse:
-        raise NotImplementedError("QwenVLClient.chat 留 CP3.5 接 DashScope API")
+        try:
+            raise NotImplementedError("QwenVLClient.chat 留 CP3.5 接 DashScope API")
+        except Exception as e:
+            await self._maybe_trace(req, error=e)
+            raise
 
     async def stream(self, req: ChatRequest) -> AsyncIterator[str]:
-        raise NotImplementedError("QwenVLClient.stream 留 CP3.5")
+        try:
+            raise NotImplementedError("QwenVLClient.stream 留 CP3.5")
+        except Exception as e:
+            await self._maybe_trace(req, error=e)
+            raise
 
     async def count_tokens(self, text: str, model: str | None = None) -> int:
         return len(text) // 4
