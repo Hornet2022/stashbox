@@ -1,26 +1,35 @@
 """
-api-gateway（端口 8000） - 听匣统一入口 + JWT 签发 + 路由分发。
+api-gateway（端口 8100） - 听匣统一入口 + JWT 签发 + 路由分发。
 
 职责：
   - GET  /health                                 健康检查
   - POST /api/v1/auth/token                     签发 JWT（公开）
-  - /api/v1/{path:path}                          按前缀转发到下游 3 个服务
+  - 路由表命中的请求（见 config.ROUTES）          按表转发到对应下游
+  - /api/v1/{path:path}                          表外兜底：按前缀猜下游
 
-下游路由（见 stashbox.backend.common.config.Settings）：
-  /api/v1/user        / /api/v1/subscription  -> user_service_url
-  /api/v1/articles    / /api/v1/tags /callback -> content_service_url
-  /api/v1/distill     / /api/v1/admin/distill  -> ai_service_url
-  未匹配                                              -> 404
+路由表（CP1.7.1）：route → service 的映射全部在 config.py，main.py 只做
+动态注册 + 统一转发。CP1.7.1 新增 3 条：
+  POST /api/v1/callback/d9-add-article      -> content-service（不要求登录态）
+  GET  /api/v1/articles/{article_id}/status -> content-service
+  GET  /api/v1/articles/{article_id}/audio-url -> content-service
+  未匹配                                          -> 404
 """
 from contextlib import asynccontextmanager
+from functools import partial
+from pathlib import Path
+import sys
 
 # 注意：本服务不再使用 sys.path hack。stashbox 包通过 PYTHONPATH（见 run_dev.sh）
 # 或 `pip install -e` 导入。直接 `uvicorn main:app` 时需保证仓库根父目录在 PYTHONPATH 中。
+# 例外：同目录下的 config.py（路由表）是「按文件加载」的一部分 —— 单测用
+# importlib 加载 main.py 时 cwd 不在服务目录，故把自身目录加入 sys.path。
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # noqa: E402
 
 import httpx
 from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel
 
+from config import D9_ROUTE, ROUTES, Route  # noqa: E402
 from stashbox.backend.common.auth import create_access_token
 from stashbox.backend.common.config import settings
 from stashbox.backend.common.exceptions import register_exception_handlers
@@ -68,6 +77,62 @@ async def issue_token(req: TokenRequest):
     )
 
 
+async def proxy(request: Request, route: Route) -> Response:
+    """统一代理：method / path / query / body / headers 全透传给下游。
+
+    CP1.7.1 不注入 service token（service-to-service auth 留 CP1.8+），
+    Authorization 原样带给下游，由下游自己校验 JWT。
+    """
+    headers = {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in ("host", "content-length")
+    }
+    # 链路串联：客户端没带 X-Request-ID 时补上 gateway 生成的那个，保证下游日志同源
+    # （ASGI 把请求头名转成小写，这里按小写判存在，避免同一个头发两遍）
+    if "x-request-id" not in {k.lower() for k in headers}:
+        headers["X-Request-ID"] = request.state.request_id
+
+    client: httpx.AsyncClient = request.app.state.httpx
+    upstream = await client.request(
+        request.method,
+        f"{route.target_url}{request.url.path}",
+        params=request.query_params,
+        content=await request.body(),
+        headers=headers,
+        timeout=30.0,
+    )
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type"),
+    )
+
+
+async def proxy_d9(request: Request) -> Response:
+    """D9 回调：gateway 侧不强制 JWT —— Authorization 有就透传，没有就不带。
+
+    承宇 2026-09-16 决策：身份判定交给下游 content-service 的
+    require_user_optional（已登录用 user_id，未登录用 device-id 头，都没有 → 4001）。
+    """
+    return await proxy(request, D9_ROUTE)
+
+
+# 按路由表动态注册（必须在下面的 /api/v1/{path:path} 兜底路由之前 —— Starlette
+# 按注册顺序匹配，兜底路由放在后面才不会把精确路由吃掉）。
+for _route in ROUTES:
+    if _route.special == "d9":
+        continue  # D9 单独挂（见下）：不要求登录态
+    app.add_api_route(
+        _route.path,
+        partial(proxy, route=_route),
+        methods=[_route.method],
+        name=f"proxy_{_route.method.lower()}_{_route.path}",
+    )
+
+app.add_api_route(D9_ROUTE.path, proxy_d9, methods=["POST"], name="proxy_d9")
+
+
 def _resolve_target(path: str) -> str | None:
     """根据第一段路径决定下游 base url。"""
     segment = path.split("/", 1)[0]
@@ -84,7 +149,8 @@ def _resolve_target(path: str) -> str | None:
     "/api/v1/{path:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
 )
-async def proxy(request: Request, path: str):
+async def proxy_fallback(request: Request, path: str):
+    """路由表没命中的兜底：按第一段路径猜下游（CP1.4/1.5 行为，逐步被路由表取代）。"""
     target_base = _resolve_target(path)
     if target_base is None:
         return Response(status_code=404, content=b'{"detail":"no downstream route"}')
