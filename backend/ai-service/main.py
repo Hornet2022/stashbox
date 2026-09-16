@@ -190,7 +190,7 @@ async def distill_article(
             DistilledArticle.article_id == article_id
         )
     )
-    already_charged = existed > 0 or await cache_service.has_article_quota(article_id)
+    already_charged = existed > 0
     quota_used = None
     if not already_charged:
         quota = await quota_service.consume(db, uid)  # 用尽抛 3001
