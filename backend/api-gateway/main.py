@@ -25,8 +25,10 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # noqa: E402
 
 import httpx
+import structlog
 from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import D9_ROUTE, ROUTES, Route  # noqa: E402
 from stashbox.backend.common.auth import create_access_token
@@ -36,6 +38,24 @@ from stashbox.backend.common.logging import setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
 from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common.event_collect import router as event_router
+from stashbox.backend.common.analytics import track_simple
+from stashbox.backend.common.events import EventName
+from stashbox.backend.common.database import AsyncSessionLocal
+
+
+class ErrorTrackingMiddleware(BaseHTTPMiddleware):
+    """5xx structlog 警告埋点（CP6.2.2.2b）。"""
+
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        if response.status_code >= 500:
+            structlog.get_logger("api_5xx").warning(
+                "api_5xx",
+                path=request.url.path,
+                status=response.status_code,
+                method=request.method,
+            )
+        return response
 
 setup_logging("api-gateway")
 
@@ -43,13 +63,26 @@ setup_logging("api-gateway")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.httpx = httpx.AsyncClient()
+    # CP6.2.2.2b 埋点：SERVICE_START
+    try:
+        async with AsyncSessionLocal() as session:
+            await track_simple(session, EventName.SERVICE_START, 0, "n/a")
+    except Exception:
+        pass  # 失败不阻塞 startup
     yield
+    # CP6.2.2.2b 埋点：SERVICE_STOP
+    try:
+        async with AsyncSessionLocal() as session:
+            await track_simple(session, EventName.SERVICE_STOP, 0, "n/a")
+    except Exception:
+        pass
     await app.state.httpx.aclose()
 
 
 app = FastAPI(title="stashbox-api-gateway", version="0.1.0", lifespan=lifespan)
 register_exception_handlers(app)
 app.add_middleware(RequestIDMiddleware)
+app.add_middleware(ErrorTrackingMiddleware)
 install_health_endpoints(app)
 
 

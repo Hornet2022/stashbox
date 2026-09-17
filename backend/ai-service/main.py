@@ -70,6 +70,12 @@ async def lifespan(app: FastAPI):
         log.info("distill queue poller 已启动")
     except Exception as exc:
         log.error("distill queue poller 启动失败（忽略）: %s", exc)
+    # CP6.2.2.2b 埋点：SERVICE_START
+    try:
+        async with AsyncSessionLocal() as session:
+            await track_simple(session, EventName.SERVICE_START, 0, "n/a")
+    except Exception:
+        pass  # 失败不阻塞 startup
 
     yield
 
@@ -81,6 +87,12 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
     await shutdown_dispatcher()
+    # CP6.2.2.2b 埋点：SERVICE_STOP
+    try:
+        async with AsyncSessionLocal() as session:
+            await track_simple(session, EventName.SERVICE_STOP, 0, "n/a")
+    except Exception:
+        pass
 
 
 setup_logging("ai-service")

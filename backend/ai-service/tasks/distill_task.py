@@ -116,6 +116,12 @@ async def distill_task(
 
     try:
         await pipeline.run(pipeline_ctx)
+        # CP6.2.2.2b 埋点：DISTILL_STEP_COMPLETE（注：步骤在 DistillPipeline 内部迭代，
+        # 本文件只在外层 pipeline.run 完成后打点；如需真正 per-step 打点需改 DistillPipeline）
+        async with AsyncSessionLocal() as db:
+            await track(db, EventName.DISTILL_STEP_COMPLETE,
+                        user_id=user_id, article_id=article_id,
+                        metadata={"step": "pipeline_run"})
         log.info("arq_distill_completed", task_id=task_id, article_id=article_id)
         # CP6.2.1 埋点：distill_completed
         async with AsyncSessionLocal() as db:
@@ -123,6 +129,11 @@ async def distill_task(
         return {"task_id": task_id, "status": "done"}
     except Exception as e:
         log.exception("arq_distill_failed", task_id=task_id, article_id=article_id, error=str(e))
+        # CP6.2.2.2b 埋点：DISTILL_RETRY（注：Arq 自动 retry，distill_task.py 内无显式 retry 计数器，
+        # 此处代表 Arq 将在该异常抛出后触发重试）
+        async with AsyncSessionLocal() as db:
+            await track(db, EventName.DISTILL_RETRY, user_id=user_id, article_id=article_id,
+                        metadata={"reason": str(e)})
         # CP6.2.1 埋点：distill_failed + distill_quota_refund
         async with AsyncSessionLocal() as db:
             await track(db, EventName.DISTILL_FAILED, user_id=user_id, article_id=article_id, reason=str(e))

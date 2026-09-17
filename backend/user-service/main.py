@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from stashbox.backend.common.auth import create_access_token, require_user
 from stashbox.backend.common.config import settings
-from stashbox.backend.common.database import get_db
+from stashbox.backend.common.database import AsyncSessionLocal, get_db
 from stashbox.backend.common.exceptions import (
     NotFound,
     register_exception_handlers,
@@ -47,10 +47,22 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         # 启动失败不能让 user-service 进入 broken state
         log.error("quota_reset_loop 启动失败（忽略）: %s", exc)
+    # CP6.2.2.2b 埋点：SERVICE_START
+    try:
+        async with AsyncSessionLocal() as session:
+            await track_simple(session, EventName.SERVICE_START, 0, "n/a")
+    except Exception:
+        pass  # 失败不阻塞 startup
 
     yield
 
     # shutdown（无清理需求，留 CP7 换 apscheduler 再处理）
+    # CP6.2.2.2b 埋点：SERVICE_STOP
+    try:
+        async with AsyncSessionLocal() as session:
+            await track_simple(session, EventName.SERVICE_STOP, 0, "n/a")
+    except Exception:
+        pass
 
 
 setup_logging("user-service")

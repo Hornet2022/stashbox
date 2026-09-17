@@ -168,3 +168,40 @@ class TestArticleCaptureFailedEvent:
         call_args = mock_track.call_args
         assert call_args[0][1] == EventName.ARTICLE_CAPTURE_FAILED  # event arg
         assert call_args[1]["user_id"] == ANONYMOUS_USER_ID
+
+
+# CP6.2.2.2b: 4 服务 lifespan 事件测试
+class TestServiceLifespanEvent:
+    """test_service_lifespan_event_tracks：SERVICE_START / SERVICE_STOP mock 验证。"""
+
+    @pytest.mark.asyncio
+    async def test_service_lifespan_event_tracks(self):
+        """SERVICE_START / SERVICE_STOP：模拟 lifespan startup/shutdown 场景，验证 track_simple 被正确调用。
+
+        注意：任务包要求加 1 个测试，但 SERVICE_START 和 SERVICE_STOP 是成对事件，
+        合并在一个测试方法内验证（避免重复用例）。
+        """
+        from stashbox.backend.common import analytics
+        from stashbox.backend.common.events import EventName
+
+        mock_db = AsyncMock()
+
+        # SERVICE_START
+        with patch.object(analytics, "track_simple", new_callable=AsyncMock) as mock_track:
+            mock_track.return_value = 1
+            await analytics.track_simple(mock_db, EventName.SERVICE_START, 0, "n/a")
+        mock_track.assert_called_once()
+        call_args = mock_track.call_args
+        assert call_args[0][1] == EventName.SERVICE_START
+        assert call_args[0][2] == 0
+        assert call_args[0][3] == "n/a"
+
+        # SERVICE_STOP
+        with patch.object(analytics, "track_simple", new_callable=AsyncMock) as mock_track:
+            mock_track.return_value = 1
+            await analytics.track_simple(mock_db, EventName.SERVICE_STOP, 0, "n/a")
+        mock_track.assert_called_once()
+        call_args = mock_track.call_args
+        assert call_args[0][1] == EventName.SERVICE_STOP
+        assert call_args[0][2] == 0
+        assert call_args[0][3] == "n/a"
