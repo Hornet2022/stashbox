@@ -5,6 +5,7 @@ from .article import Article
 from .distilled_article import DistilledArticle
 from .feedback import Feedback
 from .tag import Tag, TagSubscription
+from .admin_operation_log import AdminOperationLog
 
 __all__ = [
     "Base",
@@ -15,4 +16,5 @@ __all__ = [
     "Feedback",
     "Tag",
     "TagSubscription",
+    "AdminOperationLog",
 ]

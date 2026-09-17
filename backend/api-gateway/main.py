@@ -36,6 +36,7 @@ from stashbox.backend.common.config import settings
 from stashbox.backend.common.exceptions import register_exception_handlers
 from stashbox.backend.common.logging import setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
+from stashbox.backend.common.middleware.audit import AuditMiddleware
 from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common.event_collect import router as event_router
 from stashbox.backend.common.analytics import track_simple
@@ -83,6 +84,7 @@ app = FastAPI(title="stashbox-api-gateway", version="0.1.0", lifespan=lifespan)
 register_exception_handlers(app)
 app.add_middleware(RequestIDMiddleware)
 app.add_middleware(ErrorTrackingMiddleware)
+app.add_middleware(AuditMiddleware)
 install_health_endpoints(app)
 
 
