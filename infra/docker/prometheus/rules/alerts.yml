@@ -100,3 +100,36 @@ groups:
         annotations:
           summary: "Redis 连接失败"
           description: "Redis exporter 探测失败持续 2 分钟（队列 / 缓存不可用）"
+
+      # v1 §10.5 规则 5：blackbox 探测任意服务 down
+      - alert: ServiceUnreachable
+        expr: probe_success{service="blackbox"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          rule: v1-10.5-rule-5
+        annotations:
+          summary: "服务 {{ $labels.instance }} 不可达"
+          description: "blackbox 探测 {{ $labels.instance }} 失败超过 1 分钟（v1 §10.5 规则 5）"
+
+      # v1 §10.5 规则 8：redis 不可达
+      - alert: RedisDown
+        expr: redis_up{service="redis"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          rule: v1-10.5-rule-8
+        annotations:
+          summary: "Redis 不可达"
+          description: "redis_exporter 探测 redis 失败超过 30 秒（v1 §10.5 规则 8）"
+
+      # v1 §10.5 规则 8：redis 连接数过高
+      - alert: RedisConnectionsHigh
+        expr: redis_connected_clients{service="redis"} > 100
+        for: 5m
+        labels:
+          severity: warning
+          rule: v1-10.5-rule-8
+        annotations:
+          summary: "Redis 连接数过高（{{ $value }}）"
+          description: "redis connected_clients 超过 100 持续 5 分钟（v1 §10.5 规则 8）"

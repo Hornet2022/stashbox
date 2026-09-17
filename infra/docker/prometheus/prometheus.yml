@@ -58,3 +58,31 @@ scrape_configs:
       - targets: ["host.docker.internal:8104"]
         labels:
           service: ai-worker
+
+  # blackbox 探测（v1 §10.5 规则 5：HTTP 黑盒探测）
+  - job_name: blackbox
+    metrics_path: /probe
+    params:
+      module: [http_2xx_healthz]
+    static_configs:
+      - targets:
+          - http://host.docker.internal:8100/healthz   # api-gateway
+          - http://host.docker.internal:8101/healthz   # user-service
+          - http://host.docker.internal:8102/healthz   # content-service
+          - http://host.docker.internal:8103/healthz   # ai-service
+        labels:
+          service: blackbox
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox_exporter:9115
+
+  # redis 监控（v1 §10.5 规则 8）
+  - job_name: redis
+    static_configs:
+      - targets: ["redis_exporter:9121"]
+        labels:
+          service: redis

@@ -65,6 +65,30 @@ services:
       - "--storage.path=/alertmanager"
     restart: unless-stopped
 
+  blackbox_exporter:
+    image: prom/blackbox-exporter:v0.25.0
+    container_name: stashbox_blackbox_exporter
+    ports:
+      - "9115:9115"
+    volumes:
+      - ./prometheus/blackbox.yml:/etc/blackbox_exporter/blackbox.yml:ro
+    command:
+      - "--config.file=/etc/blackbox_exporter/blackbox.yml"
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  redis_exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    container_name: stashbox_redis_exporter
+    ports:
+      - "9121:9121"
+    environment:
+      - REDIS_ADDR=host.docker.internal:6379
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
 volumes:
   prometheus_data:
   grafana_data:
