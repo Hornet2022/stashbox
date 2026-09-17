@@ -169,9 +169,12 @@ async def distill_article(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """开始蒸馏（v1 §3.2）：未在该文章上扣过配额则再扣一次 → 建任务 → 入 Arq 队列。
+    """开始蒸馏（v1 §3.2）：已在该文章上做过完整蒸馏则直接复用（按 article 幂等）；
 
-    - 已在 content-service POST /articles 扣过的文章不会重复扣（幂等：按 article 判断）
+    否则扣一次配额 → 建任务 → 入 Arq 队列。
+
+    - CP1.7.4 幂等修复：复用判定从「已扣过配额」改为「已有完整蒸馏产物」
+      （不再把已在 content-service 抓取阶段扣过的配额误算入蒸馏阶段）
     - simulate_failure=True 用于验证「蒸馏失败 → 退还」
     - CP3.5-pre-3：任务不再在请求线程里跑（BackgroundTasks），而是塞进 Arq 队列由
       独立 worker 进程消费；端点签名不变，只多返一个 job_id

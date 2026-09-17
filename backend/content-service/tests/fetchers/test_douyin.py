@@ -11,6 +11,7 @@ import importlib
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -159,3 +160,93 @@ async def test_douyin_fetch_happy_path():
     assert result.raw_metadata["duration_ms"] == 30000
     assert result.raw_metadata["status_code"] == 200
     assert result.raw_metadata["final_url"] == VIDEO_URL
+
+
+# ==========================================================================
+# 5.5 CP2.3.1 移动端 UA + 三路径 fallback
+# ==========================================================================
+
+# 主路径命中时返回的 aweme_detail（与 FetchResult 构造路径一致）
+_MOCK_AWEME_DETAIL = {
+    "aweme_id": "7123456789012345678",
+    "desc": "测试视频",
+    "author": {"nickname": "测试作者"},
+    "video": {
+        "duration": 15000,
+        "cover": {"url_list": ["https://example.com/cover.jpg"]},
+        "play_addr": {"url_list": ["https://example.com/video.mp4"]},
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_mobile_ua_used_on_request():
+    """下载请求必须带移动端 UA（含 'Mobile'）。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "Mobile" in request.headers.get("user-agent", "")
+        return httpx.Response(200, text=DOUYIN_HTML, headers=HTML_HEADERS)
+
+    fetcher = DouyinFetcher(transport=httpx.MockTransport(handler))
+    # RENDER_DATA 命中，第一步即返回 —— UA 校验发生在 _download 里
+    result = await fetcher.fetch(SHORT_URL)
+    assert result.source == "douyin"
+
+
+@pytest.mark.asyncio
+async def test_three_path_fallback_raises_unsupported():
+    """主路径 + 两个兜底都失败 → FetcherError(UNSUPPORTED) → 2001/400。"""
+    transport = httpx.MockTransport(
+        lambda r: httpx.Response(200, text="<html>no data</html>", headers=HTML_HEADERS)
+    )
+    fetcher = DouyinFetcher(transport=transport)
+    with patch.object(
+        fetcher, "_extract_aweme_id", new=AsyncMock(return_value="7123456789012345678")
+    ), patch.object(
+        fetcher, "_fetch_mobile_h5", new=AsyncMock(return_value=None)
+    ), patch.object(
+        fetcher, "_fetch_iesdouyin_h5", new=AsyncMock(return_value=None)
+    ), patch.object(
+        fetcher, "_fetch_iesdouyin_api", new=AsyncMock(return_value=None)
+    ):
+        with pytest.raises(FetcherError) as exc_info:
+            await fetcher.fetch("https://v.douyin.com/i12345")
+    assert exc_info.value.code == FetcherErrorCode.UNSUPPORTED
+
+
+@pytest.mark.asyncio
+async def test_main_path_success_returns_result():
+    """主路径 _fetch_mobile_h5 命中 → 构造 FetchResult（含 video_url）。"""
+    transport = httpx.MockTransport(
+        lambda r: httpx.Response(200, text="<html>no data</html>", headers=HTML_HEADERS)
+    )
+    fetcher = DouyinFetcher(transport=transport)
+    with patch.object(
+        fetcher, "_extract_aweme_id", new=AsyncMock(return_value="7123456789012345678")
+    ), patch.object(
+        fetcher, "_fetch_mobile_h5", new=AsyncMock(return_value=_MOCK_AWEME_DETAIL)
+    ):
+        result = await fetcher.fetch("https://v.douyin.com/i12345")
+    assert result.title == "测试视频"
+    assert result.author == "测试作者"
+    assert any(u.startswith("https://") for u in result.media_urls)
+    assert result.raw_metadata["aweme_id"] == "7123456789012345678"
+
+
+def test_extract_aweme_id_from_url_patterns():
+    """多种 URL 形态都能抽到 aweme_id；短链无 id → None（需跳转后抽）。"""
+    cases = [
+        ("https://www.douyin.com/video/7123456789012345678", "7123456789012345678"),
+        (
+            "https://www.iesdouyin.com/share/video/7123456789012345678/",
+            "7123456789012345678",
+        ),
+        (
+            "https://v.douyin.com/abc123/?modal_id=7123456789012345678",
+            "7123456789012345678",
+        ),
+        ("https://www.douyin.com/note/7123456789012345678", "7123456789012345678"),
+        ("https://v.douyin.com/iAbC", None),  # 短链无 id
+    ]
+    for url, expected in cases:
+        assert DouyinFetcher._extract_aweme_id_from_url(url) == expected
