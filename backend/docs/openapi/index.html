@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Stashbox API 文档（OpenAPI 3.1）</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      CP6.6：Redoc 静态文档页。
+      加载同目录下的 stashbox-openapi.json（由 backend/scripts/export_openapi.py 生成）。
+      本地预览：bash backend/scripts/serve_openapi.sh  → http://localhost:8888/
+      注意：红线要求只用 Redoc，不接 Swagger UI。
+    -->
+    <redoc spec-url="./stashbox-openapi.json" hide-download-button="false"></redoc>
+    <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
+  </body>
+</html>

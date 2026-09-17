@@ -1,0 +1,3413 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Stashbox API",
+    "version": "0.1.0",
+    "description": "听匣（Stashbox）后端 4 服务合并 OpenAPI schema。\n\n由 `backend/scripts/export_openapi.py` 自动生成，请勿手改。\n\n服务分组见 tags：api-gateway / user-service / content-service / ai-service。"
+  },
+  "tags": [
+    {
+      "name": "ai-service",
+      "description": "ai-service 提供的端点（合并自 ai-service/main.py）"
+    },
+    {
+      "name": "api-gateway",
+      "description": "api-gateway 提供的端点（合并自 api-gateway/main.py）"
+    },
+    {
+      "name": "content-service",
+      "description": "content-service 提供的端点（合并自 content-service/main.py）"
+    },
+    {
+      "name": "user-service",
+      "description": "user-service 提供的端点（合并自 user-service/main.py）"
+    }
+  ],
+  "paths": {
+    "/api/v1/admin/articles/{article_id}/force-retry": {
+      "post": {
+        "summary": "Admin Force Retry",
+        "description": "v1 §3.6 强制重试蒸馏。\n\n行为：\n  1. reason ≥5 字符校验（commit 前，失败不落库）\n  2. 校验 article 存在（不存在 404）\n  3. 状态置 pending（article 表无 retry_count 列，以 status=pending 表达\"待重试\"，\n     由后续 ai-service / worker 重新蒸馏）\n  4. 同事务写 admin_operation_logs 一条（A1 已建表）\n  5. 提交后触发 ai-service 蒸馏；不可达时仅置 pending，由 worker 自动重试\n失败回滚事务。",
+        "operationId": "admin_force_retry_api_v1_admin_articles__article_id__force_retry_post",
+        "parameters": [
+          {
+            "name": "article_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Article Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminActionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
+    "/api/v1/admin/audio/{audio_id}/invalidate": {
+      "post": {
+        "summary": "Admin Audio Invalidate",
+        "description": "v1 §3.6 音频文件作废。\n\n本仓库无独立 audio_files 表，音频实体即 distilled_articles（含 audio_url）。\n行为：\n  1. reason ≥5 字符校验\n  2. 校验 distilled_article 存在（不存在 404）\n  3. 状态置 invalidated\n  4. 同事务写 admin_operation_logs 一条\n幂等：重复调用保持 invalidated 状态，仍记录操作日志。\n失败回滚事务。",
+        "operationId": "admin_audio_invalidate_api_v1_admin_audio__audio_id__invalidate_post",
+        "parameters": [
+          {
+            "name": "audio_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Audio Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminActionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
+    "/api/v1/admin/audit-log": {
+      "get": {
+        "summary": "Admin Audit Log",
+        "description": "v1 §3.6 审计日志查询（读 admin_operation_logs，CP3.6-A1）。\n\n查询参数：page / size / actor_id / action_type / from / to\n排序：created_at DESC；过滤：actor_id exact + action_type exact + 时间范围。",
+        "operationId": "admin_audit_log_api_v1_admin_audit_log_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 20,
+              "title": "Size"
+            }
+          },
+          {
+            "name": "actor_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Actor Id"
+            }
+          },
+          {
+            "name": "action_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Action Type"
+            }
+          },
+          {
+            "name": "from_",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "From "
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "To"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
+    "/api/v1/admin/auth/login": {
+      "post": {
+        "summary": "Admin Login",
+        "description": "admin / operator 邮箱密码登录，返回 1h JWT + 写审计日志。",
+        "operationId": "admin_login_api_v1_admin_auth_login_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminLoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminLoginResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service"
+        ]
+      }
+    },
+    "/api/v1/admin/stats": {
+      "get": {
+        "summary": "Admin Stats",
+        "operationId": "admin_stats_api_v1_admin_stats_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
+    "/api/v1/admin/users": {
+      "get": {
+        "summary": "Admin List Users",
+        "description": "v1 §3.6 用户管理：分页 + 关键词 + 角色过滤。\n\n- 关键词：nickname ILIKE '%keyword%'（v1 §3.6 原指 email/display_name，\n  users 表无 email 列，映射为 nickname）\n- 排序：created_at DESC\n- status 查询参数保留接口兼容；users 表无状态列，不做落库过滤",
+        "operationId": "admin_list_users_api_v1_admin_users_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 20,
+              "title": "Size"
+            }
+          },
+          {
+            "name": "keyword",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Keyword"
+            }
+          },
+          {
+            "name": "tier",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Tier"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Status"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminUserListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service"
+        ]
+      }
+    },
+    "/api/v1/admin/users/{user_id}/quota-adjust": {
+      "post": {
+        "summary": "Admin Quota Adjust",
+        "description": "v1 §3.6 调整用户月度配额。\n\n行为：\n  1. 校验 monthly_quota > 0、reason 必填 ≥5 字符、目标 user 存在\n  2. 更新 users.monthly_quota\n  3. 同事务写入 admin_operation_logs 一条（A1 已建表）\n  4. 失败整体回滚（ValidationError 在 commit 前抛出，不落库）",
+        "operationId": "admin_quota_adjust_api_v1_admin_users__user_id__quota_adjust_post",
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QuotaAdjustRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserQuotaResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service"
+        ]
+      }
+    },
+    "/api/v1/articles": {
+      "post": {
+        "summary": "Submit Article",
+        "description": "提交链接（v1 §3.1）：扣 1 次配额 → 建文章 → 配额/待听缓存失效。\n\n扣减走 quota_service 乐观锁（含 Redis Lua 原子失效），配额用尽抛 3001。",
+        "operationId": "submit_article_api_v1_articles_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddArticleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
+    "/api/v1/articles/add": {
+      "post": {
+        "summary": "Add Article",
+        "operationId": "add_article_api_v1_articles_add_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddArticleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArticleResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/articles/listened": {
+      "get": {
+        "summary": "List Listened",
+        "operationId": "list_listened_api_v1_articles_listened_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/articles/pending": {
+      "get": {
+        "summary": "List Pending",
+        "operationId": "list_pending_api_v1_articles_pending_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/articles/{article_id}": {
+      "get": {
+        "summary": "Get Article",
+        "operationId": "get_article_api_v1_articles__article_id__get",
+        "parameters": [
+          {
+            "name": "article_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Article Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArticleResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/articles/{article_id}/audio-url": {
+      "get": {
+        "summary": "Article Audio Url",
+        "description": "取音频播放地址：仅 status=ready 可用，其余 404。\n\nOSS 签名本期 mock（CP1.8+ 接真签名，依赖阿里云 RAM 配置）。",
+        "operationId": "article_audio_url_api_v1_articles__article_id__audio_url_get",
+        "parameters": [
+          {
+            "name": "article_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Article Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AudioUrlResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/articles/{article_id}/distill": {
+      "post": {
+        "summary": "Distill Article",
+        "description": "开始蒸馏（v1 §3.2）：已在该文章上做过完整蒸馏则直接复用（按 article 幂等）；\n\n否则扣一次配额 → 建任务 → 入 Arq 队列。\n\n- CP1.7.4 幂等修复：复用判定从「已扣过配额」改为「已有完整蒸馏产物」\n  （不再把已在 content-service 抓取阶段扣过的配额误算入蒸馏阶段）\n- simulate_failure=True 用于验证「蒸馏失败 → 退还」\n- CP3.5-pre-3：任务不再在请求线程里跑（BackgroundTasks），而是塞进 Arq 队列由\n  独立 worker 进程消费；端点签名不变，只多返一个 job_id",
+        "operationId": "distill_article_api_v1_articles__article_id__distill_post",
+        "parameters": [
+          {
+            "name": "article_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Article Id"
+            }
+          },
+          {
+            "name": "simulate_failure",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Simulate Failure"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "ai-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/articles/{article_id}/favorite": {
+      "post": {
+        "summary": "Favorite",
+        "operationId": "favorite_api_v1_articles__article_id__favorite_post",
+        "parameters": [
+          {
+            "name": "article_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Article Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/articles/{article_id}/mark-listened": {
+      "post": {
+        "summary": "Mark Listened",
+        "operationId": "mark_listened_api_v1_articles__article_id__mark_listened_post",
+        "parameters": [
+          {
+            "name": "article_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Article Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/articles/{article_id}/skip": {
+      "post": {
+        "summary": "Skip",
+        "operationId": "skip_api_v1_articles__article_id__skip_post",
+        "parameters": [
+          {
+            "name": "article_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Article Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/articles/{article_id}/status": {
+      "get": {
+        "summary": "Article Status",
+        "description": "文章 + 蒸馏任务聚合状态（v1 §11.4 CP1.7）：客户端轮询这个端点等 ready。",
+        "operationId": "article_status_api_v1_articles__article_id__status_get",
+        "parameters": [
+          {
+            "name": "article_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Article Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArticleStatusResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/auth/refresh-token": {
+      "post": {
+        "summary": "Proxy Post /Api/V1/Auth/Refresh-Token",
+        "operationId": "proxy_post__api_v1_auth_refresh_token_api_v1_auth_refresh_token_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/auth/token": {
+      "post": {
+        "summary": "Issue Token",
+        "description": "签发 JWT（mock：直接用传入 user_id）。",
+        "operationId": "issue_token_api_v1_auth_token_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/auth/wechat-login": {
+      "post": {
+        "summary": "Wechat Login",
+        "description": "微信登录（mock：code 派生 open_id，按 open_id 查/插 users 表）。",
+        "operationId": "wechat_login_api_v1_auth_wechat_login_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WechatLoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WechatLoginResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/callback/clawbot-message": {
+      "post": {
+        "summary": "Clawbot Message",
+        "description": "ClawBot 入口（mock）：接收消息，解析出 URL 则建文章。",
+        "operationId": "clawbot_message_api_v1_callback_clawbot_message_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClawBotMessageRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
+    "/api/v1/callback/d9-add-article": {
+      "post": {
+        "summary": "D9 Add Article",
+        "description": "D9 入口（v1 §3.5）：微信「更多打开方式」→ 听匣，不要求登录态。\n\n1. 解析 caller：已登录用 user_id，未登录用 device_id（两者都没有 → 4001）\n2. 配额预扣（仅已登录；匿名不计费）\n3. 建 articles 行（status=pending）\n4. 触发 ai-service 蒸馏（失败只 log，不影响 D9 返回）",
+        "operationId": "d9_add_article_api_v1_callback_d9_add_article_post",
+        "parameters": [
+          {
+            "name": "device-id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Device-Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/D9AddRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/D9AddResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/callback/wechat-mp-message": {
+      "post": {
+        "summary": "Wechat Mp Message",
+        "description": "微信公众号服务号回调（v1 §11.2 CP2.5）。\n\n接收用户发给服务号的 URL → 路由 fetcher 抓正文 → 建文章 → 触发蒸馏。\n\n- 不需要 JWT（公众号回调，公众号已认证用户身份）\n- 不扣配额（匿名入口，等客户端登录后再扣）\n- 失败抛 BizException(2001=URL 不支持 / 2002=抓取失败)",
+        "operationId": "wechat_mp_message_api_v1_callback_wechat_mp_message_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WechatMpMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
+    "/api/v1/distill/start": {
+      "post": {
+        "summary": "Distill Start",
+        "operationId": "distill_start_api_v1_distill_start_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DistillStartRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DistillStartResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "ai-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/distill/{task_id}": {
+      "get": {
+        "summary": "Distill Status",
+        "operationId": "distill_status_api_v1_distill__task_id__get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "ai-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/events/collect": {
+      "post": {
+        "tags": [
+          "api-gateway",
+          "events"
+        ],
+        "summary": "Collect Event",
+        "description": "客户端 SDK 上报事件端点（CP6.2.2.1 最小化版）。\n\n协议：device_id 必填 + event_name 在 EventName 枚举内。\n落库：直接走 feedback 表（CP6.2.1 已建）。",
+        "operationId": "collect_event_api_v1_events_collect_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EventCollectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Collect Event Api V1 Events Collect Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/notifications": {
+      "get": {
+        "summary": "List Notifications",
+        "description": "用户推送列表（CP5.4a）。unread_only=true 仅看未读。",
+        "operationId": "list_notifications_api_v1_notifications_get",
+        "parameters": [
+          {
+            "name": "unread_only",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Unread Only"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service"
+        ]
+      }
+    },
+    "/api/v1/notifications/{notification_id}/mark-read": {
+      "post": {
+        "summary": "Mark Notification Read",
+        "description": "标记推送已读（CP5.4a）。幂等。",
+        "operationId": "mark_notification_read_api_v1_notifications__notification_id__mark_read_post",
+        "parameters": [
+          {
+            "name": "notification_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Notification Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service"
+        ]
+      }
+    },
+    "/api/v1/subscription/plans": {
+      "get": {
+        "summary": "Get Plans",
+        "operationId": "get_plans_api_v1_subscription_plans_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service"
+        ]
+      }
+    },
+    "/api/v1/tags": {
+      "get": {
+        "summary": "List Tags",
+        "operationId": "list_tags_api_v1_tags_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      },
+      "post": {
+        "summary": "Create Tag",
+        "description": "admin/operator 创自定义标签（CP5.3b）。",
+        "operationId": "create_tag_api_v1_tags_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TagCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
+    "/api/v1/tags/{tag_id_or_slug}/subscribe": {
+      "post": {
+        "summary": "Subscribe Tag",
+        "description": "用户订阅标签（CP5.3b）。tag_id_or_slug 接受 slug 或数字 id。",
+        "operationId": "subscribe_tag_api_v1_tags__tag_id_or_slug__subscribe_post",
+        "parameters": [
+          {
+            "name": "tag_id_or_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Tag Id Or Slug"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
+    "/api/v1/tags/{tag_id_or_slug}/unsubscribe": {
+      "post": {
+        "summary": "Unsubscribe Tag",
+        "description": "用户取消订阅标签（CP5.3b）。",
+        "operationId": "unsubscribe_tag_api_v1_tags__tag_id_or_slug__unsubscribe_post",
+        "parameters": [
+          {
+            "name": "tag_id_or_slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Tag Id Or Slug"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
+    "/api/v1/user": {
+      "get": {
+        "summary": "Get User",
+        "operationId": "get_user_api_v1_user_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserInfo"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/user/quota": {
+      "get": {
+        "summary": "Get Quota",
+        "operationId": "get_quota_api_v1_user_quota_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service"
+        ]
+      }
+    },
+    "/api/v1/users/me/quota": {
+      "get": {
+        "summary": "Get My Quota",
+        "description": "CP1.6：`GET /users/me/quota`（v1 §3.3 语义同 /user/quota）。",
+        "operationId": "get_my_quota_api_v1_users_me_quota_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service"
+        ]
+      }
+    },
+    "/api/v1/users/me/quota/reset-monthly": {
+      "post": {
+        "summary": "Reset Quota Monthly",
+        "description": "手动触发月度重置（定时器见 quota_service.quota_reset_loop）。",
+        "operationId": "reset_quota_monthly_api_v1_users_me_quota_reset_monthly_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service"
+        ]
+      }
+    },
+    "/api/v1/{path}": {
+      "get": {
+        "summary": "Proxy Fallback",
+        "description": "路由表没命中的兜底：按第一段路径猜下游（CP1.4/1.5 行为，逐步被路由表取代）。",
+        "operationId": "get_api_v1_path",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      },
+      "put": {
+        "summary": "Proxy Fallback",
+        "description": "路由表没命中的兜底：按第一段路径猜下游（CP1.4/1.5 行为，逐步被路由表取代）。",
+        "operationId": "put_api_v1_path",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      },
+      "post": {
+        "summary": "Proxy Fallback",
+        "description": "路由表没命中的兜底：按第一段路径猜下游（CP1.4/1.5 行为，逐步被路由表取代）。",
+        "operationId": "post_api_v1_path",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      },
+      "delete": {
+        "summary": "Proxy Fallback",
+        "description": "路由表没命中的兜底：按第一段路径猜下游（CP1.4/1.5 行为，逐步被路由表取代）。",
+        "operationId": "delete_api_v1_path",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      },
+      "patch": {
+        "summary": "Proxy Fallback",
+        "description": "路由表没命中的兜底：按第一段路径猜下游（CP1.4/1.5 行为，逐步被路由表取代）。",
+        "operationId": "patch_api_v1_path",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health",
+        "description": "遗留别名（CP1.6 在用）：CP6.4 起新增 /healthz /readyz，本端点保持不动。",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "ai-service",
+          "content-service",
+          "user-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": [
+          "ai-service",
+          "health",
+          "content-service",
+          "user-service",
+          "api-gateway"
+        ],
+        "summary": "Healthz",
+        "description": "Liveness probe：进程活着即 ok，不碰任何依赖。",
+        "operationId": "healthz_healthz_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Healthz Healthz Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": [
+          "ai-service",
+          "health",
+          "content-service",
+          "user-service",
+          "api-gateway"
+        ],
+        "summary": "Metrics Endpoint",
+        "description": "Prometheus 抓取端点。",
+        "operationId": "metrics_endpoint_metrics_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "tags": [
+          "ai-service",
+          "health",
+          "content-service",
+          "user-service",
+          "api-gateway"
+        ],
+        "summary": "Readyz",
+        "description": "Readiness probe：PG + Redis 全通 → 200，否则 503。",
+        "operationId": "readyz_readyz_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "EventCollectRequest": {
+        "properties": {
+          "event_name": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Event Name"
+          },
+          "device_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Device Id"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "article_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Article Id"
+          },
+          "properties": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Properties"
+          },
+          "client_ts": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Ts"
+          }
+        },
+        "type": "object",
+        "required": [
+          "event_name",
+          "device_id"
+        ],
+        "title": "EventCollectRequest",
+        "description": "客户端事件收集请求体（v1 §11.6 CP6.2 SDK 协议）。\n\n注意：task §4.3 schema 与 analytics.track / Feedback 存在字段类型冲突。\n冲突处理（见 known issues）：\n- article_id: task schema=Optional[int]，track/Feedback=Mapped[str] → 按 task schema 建，\n  传 track 时转 str（int 不会损失精度）\n- user_id: task schema=Optional[int]，track=必填 int → 按 task schema 建，\n  传 track 时 0 替代 None（Feedback.user_id 非空）\n- device_id/client_ts: 按 task §4.3 末尾推荐方案，塞 properties dict，不动 schema"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "TokenRequest": {
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "title": "User Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "user_id"
+        ],
+        "title": "TokenRequest"
+      },
+      "TokenResponse": {
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "title": "Access Token"
+          },
+          "expires_in": {
+            "type": "integer",
+            "title": "Expires In"
+          }
+        },
+        "type": "object",
+        "required": [
+          "access_token",
+          "expires_in"
+        ],
+        "title": "TokenResponse"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "AdminLoginRequest": {
+        "properties": {
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "password": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Password"
+          }
+        },
+        "type": "object",
+        "title": "AdminLoginRequest",
+        "description": "POST /api/v1/admin/auth/login。\n\nemail / password 均允许缺省（None），缺失交给路由显式判 400（而非 FastAPI 422），\n以匹配 v1 错误规范「400 缺字段」。"
+      },
+      "AdminLoginResponse": {
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "title": "Access Token"
+          },
+          "token_type": {
+            "type": "string",
+            "title": "Token Type",
+            "default": "bearer"
+          },
+          "expires_in": {
+            "type": "integer",
+            "title": "Expires In"
+          },
+          "user": {
+            "$ref": "#/components/schemas/AdminLoginUser"
+          }
+        },
+        "type": "object",
+        "required": [
+          "access_token",
+          "expires_in",
+          "user"
+        ],
+        "title": "AdminLoginResponse"
+      },
+      "AdminLoginUser": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "role": {
+            "type": "string",
+            "title": "Role"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "role"
+        ],
+        "title": "AdminLoginUser"
+      },
+      "AdminUserItem": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "role": {
+            "type": "string",
+            "title": "Role"
+          },
+          "tier": {
+            "type": "string",
+            "title": "Tier"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "monthly_quota": {
+            "type": "integer",
+            "title": "Monthly Quota"
+          },
+          "used_quota": {
+            "type": "integer",
+            "title": "Used Quota"
+          },
+          "last_active_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Active At"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "role",
+          "tier",
+          "status",
+          "monthly_quota",
+          "used_quota"
+        ],
+        "title": "AdminUserItem",
+        "description": "GET /admin/users 单条用户。\n\nv1 §3.6 字段：email / display_name / role / status / last_active_at。\n这些列在 users 表尚未建模（无 email/状态/活跃时间列），按现有模型映射：\n  - email         -> None（users 表无 email 列，保留字段兼容前端）\n  - display_name  -> nickname\n  - role          -> tier（v1 §3.6 角色语义即 tier）\n  - status        -> \"active\"（无 soft-delete 状态列，默认 active）\n  - last_active_at-> None（users 表无该列）\n不在此追加 migration（CP3.6-A2 红线），仅暴露管理端点。"
+      },
+      "AdminUserListResponse": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AdminUserItem"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "total",
+          "items"
+        ],
+        "title": "AdminUserListResponse"
+      },
+      "QuotaAdjustRequest": {
+        "properties": {
+          "monthly_quota": {
+            "type": "integer",
+            "title": "Monthly Quota"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "monthly_quota",
+          "reason"
+        ],
+        "title": "QuotaAdjustRequest"
+      },
+      "UserInfo": {
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "title": "User Id"
+          },
+          "nickname": {
+            "type": "string",
+            "title": "Nickname"
+          },
+          "avatar": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar"
+          }
+        },
+        "type": "object",
+        "required": [
+          "user_id",
+          "nickname"
+        ],
+        "title": "UserInfo"
+      },
+      "UserQuotaResponse": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "monthly_quota": {
+            "type": "integer",
+            "title": "Monthly Quota"
+          },
+          "used_quota": {
+            "type": "integer",
+            "title": "Used Quota"
+          },
+          "remaining": {
+            "type": "integer",
+            "title": "Remaining"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "monthly_quota",
+          "used_quota",
+          "remaining"
+        ],
+        "title": "UserQuotaResponse"
+      },
+      "WechatLoginRequest": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "title": "WechatLoginRequest"
+      },
+      "WechatLoginResponse": {
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "title": "Access Token"
+          },
+          "user_id": {
+            "type": "string",
+            "title": "User Id"
+          },
+          "expires_in": {
+            "type": "integer",
+            "title": "Expires In"
+          }
+        },
+        "type": "object",
+        "required": [
+          "access_token",
+          "user_id",
+          "expires_in"
+        ],
+        "title": "WechatLoginResponse"
+      },
+      "AddArticleRequest": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "title": "Url"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source",
+            "default": "web"
+          }
+        },
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "title": "AddArticleRequest"
+      },
+      "AdminActionRequest": {
+        "properties": {
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "reason"
+        ],
+        "title": "AdminActionRequest",
+        "description": "admin 写操作统一 body：reason 必填（审计留痕）。"
+      },
+      "ArticleResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "url": {
+            "type": "string",
+            "title": "Url"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "owner_id": {
+            "type": "string",
+            "title": "Owner Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "favorite": {
+            "type": "boolean",
+            "title": "Favorite"
+          },
+          "skip": {
+            "type": "boolean",
+            "title": "Skip"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "url",
+          "source",
+          "owner_id",
+          "status",
+          "favorite",
+          "skip",
+          "created_at"
+        ],
+        "title": "ArticleResponse"
+      },
+      "ArticleStatusResponse": {
+        "properties": {
+          "article_id": {
+            "type": "string",
+            "title": "Article Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "task_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Status"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "audio_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audio Url"
+          },
+          "audio_duration_sec": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audio Duration Sec"
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tags"
+          },
+          "quality_score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quality Score"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "article_id",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "ArticleStatusResponse",
+        "description": "文章 + 蒸馏任务聚合状态（articles LEFT JOIN distilled_articles）。"
+      },
+      "AudioUrlResponse": {
+        "properties": {
+          "article_id": {
+            "type": "string",
+            "title": "Article Id"
+          },
+          "audio_url": {
+            "type": "string",
+            "title": "Audio Url"
+          },
+          "expires_at": {
+            "type": "string",
+            "title": "Expires At"
+          },
+          "duration_sec": {
+            "type": "integer",
+            "title": "Duration Sec"
+          }
+        },
+        "type": "object",
+        "required": [
+          "article_id",
+          "audio_url",
+          "expires_at",
+          "duration_sec"
+        ],
+        "title": "AudioUrlResponse"
+      },
+      "ClawBotMessageRequest": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "title": "ClawBotMessageRequest"
+      },
+      "D9AddRequest": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "title": "Url"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source",
+            "default": "wechat"
+          }
+        },
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "title": "D9AddRequest",
+        "description": "D9 入口请求（v1 §3.5）：微信「更多打开方式」共享过来的链接。"
+      },
+      "D9AddResponse": {
+        "properties": {
+          "article_id": {
+            "type": "string",
+            "title": "Article Id"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "estimated_distill_seconds": {
+            "type": "integer",
+            "title": "Estimated Distill Seconds",
+            "default": 30
+          },
+          "device_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "article_id",
+          "status"
+        ],
+        "title": "D9AddResponse"
+      },
+      "TagCreateRequest": {
+        "properties": {
+          "slug": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Slug"
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Name"
+          },
+          "category": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "Category",
+            "default": "subject"
+          }
+        },
+        "type": "object",
+        "required": [
+          "slug",
+          "name"
+        ],
+        "title": "TagCreateRequest"
+      },
+      "WechatMpMessageRequest": {
+        "properties": {
+          "from_user": {
+            "type": "string",
+            "title": "From User"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "create_time": {
+            "type": "integer",
+            "title": "Create Time"
+          },
+          "msg_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Msg Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "from_user",
+          "text",
+          "create_time"
+        ],
+        "title": "WechatMpMessageRequest",
+        "description": "微信公众号服务号回调消息（v1 §11.2 CP2.5）。"
+      },
+      "DistillStartRequest": {
+        "properties": {
+          "article_id": {
+            "type": "string",
+            "title": "Article Id"
+          },
+          "url": {
+            "type": "string",
+            "title": "Url"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "type": "object",
+        "required": [
+          "article_id",
+          "url"
+        ],
+        "title": "DistillStartRequest"
+      },
+      "DistillStartResponse": {
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "title": "Task Id"
+          },
+          "article_id": {
+            "type": "string",
+            "title": "Article Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "job_id": {
+            "type": "string",
+            "title": "Job Id",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "task_id",
+          "article_id",
+          "status"
+        ],
+        "title": "DistillStartResponse"
+      }
+    },
+    "securitySchemes": {}
+  }
+}
