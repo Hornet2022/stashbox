@@ -148,6 +148,9 @@ app.add_api_route(D9_ROUTE.path, proxy_d9, methods=["POST"], name="proxy_d9")
 
 def _resolve_target(path: str) -> str | None:
     """根据第一段路径决定下游 base url。"""
+    # CP4.7.1: articles/{id}/distill 优先走 ai-service（fallback 误判会走 content-service → 404）
+    if path.startswith("articles/") and "/distill" in path:
+        return settings.ai_service_url
     segment = path.split("/", 1)[0]
     if segment in ("user", "subscription"):
         return settings.user_service_url

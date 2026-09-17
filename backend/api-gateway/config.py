@@ -71,6 +71,13 @@ ROUTES: list[Route] = [
     Route("GET", "/api/v1/tags", "content-service", _url("content-service")),
     Route("POST", "/api/v1/distill/start", "ai-service", _url("ai-service")),
     Route("GET", "/api/v1/distill/{task_id}", "ai-service", _url("ai-service")),
+    # CP4.7.1: articles/{id}/distill 显式路由到 ai-service（fallback 会错误地走到 content-service）
+    Route(
+        "POST",
+        "/api/v1/articles/{article_id}/distill",
+        "ai-service",
+        _url("ai-service"),
+    ),
 ]
 
 # CP1.7.1 新增：D9 callback（不要求登录态）+ status + audio-url
