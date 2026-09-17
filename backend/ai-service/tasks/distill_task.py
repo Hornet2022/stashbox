@@ -18,10 +18,91 @@ from distill import DistillContext, DistillPipeline
 from llm import get_llm_client
 from stashbox.backend.common.database import AsyncSessionLocal
 from stashbox.backend.common.models import Article
+from stashbox.backend.common.models.tag import Tag, TagSubscription
+from stashbox.backend.common.models.push_notification import PushNotification
+from stashbox.backend.common.models.distilled_article import DistilledArticle
 from stashbox.backend.common.analytics import track_simple, track
 from stashbox.backend.common.events import EventName
 
 log = structlog.get_logger("ai-worker")
+
+
+async def _trigger_subscription_pushes(
+    db: AsyncSession, article_id: str, exclude_user_id: int,
+) -> int:
+    """蒸馏完成触发订阅推送（CP5.4b）。
+
+    1. 读 distilled_articles.tags（蒸馏时写入的标签，name 列表如 ["科技","商业"]）
+    2. 对每个 tag，查 tag_subscriptions 找 user_ids
+    3. 排除 exclude_user_id（自己蒸馏不推自己）
+    4. 批量 INSERT push_notifications 行
+    5. 失败不破主流程
+
+    Returns: 写入的推送数
+    """
+    try:
+        # 1. 读 DistilledArticle（id 是 str: dst_xxx）
+        da = await db.get(DistilledArticle, article_id)
+        if not da or not da.tags:
+            return 0
+
+        # DistilledArticle 无 title 字段，需从 Article 表查
+        article_title = "新文章"
+        if da.article_id:
+            art = await db.get(Article, da.article_id)
+            if art and art.title:
+                article_title = art.title[:50]
+
+        article_tags = da.tags if isinstance(da.tags, list) else []
+        if not article_tags:
+            return 0
+
+        # 2. da.tags 存的是 name（"科技"/"财经"），需映射为 slug（"tech"/"finance"）
+        tag_slugs_result = await db.execute(
+            select(Tag.slug).where(Tag.name.in_(article_tags))
+        )
+        tag_slugs = [row[0] for row in tag_slugs_result.fetchall()]
+        if not tag_slugs:
+            return 0
+
+        # 3. 查订阅了这些 tag 的 user_ids（去重 + 排除 exclude_user_id）
+        subs_result = await db.execute(
+            select(TagSubscription.user_id)
+            .where(TagSubscription.tag_id.in_(
+                select(Tag.id).where(Tag.slug.in_(tag_slugs))
+            ))
+            .where(TagSubscription.user_id != exclude_user_id)
+            .distinct()
+        )
+        subscriber_ids = [row[0] for row in subs_result.fetchall()]
+        if not subscriber_ids:
+            return 0
+
+        # 4. 批量 INSERT push_notifications
+        # 第一个 tag 用于显示推送来源
+        primary_tag_slug = tag_slugs[0]
+        notifs = [
+            PushNotification(
+                user_id=sub_id,
+                article_id=article_id,  # DistilledArticle.id (dst_xxx)
+                tag_slug=primary_tag_slug,
+                title=f"新文章：{article_title[:50]}",
+                body=f"你订阅的 {primary_tag_slug} 标签有新文章蒸馏完成",
+                deeplink=f"/articles/{article_id}",
+            )
+            for sub_id in subscriber_ids
+        ]
+        db.add_all(notifs)
+        await db.commit()
+        return len(notifs)
+    except Exception as e:
+        # 失败不破主流程
+        log.warning(
+            "subscription_push_trigger_failed",
+            article_id=article_id,
+            error=str(e),
+        )
+        return 0
 
 
 class ArticleNotFoundError(Exception):
@@ -126,6 +207,11 @@ async def distill_task(
         # CP6.2.1 埋点：distill_completed
         async with AsyncSessionLocal() as db:
             await track_simple(db, EventName.DISTILL_COMPLETED, user_id, article_id)
+        # CP5.4b：蒸馏完成触发订阅推送
+        async with AsyncSessionLocal() as db:
+            await _trigger_subscription_pushes(
+                db, article_id=article_id, exclude_user_id=user_id,
+            )
         return {"task_id": task_id, "status": "done"}
     except Exception as e:
         log.exception("arq_distill_failed", task_id=task_id, article_id=article_id, error=str(e))
