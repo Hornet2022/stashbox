@@ -1,6 +1,14 @@
-# GitHub Actions: pytest workflow（CP1.3.1）
+# GitHub Actions: pytest workflow（CP1.3.1 / CP6.8 修 CI）
 # 触发：PR + push to main
 # 范围：backend/ + infra/
+#
+# CP6.8 修复点：
+#   1. working-directory=backend 下 pytest 路径改 tests/（原来写成 backend/tests/ 必然找不到）
+#   2. services 起 postgres:16-alpine + redis:7-alpine（带 health check，Actions 会等 healthy 再跑步骤）
+#   3. 注入 DB/Redis 环境变量
+#   4. pytest 前跑 alembic upgrade head 建表
+#   5. pytest 统一走 poetry run（原来写 .venv/bin/pytest，但仓库没 poetry.toml，
+#      poetry 默认把 venv 建在 ~/.cache/pypoetry，.venv/bin/pytest 并不存在）
 
 name: Backend Tests
 
@@ -20,6 +28,51 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: stashbox_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d stashbox_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # DATABASE_URL / REDIS_URL 是按 CP6.8 要求显式声明的连接串。
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/stashbox_test
+      REDIS_URL: redis://localhost:6379/0
+      # 注意：backend/common/config.py 里 database_url / redis_url 是「计算属性」，
+      # 由下面的 POSTGRES_* / REDIS_* 拼装而成，不读 DATABASE_URL / REDIS_URL
+      # （SettingsConfigDict extra="ignore"）。所以真正生效的是这一组。
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: '5432'
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: stashbox_test
+      REDIS_HOST: localhost
+      REDIS_PORT: '6379'
+      REDIS_DB: '0'
+      REDIS_PASSWORD: ''
+      # backend 里的代码按 `stashbox.backend.*` 绝对包名导入，
+      # 需要仓库根目录的父目录在 sys.path 上（同 tests/conftest.py 的 parents[3]）。
+      PYTHONPATH: ${{ github.workspace }}/..
+
     steps:
       - uses: actions/checkout@v4
 
@@ -36,16 +89,21 @@ jobs:
         working-directory: backend
         run: poetry install --no-interaction
 
+      - name: Run alembic upgrade head
+        working-directory: backend
+        run: poetry run alembic upgrade head
+
       - name: Run pytest
         working-directory: backend
         # 跳过 collection error 的目录（pre-existing 已知）
         run: |
-          PYTHONPATH=. .venv/bin/pytest backend/tests/ \
-            --ignore=backend/tests/user/test_user_lifespan.py \
-            --ignore=backend/tests/content \
-            --ignore=backend/tests/gateway \
-            --ignore=backend/tests/observability \
-            --ignore=backend/tests/test_quota.py \
+          poetry run pytest tests/ \
+            --ignore=tests/user/test_user_lifespan.py \
+            --ignore=tests/content \
+            --ignore=tests/gateway \
+            --ignore=tests/observability \
+            --ignore=tests/test_quota.py \
+            --junitxml=pytest-report.xml \
             -v
 
       - name: Report pytest results
