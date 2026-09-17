@@ -6,10 +6,11 @@ CP1.5：蒸馏任务写真实 PostgreSQL（distilled_articles 表），状态机
 不读 Article 表（CP3 才接 D9 → 蒸馏全链路）；distill/{id} 经 articles 校验归属。
 """
 import asyncio
+import logging
 import uuid
 from datetime import datetime, timezone
 
-import redis.asyncio as redis
+import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI
 from pydantic import BaseModel
 from sqlalchemy import func, select
@@ -32,11 +33,38 @@ from stashbox.backend.common.redis_client import get_redis_pool
 
 from dispatcher import get_dispatcher, shutdown_dispatcher
 
+log = logging.getLogger(__name__)
+
 setup_logging("ai-service")
 app = FastAPI(title="stashbox-ai-service", version="0.2.0")
 register_exception_handlers(app)
 app.add_middleware(RequestIDMiddleware)
 install_health_endpoints(app)
+
+
+@app.on_event("startup")
+async def _start_distill_queue_poller():
+    """CP3.6：每 30s 刷新 Arq 队列长度到 Prometheus gauge。"""
+    from observability.metrics import DISTILL_QUEUE_SIZE
+    from arq_settings import load_arq_config
+
+    cfg = load_arq_config()
+    queue_name = cfg.queue_name
+    redis_url = cfg.redis_url
+
+    async def _poll_loop():
+        # Arq 0.25+ 用 ZSET 存队列，key 即 queue_name（如 "stashbox:distill"）
+        client = aioredis.from_url(redis_url)
+        while True:
+            try:
+                # ZCARD 返回 sorted set 元素数量（队列长度）
+                size = await client.zcard(queue_name)
+                DISTILL_QUEUE_SIZE.labels(queue=queue_name).set(size)
+            except Exception as exc:
+                log.warning("queue poller 失败（忽略）: %s", exc)
+            await asyncio.sleep(30)
+
+    asyncio.create_task(_poll_loop())
 
 
 @app.on_event("shutdown")

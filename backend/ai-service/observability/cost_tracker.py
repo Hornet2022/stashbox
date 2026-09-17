@@ -67,6 +67,11 @@ class CostTracker:
         写 Redis 失败只 log 不抛 —— 归因失败不能让蒸馏挂掉（任务包 §8）。
         """
         cost = estimate_cost_usd(model, prompt_tokens, completion_tokens)
+
+        # CP3.6: inc Prometheus counter（与 Redis 归因并行）
+        from .metrics import LLM_COST_USD_TOTAL
+        LLM_COST_USD_TOTAL.labels(model=model).inc(cost)
+
         today = date.today().isoformat()
         user_key = f"cost:user:{user_id}:{today}"
         article_key = f"cost:article:{article_id}"
