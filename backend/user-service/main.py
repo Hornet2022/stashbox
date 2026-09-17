@@ -22,7 +22,9 @@ from stashbox.backend.common.exceptions import (
 )
 from stashbox.backend.common.logging import setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
+from stashbox.backend.common.auth_admin import require_admin_or_operator
 from stashbox.backend.common.models import User
+from stashbox.backend.common.models.admin_operation_log import AdminOperationLog
 from stashbox.backend.common.models.push_notification import PushNotification
 from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common import quota_service
@@ -101,6 +103,49 @@ class Plan(BaseModel):
     name: str
     price_cny: int
     monthly_quota: int
+
+
+# ===== CP3.6-A2：管理后台 admin users 2 端点（v1 §3.6 第 1 段：用户管理） =====
+class AdminUserItem(BaseModel):
+    """GET /admin/users 单条用户。
+
+    v1 §3.6 字段：email / display_name / role / status / last_active_at。
+    这些列在 users 表尚未建模（无 email/状态/活跃时间列），按现有模型映射：
+      - email         -> None（users 表无 email 列，保留字段兼容前端）
+      - display_name  -> nickname
+      - role          -> tier（v1 §3.6 角色语义即 tier）
+      - status        -> "active"（无 soft-delete 状态列，默认 active）
+      - last_active_at-> None（users 表无该列）
+    不在此追加 migration（CP3.6-A2 红线），仅暴露管理端点。
+    """
+
+    id: int
+    email: str | None = None
+    display_name: str | None = None
+    role: str
+    tier: str
+    status: str
+    monthly_quota: int
+    used_quota: int
+    last_active_at: str | None = None
+    created_at: str | None = None
+
+
+class AdminUserListResponse(BaseModel):
+    total: int
+    items: list[AdminUserItem]
+
+
+class QuotaAdjustRequest(BaseModel):
+    monthly_quota: int
+    reason: str
+
+
+class UserQuotaResponse(BaseModel):
+    id: int
+    monthly_quota: int
+    used_quota: int
+    remaining: int
 
 
 @app.get("/health")
@@ -247,6 +292,122 @@ async def mark_notification_read(
         notif.read_at = datetime.now()
         await db.commit()
     return {"ok": True, "read_at": notif.read_at.isoformat()}
+
+
+@app.get("/api/v1/admin/users", response_model=AdminUserListResponse)
+async def admin_list_users(
+    page: int = 1,
+    size: int = 20,
+    keyword: str = "",
+    tier: str = "",
+    status: str = "",
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """v1 §3.6 用户管理：分页 + 关键词 + 角色过滤。
+
+    - 关键词：nickname ILIKE '%keyword%'（v1 §3.6 原指 email/display_name，
+      users 表无 email 列，映射为 nickname）
+    - 排序：created_at DESC
+    - status 查询参数保留接口兼容；users 表无状态列，不做落库过滤
+    """
+    page = max(page, 1)
+    size = min(max(size, 1), 100)
+    kw = f"%{keyword}%" if keyword else ""
+
+    # 计数 + 查询共用过滤条件
+    filters = []
+    if kw:
+        filters.append(User.nickname.ilike(kw))
+    if tier:
+        filters.append(User.tier == tier)
+
+    count_stmt = select(func.count()).select_from(User)
+    list_stmt = select(User)
+    for f in filters:
+        count_stmt = count_stmt.where(f)
+        list_stmt = list_stmt.where(f)
+
+    total = await db.scalar(count_stmt) or 0
+    list_stmt = list_stmt.order_by(User.created_at.desc()).offset((page - 1) * size).limit(size)
+    result = await db.execute(list_stmt)
+    users = result.scalars().all()
+
+    items = [
+        AdminUserItem(
+            id=u.id,
+            email=None,
+            display_name=u.nickname,
+            role=u.tier,
+            tier=u.tier,
+            status="active",
+            monthly_quota=u.monthly_quota,
+            used_quota=u.quota_used,
+            last_active_at=None,
+            created_at=u.created_at.isoformat() if u.created_at else None,
+        )
+        for u in users
+    ]
+    return AdminUserListResponse(total=total, items=items)
+
+
+@app.post("/api/v1/admin/users/{user_id}/quota-adjust", response_model=UserQuotaResponse)
+async def admin_quota_adjust(
+    user_id: int,
+    req: QuotaAdjustRequest,
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """v1 §3.6 调整用户月度配额。
+
+    行为：
+      1. 校验 monthly_quota > 0、reason 必填 ≥5 字符、目标 user 存在
+      2. 更新 users.monthly_quota
+      3. 同事务写入 admin_operation_logs 一条（A1 已建表）
+      4. 失败整体回滚（ValidationError 在 commit 前抛出，不落库）
+    """
+    # 校验（commit 前，失败不落库 → 满足“失败回滚事务”）
+    if req.monthly_quota <= 0:
+        raise HTTPException(status_code=400, detail="monthly_quota 必须为正整数")
+    if len(req.reason.strip()) < 5:
+        raise HTTPException(status_code=400, detail="reason 至少 5 个字符")
+
+    target = await db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"user {user_id} 不存在")
+
+    target.monthly_quota = req.monthly_quota
+
+    # 审计日志：与目标更新同事务提交，失败一起回滚
+    log_row = AdminOperationLog(
+        admin_id=int(user["sub"]),
+        admin_tier=user.get("tier", "unknown"),
+        action="quota_adjust",
+        target_type="user",
+        target_id=str(user_id),
+        reason=req.reason,
+        method="POST",
+        path=f"/api/v1/admin/users/{user_id}/quota-adjust",
+        request_body={"monthly_quota": req.monthly_quota, "reason": req.reason},
+        response_status=200,
+        ip=None,
+        user_agent=None,
+    )
+    db.add(log_row)
+
+    try:
+        await db.commit()
+        await db.refresh(target)
+    except Exception:
+        await db.rollback()
+        raise
+
+    return UserQuotaResponse(
+        id=target.id,
+        monthly_quota=target.monthly_quota,
+        used_quota=target.quota_used,
+        remaining=target.monthly_quota - target.quota_used,
+    )
 
 
 if __name__ == "__main__":
