@@ -26,7 +26,8 @@ jobs:
           python-version: '3.11'
 
       - name: Install ruff
-        run: pip install ruff
+        # 锁版本：不锁会装最新版，ruff 新规则触发新错误，与本地 0.7.4 产生版本漂移
+        run: pip install ruff==0.7.4
 
       - name: Run ruff
         working-directory: backend
