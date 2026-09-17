@@ -336,7 +336,9 @@ async def list_notifications(
     limit: int = 50,
 ):
     """用户推送列表（CP5.4a）。unread_only=true 仅看未读。"""
-    q = select(PushNotification).where(PushNotification.user_id == user["id"])
+    # require_user 返回的是 JWT payload，用户 id 在 "sub"（见本文件其它端点）
+    uid = int(user["sub"])
+    q = select(PushNotification).where(PushNotification.user_id == uid)
     if unread_only:
         q = q.where(PushNotification.read_at.is_(None))
     q = q.order_by(PushNotification.created_at.desc()).limit(limit)
@@ -358,7 +360,7 @@ async def list_notifications(
         ],
         "unread_count": await db.scalar(
             select(func.count()).select_from(PushNotification).where(
-                PushNotification.user_id == user["id"],
+                PushNotification.user_id == uid,
                 PushNotification.read_at.is_(None),
             )
         ),
@@ -376,7 +378,7 @@ async def mark_notification_read(
     notif = await db.get(PushNotification, notification_id)
     if not notif:
         raise HTTPException(status_code=404, detail=f"notification {notification_id} 不存在")
-    if notif.user_id != user["id"]:
+    if notif.user_id != int(user["sub"]):
         # 不能标记别人的推送（防越权）
         raise HTTPException(status_code=403, detail="无权标记他人推送")
     if notif.read_at is None:

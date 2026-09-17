@@ -48,6 +48,27 @@ def _norm_path(path: str) -> str:
     return re.sub(r"\{[^}]+\}", "{}", path)
 
 
+# FastAPI 生成的 ValidationError schema 里 input / ctx 两个字段随版本变化
+# （0.141.x 有、0.115.x 没有）。pyproject 钉的是 fastapi = "^0.115.0"，
+# 而本机 dev venv 实际装的是 0.141.x —— 直接比整个 dict 会因这两个字段
+# 误报「落盘 schema 不一致」。该断言的本意是「端点 / tag / admin 没漂移」，
+# 所以比对前先摘掉这两个版本相关字段（落盘文件本身仍按原样做合法性校验）。
+_VERSION_VARIANT_FIELDS = ("input", "ctx")
+
+
+def _drop_version_variant_fields(schema: dict) -> dict:
+    props = (
+        schema.get("components", {})
+        .get("schemas", {})
+        .get("ValidationError", {})
+        .get("properties")
+    )
+    if isinstance(props, dict):
+        for field in _VERSION_VARIANT_FIELDS:
+            props.pop(field, None)
+    return schema
+
+
 def _endpoints(schema: dict) -> set[tuple[str, str]]:
     out: set[tuple[str, str]] = set()
     for path, item in (schema.get("paths") or {}).items():
@@ -120,4 +141,6 @@ def test_generated_file_matches_and_is_valid():
     on_disk = json.loads(out_path.read_text(encoding="utf-8"))
     validate_openapi(on_disk)
     fresh = export_openapi.build_merged_schema(export_openapi.export_service_schemas())
-    assert on_disk == fresh, "落盘 schema 与现场生成不一致，请重跑 export_openapi.py"
+    assert _drop_version_variant_fields(on_disk) == _drop_version_variant_fields(fresh), (
+        "落盘 schema 与现场生成不一致，请重跑 export_openapi.py"
+    )

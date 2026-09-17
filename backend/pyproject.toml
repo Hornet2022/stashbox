@@ -31,6 +31,10 @@ pytest-asyncio = "^0.24.0"
 pytest-cov = "^6.0.0"
 ruff = "^0.7.0"
 mypy = "^1.13.0"
+# tests/test_openapi_export.py 用（CP6.6）。也列在 backend/requirements.txt，
+# 但 CI 走 `poetry install`，不装 requirements.txt —— 缺了会在 collection 阶段
+# ImportError 直接中断整轮 pytest（CP6.10 定位）。
+openapi-spec-validator = "^0.7.0"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
