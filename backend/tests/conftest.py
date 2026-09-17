@@ -26,8 +26,14 @@ async def _dispose_pools():
     yield
     from stashbox.backend.common import database, redis_client
 
-    await database.engine.dispose()
+    try:
+        await database.engine.dispose()
+    except Exception:
+        pass
     pool = redis_client._redis_pool
     if pool is not None:
-        await pool.disconnect(inuse_connections=True)
+        try:
+            await pool.disconnect(inuse_connections=True)
+        except Exception:
+            pass
         redis_client._redis_pool = None

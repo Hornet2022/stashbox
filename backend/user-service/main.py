@@ -8,6 +8,7 @@ quota / subscription/plans 仍为 mock（配额扣减事务在 CP1.6）。
 import asyncio
 import bcrypt
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -61,15 +62,19 @@ async def lifespan(app: FastAPI):
     bg_session_local = async_sessionmaker(
         bg_engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
     )
-    bg_task = None
-    try:
-        bg_task = asyncio.create_task(
-            quota_service.quota_reset_loop(session_factory=bg_session_local)
-        )
-        log.info("quota_reset_loop started")
-    except Exception as exc:
-        # 启动失败不能让 user-service 进入 broken state
-        log.error("quota_reset_loop 启动失败（忽略）: %s", exc)
+    # CP3.6.3：测试环境跳过 bg_task 启动（避免 TestClient teardown 在另一 loop
+    # 上关连接，触发 RuntimeError: Event loop is closed）。生产环境通过
+    # session_factory 走独立 bg_engine，不占用全局连接池。
+    bg_task: asyncio.Task | None = None
+    if os.environ.get("PYTEST_CURRENT_TEST") is None:
+        try:
+            bg_task = asyncio.create_task(
+                quota_service.quota_reset_loop(session_factory=bg_session_local)
+            )
+            log.info("quota_reset_loop started (production)")
+        except Exception as exc:
+            # 启动失败不能让 user-service 进入 broken state
+            log.error("quota_reset_loop 启动失败（忽略）: %s", exc)
     # CP6.2.2.2b 埋点：SERVICE_START（走 bg engine，避免占用全局 engine 连接池）
     try:
         async with bg_session_local() as session:
@@ -115,22 +120,16 @@ async def lifespan(app: FastAPI):
         from stashbox.backend.common import redis_client
 
         pool = redis_client._redis_pool
-        with open("/tmp/cp363_dbg.txt", "a") as _f:
-            _f.write(f"entered pool={pool}\n")
         if pool is not None:
             try:
                 await pool.disconnect(inuse_connections=True)
-            except Exception as _e:
-                with open("/tmp/cp363_dbg.txt", "a") as _f:
-                    _f.write(f"disconnect err: {_e!r}\n")
+            except Exception:
+                pass
             finally:
                 # 无论 disconnect 是否成功都置空，避免 _dispose_pools 在错 loop 上再关一次
                 redis_client._redis_pool = None
-                with open("/tmp/cp363_dbg.txt", "a") as _f:
-                    _f.write("set to None\n")
-    except Exception as _e:
-        with open("/tmp/cp363_dbg.txt", "a") as _f:
-            _f.write(f"block err: {_e!r}\n")
+    except Exception:
+        pass
 
 
 

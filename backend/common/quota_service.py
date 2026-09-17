@@ -198,17 +198,23 @@ async def reset_monthly(session: AsyncSession) -> int:
     return len(rows)
 
 
-async def quota_reset_loop(interval_sec: int = 3600) -> None:
+async def quota_reset_loop(interval_sec: int = 3600, session_factory=None) -> None:
     """简单定时器（CP1.6）：每小时检查一次，跨月则重置。
 
     CP7 再替换为 apscheduler。
+
+    session_factory：可选注入独立连接池（CP3.6.3）。默认走全局
+    AsyncSessionLocal，保持历史调用行为不变。
     """
     from stashbox.backend.common.database import AsyncSessionLocal
+
+    if session_factory is None:
+        session_factory = AsyncSessionLocal
 
     while True:
         try:
             now = _now()
-            async with AsyncSessionLocal() as session:
+            async with session_factory() as session:
                 users = (
                     await session.execute(
                         select(User.id).where(
