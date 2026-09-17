@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>环境异常</title>
+<meta name="robots" content="noindex,nofollow">
+<link rel="stylesheet" href="//res.wx.qq.com/a/wx_fed/assets/res/boq3gUTEe/weui.min.css">
+<style>
+  body { background: #ededed; }
+  .weui-msg { padding-top: 36px; text-align: center; }
+  .weui-msg__title { font-size: 20px; font-weight: 400; }
+  .weui-msg__desc { font-size: 14px; color: #999; }
+</style>
+</head>
+<body class="zh_CN wx_wap_page">
+<div class="weui-msg">
+  <div class="weui-msg__icon-area"><i class="weui-icon-warn weui-icon_msg"></i></div>
+  <div class="weui-msg__text-area">
+    <h2 class="weui-msg__title">环境异常</h2>
+    <p class="weui-msg__desc">当前使用网页的浏览器环境异常，完成验证后即可继续访问。</p>
+    <p class="weui-msg__desc">去微信验证</p>
+  </div>
+  <div class="weui-msg__opr-area">
+    <p class="weui-btn-area">
+      <a href="javascript:;" class="weui-btn weui-btn_primary" id="js_verify">前往验证</a>
+    </p>
+  </div>
+  <div class="weui-msg__extra-area">
+    <div class="weui-footer">
+      <p class="weui-footer__links"><a href="javascript:void(0);" class="weui-footer__link">微信团队</a></p>
+      <p class="weui-footer__text">Copyright © 2011-2026 Tencent. All Rights Reserved</p>
+    </div>
+  </div>
+</div>
+<script nonce="RnD3xK0p">
+  window.verify_url = "/mp/verify?uin=MjA5OTk5OTk5OQ%3D%3D&time=1760995200";
+  document.querySelector("#js_verify").addEventListener("click", function () {
+    location.href = window.verify_url;
+  });
+</script>
+</body>
+</html>

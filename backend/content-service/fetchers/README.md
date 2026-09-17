@@ -2,6 +2,16 @@
 
 content-service 的**收集层**抽象。本期只落接口 + 占位实现，真抓取在 CP2.2-CP2.4。
 
+模块分工（CP2.2 起解析部分共用）：
+
+```
+base.py        契约（CP2.1 定死：Fetcher / FetchResult / FetcherError）
+parser.py      共享 HTML 解析器（CP2.2 抽出来的 5 个 HTMLParser + 3 个工具函数）
+wechat.py      WechatFetcher  —— CP2.2 实现，复用 parser.py
+douyin.py      DouyinFetcher  —— CP2.1 占位
+generic_url.py GenericURLFetcher —— CP2.4 实现，复用 parser.py
+```
+
 ## 1. 接口契约（`base.py`）
 
 ```
@@ -39,7 +49,7 @@ v1 §3.x 的 `biz_code` 体系** —— 对外暴露时由上层（CP2.5）映�
 
 | Fetcher | `name` | `supports()` 匹配 | 状态 |
 |---|---|---|---|
-| `WechatFetcher` | `wechat_mp` | `mp.weixin.qq.com` | CP2.1 占位（fetch 抛 UNSUPPORTED） |
+| `WechatFetcher` | `wechat_mp` | `mp.weixin.qq.com` | **CP2.2 实现**（httpx + `#js_content` 专属选择器） |
 | `DouyinFetcher` | `douyin` | `douyin.com` / `iesdouyin.com`（含 `v.douyin.com` 短链） | CP2.1 占位 |
 | `GenericURLFetcher` | `generic_url` | 恒 `True`（catch-all） | **CP2.4 实现**（httpx + stdlib HTMLParser） |
 | `MockFetcher` | — | — | **本期不写**，留给 CP2.7 集成测（10 个真实 URL 里垫刀用） |
@@ -47,7 +57,7 @@ v1 §3.x 的 `biz_code` 体系** —— 对外暴露时由上层（CP2.5）映�
 路线：
 
 - **CP2.2 公众号**（`wechat.py`）：走 `mp.weixin.qq.com/s/xxx` 正文页，取标题 / 作者 / 正文
-  HTML+纯文本 / 图片直链；防爬时需要处理 `环境异常` 验证页 → `AUTH`。
+  HTML+纯文本 / 图片直链；`环境异常` 验证页 → `AUTH`。**已实现**，细节见 §6。
 - **CP2.3 抖音**（`douyin.py`）：先解 `v.douyin.com` 短链 302，再从页面内嵌数据取视频/图集；
   正文常常只在 JS 渲染后的数据里，可能要解析内嵌 JSON → 失败走 `PARSE`。
 - **CP2.4 通用 URL**（`generic_url.py`）：任意网页的正文抽取（readability 那类思路）。
@@ -101,6 +111,9 @@ CP2.5 之前**不要**在主流程里调 `get_fetcher()` —— 本期只是抽�
 
 `generic_url.py`：`httpx.AsyncClient` 抓 HTML + 5 个 stdlib `HTMLParser` 解析，**不装
 beautifulsoup4 / readability-lxml / lxml**（依赖只有已有的 httpx 0.28.1）。
+
+5 个解析器 CP2.2 起住在 **`parser.py`**（公众号抓取器共用），`generic_url.py` 用
+`from .parser import ...` 复用，行为不变（表里的 `_XxxExtractor` 旧名仍从 `generic_url` 导出）。
 
 ```
 fetch(url)
@@ -160,3 +173,49 @@ except FetcherError as e:               # [generic_url] code: message
 建议 5 个 URL 里至少含 1 个 JS 渲染站（验证 PARSE 兜底）+ 1 个带分页/侧栏的长文
 （验证密度启发式）。抽完打印 `result.raw_metadata`：`paragraph_count` 是最终选中段数、
 `candidate_count` 是通过阈值的候选段数，两者差太多说明阈值要调。
+
+## 6. WechatFetcher 当前能力（CP2.2）
+
+`wechat.py`：`httpx.AsyncClient` + iPhone UA + `Referer: https://mp.weixin.qq.com/`，
+单实例抓取（本期**没有**代理池 / cookie 池）。解析复用 `parser.py` 的
+Title / Author / Time / Media 四个解析器，正文走公众号专属容器，不用密度启发式。
+
+```
+fetch(url)
+├── 不是 mp.weixin.qq.com              → FetcherError(UNSUPPORTED)（supports() 说了算，不发请求）
+├── 超时 / 传输层异常                   → FetcherError(NETWORK)
+├── 404 / 410                          → FetcherError(NOT_FOUND)
+├── 其它 >= 400                         → FetcherError(NETWORK, "http {status}")
+├── 命中反爬/失效提示页                  → FetcherError(AUTH / NOT_FOUND)，见下表
+├── 拿不到 #js_content 或正文为空        → FetcherError(PARSE)
+└── FetchResult（source="wechat_mp"）
+```
+
+| 页面特征 | 错误码 | 含义 |
+|---|---|---|
+| `环境异常` | `AUTH` | 微信风控判定非真人环境（最常见的反爬页） |
+| `请在微信中打开` | `AUTH` | 必须在微信内置浏览器 |
+| `该公众号已迁移` | `NOT_FOUND` | 账号迁移，原文不再可达 |
+| `此内容因违规无法查看` | `AUTH` | 内容被处置 |
+
+公众号专属选择器（和通用页不同的地方，都在 `fetchers/wechat.py` 里）：
+
+| 字段 | 取法 |
+|---|---|
+| 正文 HTML | `<div id="js_content">` 正则抽内部 html（后面紧跟 `<script>` 时非贪婪截止；没有则兜底吃到文末） |
+| 正文纯文本 | `_strip_tags()`（自制 HTMLParser，跳过 script/style）+ `_norm()` 折叠空白 |
+| 标题 | `<title>` / `og:title`，再剥掉 ` - 公众号名` 后缀（公众号名来自 `<a id="js_name">`） |
+| 作者 | `<meta name="author">` 优先，退回公众号名 |
+| 发布时间 | `article:published_time` 优先，退回 `<em id="publish_time">`（`2026-09-17 08:30` 这种，无时区按 UTC） |
+| 图片 | `og:image` + 正文里懒加载的 `<img data-src>`（`data-src` 才是真图，`src` 常是占位） |
+
+**已知限制**：
+
+- 只能用 `data-src` / `og:image` 拿静态直链，图文里的视频（`v.qq.com` iframe）拿不到。
+- 反爬加严（出现验证码 / 需要登录 cookie）时仍会落到 `AUTH` —— 本期只识别不破解。
+  **如果未来要加代理 / cookie 池，扩展点是 `WechatFetcher._download()`，不是 `base.py` 契约。**
+- 正文里有嵌套 `<div>` 且外层不是 `js_content` 时，非贪婪截止依赖 `</div>\s*<script`；
+  兜底分支会把文末的推荐位 / 页脚一起吃进来（真实公众号页面 `js_content` 后紧跟脚本，罕见）。
+
+**CP2.7 集成测**：公众号 URL 现在走 `WechatFetcher`，不再抛 2001（之前是 UNSUPPORTED → 2001）。
+真机抓取要用 iPhone UA，`content-service/tests/fetchers/fixtures/wechat_article.html` 是测试用的样本页。
