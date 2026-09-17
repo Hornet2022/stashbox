@@ -5,6 +5,9 @@ CP1.5：wechat-login / user 走真实 PostgreSQL（users 表）；
 quota / subscription/plans 仍为 mock（配额扣减事务在 CP1.6）。
 鉴权：JWT 的 sub = users.id（整数），下游据此校验归属。
 """
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -23,19 +26,35 @@ from stashbox.backend.common.models import User
 from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common import quota_service
 
+log = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """CP3.6.2：FastAPI lifespan 替代 deprecated @app.on_event("startup")。
+
+    startup：拉起月度配额重置定时器（try/except 包住，不拖垮服务）。
+    shutdown：no-op（CP3.6.2 阶段不需要清理）。
+    """
+    # startup
+    try:
+        import asyncio
+        asyncio.create_task(quota_service.quota_reset_loop())
+        log.info("quota_reset_loop started")
+    except Exception as exc:
+        # 启动失败不能让 user-service 进入 broken state
+        log.error("quota_reset_loop 启动失败（忽略）: %s", exc)
+
+    yield
+
+    # shutdown（无清理需求，留 CP7 换 apscheduler 再处理）
+
+
 setup_logging("user-service")
-app = FastAPI(title="stashbox-user-service", version="0.2.0")
+app = FastAPI(title="stashbox-user-service", version="0.2.0", lifespan=lifespan)
 register_exception_handlers(app)
 app.add_middleware(RequestIDMiddleware)
 install_health_endpoints(app)
-
-
-@app.on_event("startup")
-async def _start_quota_reset_loop():
-    """CP1.6：拉起月度配额重置定时器（每小时检查一次，CP7 换 apscheduler）。"""
-    import asyncio
-
-    asyncio.create_task(quota_service.quota_reset_loop())
 
 
 class WechatLoginRequest(BaseModel):
