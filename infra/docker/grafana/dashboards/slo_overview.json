@@ -1,0 +1,335 @@
+{
+  "uid": "stashbox-slo-overview",
+  "title": "Stashbox · SLO 业务指标（slo_overview）",
+  "description": "CP6.3 SLO 业务指标 dashboard：API / 蒸馏 / 配额 / 黑盒 / Redis / 服务存活（14 panel）。数据来源：api_request_total (CP6.2.2.1), distill_* (CP3.6), quota_* (CP3.5), probe_success / redis_* (CP6.4), up{service} (CP3.6.1/2)。",
+  "tags": ["stashbox", "slo", "api", "distill", "quota"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "annotations": { "list": [] },
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "API QPS by status",
+      "description": "来源 metric: api_request_total (CP6.2.2.1)",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "sum(rate(api_request_total[5m])) by (status)",
+          "legendFormat": "{{status}}",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "API P95 延迟",
+      "description": "来源 metric: api_request_duration_seconds_bucket (CP6.2.2.1)",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(api_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P95",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "蒸馏成功率",
+      "description": "来源 metric: distill_success_total / distill_attempt_total (CP3.6)",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "sum(rate(distill_success_total[5m])) / sum(rate(distill_attempt_total[5m]))",
+          "legendFormat": "成功率",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "蒸馏 P95 耗时 by step",
+      "description": "来源 metric: distill_step_duration_seconds_bucket (CP3.6)",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(distill_step_duration_seconds_bucket[5m])) by (le, step))",
+          "legendFormat": "{{step}}",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "蒸馏失败率 by step",
+      "description": "来源 metric: distill_failure_total (CP3.6)",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "sum(rate(distill_failure_total[5m])) by (step)",
+          "legendFormat": "{{step}}",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "LLM 成本 USD/h",
+      "description": "来源 metric: llm_cost_usd_total (CP3.6)",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": {
+        "defaults": { "unit": "currencyUSD", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "sum(rate(llm_cost_usd_total[1h]))",
+          "legendFormat": "USD/h",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "蒸馏队列大小",
+      "description": "来源 metric: distill_queue_size (CP3.6)",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "distill_queue_size",
+          "legendFormat": "{{label}}",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "配额消费 QPS by plan",
+      "description": "来源 metric: quota_consume_total (CP3.5)",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "sum(rate(quota_consume_total[5m])) by (plan)",
+          "legendFormat": "{{plan}}",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "配额缓存命中率",
+      "description": "来源 metric: quota_cache_hit_total / quota_cache_miss_total (CP3.5). NaN 时 Grafana 显示 No data，不做特殊处理。",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "sum(rate(quota_cache_hit_total[5m])) / (sum(rate(quota_cache_hit_total[5m])) + sum(rate(quota_cache_miss_total[5m])))",
+          "legendFormat": "命中率",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "配额消费 P95 耗时",
+      "description": "来源 metric: quota_consume_duration_seconds_bucket (CP3.5)",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(quota_consume_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P95",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "黑盒探测成功率 by service",
+      "description": "来源 metric: probe_success{service=\"blackbox\"} (CP6.4). blackbox scrape job 在 CP6.4 prometheus.yml 已加 service=\"blackbox\" 标签。",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "sum(probe_success{service=\"blackbox\"}) by (instance)",
+          "legendFormat": "{{instance}}",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Redis 连接数",
+      "description": "来源 metric: redis_connected_clients (CP6.4)",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "redis_connected_clients",
+          "legendFormat": "{{label}}",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Redis 内存 (MB)",
+      "description": "来源 metric: redis_used_memory_bytes (CP6.4)",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "redis_used_memory_bytes / 1024 / 1024",
+          "legendFormat": "{{label}}",
+          "interval": ""
+        }
+      ],
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "4 服务存活状态",
+      "description": "来源 metric: up{service=~\"api-gateway|user-service|content-service|ai-service\"} (CP3.6.1/2). 1=存活, 0=宕机。",
+      "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "stashbox-prometheus" },
+          "expr": "up{service=~\"api-gateway|user-service|content-service|ai-service\"}",
+          "legendFormat": "{{service}}",
+          "interval": ""
+        }
+      ],
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "textMode": "auto" }
+    }
+  ]
+}
