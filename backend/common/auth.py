@@ -17,9 +17,17 @@ from jose import JWTError, jwt
 from stashbox.backend.common.config import settings
 
 
-def create_access_token(user_id: str, extra: dict | None = None) -> str:
-    """签发 JWT"""
-    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.jwt_expire_minutes)
+def create_access_token(
+    user_id: str, extra: dict | None = None, expire_minutes: int | None = None
+) -> str:
+    """签发 JWT
+
+    expire_minutes 默认用 settings.jwt_expire_minutes（7d，微信登录等）。
+    admin login 等场景可传 expire_minutes=60 签发短时 token，不改默认行为。
+    """
+    if expire_minutes is None:
+        expire_minutes = settings.jwt_expire_minutes
+    expire = datetime.now(timezone.utc) + timedelta(minutes=expire_minutes)
     payload = {
         "sub": user_id,
         "exp": expire,

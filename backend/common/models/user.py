@@ -19,6 +19,9 @@ class User(Base, TimestampMixin):
     apple_id: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     nickname: Mapped[str | None] = mapped_column(String(64), nullable=True)
     avatar_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # CP3.6.2-XIN admin login：email 用于 admin 登录查用户；password_hash 存 bcrypt hash
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     tier: Mapped[str] = mapped_column(
         String(16), default="free", nullable=False,
         doc="用户角色：free|student|member|pro|operator|admin（v1 §3.6，CP1.8 扩展 admin/operator）"
@@ -40,6 +43,7 @@ class User(Base, TimestampMixin):
 
     __table_args__ = (
         Index("idx_users_tier", "tier"),
+        Index("idx_users_email", "email"),
         Index(
             "idx_users_open_id_active",
             "open_id",
