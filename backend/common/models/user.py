@@ -19,7 +19,10 @@ class User(Base, TimestampMixin):
     apple_id: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     nickname: Mapped[str | None] = mapped_column(String(64), nullable=True)
     avatar_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    tier: Mapped[str] = mapped_column(String(16), default="free", nullable=False)
+    tier: Mapped[str] = mapped_column(
+        String(16), default="free", nullable=False,
+        doc="用户角色：free|student|member|pro|operator|admin（v1 §3.6，CP1.8 扩展 admin/operator）"
+    )
     student_verified_at: Mapped[TIMESTAMP | None] = mapped_column(TIMESTAMP, nullable=True)
     student_expire_at: Mapped[TIMESTAMP | None] = mapped_column(TIMESTAMP, nullable=True)
 

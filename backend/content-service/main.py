@@ -47,6 +47,7 @@ from schemas import (  # noqa: E402
 
 from stashbox.backend.common import cache_service, quota_service
 from stashbox.backend.common.auth import create_access_token, require_user, require_user_optional
+from stashbox.backend.common.auth_admin import require_admin_or_operator
 from stashbox.backend.common.database import get_db
 from stashbox.backend.common.exceptions import (
     BizException,
@@ -502,7 +503,7 @@ async def list_tags(user: dict = Depends(require_user)):
 
 
 @app.get("/api/v1/admin/stats")
-async def admin_stats(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
+async def admin_stats(user: dict = Depends(require_admin_or_operator), db: AsyncSession = Depends(get_db)):
     total_users = await db.scalar(select(func.count()).select_from(User))
     total_articles = await db.scalar(select(func.count()).select_from(Article))
     pending = await db.scalar(
