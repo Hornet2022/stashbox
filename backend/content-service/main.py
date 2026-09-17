@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # noqa: E402
 from clients.ai_client import get_ai_client  # noqa: E402
 from fetchers import (  # noqa: E402
     FetcherError,
+    FetcherErrorCode,
     get_fetcher,
     map_fetcher_error,
 )
@@ -57,7 +58,7 @@ from stashbox.backend.common.logging import setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
 from stashbox.backend.common.models import Article, DistilledArticle, User
 from stashbox.backend.common.observability import install_health_endpoints
-from stashbox.backend.common.analytics import track_simple
+from stashbox.backend.common.analytics import track, track_simple
 from stashbox.backend.common.events import EventName
 
 setup_logging("content-service")
@@ -458,6 +459,15 @@ async def wechat_mp_message(
     try:
         result = await fetcher.fetch(url)
     except FetcherError as exc:
+        # CP6.2.2.2a: ARTICLE_CAPTURE_FAILED / ARTICLE_UNSUPPORTED 埋点
+        if exc.code == FetcherErrorCode.UNSUPPORTED:
+            await track(db, EventName.ARTICLE_UNSUPPORTED,
+                        user_id=ANONYMOUS_USER_ID, article_id="n/a",
+                        metadata={"error": exc.message})
+        else:
+            await track(db, EventName.ARTICLE_CAPTURE_FAILED,
+                        user_id=ANONYMOUS_USER_ID, article_id="n/a",
+                        metadata={"error": exc.code.value if hasattr(exc.code, 'value') else str(exc.code)})
         raise map_fetcher_error(exc) from exc
 
     await _ensure_anonymous_user(db)

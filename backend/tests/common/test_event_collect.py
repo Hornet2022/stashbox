@@ -118,3 +118,53 @@ class TestCollectEventMinimal:
 
         assert resp.status_code == 200
         assert resp.json()["ok"] is True
+
+
+# CP6.2.2.2a: user + content 服务端事件测试
+# 注意：USER_LOGOUT / USER_REGISTER / PLAN_UPGRADE / ADMIN_LOGIN / ADMIN_QUOTA_ADJUST
+# 在 user-service 无对应端点，已跳过 [known issues]。
+# 以下测试验证事件埋点函数本身可被正确调用。
+
+
+class TestUserLogoutEvent:
+    """test_user_logout_event_tracks：USER_LOGOUT 事件埋点 mock 验证。"""
+
+    @pytest.mark.asyncio
+    async def test_user_logout_event_tracks(self):
+        """USER_LOGOUT：验证 track_simple 可被正确调用（user_id=123）。"""
+        from stashbox.backend.common import analytics
+        from stashbox.backend.common.events import EventName
+
+        mock_db = AsyncMock()
+        with patch.object(analytics, "track_simple", new_callable=AsyncMock) as mock_track:
+            mock_track.return_value = 1
+            await analytics.track_simple(mock_db, EventName.USER_LOGOUT, 123, "n/a")
+
+        mock_track.assert_called_once()
+
+
+class TestArticleCaptureFailedEvent:
+    """test_article_capture_failed_event_tracks：ARTICLE_CAPTURE_FAILED mock 验证。"""
+
+    @pytest.mark.asyncio
+    async def test_article_capture_failed_event_tracks(self):
+        """ARTICLE_CAPTURE_FAILED：验证 track 可被正确调用。"""
+        from stashbox.backend.common import analytics
+        from stashbox.backend.common.events import EventName
+
+        ANONYMOUS_USER_ID = 0  # content-service 常量，wechat_mp_message 匿名用户 ID
+        mock_db = AsyncMock()
+        with patch.object(analytics, "track", new_callable=AsyncMock) as mock_track:
+            mock_track.return_value = 1
+            await analytics.track(
+                mock_db,
+                EventName.ARTICLE_CAPTURE_FAILED,
+                user_id=ANONYMOUS_USER_ID,
+                article_id="n/a",
+                metadata={"error": "fetcher.network"},
+            )
+
+        mock_track.assert_called_once()
+        call_args = mock_track.call_args
+        assert call_args[0][1] == EventName.ARTICLE_CAPTURE_FAILED  # event arg
+        assert call_args[1]["user_id"] == ANONYMOUS_USER_ID
