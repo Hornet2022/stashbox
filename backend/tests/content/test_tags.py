@@ -3,7 +3,7 @@
 前置条件：alembic upgrade 0007 已跑（dev DB 升级由 Hornet 手动执行）。
 """
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -36,7 +36,7 @@ async def test_tags_table_exists():
 async def test_tag_subscriptions_table_exists():
     """tag_subscriptions 表存在"""
     async with AsyncSessionLocal() as s:
-        r = await s.execute(text("SELECT 1 FROM tag_subscriptions LIMIT 1"))
+        await s.execute(text("SELECT 1 FROM tag_subscriptions LIMIT 1"))
         # 不管返不返 rows，只确认表存在
         # 如果表不存在 SQLAlchemy 抛 ProgrammingError
 

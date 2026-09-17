@@ -9,7 +9,6 @@ Revision ID: 0003
 Revises: 0002
 Create Date: 2026-09-17
 """
-from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op

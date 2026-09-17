@@ -10,7 +10,6 @@ from sqlalchemy.ext.asyncio import (
 )
 
 # 全局唯一 Base / metadata 来自 common.models.base，避免与 ORM 模型出现双 metadata。
-from stashbox.backend.common.models.base import Base  # noqa: E402
 
 from stashbox.backend.common.config import settings
 

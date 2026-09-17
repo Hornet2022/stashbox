@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from stashbox.backend.common.event_collect import router, _rate_limit, _RATE_LIMIT_MAX
+from stashbox.backend.common.event_collect import router, _rate_limit
 
 
 @pytest.fixture

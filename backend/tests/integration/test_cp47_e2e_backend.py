@@ -140,7 +140,7 @@ async def test_wechat_url_full_distill_pipeline():
             f"audio_url 非音频格式: {audio_url}"
         )
         print(f"[CP4.7] audio_url 合法: {audio_url}")
-        print(f"[CP4.7] 完整链路验证通过")
+        print("[CP4.7] 完整链路验证通过")
 
 
 # ---------------------------------------------------------------------------
@@ -272,4 +272,4 @@ async def test_get_audio_before_distill_returns_404():
         assert audio_resp.status_code == 404, (
             f"未蒸馏文章应返回 404，实际 {audio_resp.status_code}: {audio_resp.text}"
         )
-        print(f"[CP4.7] 未蒸馏 audio-url 正确返回 404")
+        print("[CP4.7] 未蒸馏 audio-url 正确返回 404")

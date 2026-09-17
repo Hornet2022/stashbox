@@ -1,6 +1,6 @@
 """AdminOperationLog model（CP3.6-A1）。v1 §3.6 5 原则 2。"""
 from datetime import datetime
-from typing import Optional, Any
+from typing import Optional
 from sqlalchemy import String, Integer, Text, DateTime, ForeignKey, JSON, Index
 from sqlalchemy.orm import Mapped, mapped_column
 from stashbox.backend.common.models.base import Base

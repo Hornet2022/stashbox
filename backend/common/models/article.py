@@ -6,7 +6,6 @@ from sqlalchemy import (
     Index,
     String,
     Text,
-    TIMESTAMP,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column

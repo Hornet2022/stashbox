@@ -5,7 +5,6 @@ CP4.7-E2E-BACKEND 集成测 conftest：提供 auth fixture，跨服务测试用�
 - fixture scope="session" 减少 db 重置（CP2 集成测踩过的坑）
 """
 import asyncio
-from typing import AsyncGenerator
 
 import httpx
 import pytest

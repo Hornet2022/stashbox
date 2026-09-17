@@ -9,7 +9,6 @@ import asyncio
 import logging
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI
@@ -19,7 +18,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from stashbox.backend.common import cache_service, quota_service
 from stashbox.backend.common.auth import require_user
-from stashbox.backend.common.config import settings
 from stashbox.backend.common.database import AsyncSessionLocal, get_db
 from stashbox.backend.common.exceptions import (
     Forbidden,
@@ -182,7 +180,7 @@ async def health():
     """遗留别名（CP1.6 在用）：CP6.4 起新增 /healthz /readyz，本端点保持不动。"""
     redis_status = "ok"
     try:
-        client = redis.Redis(connection_pool=get_redis_pool())
+        client = aioredis.Redis(connection_pool=get_redis_pool())
         await client.ping()
         await client.aclose()
     except Exception:

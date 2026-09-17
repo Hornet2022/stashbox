@@ -1,5 +1,4 @@
 """CP6.2.1 埋点 SDK 单测（v1 §11.6）。"""
-import pytest
 from unittest.mock import AsyncMock, MagicMock
 from sqlalchemy.ext.asyncio import AsyncSession
 

@@ -22,11 +22,9 @@ from pathlib import Path
 import bcrypt
 import httpx
 import pytest
-from jose import jwt
 from sqlalchemy import text
 
 from stashbox.backend.common.auth import decode_token
-from stashbox.backend.common.config import settings
 from stashbox.backend.common.database import AsyncSessionLocal, engine
 from stashbox.backend.common.models import User
 from stashbox.backend.common.models.admin_operation_log import AdminOperationLog
@@ -128,7 +126,7 @@ async def test_admin_login_ok():
 async def test_operator_login_ok():
     """正常 operator 登录 → 200 + JWT（role=operator）。"""
     email = "operator_" + uuid.uuid4().hex[:8] + "@stashbox.dev"
-    uid = await _make_user(email, "op_secret_123", tier="operator", nickname="Op")
+    await _make_user(email, "op_secret_123", tier="operator", nickname="Op")
     resp = await _login(email, "op_secret_123")
     assert resp.status_code == 200
     body = resp.json()

@@ -1,11 +1,9 @@
 """AuditMiddleware 自动记录 admin 写操作（CP3.6-A1）。v1 §3.6 5 原则 1。"""
 import json
 import re
-import time
 from typing import Optional
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.types import ASGIApp
 from stashbox.backend.common.database import AsyncSessionLocal
 from stashbox.backend.common.models.admin_operation_log import AdminOperationLog
 
@@ -80,7 +78,6 @@ class AuditMiddleware(BaseHTTPMiddleware):
                 pass
 
         # 4. 执行实际请求
-        start = time.time()
         response = await call_next(request)
 
         # 5. 异步写 log（不阻塞响应）

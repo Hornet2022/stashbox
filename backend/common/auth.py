@@ -11,7 +11,7 @@ JWT 鉴权 - 签发 + 解析 + FastAPI 依赖。
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Header, HTTPException, status
 from jose import JWTError, jwt
 
 from stashbox.backend.common.config import settings

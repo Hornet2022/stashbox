@@ -8,7 +8,6 @@ v1 §3.6：admin + operator 角色扩展到 tier 字段。
 admin_seed 用户不存在于本机 DB，UPDATE 已跳过， CHECK constraint 仍生效。
 """
 from alembic import op
-import sqlalchemy as sa
 
 # revision identifiers
 revision = "0005"

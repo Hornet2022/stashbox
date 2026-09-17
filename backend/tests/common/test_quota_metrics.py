@@ -11,7 +11,6 @@ from prometheus_client import REGISTRY
 from stashbox.backend.common import quota_metrics
 from stashbox.backend.common.quota_service import (
     QuotaExceededError,
-    QuotaConflictError,
     consume,
     get_quota,
     refund,

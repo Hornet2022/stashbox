@@ -4,7 +4,6 @@ Hornet 一期 owner 兼任 admin。open_id = 'admin_seed'（不与微信 openid 
 INSERT 而非 UPDATE：不破坏现有 users 行。
 """
 from alembic import op
-import sqlalchemy as sa
 
 revision = "0006"
 down_revision = "0005"
