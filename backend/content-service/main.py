@@ -8,6 +8,8 @@ CP1.5：全部走真实 PostgreSQL（articles 表）。
 CP1.7：D9 端到端 —— 不要求登录态 → 建文章 → 自动触发 ai-service 蒸馏 →
 客户端轮询 status / audio-url 拿音频。
 """
+import csv
+import io
 import json
 import re
 import sys
@@ -20,6 +22,7 @@ from typing import Annotated
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.dialects.postgresql import insert
@@ -49,7 +52,7 @@ from schemas import (  # noqa: E402
 from stashbox.backend.common import cache_service, quota_service
 from stashbox.backend.common.auth import create_access_token, require_user, require_user_optional
 from stashbox.backend.common.auth_admin import require_admin_or_operator
-from stashbox.backend.common.database import get_db
+from stashbox.backend.common.database import AsyncSessionLocal, get_db
 from stashbox.backend.common.exceptions import (
     BizException,
     Forbidden,
@@ -917,6 +920,264 @@ async def admin_audit_log(
         for r in rows
     ]
     return {"total": total or 0, "items": items}
+
+
+# ---------------------------------------------------------------------------
+# CP5.6 admin CSV 数据导出（5 端点，v1 §11.5）
+#
+# 实现约束（本任务红线）：
+#   - 标准库 csv + io.StringIO 生成，不引第三方（pandas / openpyxl）
+#   - StreamingResponse 逐批下发，避免大表一次性进内存
+#   - 不接 OSS / S3、不加 gzip、不加 limit（admin 全量）
+#   - 鉴权统一 require_admin_or_operator；每次导出写一条 admin_operation_logs
+# ---------------------------------------------------------------------------
+_CSV_MEDIA_TYPE = "text/csv; charset=utf-8"
+_EXPORT_LOG_ACTION = "ADMIN_EXPORT"
+
+
+def _csv_filename(name: str) -> str:
+    """users -> users-2026-09-17.csv（UTC 日期）。"""
+    return f"{name}-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.csv"
+
+
+def _csv_cell(value):
+    """单元格归一化：None -> ""，datetime -> ISO8601，dict/list -> JSON 文本。"""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
+def _csv_chunk(rows: list[list]) -> str:
+    """把一批行渲染成 CSV 文本（行尾 CRLF，符合 RFC 4180）。"""
+    buf = io.StringIO()
+    csv.writer(buf).writerows([[_csv_cell(c) for c in row] for row in rows])
+    return buf.getvalue()
+
+
+def _stream_csv(filename: str, header: list[str], fetch_rows=None) -> StreamingResponse:
+    """组 StreamingResponse：BOM + header + 逐行下发。
+
+    ``fetch_rows(session)`` 返回 async 迭代器；用**独立 session**（而非请求级
+    ``Depends(get_db)``）在生成器内执行，避免请求级 session 在响应体流式发送
+    期间被依赖注入提前 close。``fetch_rows=None`` 时只回 header（表缺失降级）。
+    """
+    async def _gen():
+        yield "\ufeff"  # UTF-8 BOM：Excel 直接打开中文列名/内容不乱码
+        yield _csv_chunk([header])
+        if fetch_rows is None:
+            return
+        async with AsyncSessionLocal() as session:
+            async for row in fetch_rows(session):
+                yield _csv_chunk([row])
+
+    return StreamingResponse(
+        _gen(),
+        media_type=_CSV_MEDIA_TYPE,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+async def _write_export_log(
+    db: AsyncSession, user: dict, path: str, filename: str, row_count: int
+) -> None:
+    """每次导出写一条 admin_operation_logs（响应开始前提交，客户端中断也留痕）。"""
+    db.add(
+        AdminOperationLog(
+            admin_id=int(user["sub"]),
+            admin_tier=user.get("tier", "unknown"),
+            action=_EXPORT_LOG_ACTION,
+            target_type="export",
+            target_id=filename,
+            reason=f"admin CSV 导出 {filename}",
+            method="GET",
+            path=path,
+            request_body={"filename": filename, "row_count": row_count},
+            response_status=200,
+        )
+    )
+    await db.commit()
+
+
+async def _table_exists(db: AsyncSession, name: str) -> bool:
+    """表是否存在。v1 §4 部分表尚未落 migration，缺失时导出降级为 header-only。"""
+    return bool(
+        await db.scalar(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_name = :name)"
+            ),
+            {"name": name},
+        )
+    )
+
+
+@app.get("/api/v1/admin/export/users.csv")
+async def admin_export_users_csv(
+    user: dict = Depends(require_admin_or_operator), db: AsyncSession = Depends(get_db)
+):
+    """导出 users 全量（v1 §4.2.1 字段 + 月配额 / 已用配额）。
+
+    display_name / role 是 v1 §3.6 admin web 的字段名（对应 users.nickname / users.tier）；
+    last_active_at 本仓库 users 表未建该列（v1 §4.2.1 未列），列位保留但恒为空，
+    以免 admin web 表头随实现漂移。
+    """
+    path = "/api/v1/admin/export/users.csv"
+    filename = _csv_filename("users")
+    header = [
+        "id", "email", "display_name", "role", "tier", "status",
+        "monthly_quota", "used_quota", "last_active_at", "created_at",
+    ]
+    total = await db.scalar(select(func.count()).select_from(User)) or 0
+    await _write_export_log(db, user, path, filename, total)
+
+    async def fetch(session: AsyncSession):
+        result = await session.stream(select(User).order_by(User.id))
+        async for u in result.scalars():
+            yield [
+                u.id, u.email, u.nickname, u.tier, u.tier, "active",
+                u.monthly_quota, u.quota_used, None, u.created_at,
+            ]
+
+    return _stream_csv(filename, header, fetch)
+
+
+@app.get("/api/v1/admin/export/articles.csv")
+async def admin_export_articles_csv(
+    user: dict = Depends(require_admin_or_operator), db: AsyncSession = Depends(get_db)
+):
+    """导出 articles 全量 + distilled_articles 标签 / 质量分（LEFT JOIN）。
+
+    listened_at：articles 表无该列（v1 §4.3.1 未建），沿用 CP5.5 口径取
+    feedback(type='listen_complete') 的 created_at 最大值。
+    """
+    path = "/api/v1/admin/export/articles.csv"
+    filename = _csv_filename("articles")
+    header = [
+        "id", "user_id", "title", "source", "url", "status",
+        "tags", "quality_score", "listened_at", "created_at",
+    ]
+    total = await db.scalar(select(func.count()).select_from(Article)) or 0
+    await _write_export_log(db, user, path, filename, total)
+
+    listened_at = (
+        select(func.max(Feedback.created_at))
+        .where(Feedback.article_id == Article.id, Feedback.type == "listen_complete")
+        .correlate(Article)
+        .scalar_subquery()
+    )
+
+    async def fetch(session: AsyncSession):
+        stmt = (
+            select(Article, DistilledArticle.tags, DistilledArticle.quality_score, listened_at)
+            .outerjoin(DistilledArticle, DistilledArticle.article_id == Article.id)
+            .order_by(Article.created_at, Article.id)
+        )
+        result = await session.stream(stmt)
+        async for row in result:
+            art, tags, score, listened = row
+            yield [
+                art.id, art.user_id, art.title, art.source, art.url, art.status,
+                "|".join(str(t) for t in tags) if tags else "",
+                score, listened, art.created_at,
+            ]
+
+    return _stream_csv(filename, header, fetch)
+
+
+@app.get("/api/v1/admin/export/feedback.csv")
+async def admin_export_feedback_csv(
+    user: dict = Depends(require_admin_or_operator), db: AsyncSession = Depends(get_db)
+):
+    """导出 feedback 全量（v1 §4.3.4 全字段）。"""
+    path = "/api/v1/admin/export/feedback.csv"
+    filename = _csv_filename("feedback")
+    header = ["id", "user_id", "article_id", "type", "rating", "reason", "metadata", "created_at"]
+    total = await db.scalar(select(func.count()).select_from(Feedback)) or 0
+    await _write_export_log(db, user, path, filename, total)
+
+    async def fetch(session: AsyncSession):
+        result = await session.stream(select(Feedback).order_by(Feedback.id))
+        async for f in result.scalars():
+            yield [
+                f.id, f.user_id, f.article_id, f.type,
+                f.rating, f.reason, f.metadata_, f.created_at,
+            ]
+
+    return _stream_csv(filename, header, fetch)
+
+
+@app.get("/api/v1/admin/export/audit-log.csv")
+async def admin_export_audit_log_csv(
+    user: dict = Depends(require_admin_or_operator), db: AsyncSession = Depends(get_db)
+):
+    """导出 admin_operation_logs 全量（v1 §3.6 5 原则 2 审计留痕）。
+
+    排序与 GET /api/v1/admin/audit-log 一致（created_at DESC）。
+    row_count 在写本次导出日志**之前**统计，故不含本次这条。
+    """
+    path = "/api/v1/admin/export/audit-log.csv"
+    filename = _csv_filename("audit-log")
+    header = [
+        "id", "actor_id", "action_type", "target_type", "target_id", "payload", "created_at",
+    ]
+    total = await db.scalar(select(func.count()).select_from(AdminOperationLog)) or 0
+    await _write_export_log(db, user, path, filename, total)
+
+    async def fetch(session: AsyncSession):
+        stmt = select(AdminOperationLog).order_by(
+            AdminOperationLog.created_at.desc(), AdminOperationLog.id.desc()
+        )
+        result = await session.stream(stmt)
+        async for r in result.scalars():
+            yield [
+                r.id, r.admin_id, r.action, r.target_type,
+                r.target_id, r.request_body, r.created_at,
+            ]
+
+    return _stream_csv(filename, header, fetch)
+
+
+@app.get("/api/v1/admin/export/subscriptions.csv")
+async def admin_export_subscriptions_csv(
+    user: dict = Depends(require_admin_or_operator), db: AsyncSession = Depends(get_db)
+):
+    """导出 subscriptions 全量（v1 §4.6.1）。
+
+    [known issue] 本仓库 subscriptions 表尚未实现（无 ORM 模型 / 无 migration，
+    本地 alembic 停在 0004），故表缺失时降级为「只回 header」的合法 CSV 而非 500
+    —— 与 admin stats 对同样未实现的 orders 表的处理口径一致（见 _safe_revenue）。
+    表落地后本端点无需改代码即自动生效。
+    """
+    path = "/api/v1/admin/export/subscriptions.csv"
+    filename = _csv_filename("subscriptions")
+    header = ["id", "user_id", "tier", "started_at", "expires_at", "status", "auto_renew"]
+
+    if not await _table_exists(db, "subscriptions"):
+        await _write_export_log(db, user, path, filename, 0)
+        return _stream_csv(filename, header)
+
+    total = await db.scalar(text("SELECT count(*) FROM subscriptions")) or 0
+    await _write_export_log(db, user, path, filename, total)
+
+    async def fetch(session: AsyncSession):
+        # v1 §4.6.1 建表列名是 start_at / expire_at，导出表头按 admin web 契约用 started_at / expires_at
+        result = await session.stream(
+            text(
+                "SELECT id, user_id, tier, start_at AS started_at, expire_at AS expires_at, "
+                "status, auto_renew FROM subscriptions ORDER BY id"
+            )
+        )
+        async for r in result:
+            yield [
+                r.id, r.user_id, r.tier, r.started_at,
+                r.expires_at, r.status, r.auto_renew,
+            ]
+
+    return _stream_csv(filename, header, fetch)
 
 
 async def _safe_revenue(db: AsyncSession) -> float:

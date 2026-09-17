@@ -332,6 +332,246 @@
         ]
       }
     },
+    "/api/v1/admin/export/articles.csv": {
+      "get": {
+        "summary": "Admin Export Articles Csv",
+        "description": "导出 articles 全量 + distilled_articles 标签 / 质量分（LEFT JOIN）。\n\nlistened_at：articles 表无该列（v1 §4.3.1 未建），沿用 CP5.5 口径取\nfeedback(type='listen_complete') 的 created_at 最大值。",
+        "operationId": "admin_export_articles_csv_api_v1_admin_export_articles_csv_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
+    "/api/v1/admin/export/audit-log.csv": {
+      "get": {
+        "summary": "Admin Export Audit Log Csv",
+        "description": "导出 admin_operation_logs 全量（v1 §3.6 5 原则 2 审计留痕）。\n\n排序与 GET /api/v1/admin/audit-log 一致（created_at DESC）。\nrow_count 在写本次导出日志**之前**统计，故不含本次这条。",
+        "operationId": "admin_export_audit_log_csv_api_v1_admin_export_audit_log_csv_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
+    "/api/v1/admin/export/feedback.csv": {
+      "get": {
+        "summary": "Admin Export Feedback Csv",
+        "description": "导出 feedback 全量（v1 §4.3.4 全字段）。",
+        "operationId": "admin_export_feedback_csv_api_v1_admin_export_feedback_csv_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
+    "/api/v1/admin/export/subscriptions.csv": {
+      "get": {
+        "summary": "Admin Export Subscriptions Csv",
+        "description": "导出 subscriptions 全量（v1 §4.6.1）。\n\n[known issue] 本仓库 subscriptions 表尚未实现（无 ORM 模型 / 无 migration，\n本地 alembic 停在 0004），故表缺失时降级为「只回 header」的合法 CSV 而非 500\n—— 与 admin stats 对同样未实现的 orders 表的处理口径一致（见 _safe_revenue）。\n表落地后本端点无需改代码即自动生效。",
+        "operationId": "admin_export_subscriptions_csv_api_v1_admin_export_subscriptions_csv_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
+    "/api/v1/admin/export/users.csv": {
+      "get": {
+        "summary": "Admin Export Users Csv",
+        "description": "导出 users 全量（v1 §4.2.1 字段 + 月配额 / 已用配额）。\n\ndisplay_name / role 是 v1 §3.6 admin web 的字段名（对应 users.nickname / users.tier）；\nlast_active_at 本仓库 users 表未建该列（v1 §4.2.1 未列），列位保留但恒为空，\n以免 admin web 表头随实现漂移。",
+        "operationId": "admin_export_users_csv_api_v1_admin_export_users_csv_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
     "/api/v1/admin/stats": {
       "get": {
         "summary": "Admin Stats",
