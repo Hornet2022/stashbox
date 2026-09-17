@@ -8,7 +8,7 @@ content-service 的**收集层**抽象。本期只落接口 + 占位实现，真
 base.py        契约（CP2.1 定死：Fetcher / FetchResult / FetcherError）
 parser.py      共享 HTML 解析器（CP2.2 抽出来的 5 个 HTMLParser + 3 个工具函数）
 wechat.py      WechatFetcher  —— CP2.2 实现，复用 parser.py
-douyin.py      DouyinFetcher  —— CP2.1 占位
+douyin.py      DouyinFetcher  —— CP2.3 实现（RENDER_DATA 内嵌 JSON，不走 parser.py）
 generic_url.py GenericURLFetcher —— CP2.4 实现，复用 parser.py
 ```
 
@@ -50,7 +50,7 @@ v1 §3.x 的 `biz_code` 体系** —— 对外暴露时由上层（CP2.5）映�
 | Fetcher | `name` | `supports()` 匹配 | 状态 |
 |---|---|---|---|
 | `WechatFetcher` | `wechat_mp` | `mp.weixin.qq.com` | **CP2.2 实现**（httpx + `#js_content` 专属选择器） |
-| `DouyinFetcher` | `douyin` | `douyin.com` / `iesdouyin.com`（含 `v.douyin.com` 短链） | CP2.1 占位 |
+| `DouyinFetcher` | `douyin` | `douyin.com` / `iesdouyin.com`（含 `v.douyin.com` 短链） | **CP2.3 实现**（httpx 移动端 UA + `#RENDER_DATA` 内嵌 JSON） |
 | `GenericURLFetcher` | `generic_url` | 恒 `True`（catch-all） | **CP2.4 实现**（httpx + stdlib HTMLParser） |
 | `MockFetcher` | — | — | **本期不写**，留给 CP2.7 集成测（10 个真实 URL 里垫刀用） |
 
@@ -59,7 +59,7 @@ v1 §3.x 的 `biz_code` 体系** —— 对外暴露时由上层（CP2.5）映�
 - **CP2.2 公众号**（`wechat.py`）：走 `mp.weixin.qq.com/s/xxx` 正文页，取标题 / 作者 / 正文
   HTML+纯文本 / 图片直链；`环境异常` 验证页 → `AUTH`。**已实现**，细节见 §6。
 - **CP2.3 抖音**（`douyin.py`）：先解 `v.douyin.com` 短链 302，再从页面内嵌数据取视频/图集；
-  正文常常只在 JS 渲染后的数据里，可能要解析内嵌 JSON → 失败走 `PARSE`。
+  正文常常只在 JS 渲染后的数据里，可能要解析内嵌 JSON → 失败走 `PARSE`。**已实现**，细节见 §7。
 - **CP2.4 通用 URL**（`generic_url.py`）：任意网页的正文抽取（readability 那类思路）。
 - 三个实现都**不改 `base.py`** —— 契约本期定死，改契约要单独提。
 
@@ -219,3 +219,53 @@ fetch(url)
 
 **CP2.7 集成测**：公众号 URL 现在走 `WechatFetcher`，不再抛 2001（之前是 UNSUPPORTED → 2001）。
 真机抓取要用 iPhone UA，`content-service/tests/fetchers/fixtures/wechat_article.html` 是测试用的样本页。
+
+## 7. DouyinFetcher 当前能力（CP2.3）
+
+`douyin.py`：`httpx.AsyncClient` + 移动端 iPhone UA + `follow_redirects=True`，单实例抓取
+（本期**没有**代理池 / cookie 池，也不做滑块验证绕过）。正文不在 DOM 里，数据是
+`<script id="RENDER_DATA">` 里的 **URL-encoded JSON**（`unquote` 一次后 `json.loads`），
+所以**不复用 `parser.py`**（那边是 HTMLParser，处理不了内嵌 JSON）。
+
+```
+fetch(url)
+├── 不是 douyin.com / iesdouyin.com      → FetcherError(UNSUPPORTED)（supports() 说了算，不发请求）
+├── 超时 / 传输层异常                     → FetcherError(NETWORK)
+├── 404 / 410                            → FetcherError(NOT_FOUND)
+├── 其它 >= 400                           → FetcherError(NETWORK, "http {status}")
+├── 命中"视频不存在 / 内容不存在 / 已被删除" → FetcherError(NOT_FOUND)
+├── 找不到 <script id="RENDER_DATA">      → FetcherError(PARSE)
+├── unquote + json.loads 失败             → FetcherError(PARSE)
+├── BFS 找不到 aweme_detail               → FetcherError(PARSE)
+└── FetchResult（source="douyin"）
+```
+
+短链 `v.douyin.com/iXXXX` 302 跳到 `www.iesdouyin.com/share/video/XXXX` 或
+`www.douyin.com/video/XXXX`，httpx 自动跟跳，**跳转后的 URL 记在 `raw_metadata["final_url"]`**。
+抖音 PC UA 常常 404 / 撞反爬，所以**短链和主页都用移动端 UA**。
+
+| 字段 | 取法（都在 `aweme_detail` 里） |
+|---|---|
+| 标题 `title` | `desc`（话题 tag `#xx#` 本来就在 desc 里，不额外拼） |
+| 正文 `content_text` | 同 `desc` |
+| 正文 `content_html` | 空串 —— 抖音没有服务端渲染的正文 HTML |
+| 作者 `author` | `author.nickname` |
+| 发布时间 `publish_time` | `create_time`（Unix 秒）→ `datetime.fromtimestamp(ts, tz=utc)` |
+| 媒体 `media_urls` | `[video.cover.url_list[0], video.play_addr.url_list[0]]`（封面在前，视频直链在后） |
+| `raw_metadata` | `aweme_id` / `duration_ms`(毫秒) / `author_uid` / `final_url` / `status_code` / `publish_time_raw` |
+
+`aweme_detail` 用 **BFS（广度优先）** 找一次，兼容抖音把数据包在更深的层级里
+（`_find_aweme_detail()`）；结构变了只要节点名还叫 `aweme_detail` 就能命中。
+
+**已知限制**：
+
+- 只抽 `RENDER_DATA`，**不渲染 JS**（没装 playwright）—— 抖音把数据挪到别的内嵌脚本
+  （比如 `window._ROUTER_DATA`）时会落 `PARSE: RENDER_DATA script not found`，**发现就回报**，不擅自改。
+- 视频直链 `play_addr` 有**时效性**（带签名参数，几小时过期），只适合"马上下载/转存"，
+  不适合长期存库；长期方案是 CP3.x 落本地对象存储。
+- 图文（图集）作品的 `images` 数组本期不抽 —— `media_urls` 只会拿到封面，图集直链留给后续 CP。
+- 反爬加严（滑块 / 需要登录 cookie / IP 限流）时会落 `NOT_FOUND` 或 `PARSE` —— 本期只识别不破解。
+  **如果未来要加代理 / cookie 池，扩展点是 `DouyinFetcher._download()`，不是 `base.py` 契约。**
+
+**CP2.7 集成测**：抖音 URL 现在走 `DouyinFetcher`，不再抛 2001（之前是 UNSUPPORTED → 2001）。
+真机抓取要用移动端 UA，`content-service/tests/fetchers/fixtures/douyin_video.html` 是测试用的样本页。
