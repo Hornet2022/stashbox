@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from stashbox.backend.common import cache_service
 from stashbox.backend.common.exceptions import BizException
 from stashbox.backend.common.models import User
+from stashbox.backend.common import quota_metrics
 
 MAX_RETRY = 3
 
@@ -110,21 +111,44 @@ async def _apply(
 
 async def consume(session: AsyncSession, user_id: int, amount: int = 1) -> dict:
     """扣减配额（配额不足抛 QuotaExceededError 3001）。"""
-    return await _apply(session, user_id, amount)
+    with quota_metrics.quota_consume_duration_seconds.time():
+        try:
+            result = await _apply(session, user_id, amount)
+            user = await session.get(User, user_id)
+            try:
+                quota_metrics.quota_consume_total.labels(plan=user.plan if user else "unknown").inc()
+            except Exception:
+                pass
+            return result
+        except QuotaExceededError:
+            quota_metrics.quota_consume_blocked_total.labels(reason="exceeded").inc()
+            raise
+        except QuotaConflictError:
+            quota_metrics.quota_consume_blocked_total.labels(reason="conflict").inc()
+            raise
 
 
-async def refund(session: AsyncSession, user_id: int, amount: int = 1) -> dict:
+async def refund(session: AsyncSession, user_id: int, amount: int = 1, trigger: str = "distill_failed") -> dict:
     """退还配额（蒸馏失败时调用）。"""
-    return await _apply(session, user_id, -amount)
+    try:
+        result = await _apply(session, user_id, -amount)
+        try:
+            quota_metrics.quota_refund_total.labels(trigger=trigger).inc()
+        except Exception:
+            pass
+        return result
+    except Exception:
+        raise
 
 
 async def get_quota(session: AsyncSession, user_id: int) -> dict:
     """读配额：先 Redis，miss 则查 DB + 回填。"""
     cached = await cache_service.get_quota(user_id)
     if cached:
+        quota_metrics.quota_cache_hit_total.inc()
         cached["cached"] = True
         return cached
-
+    quota_metrics.quota_cache_miss_total.inc()
     result = await session.execute(
         select(
             User.quota_used, User.monthly_quota, User.quota_version, User.quota_reset_at
@@ -166,6 +190,11 @@ async def reset_monthly(session: AsyncSession) -> int:
     await session.commit()
     for uid, version in rows:
         await cache_service.invalidate_quota(int(uid), int(version))
+    if rows:
+        try:
+            quota_metrics.quota_reset_total.inc(len(rows))
+        except Exception:
+            pass
     return len(rows)
 
 

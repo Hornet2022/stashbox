@@ -27,6 +27,7 @@ from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common import quota_service
 from stashbox.backend.common.analytics import track_simple
 from stashbox.backend.common.events import EventName
+from stashbox.backend.common import quota_metrics
 
 log = logging.getLogger(__name__)
 
@@ -153,7 +154,9 @@ async def get_quota(user: dict = Depends(require_user), db: AsyncSession = Depen
 @app.get("/api/v1/users/me/quota")
 async def get_my_quota(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
     """CP1.6：`GET /users/me/quota`（v1 §3.3 语义同 /user/quota）。"""
-    return await _quota_payload(int(user["sub"]), db)
+    q = await _quota_payload(int(user["sub"]), db)
+    quota_metrics.quota_request_total.labels(endpoint="me_quota").inc()
+    return q
 
 
 @app.post("/api/v1/users/me/quota/reset-monthly")
