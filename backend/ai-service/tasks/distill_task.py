@@ -18,6 +18,8 @@ from distill import DistillContext, DistillPipeline
 from llm import get_llm_client
 from stashbox.backend.common.database import AsyncSessionLocal
 from stashbox.backend.common.models import Article
+from stashbox.backend.common.analytics import track_simple, track
+from stashbox.backend.common.events import EventName
 
 log = structlog.get_logger("ai-worker")
 
@@ -115,9 +117,16 @@ async def distill_task(
     try:
         await pipeline.run(pipeline_ctx)
         log.info("arq_distill_completed", task_id=task_id, article_id=article_id)
+        # CP6.2.1 埋点：distill_completed
+        async with AsyncSessionLocal() as db:
+            await track_simple(db, EventName.DISTILL_COMPLETED, user_id, article_id)
         return {"task_id": task_id, "status": "done"}
     except Exception as e:
         log.exception("arq_distill_failed", task_id=task_id, article_id=article_id, error=str(e))
+        # CP6.2.1 埋点：distill_failed + distill_quota_refund
+        async with AsyncSessionLocal() as db:
+            await track(db, EventName.DISTILL_FAILED, user_id=user_id, article_id=article_id, reason=str(e))
+            await track_simple(db, EventName.DISTILL_QUOTA_REFUND, user_id, article_id)
         raise  # 让 Arq 走 retry 逻辑
     finally:
         await llm.close()

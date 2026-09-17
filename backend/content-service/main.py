@@ -57,6 +57,8 @@ from stashbox.backend.common.logging import setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
 from stashbox.backend.common.models import Article, DistilledArticle, User
 from stashbox.backend.common.observability import install_health_endpoints
+from stashbox.backend.common.analytics import track_simple
+from stashbox.backend.common.events import EventName
 
 setup_logging("content-service")
 app = FastAPI(title="stashbox-content-service", version="0.3.0")
@@ -244,6 +246,8 @@ async def submit_article(
     quota = await quota_service.consume(db, uid)  # 用尽抛 QuotaExceededError(3001)
     art = await _create_article(req.url, uid, req.source, None, db)
     await cache_service.mark_article_quota(art.id)  # 打标：该文章已扣过配额
+    # CP6.2.1 埋点：article_submit
+    await track_simple(db, EventName.ARTICLE_SUBMIT, uid, art.id)
     return {
         "article_id": art.id,
         "url": art.url,
@@ -310,6 +314,8 @@ async def mark_listened(
     art = await _get_owned(article_id, int(user["sub"]), db)
     art.status = "listened"
     await db.commit()
+    # CP6.2.1 埋点：audio_complete
+    await track_simple(db, EventName.AUDIO_COMPLETE, int(user["sub"]), article_id)
     return {"id": article_id, "status": "listened"}
 
 
@@ -406,6 +412,8 @@ async def article_audio_url(
 
     expires_ts = int(time.time()) + AUDIO_URL_TTL_SEC
     base = (task.audio_url if task else None) or f"{OSS_AUDIO_BASE}/{art.id}.m4a"
+    # CP6.2.1 埋点：audio_play_start
+    await track_simple(db, EventName.AUDIO_PLAY_START, int(user["sub"]), article_id)
     return AudioUrlResponse(
         article_id=art.id,
         audio_url=f"{base}?Expires={expires_ts}&OSSAccessKeyId=mock&Signature=mock",

@@ -3,6 +3,7 @@ from .base import Base, TimestampMixin
 from .user import User
 from .article import Article
 from .distilled_article import DistilledArticle
+from .feedback import Feedback
 
 __all__ = [
     "Base",
@@ -10,4 +11,5 @@ __all__ = [
     "User",
     "Article",
     "DistilledArticle",
+    "Feedback",
 ]

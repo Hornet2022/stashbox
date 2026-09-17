@@ -25,6 +25,8 @@ from stashbox.backend.common.middleware import RequestIDMiddleware
 from stashbox.backend.common.models import User
 from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common import quota_service
+from stashbox.backend.common.analytics import track_simple
+from stashbox.backend.common.events import EventName
 
 log = logging.getLogger(__name__)
 
@@ -106,6 +108,8 @@ async def wechat_login(req: WechatLoginRequest, db: AsyncSession = Depends(get_d
         await db.refresh(user)
 
     token = create_access_token(str(user.id))
+    # CP6.2.1 埋点：user_login
+    await track_simple(db, EventName.USER_LOGIN, user.id, "n/a")
     return WechatLoginResponse(
         access_token=token,
         user_id=str(user.id),
@@ -156,6 +160,8 @@ async def get_my_quota(user: dict = Depends(require_user), db: AsyncSession = De
 async def reset_quota_monthly(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
     """手动触发月度重置（定时器见 quota_service.quota_reset_loop）。"""
     n = await quota_service.reset_monthly(db)
+    # CP6.2.1 埋点：quota_reset
+    await track_simple(db, EventName.QUOTA_RESET, int(user["sub"]), "n/a")
     return {"reset_users": n}
 
 

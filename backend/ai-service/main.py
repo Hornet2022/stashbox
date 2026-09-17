@@ -31,6 +31,8 @@ from stashbox.backend.common.middleware import RequestIDMiddleware
 from stashbox.backend.common.models import Article, DistilledArticle
 from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common.redis_client import get_redis_pool
+from stashbox.backend.common.analytics import track_simple
+from stashbox.backend.common.events import EventName
 
 from dispatcher import get_dispatcher, shutdown_dispatcher
 
@@ -263,6 +265,8 @@ async def distill_article(
         title=art.title,
         simulate_failure=simulate_failure,
     )
+    # CP6.2.1 埋点：distill_start
+    await track_simple(db, EventName.DISTILL_START, uid, article_id)
 
     if quota_used is None:
         quota_used = (await quota_service.get_quota(db, uid))["quota_used"]
