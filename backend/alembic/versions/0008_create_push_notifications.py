@@ -16,7 +16,7 @@ def upgrade() -> None:
         "push_notifications",
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
         sa.Column("user_id", sa.Integer(), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("article_id", sa.Integer(), sa.ForeignKey("distilled_articles.id", ondelete="CASCADE"), nullable=True),
+        sa.Column("article_id", sa.String(32), sa.ForeignKey("distilled_articles.id", ondelete="CASCADE"), nullable=True),
         sa.Column("tag_slug", sa.String(64), sa.ForeignKey("tags.slug", ondelete="SET NULL"), nullable=True),
         sa.Column("title", sa.String(128), nullable=False),
         sa.Column("body", sa.Text(), nullable=False),

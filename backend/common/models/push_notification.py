@@ -14,8 +14,8 @@ class PushNotification(Base):
     user_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
-    article_id: Mapped[Optional[int]] = mapped_column(
-        Integer, ForeignKey("distilled_articles.id", ondelete="CASCADE"), nullable=True
+    article_id: Mapped[Optional[str]] = mapped_column(
+        String(32), ForeignKey("distilled_articles.id", ondelete="CASCADE"), nullable=True
     )
     tag_slug: Mapped[Optional[str]] = mapped_column(
         String(64), ForeignKey("tags.slug", ondelete="SET NULL"), nullable=True
