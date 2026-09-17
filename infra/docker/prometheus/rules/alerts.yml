@@ -133,3 +133,75 @@ groups:
         annotations:
           summary: "Redis 连接数过高（{{ $value }}）"
           description: "redis connected_clients 超过 100 持续 5 分钟（v1 §10.5 规则 8）"
+
+      # === v1 §10.5 业务告警（CP6.5.1）===
+
+      # 9. 蒸馏成功率 < 90% 持续 5 分钟（v1 §10.5 业务告警 1）
+      - alert: DistillSuccessRateLow
+        expr: |
+          sum(rate(distill_success_total[5m]))
+            /
+          (sum(rate(distill_success_total[5m])) + sum(rate(distill_failure_total[5m])))
+            < 0.9
+        for: 5m
+        labels:
+          severity: critical
+          rule: v1-10.5-distill-success
+        annotations:
+          summary: "蒸馏成功率 < 90% 持续 5 分钟"
+          description: "当前 5 分钟蒸馏成功率 {{ $value | humanizePercentage }}（v1 §10.5 业务告警 1）"
+
+      # 10. 蒸馏 P95 耗时 > 300s（5 分钟）持续 10 分钟（v1 §10.5 业务告警 2）
+      - alert: DistillDurationP95High
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(distill_step_duration_seconds_bucket[5m])) by (le, step)
+          ) > 300
+        for: 10m
+        labels:
+          severity: warning
+          rule: v1-10.5-distill-duration
+        annotations:
+          summary: "蒸馏 P95 > 5 分钟（步骤 {{ $labels.step }}）"
+          description: "步骤 {{ $labels.step }} P95 耗时 {{ $value }}s 持续 10 分钟（v1 §10.5 业务告警 2）"
+
+      # 11. 单步失败率 > 10% 持续 5 分钟（v1 §10.5 业务告警 3）
+      - alert: StepFailureRateHigh
+        expr: |
+          sum(rate(distill_failure_total[5m])) by (step)
+            /
+          sum(rate(distill_attempt_total[5m])) by (step)
+            > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          rule: v1-10.5-step-failure
+        annotations:
+          summary: "步骤 {{ $labels.step }} 失败率 > 10% 持续 5 分钟"
+          description: "步骤 {{ $labels.step }} 失败率 {{ $value | humanizePercentage }}（v1 §10.5 业务告警 3）"
+
+      # 12. OSS 存储 > 100GB（v1 §10.5 业务告警 6）
+      # DISABLED：dev 环境无 oss-exporter 部署，对应 metric 不存在。
+      # 启用条件：部署 oss-exporter + 在 prometheus.yml 添加对应 scrape job。
+      # - alert: OSSStorageHigh
+      #   expr: oss_storage_bytes > 107374182400  # 100GB
+      #   labels:
+      #     severity: warning
+      #     rule: v1-10.5-oss-storage
+      #   annotations:
+      #     summary: "OSS 存储 > 100GB"
+      #     description: "当前 {{ $value | humanize1024 }}B（v1 §10.5 业务告警 6）"
+
+      # 13. 节点 CPU > 80% 持续 10 分钟（v1 §10.5 业务告警 7）
+      # DISABLED：dev 环境无 node-exporter 部署，对应 metric 不存在。
+      # 启用条件：部署 node-exporter + 在 prometheus.yml 添加对应 scrape job。
+      # - alert: NodeCPUHigh
+      #   expr: |
+      #     100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+      #   for: 10m
+      #   labels:
+      #     severity: warning
+      #     rule: v1-10.5-node-cpu
+      #   annotations:
+      #     summary: "节点 {{ $labels.instance }} CPU > 80%"
+      #     description: "CPU 使用率 {{ $value }}% 持续 10 分钟（v1 §10.5 业务告警 7）"
