@@ -3,6 +3,11 @@
 - X-Request-ID：请求头带就沿用（api-gateway → 下游串联），否则生成 `req_xxx`
 - 响应头回写 X-Request-ID，客户端可拿去做链路排查
 - 每个请求记 3 个指标：REQUEST_COUNT / REQUEST_LATENCY / ERROR_COUNT(仅 >= 400)
+
+CP3.6-A2：原 backend/common/middleware.py 与 backend/common/middleware/（audit.py
+所在包）同名冲突，导致 `from stashbox.backend.common.middleware import
+RequestIDMiddleware` 解析到空 __init__ 而 ImportError。本文件把 RequestIDMiddleware
+收编进包内，__init__.py 统一 re-export，消除 file/package 同名碰撞。
 """
 import time
 
