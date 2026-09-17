@@ -8,9 +8,9 @@ quota / subscription/plans 仍为 mock（配额扣减事务在 CP1.6）。
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from stashbox.backend.common.auth import create_access_token, require_user
@@ -23,6 +23,7 @@ from stashbox.backend.common.exceptions import (
 from stashbox.backend.common.logging import setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
 from stashbox.backend.common.models import User
+from stashbox.backend.common.models.push_notification import PushNotification
 from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common import quota_service
 from stashbox.backend.common.analytics import track_simple
@@ -189,6 +190,63 @@ async def get_plans(user: dict = Depends(require_user)):
         Plan(id="pro", name="专业", price_cny=69, monthly_quota=-1),
     ]
     return {"plans": [p.model_dump() for p in plans]}
+
+
+@app.get("/api/v1/notifications")
+async def list_notifications(
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+    unread_only: bool = False,
+    limit: int = 50,
+):
+    """用户推送列表（CP5.4a）。unread_only=true 仅看未读。"""
+    q = select(PushNotification).where(PushNotification.user_id == user["id"])
+    if unread_only:
+        q = q.where(PushNotification.read_at.is_(None))
+    q = q.order_by(PushNotification.created_at.desc()).limit(limit)
+    result = await db.execute(q)
+    notifs = result.scalars().all()
+    return {
+        "notifications": [
+            {
+                "id": n.id,
+                "article_id": n.article_id,
+                "tag_slug": n.tag_slug,
+                "title": n.title,
+                "body": n.body,
+                "deeplink": n.deeplink,
+                "read": n.read_at is not None,
+                "created_at": n.created_at.isoformat(),
+            }
+            for n in notifs
+        ],
+        "unread_count": await db.scalar(
+            select(func.count()).select_from(PushNotification).where(
+                PushNotification.user_id == user["id"],
+                PushNotification.read_at.is_(None),
+            )
+        ),
+    }
+
+
+@app.post("/api/v1/notifications/{notification_id}/mark-read")
+async def mark_notification_read(
+    notification_id: int,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """标记推送已读（CP5.4a）。幂等。"""
+    from datetime import datetime
+    notif = await db.get(PushNotification, notification_id)
+    if not notif:
+        raise HTTPException(status_code=404, detail=f"notification {notification_id} 不存在")
+    if notif.user_id != user["id"]:
+        # 不能标记别人的推送（防越权）
+        raise HTTPException(status_code=403, detail="无权标记他人推送")
+    if notif.read_at is None:
+        notif.read_at = datetime.now()
+        await db.commit()
+    return {"ok": True, "read_at": notif.read_at.isoformat()}
 
 
 if __name__ == "__main__":
