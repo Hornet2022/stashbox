@@ -62,6 +62,7 @@ from stashbox.backend.common.models import (
     AdminOperationLog,
     Article,
     DistilledArticle,
+    Feedback,
     Tag,
     TagSubscription,
     User,
@@ -329,24 +330,143 @@ async def mark_listened(
     return {"id": article_id, "status": "listened"}
 
 
+# ---------------------------------------------------------------------------
+# CP5.5 文章反馈闭环（v1 §3.1 / §4.3.4）：4 端点写 feedback 表
+# ---------------------------------------------------------------------------
+SKIP_REASONS = ("too_long", "boring", "low_quality", "other")
+
+
+class SkipRequest(BaseModel):
+    """skip 原因（v1 §3.1）：4 选 1。字段缺失/非法走业务 400（非 422）。"""
+
+    reason: str | None = None
+
+
+class ListenCompleteRequest(BaseModel):
+    """听完上报：duration_sec 可选（客户端播放时长，用于断点续听分析）。"""
+
+    duration_sec: int | None = None
+
+
+class RateRequest(BaseModel):
+    """评分：1-5 星 + 可选评论。越界走业务 400（非 422）。"""
+
+    rating: int | None = None
+    comment: str | None = None
+
+
+async def _write_feedback(
+    db: AsyncSession,
+    user_id: int,
+    article_id: str,
+    type_: str,
+    *,
+    rating: int | None = None,
+    reason: str | None = None,
+    metadata: dict | None = None,
+) -> Feedback:
+    """写 feedback 行（v1 §4.3.4）。
+
+    只 add 不 commit —— 调用方把 feedback 写和 article 字段更新放同一事务提交。
+    """
+    fb = Feedback(
+        user_id=user_id,
+        article_id=article_id,
+        type=type_,
+        rating=rating,
+        reason=reason,
+        metadata_=metadata if metadata is not None else {},
+    )
+    db.add(fb)
+    return fb
+
+
 @app.post("/api/v1/articles/{article_id}/favorite")
 async def favorite(
     article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
 ):
-    art = await _get_owned(article_id, int(user["sub"]), db)
+    """收藏（v1 §3.1）：articles.favorite=True + feedback(type=favorite)，同一事务。"""
+    uid = int(user["sub"])
+    art = await _get_owned(article_id, uid, db)
     art.favorite = True
+    fb = await _write_feedback(db, uid, article_id, "favorite")
     await db.commit()
-    return {"id": article_id, "favorite": True}
+    await db.refresh(fb)  # commit 后 id/created_at 需回读（expire_on_commit）
+    return {"id": article_id, "favorite": True, "feedback_id": fb.id}
 
 
 @app.post("/api/v1/articles/{article_id}/skip")
 async def skip(
-    article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+    article_id: str,
+    req: SkipRequest = SkipRequest(),
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
 ):
-    art = await _get_owned(article_id, int(user["sub"]), db)
+    """跳过（v1 §3.1）：articles.skip=True + feedback(type=skip, reason=...)，同一事务。"""
+    if not req.reason:
+        raise InvalidRequest(message="reason is required", code=4001)
+    if req.reason not in SKIP_REASONS:
+        raise InvalidRequest(message=f"invalid reason: {req.reason}", code=4001)
+
+    uid = int(user["sub"])
+    art = await _get_owned(article_id, uid, db)
     art.skip = True
+    fb = await _write_feedback(db, uid, article_id, "skip", reason=req.reason)
     await db.commit()
-    return {"id": article_id, "skip": True}
+    await db.refresh(fb)
+    return {"id": article_id, "skip": True, "feedback_id": fb.id}
+
+
+@app.post("/api/v1/articles/{article_id}/listen-complete")
+async def listen_complete(
+    article_id: str,
+    req: ListenCompleteRequest = ListenCompleteRequest(),
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """听完上报（v1 §3.1 mark-listened 的反馈闭环版）：写 feedback(type=listen_complete)。
+
+    articles 表无 listened_at 列（v1 §4.3.1 未建，本期红线不动 alembic），
+    故 listened_at 取 feedback.created_at —— 同一事务里 DB 侧 NOW()，语义等价。
+    """
+    uid = int(user["sub"])
+    await _get_owned(article_id, uid, db)
+    meta = {"duration_sec": req.duration_sec} if req.duration_sec is not None else {}
+    fb = await _write_feedback(db, uid, article_id, "listen_complete", metadata=meta)
+    await db.commit()
+    await db.refresh(fb)
+    return {
+        "id": article_id,
+        "listened_at": fb.created_at.isoformat() if fb.created_at else None,
+        "feedback_id": fb.id,
+    }
+
+
+@app.post("/api/v1/articles/{article_id}/rate")
+async def rate(
+    article_id: str,
+    req: RateRequest = RateRequest(),
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """评分（1-5 星）：写 feedback(type=rate, rating=..., metadata={comment})。
+
+    刻意**不**改 articles.quality_score —— 避免与推荐算法循环依赖，留 CP5.6 离线计算。
+    """
+    if req.rating is None:
+        raise InvalidRequest(message="rating is required", code=4001)
+    if not 1 <= req.rating <= 5:
+        raise InvalidRequest(message="rating must be between 1 and 5", code=4001)
+
+    uid = int(user["sub"])
+    await _get_owned(article_id, uid, db)
+    meta = {"comment": req.comment} if req.comment else {}
+    fb = await _write_feedback(
+        db, uid, article_id, "rate", rating=req.rating, metadata=meta
+    )
+    await db.commit()
+    await db.refresh(fb)
+    return {"id": article_id, "rating": req.rating, "feedback_id": fb.id}
 
 
 @app.post("/api/v1/callback/d9-add-article", response_model=D9AddResponse)

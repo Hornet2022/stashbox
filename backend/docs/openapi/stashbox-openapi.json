@@ -952,6 +952,7 @@
     "/api/v1/articles/{article_id}/favorite": {
       "post": {
         "summary": "Favorite",
+        "description": "收藏（v1 §3.1）：articles.favorite=True + feedback(type=favorite)，同一事务。",
         "operationId": "favorite_api_v1_articles__article_id__favorite_post",
         "parameters": [
           {
@@ -1003,6 +1004,73 @@
         "tags": [
           "content-service",
           "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/articles/{article_id}/listen-complete": {
+      "post": {
+        "summary": "Listen Complete",
+        "description": "听完上报（v1 §3.1 mark-listened 的反馈闭环版）：写 feedback(type=listen_complete)。\n\narticles 表无 listened_at 列（v1 §4.3.1 未建，本期红线不动 alembic），\n故 listened_at 取 feedback.created_at —— 同一事务里 DB 侧 NOW()，语义等价。",
+        "operationId": "listen_complete_api_v1_articles__article_id__listen_complete_post",
+        "parameters": [
+          {
+            "name": "article_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Article Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListenCompleteRequest",
+                "default": {}
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
         ]
       }
     },
@@ -1063,9 +1131,77 @@
         ]
       }
     },
+    "/api/v1/articles/{article_id}/rate": {
+      "post": {
+        "summary": "Rate",
+        "description": "评分（1-5 星）：写 feedback(type=rate, rating=..., metadata={comment})。\n\n刻意**不**改 articles.quality_score —— 避免与推荐算法循环依赖，留 CP5.6 离线计算。",
+        "operationId": "rate_api_v1_articles__article_id__rate_post",
+        "parameters": [
+          {
+            "name": "article_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Article Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RateRequest",
+                "default": {}
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
     "/api/v1/articles/{article_id}/skip": {
       "post": {
         "summary": "Skip",
+        "description": "跳过（v1 §3.1）：articles.skip=True + feedback(type=skip, reason=...)，同一事务。",
         "operationId": "skip_api_v1_articles__article_id__skip_post",
         "parameters": [
           {
@@ -1094,6 +1230,16 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SkipRequest",
+                "default": {}
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -3286,6 +3432,71 @@
           "status"
         ],
         "title": "D9AddResponse"
+      },
+      "ListenCompleteRequest": {
+        "properties": {
+          "duration_sec": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Sec"
+          }
+        },
+        "type": "object",
+        "title": "ListenCompleteRequest",
+        "description": "听完上报：duration_sec 可选（客户端播放时长，用于断点续听分析）。"
+      },
+      "RateRequest": {
+        "properties": {
+          "rating": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rating"
+          },
+          "comment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Comment"
+          }
+        },
+        "type": "object",
+        "title": "RateRequest",
+        "description": "评分：1-5 星 + 可选评论。越界走业务 400（非 422）。"
+      },
+      "SkipRequest": {
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "title": "SkipRequest",
+        "description": "skip 原因（v1 §3.1）：4 选 1。字段缺失/非法走业务 400（非 422）。"
       },
       "TagCreateRequest": {
         "properties": {
