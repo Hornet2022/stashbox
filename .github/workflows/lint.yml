@@ -1,0 +1,48 @@
+# GitHub Actions: lint workflow（CP1.3.1）
+# 触发：push to main
+# 范围：backend/ + infra/ + .github/
+
+name: Backend Lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - 'infra/**'
+      - '.github/**'
+
+jobs:
+  ruff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run ruff
+        working-directory: backend
+        run: ruff check .
+
+  yaml-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yamllint
+        run: pip install yamllint
+
+      - name: Lint infra/ YAML
+        run: |
+          yamllint infra/docker/ \
+            -d "{extends: default, rules: {line-length: disable, document-start: disable, truthy: disable}}"
