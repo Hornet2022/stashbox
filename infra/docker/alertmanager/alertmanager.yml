@@ -1,8 +1,15 @@
-# Alertmanager 告警路由（CP6.4-pre-2）。
+# Alertmanager 告警路由（CP6.4-pre-2 建，CP6.5.2 补 warning 路由 + 抑制/静默）。
 # ⚠️ 飞书 webhook token 是占位符，CP1.8 才接真账号；本地 dev 阶段告警只在 Alertmanager UI 看。
+# ⚠️ CP6.5.2 范围：只做分组 + 抑制 + 静默占位，不接真飞书 webhook。
 global:
   resolve_timeout: 5m
 
+# 路由：按 severity 分流，critical / warning 各走独立 receiver。
+# 分组 + 节流参数用于抑制告警噪音（v1 §10.5）：
+#   group_by        同 alertname + service 的告警合成一条
+#   group_wait      首次告警等 30s，攒够同组再发
+#   group_interval  同组新增告警最快 5m 发一次
+#   repeat_interval 未恢复告警每 4h 重复提醒一次（critical 单独收紧到 30m）
 route:
   receiver: "stashbox-feishu"
   group_by: ["alertname", "service"]
@@ -14,8 +21,12 @@ route:
         severity: critical
       receiver: "stashbox-feishu-critical"
       repeat_interval: 30m
+    - match:
+        severity: warning
+      receiver: "stashbox-feishu-warning"
 
 receivers:
+  # 兜底 receiver：severity 未打标签或值不在 critical/warning 时落到这里
   - name: "stashbox-feishu"
     webhook_configs:
       # TODO(CP1.8): 换成真飞书机器人的 webhook 地址
@@ -28,6 +39,12 @@ receivers:
       - url: "https://open.feishu.cn/open-apis/bot/v2/hook/STASHBOX_WEBHOOK_TOKEN_CRITICAL"
         send_resolved: true
 
+  - name: "stashbox-feishu-warning"
+    webhook_configs:
+      # TODO(CP1.8): 换成真 warning 告警群的 webhook 地址
+      - url: "https://open.feishu.cn/open-apis/bot/v2/hook/STASHBOX_WEBHOOK_TOKEN_WARNING"
+        send_resolved: true
+
 inhibit_rules:
   # critical 已告警时，抑制同名的 warning，避免刷屏
   - source_match:
@@ -35,3 +52,9 @@ inhibit_rules:
     target_match:
       severity: warning
     equal: ["alertname", "service"]
+
+# 静默规则（v1 §10.5 提到的"已知问题"）
+# Alertmanager 的静默是运行时对象，不写在配置文件里，只能通过 UI / amtool 创建：
+#   amtool silence add alertname=DistillTaskBacklog --duration=2h \
+#     --comment="升级窗口期已知积压"
+# 例如：升级窗口期 / 已知缺陷导致的告警，由 admin 手动加静默，避免改动本文件。
