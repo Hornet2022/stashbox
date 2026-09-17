@@ -14,14 +14,14 @@ import sys
 import time
 import uuid
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -58,7 +58,14 @@ from stashbox.backend.common.exceptions import (
 )
 from stashbox.backend.common.logging import setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
-from stashbox.backend.common.models import Article, DistilledArticle, Tag, TagSubscription, User
+from stashbox.backend.common.models import (
+    AdminOperationLog,
+    Article,
+    DistilledArticle,
+    Tag,
+    TagSubscription,
+    User,
+)
 from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common.analytics import track, track_simple
 from stashbox.backend.common.events import EventName
@@ -617,6 +624,200 @@ async def unsubscribe_tag(
 # TODO: tag_filter 埋点（CP5.3b）—— v1 §11.5 没明确 filter 触发位置，GET /api/v1/articles ?tag=xxx 是 CP5.3 后续工作，留在 [known issues] 报备
 
 
+class AdminActionRequest(BaseModel):
+    """admin 写操作统一 body：reason 必填（审计留痕）。"""
+
+    reason: str
+
+
+# ---------------------------------------------------------------------------
+# CP3.6-A3 admin 其他端点（v1 §3.6）
+# ---------------------------------------------------------------------------
+@app.post("/api/v1/admin/articles/{article_id}/force-retry")
+async def admin_force_retry(
+    article_id: str,
+    req: AdminActionRequest,
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """v1 §3.6 强制重试蒸馏。
+
+    行为：
+      1. reason ≥5 字符校验（commit 前，失败不落库）
+      2. 校验 article 存在（不存在 404）
+      3. 状态置 pending（article 表无 retry_count 列，以 status=pending 表达"待重试"，
+         由后续 ai-service / worker 重新蒸馏）
+      4. 同事务写 admin_operation_logs 一条（A1 已建表）
+      5. 提交后触发 ai-service 蒸馏；不可达时仅置 pending，由 worker 自动重试
+    失败回滚事务。
+    """
+    if len(req.reason.strip()) < 5:
+        raise HTTPException(status_code=400, detail="reason 至少 5 个字符")
+
+    art = await db.get(Article, article_id)
+    if art is None:
+        raise HTTPException(status_code=404, detail=f"article {article_id} not found")
+
+    art.status = "pending"
+
+    log_row = AdminOperationLog(
+        admin_id=int(user["sub"]),
+        admin_tier=user.get("tier", "unknown"),
+        action="force_retry",
+        target_type="article",
+        target_id=article_id,
+        reason=req.reason,
+        method="POST",
+        path=f"/api/v1/admin/articles/{article_id}/force-retry",
+        request_body={"reason": req.reason},
+        response_status=200,
+    )
+    db.add(log_row)
+
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    # 触发蒸馏（ai-service 不可达返回 None，不破请求；status=pending 让 worker 自动重试）
+    queued = await get_ai_client().trigger_distill(
+        article_id, auth_token=create_access_token(str(art.user_id))
+    )
+    return {
+        "article_id": article_id,
+        "status": "pending",
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+        "distill_triggered": queued is not None,
+    }
+
+
+@app.post("/api/v1/admin/audio/{audio_id}/invalidate")
+async def admin_audio_invalidate(
+    audio_id: str,
+    req: AdminActionRequest,
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """v1 §3.6 音频文件作废。
+
+    本仓库无独立 audio_files 表，音频实体即 distilled_articles（含 audio_url）。
+    行为：
+      1. reason ≥5 字符校验
+      2. 校验 distilled_article 存在（不存在 404）
+      3. 状态置 invalidated
+      4. 同事务写 admin_operation_logs 一条
+    幂等：重复调用保持 invalidated 状态，仍记录操作日志。
+    失败回滚事务。
+    """
+    if len(req.reason.strip()) < 5:
+        raise HTTPException(status_code=400, detail="reason 至少 5 个字符")
+
+    audio = await db.get(DistilledArticle, audio_id)
+    if audio is None:
+        raise HTTPException(status_code=404, detail=f"audio {audio_id} not found")
+
+    audio.status = "invalidated"
+
+    log_row = AdminOperationLog(
+        admin_id=int(user["sub"]),
+        admin_tier=user.get("tier", "unknown"),
+        action="audio_invalidate",
+        target_type="audio",
+        target_id=audio_id,
+        reason=req.reason,
+        method="POST",
+        path=f"/api/v1/admin/audio/{audio_id}/invalidate",
+        request_body={"reason": req.reason},
+        response_status=200,
+    )
+    db.add(log_row)
+
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    return {"audio_id": audio_id, "status": "invalidated"}
+
+
+@app.get("/api/v1/admin/audit-log")
+async def admin_audit_log(
+    page: int = 1,
+    size: int = 20,
+    actor_id: str | None = None,
+    action_type: str | None = None,
+    from_: str | None = None,
+    to: str | None = None,
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """v1 §3.6 审计日志查询（读 admin_operation_logs，CP3.6-A1）。
+
+    查询参数：page / size / actor_id / action_type / from / to
+    排序：created_at DESC；过滤：actor_id exact + action_type exact + 时间范围。
+    """
+    page = max(page, 1)
+    size = max(min(size, 100), 1)
+    offset = (page - 1) * size
+
+    query = select(AdminOperationLog)
+    if actor_id is not None:
+        try:
+            query = query.where(AdminOperationLog.admin_id == int(actor_id))
+        except ValueError:
+            pass  # 非数字 actor_id 不匹配任何行，返回空
+    if action_type is not None:
+        query = query.where(AdminOperationLog.action == action_type)
+    if from_ is not None:
+        query = query.where(AdminOperationLog.created_at >= from_)
+    if to is not None:
+        query = query.where(AdminOperationLog.created_at <= to)
+
+    total = await db.scalar(select(func.count()).select_from(query.subquery()))
+    rows = (
+        await db.execute(
+            query.order_by(AdminOperationLog.created_at.desc())
+            .offset(offset)
+            .limit(size)
+        )
+    ).scalars().all()
+
+    items = [
+        {
+            "id": r.id,
+            "actor_id": r.admin_id,
+            "action_type": r.action,
+            "target_type": r.target_type,
+            "target_id": r.target_id,
+            "payload": r.request_body,
+            "created_at": r.created_at.isoformat() if r.created_at else "",
+        }
+        for r in rows
+    ]
+    return {"total": total or 0, "items": items}
+
+
+async def _safe_revenue(db: AsyncSession) -> float:
+    """本月已支付订单金额合计（revenue）。
+
+    orders 表在部分部署可能不存在（无独立 migration 约束），缺表/缺列时返回 0
+    而非让 stats 端点整体 500。
+    """
+    try:
+        val = await db.scalar(
+            text(
+                "SELECT COALESCE(SUM(amount), 0) FROM orders "
+                "WHERE status = 'paid' "
+                "AND date_trunc('month', created_at) = date_trunc('month', now())"
+            )
+        )
+        return float(val or 0)
+    except Exception:
+        return 0.0
+
+
 @app.get("/api/v1/admin/stats")
 async def admin_stats(user: dict = Depends(require_admin_or_operator), db: AsyncSession = Depends(get_db)):
     total_users = await db.scalar(select(func.count()).select_from(User))
@@ -631,11 +832,37 @@ async def admin_stats(user: dict = Depends(require_admin_or_operator), db: Async
         .select_from(Article)
         .where(Article.status == "listened", Article.deleted_at.is_(None))
     )
+
+    # CP3.6-A3 新增字段（不破坏现有结构，仅加字段）
+    # failed_distillations_24h：articles 近 24h 失败
+    failed_24h = await db.scalar(
+        select(func.count())
+        .select_from(Article)
+        .where(
+            Article.status == "failed",
+            Article.created_at > (func.now() - timedelta(days=1)),
+        )
+    )
+    # active_audio_files：distilled_articles done 且有 audio_url（映射 audio_files ready）
+    active_audio = await db.scalar(
+        select(func.count())
+        .select_from(DistilledArticle)
+        .where(
+            DistilledArticle.status == "done",
+            DistilledArticle.audio_url.isnot(None),
+        )
+    )
+    # revenue：orders 本月已支付（表可能缺失 → 0）
+    revenue = await _safe_revenue(db)
+
     return {
         "total_users": total_users or 0,
         "total_articles": total_articles or 0,
         "pending": pending or 0,
         "listened": listened or 0,
+        "revenue": revenue,
+        "active_audio_files": active_audio or 0,
+        "failed_distillations_24h": failed_24h or 0,
     }
 
 
