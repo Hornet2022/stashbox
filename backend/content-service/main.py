@@ -57,7 +57,7 @@ from stashbox.backend.common.exceptions import (
 )
 from stashbox.backend.common.logging import setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
-from stashbox.backend.common.models import Article, DistilledArticle, User
+from stashbox.backend.common.models import Article, DistilledArticle, Tag, User
 from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common.analytics import track, track_simple
 from stashbox.backend.common.events import EventName
@@ -492,14 +492,23 @@ async def wechat_mp_message(
 
 
 @app.get("/api/v1/tags")
-async def list_tags(user: dict = Depends(require_user)):
-    tags = [
-        {"id": "t_tech", "name": "科技", "category": "subject"},
-        {"id": "t_finance", "name": "财经", "category": "subject"},
-        {"id": "t_life", "name": "生活", "category": "subject"},
-        {"id": "t_news", "name": "时事", "category": "subject"},
-    ]
-    return {"tags": tags}
+async def list_tags(
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # CP5.3a：从 DB 读标签（不再用 mock）
+    result = await db.execute(select(Tag).order_by(Tag.category, Tag.name))
+    tags = result.scalars().all()
+    return {
+        "tags": [
+            {
+                "id": tag.slug,  # 用 slug 作为 id（与 mock 兼容）
+                "name": tag.name,
+                "category": tag.category,
+            }
+            for tag in tags
+        ]
+    }
 
 
 @app.get("/api/v1/admin/stats")
