@@ -8,6 +8,7 @@ CP1.5：蒸馏任务写真实 PostgreSQL（distilled_articles 表），状态机
 import asyncio
 import logging
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
@@ -35,42 +36,56 @@ from dispatcher import get_dispatcher, shutdown_dispatcher
 
 log = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """CP3.6.1：FastAPI lifespan 替代 deprecated @app.on_event。
+
+    startup 期间启动队列 poller（try/except 包住，不拖垮服务）。
+    shutdown 期间关闭 Arq 连接池。
+    """
+    # ---- startup: 队列 poller ----
+    poll_task = None
+    try:
+        from observability.metrics import DISTILL_QUEUE_SIZE
+        from arq_settings import load_arq_config
+
+        cfg = load_arq_config()
+        queue_name = cfg.queue_name
+        redis_url = cfg.redis_url
+
+        async def _poll_loop():
+            client = aioredis.from_url(redis_url)
+            while True:
+                try:
+                    size = await client.zcard(queue_name)
+                    DISTILL_QUEUE_SIZE.labels(queue=queue_name).set(size)
+                except Exception as exc:
+                    log.warning("queue poller 失败（忽略）: %s", exc)
+                await asyncio.sleep(30)
+
+        poll_task = asyncio.create_task(_poll_loop())
+        log.info("distill queue poller 已启动")
+    except Exception as exc:
+        log.error("distill queue poller 启动失败（忽略）: %s", exc)
+
+    yield
+
+    # ---- shutdown: 关闭 poller + Arq ----
+    if poll_task:
+        poll_task.cancel()
+        try:
+            await poll_task
+        except asyncio.CancelledError:
+            pass
+    await shutdown_dispatcher()
+
+
 setup_logging("ai-service")
-app = FastAPI(title="stashbox-ai-service", version="0.2.0")
+app = FastAPI(title="stashbox-ai-service", version="0.2.0", lifespan=lifespan)
 register_exception_handlers(app)
 app.add_middleware(RequestIDMiddleware)
 install_health_endpoints(app)
-
-
-@app.on_event("startup")
-async def _start_distill_queue_poller():
-    """CP3.6：每 30s 刷新 Arq 队列长度到 Prometheus gauge。"""
-    from observability.metrics import DISTILL_QUEUE_SIZE
-    from arq_settings import load_arq_config
-
-    cfg = load_arq_config()
-    queue_name = cfg.queue_name
-    redis_url = cfg.redis_url
-
-    async def _poll_loop():
-        # Arq 0.25+ 用 ZSET 存队列，key 即 queue_name（如 "stashbox:distill"）
-        client = aioredis.from_url(redis_url)
-        while True:
-            try:
-                # ZCARD 返回 sorted set 元素数量（队列长度）
-                size = await client.zcard(queue_name)
-                DISTILL_QUEUE_SIZE.labels(queue=queue_name).set(size)
-            except Exception as exc:
-                log.warning("queue poller 失败（忽略）: %s", exc)
-            await asyncio.sleep(30)
-
-    asyncio.create_task(_poll_loop())
-
-
-@app.on_event("shutdown")
-async def _shutdown_dispatcher():
-    """关掉 Arq 连接池（否则 uvicorn 退出时 redis 连接会挂 warning）。"""
-    await shutdown_dispatcher()
 
 
 # mock 4 步蒸馏流水线（本期不落库每一步，仅用其耗时模拟）
