@@ -35,6 +35,7 @@ from stashbox.backend.common.exceptions import register_exception_handlers
 from stashbox.backend.common.logging import setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
 from stashbox.backend.common.observability import install_health_endpoints
+from stashbox.backend.common.event_collect import router as event_router
 
 setup_logging("api-gateway")
 
@@ -144,6 +145,8 @@ for _route in ROUTES:
     )
 
 app.add_api_route(D9_ROUTE.path, proxy_d9, methods=["POST"], name="proxy_d9")
+
+app.include_router(event_router)
 
 
 def _resolve_target(path: str) -> str | None:
