@@ -8,10 +8,12 @@ CP1.5：全部走真实 PostgreSQL（articles 表）。
 CP1.7：D9 端到端 —— 不要求登录态 → 建文章 → 自动触发 ai-service 蒸馏 →
 客户端轮询 status / audio-url 拿音频。
 """
+import json
 import re
 import sys
 import time
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
@@ -185,8 +187,24 @@ async def health():
     return {"status": "ok", "service": "content-service"}
 
 
+def _json_default(obj):
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _to_raw_content(result) -> dict:
+    """FetchResult → JSONB-ready dict。
+
+    asdict 只重建 dict/list/tuple，datetime 会原样保留（不会自动转 ISO 字符串），
+    直接写 JSONB 会在序列化时炸，故再走一次 json 归一化。
+    """
+    return json.loads(json.dumps(asdict(result), default=_json_default))
+
+
 async def _create_article(
-    url: str, user_id: int, source: str, title: str | None, db: AsyncSession
+    url: str, user_id: int, source: str, title: str | None, db: AsyncSession,
+    raw_content: dict | None = None,  # 默认为 None：其他调用点行为不变
 ) -> Article:
     art = Article(
         id=_new_article_id(),
@@ -195,6 +213,7 @@ async def _create_article(
         source=source,
         title=title,
         status="pending",
+        raw_content=raw_content,  # FetchResult 全字段（JSONB，ai-service 蒸馏输入）
         favorite=False,
         skip=False,
     )
@@ -435,7 +454,8 @@ async def wechat_mp_message(
 
     await _ensure_anonymous_user(db)
     art = await _create_article(
-        url, ANONYMOUS_USER_ID, "wechat_mp", result.title or None, db
+        url, ANONYMOUS_USER_ID, "wechat_mp", result.title or None, db,
+        raw_content=_to_raw_content(result),  # FetchResult → JSONB，免二次抓取
     )
     task = await get_ai_client().trigger_distill(
         art.id, auth_token=create_access_token(str(ANONYMOUS_USER_ID))
@@ -446,6 +466,9 @@ async def wechat_mp_message(
         "task_id": (task or {}).get("task_id"),
         "title": art.title,
         "source": art.source,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "content_text_length": len(result.content_text),
+        "has_media": len(result.media_urls) > 0,
     }
 
 

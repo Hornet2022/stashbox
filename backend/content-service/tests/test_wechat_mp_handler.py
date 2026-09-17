@@ -1,6 +1,7 @@
-"""CP2.5 服务号 Handler 单测（11 个 case）。
+"""CP2.5 服务号 Handler 单测（14 个 case）。
 
-覆盖：URL 解析 2 + URL 合法性 3 + FetcherError→BizException 映射 5 + 端点 E2E 1。
+覆盖：URL 解析 2 + URL 合法性 3 + FetcherError→BizException 映射 5 + 端点 E2E 1
++ raw_content 落库 3（CP-CREATE-ARTICLE：1 单元 + 2 E2E）。
 
 导入说明：content-service 目录名带连字符，不能 import，只能按文件加载
 （做法同 backend/tests/content/helpers.py）。main.py 自己会 sys.path.insert
@@ -14,6 +15,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -61,10 +63,28 @@ map_fetcher_error = content_main.map_fetcher_error
 FetcherError = cs_fetchers.FetcherError
 FetcherErrorCode = cs_fetchers.FetcherErrorCode
 
-from stashbox.backend.common.database import AsyncSessionLocal  # noqa: E402
+from stashbox.backend.common.database import AsyncSessionLocal, engine  # noqa: E402
 from stashbox.backend.common.models import Article  # noqa: E402
 
 MP_URL = "/api/v1/callback/wechat-mp-message"
+
+
+@pytest.fixture(autouse=True)
+async def _dispose_pools():
+    """每个 case 结束释放 DB/Redis 连接池。
+
+    pytest-asyncio 为每个 async test 建新 event loop，而连接池是模块级全局的，
+    不释放会把上一个 loop 的连接带到下一个 case（asyncpg: attached to a different
+    loop；redis-py: Event loop is closed）。做法同 backend/tests/conftest.py。
+    """
+    yield
+    from stashbox.backend.common import redis_client
+
+    await engine.dispose()
+    pool = redis_client._redis_pool
+    if pool is not None:
+        await pool.disconnect(inuse_connections=True)
+        redis_client._redis_pool = None
 
 
 class FakeAIClient:
@@ -226,3 +246,104 @@ async def test_wechat_mp_message_happy_path(monkeypatch):
 
     assert len(fake_ai.calls) == 1
     assert fake_ai.calls[0]["article_id"] == body["article_id"]
+
+
+# ---------------------------------------------------------------------------
+# 5.5 raw_content 落库（CP-CREATE-ARTICLE，3）
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_create_article_with_raw_content():
+    """_create_article 传 raw_content → 落库到 articles.raw_content JSONB。"""
+    async with AsyncSessionLocal() as db:
+        art = await content_main._create_article(
+            "https://example.com/raw-content-unit",
+            content_main.ANONYMOUS_USER_ID,
+            "unit_test",
+            "Unit Title",
+            db,
+            raw_content={"title": "x", "content_text": "y", "media_urls": ["http://img.jpg"]},
+        )
+        try:
+            result = await db.execute(select(Article).where(Article.id == art.id))
+            row = result.scalar_one()
+            assert row.raw_content["content_text"] == "y"
+            assert row.raw_content["media_urls"] == ["http://img.jpg"]
+        finally:
+            await db.delete(art)
+            await db.commit()
+
+
+_HTML_WITH_MEDIA = (
+    "<html><head>"
+    '<meta property="og:title" content="带图片的原文标题">'
+    '<meta property="article:published_time" content="2026-01-15T08:30:00+00:00">'
+    "</head><body>"
+    "<p>这是一段足够长的正文内容，用来通过正文抽取的密度与长度阈值检查，确保抓取成功。</p>"
+    '<p><img src="https://example.com/pic1.jpg"></p>'
+    "</body></html>"
+)
+
+
+def _mock_transport_with_media(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(
+        200, text=_HTML_WITH_MEDIA, headers={"content-type": "text/html; charset=utf-8"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_handler_stores_fetch_result_raw_content(monkeypatch):
+    """Handler 把 FetchResult 全字段落到 articles.raw_content。"""
+    monkeypatch.setattr(content_main, "get_ai_client", lambda: FakeAIClient())
+    monkeypatch.setattr(
+        cs_fetchers,
+        "_ALL_FETCHERS",
+        [cs_fetchers.GenericURLFetcher(transport=httpx.MockTransport(_mock_transport_with_media))],
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=content_main.app), base_url="http://test"
+    ) as c:
+        r = await c.post(
+            MP_URL,
+            json={"from_user": "o_openid_123", "text": "https://example.com/media", "create_time": 1},
+        )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    art = await article_row(body["article_id"])
+    try:
+        assert art is not None
+        assert art.raw_content["source"] == "generic_url"
+        assert "足够长的正文内容" in art.raw_content["content_text"]
+        assert art.raw_content["media_urls"] == ["https://example.com/pic1.jpg"]
+        # datetime → ISO 字符串（否则 JSONB 序列化会失败）
+        assert art.raw_content["publish_time"] == "2026-01-15T08:30:00+00:00"
+    finally:
+        async with AsyncSessionLocal() as session:
+            await session.delete(art)
+            await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_handler_response_includes_fetch_metadata(monkeypatch):
+    """Handler 响应含 fetched_at / content_text_length / has_media。"""
+    monkeypatch.setattr(content_main, "get_ai_client", lambda: FakeAIClient())
+    monkeypatch.setattr(
+        cs_fetchers,
+        "_ALL_FETCHERS",
+        [cs_fetchers.GenericURLFetcher(transport=httpx.MockTransport(_mock_transport_with_media))],
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=content_main.app), base_url="http://test"
+    ) as c:
+        r = await c.post(
+            MP_URL,
+            json={"from_user": "o_openid_123", "text": "https://example.com/meta", "create_time": 1},
+        )
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+    datetime.fromisoformat(data["fetched_at"])  # ISO 字符串可解析
+    assert data["content_text_length"] > 0
+    assert data["has_media"] is True
