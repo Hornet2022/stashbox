@@ -19,8 +19,9 @@ from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, Header
-from sqlalchemy import func, select
+from fastapi import Depends, FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -57,7 +58,7 @@ from stashbox.backend.common.exceptions import (
 )
 from stashbox.backend.common.logging import setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
-from stashbox.backend.common.models import Article, DistilledArticle, Tag, User
+from stashbox.backend.common.models import Article, DistilledArticle, Tag, TagSubscription, User
 from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common.analytics import track, track_simple
 from stashbox.backend.common.events import EventName
@@ -509,6 +510,111 @@ async def list_tags(
             for tag in tags
         ]
     }
+
+
+class TagCreateRequest(BaseModel):
+    slug: str = Field(..., min_length=1, max_length=64)
+    name: str = Field(..., min_length=1, max_length=64)
+    category: str = Field("subject", max_length=32)
+
+
+@app.post("/api/v1/tags")
+async def create_tag(
+    req: TagCreateRequest,
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """admin/operator 创自定义标签（CP5.3b）。"""
+    existing = await db.scalar(select(Tag).where(Tag.slug == req.slug))
+    if existing:
+        raise HTTPException(status_code=409, detail=f"tag slug 已存在: {req.slug}")
+
+    tag = Tag(
+        slug=req.slug,
+        name=req.name,
+        category=req.category,
+        is_system=False,
+        creator_id=user["id"],
+    )
+    db.add(tag)
+    await db.commit()
+    await db.refresh(tag)
+
+    await track_simple(db, EventName.TAG_CREATE, user_id=user["id"],
+                       properties={"tag_slug": tag.slug, "category": tag.category})
+
+    return {
+        "id": tag.slug,
+        "name": tag.name,
+        "category": tag.category,
+    }
+
+
+@app.post("/api/v1/tags/{tag_id_or_slug}/subscribe")
+async def subscribe_tag(
+    tag_id_or_slug: str,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """用户订阅标签（CP5.3b）。tag_id_or_slug 接受 slug 或数字 id。"""
+    if tag_id_or_slug.isdigit():
+        tag = await db.get(Tag, int(tag_id_or_slug))
+    else:
+        tag = await db.scalar(select(Tag).where(Tag.slug == tag_id_or_slug))
+    if not tag:
+        raise HTTPException(status_code=404, detail=f"tag 不存在: {tag_id_or_slug}")
+
+    existing = await db.scalar(
+        select(TagSubscription).where(
+            TagSubscription.user_id == user["id"],
+            TagSubscription.tag_id == tag.id,
+        )
+    )
+    if existing:
+        return {"ok": True, "already_subscribed": True}
+
+    sub = TagSubscription(user_id=user["id"], tag_id=tag.id)
+    db.add(sub)
+    await db.commit()
+
+    await track_simple(db, EventName.TAG_SUBSCRIBE, user_id=user["id"],
+                       properties={"tag_slug": tag.slug})
+
+    return {"ok": True, "tag_id": tag.id, "tag_slug": tag.slug}
+
+
+@app.post("/api/v1/tags/{tag_id_or_slug}/unsubscribe")
+async def unsubscribe_tag(
+    tag_id_or_slug: str,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """用户取消订阅标签（CP5.3b）。"""
+    if tag_id_or_slug.isdigit():
+        tag = await db.get(Tag, int(tag_id_or_slug))
+    else:
+        tag = await db.scalar(select(Tag).where(Tag.slug == tag_id_or_slug))
+    if not tag:
+        raise HTTPException(status_code=404, detail=f"tag 不存在: {tag_id_or_slug}")
+
+    result = await db.execute(
+        delete(TagSubscription).where(
+            TagSubscription.user_id == user["id"],
+            TagSubscription.tag_id == tag.id,
+        )
+    )
+    await db.commit()
+
+    if result.rowcount == 0:
+        return {"ok": True, "already_unsubscribed": True}
+
+    await track_simple(db, EventName.TAG_UNSUBSCRIBE, user_id=user["id"],
+                       properties={"tag_slug": tag.slug})
+
+    return {"ok": True, "tag_id": tag.id, "tag_slug": tag.slug}
+
+
+# TODO: tag_filter 埋点（CP5.3b）—— v1 §11.5 没明确 filter 触发位置，GET /api/v1/articles ?tag=xxx 是 CP5.3 后续工作，留在 [known issues] 报备
 
 
 @app.get("/api/v1/admin/stats")
