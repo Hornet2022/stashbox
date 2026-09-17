@@ -7,18 +7,25 @@
 
 CP3.5-pre-3 说明：
 - 4 步流水线本身是 CP3.5-pre-2 的 DistillPipeline，本文件只做「参数 → DistillContext」的适配
-- 抓取器还没接（CP3.5），raw_content 用占位文本，Step 1 拿到的就是这段占位内容
+- CP3-CONTENT：raw_content 不再用占位文本，改从 articles.raw_content JSONB 读
+  （CP2.5 / CP-CREATE-ARTICLE 抓完落库的 FetchResult），Step 1 拿到的是真正文
 """
 import structlog
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from distill import DistillContext, DistillPipeline
 from llm import get_llm_client
 from stashbox.backend.common.database import AsyncSessionLocal
+from stashbox.backend.common.models import Article
 
 log = structlog.get_logger("ai-worker")
 
-# CP3.5 未接抓取器：raw_content 先用占位文本，接抓取后换成正文
-RAW_CONTENT_PLACEHOLDER = "[mock raw content] CP3.5 抓取器未接入，Step1 读到的正文是占位文本。"
+
+class ArticleNotFoundError(Exception):
+    """文章不存在（让 Arq 走 retry_max 次后失败）。"""
+
+    pass
 
 
 class _FailingLLM:
@@ -35,8 +42,33 @@ class _FailingLLM:
         return None
 
 
-def _build_raw_content(url: str, title: str | None) -> str:
-    return f"{RAW_CONTENT_PLACEHOLDER} title={title or '(无标题)'} url={url}"
+async def _load_raw_content(db: AsyncSession, article_id: str) -> str:
+    """从 articles.raw_content JSONB 读 content_text（CP2 + CP3 打通）。
+
+    优先级：
+    1. raw_content["content_text"] (CP-CREATE-ARTICLE 写入的 FetchResult)
+    2. fallback: raw_content["title"] + raw_content["url"] + "[无正文]"
+    3. 文章不存在 / raw_content 为空 → "[empty article]"
+
+    Raises:
+        ArticleNotFoundError: 文章不存在（让 Arq 走 retry）
+    """
+    art = await db.scalar(select(Article).where(Article.id == article_id))
+    if art is None:
+        raise ArticleNotFoundError(f"article {article_id} not found")
+
+    raw = art.raw_content
+    if not isinstance(raw, dict):
+        return f"[empty article] title={art.title or '(无标题)'} url={art.url}"
+
+    content_text = raw.get("content_text")
+    if content_text and content_text.strip():
+        return content_text
+
+    # fallback：标题 + URL
+    title = raw.get("title") or art.title or "(无标题)"
+    url = raw.get("url") or art.url
+    return f"[无正文] title={title} url={url}"
 
 
 async def distill_task(
@@ -55,11 +87,18 @@ async def distill_task(
         task_id: distilled_articles.id
         article_id: articles.id
         user_id: 用户 ID
-        url: 文章 URL（CP3.5 接抓取器后用于抓正文）
+        url: 文章 URL
         title: 文章标题
         simulate_failure: 模拟失败（走真实失败路径：FAILED + 退还配额 + 抛异常给 Arq retry）
+
+    Raises:
+        ArticleNotFoundError: articles 里查不到 article_id（交给 Arq retry）
     """
     log.info("arq_distill_started", task_id=task_id, article_id=article_id)
+
+    # CP2 + CP3 打通：从 articles.raw_content JSONB 读真正文（替代占位文本）
+    async with AsyncSessionLocal() as db:
+        raw_content = await _load_raw_content(db, article_id)
 
     pipeline_ctx = DistillContext(
         task_id=task_id,
@@ -67,7 +106,7 @@ async def distill_task(
         user_id=user_id,
         url=url,
         title=title,
-        raw_content=_build_raw_content(url, title),
+        raw_content=raw_content,  # ← 真抓的内容（or fallback），不是占位文本
     )
 
     llm = _FailingLLM() if simulate_failure else get_llm_client()

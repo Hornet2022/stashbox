@@ -6,12 +6,88 @@ ai-service 目录名带连字符（不是合法包名），`llm` 包只能这样
 import sys
 from pathlib import Path
 
+import uuid
+
 import pytest
+import pytest_asyncio
+
+from stashbox.backend.common.database import AsyncSessionLocal
+from stashbox.backend.common.models import Article, User
 
 AI_SERVICE_DIR = Path(__file__).resolve().parents[2] / "ai-service"
 
 if str(AI_SERVICE_DIR) not in sys.path:
     sys.path.insert(0, str(AI_SERVICE_DIR))
+
+
+@pytest_asyncio.fixture
+async def db_session():
+    """真 PostgreSQL session（content tests 同款：本机 5432 + alembic upgrade head）。"""
+    async with AsyncSessionLocal() as session:
+        yield session
+
+
+@pytest_asyncio.fixture
+async def test_user(db_session) -> int:
+    """建一个测试用户（articles.user_id 外键指向 users.id）。"""
+    user = User(
+        open_id="cp3content_" + uuid.uuid4().hex[:24],
+        nickname="pytest",
+        tier="free",
+        monthly_quota=5,
+    )
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+    yield int(user.id)
+    await db_session.delete(user)
+    await db_session.commit()
+
+
+@pytest_asyncio.fixture
+async def article_factory(db_session, test_user):
+    """建 articles 行的工厂（raw_content 可传 None / dict）。"""
+
+    async def _create(raw_content=None, **overrides):
+        base = {
+            "id": f"art_{uuid.uuid4().hex[:24]}",
+            "user_id": test_user,
+            "url": "https://example.com/x",
+            "source": "wechat_mp",
+            "title": "测试文章",
+            "status": "pending",
+            "raw_content": raw_content,
+        }
+        base.update(overrides)
+        art = Article(**base)
+        db_session.add(art)
+        await db_session.commit()
+        return art
+
+    created: list = []
+
+    async def _create_tracked(*args, **kwargs):
+        art = await _create(*args, **kwargs)
+        created.append(art)
+        return art
+
+    yield _create_tracked
+    for art in created:
+        await db_session.delete(art)
+    await db_session.commit()
+
+
+@pytest_asyncio.fixture
+async def article_with_raw_content(article_factory):
+    """默认 article：raw_content 是 CP-CREATE-ARTICLE 落库的 FetchResult。"""
+    return await article_factory(
+        {
+            "content_text": "测试真内容 1+2=3",
+            "title": "测试文章",
+            "media_urls": ["https://example.com/img.jpg"],
+            "source": "wechat_mp",
+        }
+    )
 
 
 class FakeLLM:

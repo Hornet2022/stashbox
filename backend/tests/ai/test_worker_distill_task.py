@@ -46,6 +46,24 @@ def fake_pipeline(monkeypatch):
     return FakePipeline
 
 
+@pytest.fixture(autouse=True)
+def raw_content_calls(monkeypatch):
+    """把 _load_raw_content 打成替身（CP3-CONTENT 后它要查真 DB）。
+
+    本文件测的是「任务参数 → DistillContext 适配 / 异常传播」，不是 DB 读取；
+    DB 读取本身由 test_distill_task_content.py 用真 PostgreSQL 覆盖。
+    返回记录的 article_id 列表，供用例断言 loader 确实被调用。
+    """
+    calls: list = []
+
+    async def _load(db, article_id):
+        calls.append(article_id)
+        return f"[stub raw content] article_id={article_id}"
+
+    monkeypatch.setattr(dt_module, "_load_raw_content", _load)
+    return calls
+
+
 class FakeSession:
     def __init__(self, recorder: list):
         self.recorder = recorder
@@ -111,13 +129,13 @@ async def test_task_builds_distill_context_from_args(fake_pipeline):
     assert ctx.title == "标题"
 
 
-async def test_task_fills_raw_content_placeholder(fake_pipeline):
-    """CP3.5 还没接抓取器：raw_content 必须有值（DistillContext 必填），用占位文本。"""
+async def test_task_loads_raw_content_from_db(fake_pipeline, raw_content_calls):
+    """CP3-CONTENT：raw_content 由 _load_raw_content(db, article_id) 提供，不再是占位文本。"""
     await dt_module.distill_task(CTX, "dst_1", "art_1", 7, "https://x.com/a")
 
     ctx = FakePipeline.instances[0].ctx
-    assert ctx.raw_content
-    assert "https://x.com/a" in ctx.raw_content
+    assert ctx.raw_content == "[stub raw content] article_id=art_1"
+    assert raw_content_calls == ["art_1"]
 
 
 async def test_task_passes_session_factory_and_llm(fake_pipeline):
