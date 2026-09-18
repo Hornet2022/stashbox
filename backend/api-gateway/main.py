@@ -14,6 +14,7 @@ api-gateway（端口 8100） - 听匣统一入口 + JWT 签发 + 路由分发。
   GET  /api/v1/articles/{article_id}/audio-url -> content-service
   未匹配                                          -> 404
 """
+
 from contextlib import asynccontextmanager
 from pathlib import Path
 import sys
@@ -24,9 +25,12 @@ import sys
 # importlib 加载 main.py 时 cwd 不在服务目录，故把自身目录加入 sys.path。
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # noqa: E402
 
+import os
+
 import httpx
 import structlog
 from fastapi import FastAPI, Request, Response
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -58,6 +62,7 @@ class ErrorTrackingMiddleware(BaseHTTPMiddleware):
                 method=request.method,
             )
         return response
+
 
 setup_logging("api-gateway")
 
@@ -106,6 +111,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+os.makedirs("/tmp/audio", exist_ok=True)
+app.mount("/audio", StaticFiles(directory="/tmp/audio"), name="audio")
+
 
 class TokenRequest(BaseModel):
     user_id: str
@@ -138,9 +146,7 @@ async def proxy(request: Request, route: Route) -> Response:
     Authorization 原样带给下游，由下游自己校验 JWT。
     """
     headers = {
-        k: v
-        for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length")
+        k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")
     }
     # 链路串联：客户端没带 X-Request-ID 时补上 gateway 生成的那个，保证下游日志同源
     # （ASGI 把请求头名转成小写，这里按小写判存在，避免同一个头发两遍）
@@ -231,9 +237,7 @@ async def proxy_fallback(request: Request, path: str):
     url = f"{target_base}/api/v1/{path}"
     body = await request.body()
     headers = {
-        k: v
-        for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length")
+        k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")
     }
 
     client = request.app.state.httpx

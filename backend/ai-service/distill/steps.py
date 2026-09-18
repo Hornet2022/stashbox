@@ -3,6 +3,7 @@
 每步接 LLMClient（Step 3 接 TTS client），输出中间结果写到 context。
 LLM 响应按「JSON 优先、纯文本兜底」解析 —— mock client 与真 LLM 都能跑通。
 """
+
 import json
 
 from llm.types import ChatMessage, ChatRequest
@@ -122,8 +123,16 @@ async def step3_tts(ctx: DistillContext, tts_client) -> None:
         raise ValueError("rewrite not set, call step2 first")
 
     prompt = STEP3_USER.format(rewrite_body=ctx.rewrite.body)
-    segments = await tts_client.synthesize(prompt)
-    ctx.tts = TTSOutput(segments=list(segments))
+    # CP7.2: 新 TTSClient.synthesize() 返回 bytes（旧 MockTTSClient 返回 list[dict]）
+    # 旧接口兼容：新 client 返回 bytes 时走这里；旧 client 返回 list[dict] 时走 except
+    try:
+        audio_bytes = await tts_client.synthesize(prompt)
+        # 新接口：bytes 直接作为 ctx.tts（后续 _save_audio 用这个做存储）
+        ctx.tts = TTSOutput(segments=[{"bytes": audio_bytes}])
+    except (AttributeError, TypeError):
+        # 旧接口：list[dict] 兼容
+        segments = await tts_client.synthesize(prompt)
+        ctx.tts = TTSOutput(segments=list(segments))
 
 
 @trace_distill_step("step4_concat")
