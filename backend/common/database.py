@@ -18,6 +18,7 @@ from stashbox.backend.common.config import settings
 engine = create_async_engine(
     settings.database_url,
     pool_size=settings.postgres_pool_size,
+    max_overflow=10,
     pool_recycle=settings.postgres_pool_recycle,
     echo=settings.debug,
     future=True,
