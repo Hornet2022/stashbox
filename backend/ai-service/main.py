@@ -179,12 +179,15 @@ class DistillStartResponse(BaseModel):
 async def health():
     """遗留别名（CP1.6 在用）：CP6.4 起新增 /healthz /readyz，本端点保持不动。"""
     redis_status = "ok"
+    client = None
     try:
         client = aioredis.Redis(connection_pool=get_redis_pool())
         await client.ping()
-        await client.aclose()
     except Exception:
         redis_status = "error"
+    finally:
+        if client is not None:
+            await client.aclose()
     return {"status": "ok", "service": "ai-service", "redis": redis_status}
 
 
