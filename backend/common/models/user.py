@@ -41,6 +41,9 @@ class User(Base, TimestampMixin):
     )  # 乐观锁版本号
     quota_reset_at: Mapped[TIMESTAMP | None] = mapped_column(TIMESTAMP, nullable=True)
 
+    # CP5.1 用户引导完成时间（v1 §11.5 首次打开转化率追踪）
+    onboarding_done_at: Mapped[TIMESTAMP | None] = mapped_column(TIMESTAMP, nullable=True)
+
     __table_args__ = (
         Index("idx_users_tier", "tier"),
         Index("idx_users_email", "email"),

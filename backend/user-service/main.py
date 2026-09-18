@@ -10,6 +10,7 @@ import bcrypt
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
@@ -315,6 +316,101 @@ async def reset_quota_monthly(user: dict = Depends(require_user), db: AsyncSessi
     # CP6.2.1 埋点：quota_reset
     await track_simple(db, EventName.QUOTA_RESET, int(user["sub"]), "n/a")
     return {"reset_users": n}
+
+
+@app.post("/api/v1/users/me/onboarding/start")
+async def onboarding_start(
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """v1 §11.5 CP5.1 用户进入引导（首次启动）。
+
+    行为：
+      1. 校验 user 存在（不存在 404）
+      2. 校验未引导过（onboarding_done_at 已设置 → 409 already_done）
+      3. 写埋点 ONBOARDING_STARTED
+    不修改 user 字段（开始 ≠ 完成）。
+    """
+    u = await db.get(User, int(user["sub"]))
+    if u is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    if u.onboarding_done_at is not None:
+        raise HTTPException(status_code=409, detail="onboarding already done")
+
+    await track_simple(db, EventName.ONBOARDING_STARTED, u.id, await _get_placeholder_article_id(db))
+    return {"onboarding_started": True}
+
+
+# CP5.1: onboarding 埋点需要 article_id（FK 约束），用"系统引导"占位 article
+_PLACEHOLDER_ARTICLE_ID: str | None = None
+
+
+async def _get_placeholder_article_id(db: AsyncSession) -> str:
+    """返回任意一个已存在的 article.id，供 onboarding 埋点用（FK 约束）。"""
+    global _PLACEHOLDER_ARTICLE_ID
+    if _PLACEHOLDER_ARTICLE_ID is None:
+        from sqlalchemy import select, text
+        row = await db.execute(select(text("id")).select_from(text("articles")).limit(1))
+        _PLACEHOLDER_ARTICLE_ID = row.scalar_one_or_none() or "n/a"
+    return _PLACEHOLDER_ARTICLE_ID
+
+
+@app.post("/api/v1/users/me/onboarding/step")
+async def onboarding_step_viewed(
+    step: int,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """v1 §11.5 CP5.1 用户看了引导第 N 步。
+
+    行为：
+      1. 校验 step ∈ [1, 3]
+      2. 校验 user 存在
+      3. 写埋点 ONBOARDING_STEP_VIEWED + step 元数据
+    """
+    if step not in (1, 2, 3):
+        raise HTTPException(status_code=400, detail="step must be 1/2/3")
+    u = await db.get(User, int(user["sub"]))
+    if u is None:
+        raise HTTPException(status_code=404, detail="user not found")
+
+    step_names = {1: "copy_link", 2: "open_d9", 3: "listen_audio"}
+    await track_simple(
+        db,
+        EventName.ONBOARDING_STEP_VIEWED,
+        u.id,
+        await _get_placeholder_article_id(db),
+    )
+    return {"step_viewed": step, "step_name": step_names[step]}
+
+
+@app.post("/api/v1/users/me/onboarding/done")
+async def onboarding_complete(
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """v1 §11.5 CP5.1 用户完成引导。
+
+    行为：
+      1. 校验 user 存在
+      2. 设置 onboarding_done_at = now (UTC)
+      3. 写埋点 ONBOARDING_COMPLETED
+    幂等：重复调用更新 onboarding_done_at = now（v1 §11.5 验收只关心"用户曾完成过"）。
+    """
+    u = await db.get(User, int(user["sub"]))
+    if u is None:
+        raise HTTPException(status_code=404, detail="user not found")
+
+    u.onboarding_done_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    await track_simple(db, EventName.ONBOARDING_COMPLETED, u.id, await _get_placeholder_article_id(db))
+    return {"onboarding_done": True, "onboarding_done_at": u.onboarding_done_at.isoformat()}
 
 
 @app.get("/api/v1/subscription/plans")

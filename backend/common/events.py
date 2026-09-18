@@ -85,6 +85,11 @@ class EventName(str, Enum):
     ADMIN_QUOTA_ADJUST = "admin_quota_adjust"
     ADMIN_METRICS_VIEW = "admin_metrics_view"
 
+    # === 引导流程（CP5.1）===
+    ONBOARDING_STARTED = "onboarding_started"
+    ONBOARDING_STEP_VIEWED = "onboarding_step_viewed"  # 3 步引导：复制链接 / 打开 D9 / 听音频
+    ONBOARDING_COMPLETED = "onboarding_completed"
+
     # === 系统（CP6.2.2 全做）===
     SERVICE_START = "service_start"
     SERVICE_STOP = "service_stop"
