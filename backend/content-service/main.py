@@ -275,6 +275,44 @@ async def submit_article(
     }
 
 
+@app.get("/api/v1/articles")
+async def list_articles(
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+    limit: int = 20,
+    offset: int = 0,
+):
+    """列出当前用户的 articles 列表（按 created_at desc 排序，分页）。
+
+    admin-web Articles 页调用此端点。
+    """
+    uid = int(user["sub"])
+
+    total = await db.scalar(
+        select(func.count()).select_from(Article).where(
+            Article.user_id == uid,
+            Article.deleted_at.is_(None),
+        )
+    )
+
+    result = await db.execute(
+        select(Article)
+        .where(
+            Article.user_id == uid,
+            Article.deleted_at.is_(None),
+        )
+        .order_by(Article.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    articles = result.scalars().all()
+
+    return {
+        "items": [_to_response(a).model_dump() for a in articles],
+        "total": total or 0,
+    }
+
+
 @app.get("/api/v1/articles/pending")
 async def list_pending(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
     uid = int(user["sub"])
