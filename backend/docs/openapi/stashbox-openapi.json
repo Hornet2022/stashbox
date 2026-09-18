@@ -1438,6 +1438,63 @@
         ]
       }
     },
+    "/api/v1/articles/{article_id}/retry": {
+      "post": {
+        "summary": "User Retry Distill",
+        "description": "v1 §11.5 CP5.2 用户端蒸馏失败重试。\n\n行为：\n  1. 校验 article 存在（不存在 404）\n  2. 校验 article 属于当前 user（user_id 不匹配 403）\n  3. 校验状态 = failed（其他状态 409 conflict）\n  4. 状态置 pending，retry_count += 1\n  5. 触发 ai-service 蒸馏（不可达时仅置 pending，worker 自动重试）\n  6. 触发推送\"换源重试\"卡片（CP5.4b push 队列已有，写消息）\n失败回滚事务。",
+        "operationId": "user_retry_distill_api_v1_articles__article_id__retry_post",
+        "parameters": [
+          {
+            "name": "article_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Article Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
     "/api/v1/articles/{article_id}/skip": {
       "post": {
         "summary": "Skip",
@@ -2452,6 +2509,159 @@
         "summary": "Get Quota",
         "operationId": "get_quota_api_v1_user_quota_get",
         "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service"
+        ]
+      }
+    },
+    "/api/v1/users/me/onboarding/done": {
+      "post": {
+        "summary": "Onboarding Complete",
+        "description": "v1 §11.5 CP5.1 用户完成引导。\n\n行为：\n  1. 校验 user 存在\n  2. 设置 onboarding_done_at = now (UTC)\n  3. 写埋点 ONBOARDING_COMPLETED\n幂等：重复调用更新 onboarding_done_at = now（v1 §11.5 验收只关心\"用户曾完成过\"）。",
+        "operationId": "onboarding_complete_api_v1_users_me_onboarding_done_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service"
+        ]
+      }
+    },
+    "/api/v1/users/me/onboarding/start": {
+      "post": {
+        "summary": "Onboarding Start",
+        "description": "v1 §11.5 CP5.1 用户进入引导（首次启动）。\n\n行为：\n  1. 校验 user 存在（不存在 404）\n  2. 校验未引导过（onboarding_done_at 已设置 → 409 already_done）\n  3. 写埋点 ONBOARDING_STARTED\n不修改 user 字段（开始 ≠ 完成）。",
+        "operationId": "onboarding_start_api_v1_users_me_onboarding_start_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service"
+        ]
+      }
+    },
+    "/api/v1/users/me/onboarding/step": {
+      "post": {
+        "summary": "Onboarding Step Viewed",
+        "description": "v1 §11.5 CP5.1 用户看了引导第 N 步。\n\n行为：\n  1. 校验 step ∈ [1, 3]\n  2. 校验 user 存在\n  3. 写埋点 ONBOARDING_STEP_VIEWED + step 元数据",
+        "operationId": "onboarding_step_viewed_api_v1_users_me_onboarding_step_post",
+        "parameters": [
+          {
+            "name": "step",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Step"
+            }
+          },
           {
             "name": "authorization",
             "in": "header",
