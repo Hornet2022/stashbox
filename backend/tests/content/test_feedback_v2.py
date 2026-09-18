@@ -134,8 +134,8 @@ async def test_create_feedback_v2_invalid_category():
                 json={"category": "invalid_category", "content": "test"},
             )
 
-        assert r.status_code == 422, r.text
-        assert "category 必须是" in r.json()["detail"]
+        assert r.status_code == 400, r.text
+        assert "category 必须是" in r.json()["message"]
         assert await _feedback_v2_rows(uid) == []
     finally:
         await _purge(uid)
@@ -151,9 +151,9 @@ async def test_create_feedback_v2_rating_out_of_range():
             r0 = await c.post(FEEDBACK_V2_URL, json={"category": "bug", "rating": 0, "content": "a"})
             r6 = await c.post(FEEDBACK_V2_URL, json={"category": "bug", "rating": 6, "content": "a"})
 
-        assert r0.status_code == 422, r0.text
-        assert "rating 必须在 1-5 之间" in r0.json()["detail"]
-        assert r6.status_code == 422, r6.text
+        assert r0.status_code == 400, r0.text
+        assert "rating 必须在 1-5 之间" in r0.json()["message"]
+        assert r6.status_code == 400, r6.text
         assert await _feedback_v2_rows(uid) == []
     finally:
         await _purge(uid)
@@ -169,9 +169,9 @@ async def test_create_feedback_v2_empty_content():
             r_empty = await c.post(FEEDBACK_V2_URL, json={"category": "bug", "content": ""})
             r_space = await c.post(FEEDBACK_V2_URL, json={"category": "bug", "content": "  "})
 
-        assert r_empty.status_code == 422, r_empty.text
-        assert "content 必填" in r_empty.json()["detail"]
-        assert r_space.status_code == 422, r_space.text
+        assert r_empty.status_code == 400, r_empty.text
+        assert "content 必填" in r_empty.json()["message"]
+        assert r_space.status_code == 400, r_space.text
         assert await _feedback_v2_rows(uid) == []
     finally:
         await _purge(uid)
@@ -191,7 +191,7 @@ async def test_create_feedback_v2_article_not_found():
             )
 
         assert r.status_code == 404, r.text
-        assert "article 不存在" in r.json()["detail"]
+        assert "article 不存在" in r.json()["message"]
         assert await _feedback_v2_rows(uid) == []
     finally:
         await _purge(uid)

@@ -424,10 +424,10 @@ async def user_retry_distill(
     """
     art = await db.get(Article, article_id)
     if art is None:
-        raise HTTPException(status_code=404, detail=f"article {article_id} not found")
+        raise NotFound(message=f"article {article_id} not found")
 
     if art.user_id != int(user["sub"]):
-        raise HTTPException(status_code=403, detail="not your article")
+        raise Forbidden(message="not your article")
 
     if art.status != "failed":
         raise HTTPException(
@@ -599,7 +599,7 @@ async def add_favorite(
     # 文章必须存在
     art = await db.get(Article, article_id)
     if not art:
-        raise HTTPException(status_code=404, detail=f"article 不存在: {article_id}")
+        raise NotFound(message=f"article 不存在: {article_id}")
 
     # 检查是否已存在
     existing = await db.scalar(
@@ -635,7 +635,7 @@ async def update_favorite(
     uid = int(user["sub"])
     fav = await db.get(Favorite, favorite_id)
     if not fav or fav.user_id != uid:
-        raise HTTPException(status_code=404, detail="favorite 不存在")
+        raise NotFound(message="favorite 不存在")
 
     if "folder" in body:
         fav.folder = body["folder"]
@@ -656,7 +656,7 @@ async def delete_favorite(
     uid = int(user["sub"])
     fav = await db.get(Favorite, favorite_id)
     if not fav or fav.user_id != uid:
-        raise HTTPException(status_code=404, detail="favorite 不存在")
+        raise NotFound(message="favorite 不存在")
 
     article_id = fav.article_id
     await db.delete(fav)
@@ -703,7 +703,7 @@ async def snooze_article(
     uid = int(user["sub"])
     art = await db.get(Article, article_id)
     if not art:
-        raise HTTPException(status_code=404, detail=f"article 不存在: {article_id}")
+        raise NotFound(message=f"article 不存在: {article_id}")
 
     snooze_until = body.get("snooze_until")
     if snooze_until:
@@ -853,24 +853,21 @@ async def create_feedback_v2(
 
     # 校验 category
     if body.category not in FEEDBACK_CATEGORIES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"category 必须是 {FEEDBACK_CATEGORIES} 之一"
-        )
+        raise InvalidRequest(message=f"category 必须是 {FEEDBACK_CATEGORIES} 之一")
 
     # 校验 rating
     if body.rating is not None and not (1 <= body.rating <= 5):
-        raise HTTPException(status_code=422, detail="rating 必须在 1-5 之间")
+        raise InvalidRequest(message="rating 必须在 1-5 之间")
 
     # content 非空
     if not body.content.strip():
-        raise HTTPException(status_code=422, detail="content 必填")
+        raise InvalidRequest(message="content 必填")
 
     # article_id 可选，但若填了必须存在
     if body.article_id:
         art = await db.get(Article, body.article_id)
         if not art:
-            raise HTTPException(status_code=404, detail=f"article 不存在: {body.article_id}")
+            raise NotFound(message=f"article 不存在: {body.article_id}")
 
     fb = FeedbackV2(
         user_id=uid,
@@ -1155,7 +1152,7 @@ async def subscribe_tag(
     else:
         tag = await db.scalar(select(Tag).where(Tag.slug == tag_id_or_slug))
     if not tag:
-        raise HTTPException(status_code=404, detail=f"tag 不存在: {tag_id_or_slug}")
+        raise NotFound(message=f"tag 不存在: {tag_id_or_slug}")
 
     existing = await db.scalar(
         select(TagSubscription).where(
@@ -1188,7 +1185,7 @@ async def unsubscribe_tag(
     else:
         tag = await db.scalar(select(Tag).where(Tag.slug == tag_id_or_slug))
     if not tag:
-        raise HTTPException(status_code=404, detail=f"tag 不存在: {tag_id_or_slug}")
+        raise NotFound(message=f"tag 不存在: {tag_id_or_slug}")
 
     result = await db.execute(
         delete(TagSubscription).where(
@@ -1238,11 +1235,11 @@ async def admin_force_retry(
     失败回滚事务。
     """
     if len(req.reason.strip()) < 5:
-        raise HTTPException(status_code=400, detail="reason 至少 5 个字符")
+        raise InvalidRequest(message="reason 至少 5 个字符")
 
     art = await db.get(Article, article_id)
     if art is None:
-        raise HTTPException(status_code=404, detail=f"article {article_id} not found")
+        raise NotFound(message=f"article {article_id} not found")
 
     art.status = "pending"
 
@@ -1297,11 +1294,11 @@ async def admin_audio_invalidate(
     失败回滚事务。
     """
     if len(req.reason.strip()) < 5:
-        raise HTTPException(status_code=400, detail="reason 至少 5 个字符")
+        raise InvalidRequest(message="reason 至少 5 个字符")
 
     audio = await db.get(DistilledArticle, audio_id)
     if audio is None:
-        raise HTTPException(status_code=404, detail=f"audio {audio_id} not found")
+        raise NotFound(message=f"audio {audio_id} not found")
 
     audio.status = "invalidated"
 
