@@ -17,7 +17,7 @@
 """
 import uuid
 
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, select
 
 from stashbox.backend.common.database import AsyncSessionLocal
 from stashbox.backend.common.models import Article, Feedback, FeedbackV2

@@ -1,6 +1,5 @@
 """收藏表（CP5.5）。"""
 from sqlalchemy import BigInteger, ForeignKey, Index, Text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, TimestampMixin
