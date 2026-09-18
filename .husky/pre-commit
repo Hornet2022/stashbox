@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+HUSKY_DIR="$(cd "$(dirname -- "$0")" && pwd)"
+. "$HUSKY_DIR/_/husky.sh"
+
+cd "$HUSKY_DIR/.."
+.venv/bin/ruff check $(git diff --cached --name-only --diff-filter=ACM | grep -E '\.py$' | tr '\n' ' ')
+.venv/bin/ruff format --check $(git diff --cached --name-only --diff-filter=ACM | grep -E '\.py$' | tr '\n' ' ')

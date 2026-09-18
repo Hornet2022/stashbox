@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+HUSKY_DIR="$(cd "$(dirname -- "$0")" && pwd)"
+. "$HUSKY_DIR/_/husky.sh"
+
+cd "$HUSKY_DIR/.."
+npx --no-install commitlint --edit "$1"
