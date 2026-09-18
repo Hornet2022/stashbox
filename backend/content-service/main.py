@@ -67,6 +67,7 @@ from stashbox.backend.common.models import (
     DistilledArticle,
     Favorite,
     Feedback,
+    FeedbackV2,
     LaterListen,
     Tag,
     TagSubscription,
@@ -786,6 +787,114 @@ async def rate(
     await db.commit()
     await db.refresh(fb)
     return {"id": article_id, "rating": req.rating, "feedback_id": fb.id}
+
+
+# ---------------------------------------------------------------------------
+# CP5.5-A3 反馈分类 + 评分（feedback_v2 双轨）
+# ---------------------------------------------------------------------------
+FEEDBACK_CATEGORIES = ("bug", "feature", "content", "audio_quality", "other")
+
+
+class FeedbackV2CreateRequest(BaseModel):
+    article_id: str | None = None
+    category: str
+    rating: int | None = None
+    content: str
+    contact: str | None = None
+    device_info: dict | None = None
+
+
+@app.post("/api/v1/feedback-v2")
+async def create_feedback_v2(
+    body: FeedbackV2CreateRequest,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """提交反馈（分类 + 可选评分）。"""
+    uid = int(user["sub"])
+
+    # 校验 category
+    if body.category not in FEEDBACK_CATEGORIES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"category 必须是 {FEEDBACK_CATEGORIES} 之一"
+        )
+
+    # 校验 rating
+    if body.rating is not None and not (1 <= body.rating <= 5):
+        raise HTTPException(status_code=422, detail="rating 必须在 1-5 之间")
+
+    # content 非空
+    if not body.content.strip():
+        raise HTTPException(status_code=422, detail="content 必填")
+
+    # article_id 可选，但若填了必须存在
+    if body.article_id:
+        art = await db.get(Article, body.article_id)
+        if not art:
+            raise HTTPException(status_code=404, detail=f"article 不存在: {body.article_id}")
+
+    fb = FeedbackV2(
+        user_id=uid,
+        article_id=body.article_id,
+        category=body.category,
+        rating=body.rating,
+        content=body.content.strip(),
+        contact=body.contact,
+        device_info=body.device_info,
+    )
+    db.add(fb)
+    await db.flush()  # get id without ending transaction
+    fb_id = fb.id
+    fb_category = fb.category
+
+    # 埋点（仅当有 article_id 时，feedback 表 article_id 为 NOT NULL FK）
+    if body.article_id:
+        await track(
+            db,
+            EventName.FEEDBACK_V2_SUBMIT,
+            user_id=uid,
+            article_id=body.article_id,
+            metadata={
+                "category": body.category,
+                "rating": body.rating,
+                "has_contact": bool(body.contact),
+            },
+        )
+
+    await db.commit()
+
+    return {"ok": True, "id": fb_id, "category": fb_category}
+
+
+@app.get("/api/v1/feedback-v2")
+async def list_my_feedback_v2(
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+    category: str | None = None,
+    limit: int = 50,
+):
+    """列出我提交的反馈。"""
+    uid = int(user["sub"])
+    q = select(FeedbackV2).where(FeedbackV2.user_id == uid)
+    if category:
+        q = q.where(FeedbackV2.category == category)
+    q = q.order_by(FeedbackV2.created_at.desc()).limit(limit)
+    result = await db.execute(q)
+    items = result.scalars().all()
+    return {
+        "feedbacks": [
+            {
+                "id": f.id,
+                "article_id": f.article_id,
+                "category": f.category,
+                "rating": f.rating,
+                "content": f.content,
+                "created_at": f.created_at.isoformat(),
+            }
+            for f in items
+        ]
+    }
 
 
 @app.post("/api/v1/callback/d9-add-article", response_model=D9AddResponse)

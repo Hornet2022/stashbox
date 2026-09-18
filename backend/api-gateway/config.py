@@ -111,6 +111,9 @@ ROUTES += [
         "content-service",
         _url("content-service"),
     ),
+    # CP5.5-A3 反馈分类
+    Route("POST", "/api/v1/feedback-v2", "content-service", _url("content-service")),
+    Route("GET", "/api/v1/feedback-v2", "content-service", _url("content-service")),
 ]
 
 
