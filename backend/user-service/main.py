@@ -21,6 +21,7 @@ from stashbox.backend.common.auth import create_access_token, require_user
 from stashbox.backend.common.config import settings
 from stashbox.backend.common.database import get_db
 from stashbox.backend.common.exceptions import (
+    BizException,
     NotFound,
     register_exception_handlers,
 )
@@ -610,7 +611,7 @@ async def admin_login(req: AdminLoginRequest, db: AsyncSession = Depends(get_db)
     """admin / operator 邮箱密码登录，返回 1h JWT + 写审计日志。"""
     # 1) 字段校验（commit 前，缺字段直接 400，不落库）
     if not req.email or not req.password:
-        raise HTTPException(status_code=400, detail="email 和 password 必填")
+        raise BizException(message="email 和 password 必填", code=40000)
 
     # 2) 按 email 查用户（不存在 → 401，不泄露是否存在）
     result = await db.execute(select(User).where(User.email == req.email))
