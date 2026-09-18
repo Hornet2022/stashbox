@@ -11,10 +11,18 @@ CP4.7-E2E-BACKEND 端到端集成测试（content-service → ai-service → aud
 实际使用 /api/v1/distill/start（显式路由到 ai-service）。
 """
 import asyncio
+import os
 import uuid
 
 import httpx
 import pytest
+
+# 集成测试需要 gateway/user/content/ai 4 个服务真跑，CI workflow 只起 PG/Redis，
+# 服务不在。CI 上跳过（CP6.12），本地手跑保留测试。
+skip_in_ci = pytest.mark.skipif(
+    os.getenv("CI") is not None,
+    reason="integration test requires running services (skipped in CI, run locally with services up)",
+)
 
 # dev 服务地址（已在跑，不要重启）
 GATEWAY_URL = "http://localhost:8100"
@@ -60,6 +68,7 @@ async def _poll_task_status(
 
 
 @pytest.mark.asyncio
+@skip_in_ci
 async def test_wechat_url_full_distill_pipeline():
     """
     完整链路：POST /articles → content-service 抓取 →
@@ -153,6 +162,7 @@ AI_SERVICE_URL = "http://localhost:8103"
 
 
 @pytest.mark.asyncio
+@skip_in_ci
 async def test_distill_failure_refund_quota():
     """
     蒸馏失败（simulate_failure=True）→ 配额退还。
@@ -213,6 +223,7 @@ async def test_distill_failure_refund_quota():
 
 
 @pytest.mark.asyncio
+@skip_in_ci
 async def test_unsupported_url_creates_pending_article():
     """
     不支持的 URL 格式 → 文章创建成功（pending），后续 distill 时处理。
@@ -245,6 +256,7 @@ async def test_unsupported_url_creates_pending_article():
 
 
 @pytest.mark.asyncio
+@skip_in_ci
 async def test_get_audio_before_distill_returns_404():
     """
     蒸馏前 GET /articles/{id}/audio-url → 404（audio not ready）。

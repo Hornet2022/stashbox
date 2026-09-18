@@ -8,13 +8,23 @@ CP4.7.1 gateway routing bugfix: POST /api/v1/articles/{id}/distill 必须路由�
 CP4.7-E2E-BACKEND (b2bd9a4) 自报的 [known issues] #1。
 """
 
+import os
+
 import pytest
 import httpx
 
 GATEWAY_URL = "http://localhost:8100"
 
+# 集成测试需要 gateway/user/content/ai 4 个服务真跑，CI workflow 只起 PG/Redis，
+# 服务不在。CI 上跳过（CP6.12），本地手跑保留测试。
+skip_in_ci = pytest.mark.skipif(
+    os.getenv("CI") is not None,
+    reason="integration test requires running services (skipped in CI, run locally with services up)",
+)
+
 
 @pytest.mark.asyncio
+@skip_in_ci
 async def test_distill_routes_to_ai_service_via_gateway():
     """POST /api/v1/articles/{id}/distill 走 gateway 必须到 ai-service，不是 content-service"""
 
@@ -62,6 +72,7 @@ async def test_distill_routes_to_ai_service_via_gateway():
 
 
 @pytest.mark.asyncio
+@skip_in_ci
 async def test_audio_url_routes_to_content_service_via_gateway():
     """GET /api/v1/articles/{id}/audio-url 走 gateway → content-service（既有路径，验证 fallback 仍正常）"""
 
