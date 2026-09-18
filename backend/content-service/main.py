@@ -334,6 +334,96 @@ async def mark_listened(
 
 
 # ---------------------------------------------------------------------------
+# CP5.2 用户端 distill 失败重试（v1 §11.5）
+# ---------------------------------------------------------------------------
+
+
+async def push_retry_message(user_id: int, article_id: str) -> None:
+    """v1 §11.5 CP5.2 '换源重试' 推送卡片。
+
+    复用 CP5.4b push 队列（write_notification），不接极光推送（红线）。
+    本期卡片类型 = retry_card，data 字段含 article_id + suggested_alternative。
+    注意：PushNotification 模型无 type/data 字段，简化 title+body 直接展示。
+    """
+    from stashbox.backend.common.database import AsyncSessionLocal
+    from stashbox.backend.common.models.push_notification import PushNotification
+
+    async with AsyncSessionLocal() as session:
+        notif = PushNotification(
+            user_id=user_id,
+            article_id=article_id,
+            title="换个来源重试？",
+            body="这篇原文被拒收，要不要换一个源？",
+        )
+        session.add(notif)
+        try:
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            # 推送失败不破请求
+            pass
+
+
+@app.post("/api/v1/articles/{article_id}/retry")
+async def user_retry_distill(
+    article_id: str,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """v1 §11.5 CP5.2 用户端蒸馏失败重试。
+
+    行为：
+      1. 校验 article 存在（不存在 404）
+      2. 校验 article 属于当前 user（user_id 不匹配 403）
+      3. 校验状态 = failed（其他状态 409 conflict）
+      4. 状态置 pending，retry_count += 1
+      5. 触发 ai-service 蒸馏（不可达时仅置 pending，worker 自动重试）
+      6. 触发推送"换源重试"卡片（CP5.4b push 队列已有，写消息）
+    失败回滚事务。
+    """
+    art = await db.get(Article, article_id)
+    if art is None:
+        raise HTTPException(status_code=404, detail=f"article {article_id} not found")
+
+    if art.user_id != int(user["sub"]):
+        raise HTTPException(status_code=403, detail="not your article")
+
+    if art.status != "failed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"article status is {art.status}, only 'failed' can retry",
+        )
+
+    art.status = "pending"
+    art.retry_count = (art.retry_count or 0) + 1
+
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    # 触发蒸馏
+    queued = await get_ai_client().trigger_distill(
+        article_id, auth_token=create_access_token(str(art.user_id))
+    )
+
+    # 写推送"换源重试"卡片（CP5.4b push 队列）
+    await push_retry_message(art.user_id, article_id)
+
+    # CP5.2 埋点
+    await track_simple(db, EventName.ARTICLE_RETRY_REQUESTED, int(user["sub"]), article_id)
+
+    return {
+        "article_id": article_id,
+        "status": "pending",
+        "retry_count": art.retry_count,
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+        "distill_triggered": queued is not None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CP5.5 文章反馈闭环（v1 §3.1 / §4.3.4）：4 端点写 feedback 表
 # ---------------------------------------------------------------------------
 SKIP_REASONS = ("too_long", "boring", "low_quality", "other")

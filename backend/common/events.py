@@ -45,6 +45,7 @@ class EventName(str, Enum):
     DISTILL_FAILED = "distill_failed"  # CP6.2.1
     DISTILL_RETRY = "distill_retry"  # CP6.2.2
     DISTILL_QUOTA_REFUND = "distill_quota_refund"  # CP6.2.1
+    ARTICLE_RETRY_REQUESTED = "article_retry_requested"  # CP5.2
 
     # === 音频播放（CP6.2.1 覆盖 2）===
     AUDIO_PLAY_START = "audio_play_start"  # CP6.2.1

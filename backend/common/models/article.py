@@ -4,6 +4,7 @@ from sqlalchemy import (
     Boolean,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
 )
@@ -38,6 +39,9 @@ class Article(Base, TimestampMixin):
         JSONB, nullable=True
     )  # 抓取后的原始内容（L4 多模态理解输入）
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )  # CP5.2 用户端重试计数
 
     # CP1.4 端点保留字段
     favorite: Mapped[bool] = mapped_column(
