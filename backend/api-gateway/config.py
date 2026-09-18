@@ -114,6 +114,22 @@ ROUTES += [
     # CP5.5-A3 反馈分类
     Route("POST", "/api/v1/feedback-v2", "content-service", _url("content-service")),
     Route("GET", "/api/v1/feedback-v2", "content-service", _url("content-service")),
+    # CP-ADMIN: admin 后台路由（admin-web 通过这些端点运营）
+    Route("POST", "/api/v1/admin/auth/login", "user-service", _url("user-service")),
+    Route("GET", "/api/v1/admin/users", "user-service", _url("user-service")),
+    Route("POST", "/api/v1/admin/users/{user_id}/quota-adjust", "user-service", _url("user-service")),
+    Route("POST", "/api/v1/admin/articles/{article_id}/force-retry", "content-service", _url("content-service")),
+    Route("POST", "/api/v1/admin/audio/{audio_id}/invalidate", "content-service", _url("content-service")),
+    Route("GET", "/api/v1/admin/audit-log", "content-service", _url("content-service")),
+    Route("GET", "/api/v1/admin/stats", "content-service", _url("content-service")),
+    Route("GET", "/api/v1/admin/export/users.csv", "content-service", _url("content-service")),
+    Route("GET", "/api/v1/admin/export/articles.csv", "content-service", _url("content-service")),
+    Route("GET", "/api/v1/admin/export/feedback.csv", "content-service", _url("content-service")),
+    Route("GET", "/api/v1/admin/export/audit-log.csv", "content-service", _url("content-service")),
+    Route("GET", "/api/v1/admin/export/subscriptions.csv", "content-service", _url("content-service")),
+    # admin-web 用的 POST /api/v1/tags + GET /api/v1/notifications（CP3.6-A2 + CP5.4a）
+    Route("POST", "/api/v1/tags", "content-service", _url("content-service")),
+    Route("GET", "/api/v1/notifications", "user-service", _url("user-service")),
 ]
 
 
