@@ -65,7 +65,9 @@ from stashbox.backend.common.models import (
     AdminOperationLog,
     Article,
     DistilledArticle,
+    Favorite,
     Feedback,
+    LaterListen,
     Tag,
     TagSubscription,
     User,
@@ -486,6 +488,230 @@ async def favorite(
     await db.commit()
     await db.refresh(fb)  # commit 后 id/created_at 需回读（expire_on_commit）
     return {"id": article_id, "favorite": True, "feedback_id": fb.id}
+
+
+# ---------------------------------------------------------------------------
+# CP5.5 收藏 + 稍后听（folder+note 双轨——不动 articles.favorite / feedback 表）
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/v1/favorites")
+async def list_favorites(
+    folder: str | None = None,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """列出我的收藏（可按 folder 过滤）。"""
+    uid = int(user["sub"])
+    q = select(Favorite).where(Favorite.user_id == uid)
+    if folder:
+        q = q.where(Favorite.folder == folder)
+    q = q.order_by(Favorite.created_at.desc())
+    result = await db.execute(q)
+    favs = result.scalars().all()
+    return {
+        "favorites": [
+            {
+                "id": f.id,
+                "article_id": f.article_id,
+                "folder": f.folder,
+                "note": f.note,
+                "created_at": f.created_at.isoformat(),
+            }
+            for f in favs
+        ]
+    }
+
+
+@app.get("/api/v1/favorites/folders")
+async def list_favorite_folders(
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """列出我的所有 folder（去重 + 计数）。"""
+    uid = int(user["sub"])
+    result = await db.execute(
+        select(Favorite.folder, func.count(Favorite.id))
+        .where(Favorite.user_id == uid)
+        .group_by(Favorite.folder)
+        .order_by(Favorite.folder)
+    )
+    rows = result.all()
+    return {
+        "folders": [
+            {"folder": folder, "count": count}
+            for folder, count in rows
+        ]
+    }
+
+
+@app.post("/api/v1/articles/{article_id}/favorites")
+async def add_favorite(
+    article_id: str,
+    body: dict,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """加收藏（带 folder + note）。"""
+    uid = int(user["sub"])
+    folder = body.get("folder", "default")
+    note = body.get("note")
+
+    # 文章必须存在
+    art = await db.get(Article, article_id)
+    if not art:
+        raise HTTPException(status_code=404, detail=f"article 不存在: {article_id}")
+
+    # 检查是否已存在
+    existing = await db.scalar(
+        select(Favorite).where(
+            Favorite.user_id == uid,
+            Favorite.article_id == article_id,
+            Favorite.folder == folder,
+        )
+    )
+    if existing:
+        return {"ok": True, "already_favorited": True, "id": existing.id}
+
+    fav = Favorite(user_id=uid, article_id=article_id, folder=folder, note=note)
+    db.add(fav)
+    await db.commit()
+    await db.refresh(fav)
+
+    # 埋点
+    await track(db, EventName.FAVORITE_ADD, user_id=uid, article_id=article_id,
+                metadata={"folder": folder})
+
+    return {"ok": True, "id": fav.id, "folder": folder}
+
+
+@app.patch("/api/v1/favorites/{favorite_id}")
+async def update_favorite(
+    favorite_id: int,
+    body: dict,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """改 folder / note。"""
+    uid = int(user["sub"])
+    fav = await db.get(Favorite, favorite_id)
+    if not fav or fav.user_id != uid:
+        raise HTTPException(status_code=404, detail="favorite 不存在")
+
+    if "folder" in body:
+        fav.folder = body["folder"]
+    if "note" in body:
+        fav.note = body["note"]
+    await db.commit()
+
+    return {"ok": True, "id": fav.id}
+
+
+@app.delete("/api/v1/favorites/{favorite_id}")
+async def delete_favorite(
+    favorite_id: int,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """删收藏。"""
+    uid = int(user["sub"])
+    fav = await db.get(Favorite, favorite_id)
+    if not fav or fav.user_id != uid:
+        raise HTTPException(status_code=404, detail="favorite 不存在")
+
+    article_id = fav.article_id
+    await db.delete(fav)
+    await db.commit()
+
+    await track_simple(db, EventName.FAVORITE_REMOVE, uid, article_id)
+
+    return {"ok": True}
+
+
+@app.get("/api/v1/later-listens")
+async def list_later_listens(
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """我的稍后听列表。"""
+    uid = int(user["sub"])
+    result = await db.execute(
+        select(LaterListen).where(LaterListen.user_id == uid)
+        .order_by(LaterListen.created_at.desc())
+    )
+    items = result.scalars().all()
+    return {
+        "later_listens": [
+            {
+                "id": i.id,
+                "article_id": i.article_id,
+                "snooze_until": i.snooze_until.isoformat() if i.snooze_until else None,
+                "created_at": i.created_at.isoformat(),
+            }
+            for i in items
+        ]
+    }
+
+
+@app.post("/api/v1/articles/{article_id}/snooze")
+async def snooze_article(
+    article_id: str,
+    body: dict,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """标记稍后听。"""
+    uid = int(user["sub"])
+    art = await db.get(Article, article_id)
+    if not art:
+        raise HTTPException(status_code=404, detail=f"article 不存在: {article_id}")
+
+    snooze_until = body.get("snooze_until")
+    if snooze_until:
+        dt = datetime.fromisoformat(snooze_until.replace("Z", "+00:00"))
+        snooze_until = dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+    existing = await db.scalar(
+        select(LaterListen).where(
+            LaterListen.user_id == uid,
+            LaterListen.article_id == article_id,
+        )
+    )
+    if existing:
+        existing.snooze_until = snooze_until
+        await db.commit()
+        return {"ok": True, "id": existing.id, "updated": True}
+
+    item = LaterListen(user_id=uid, article_id=article_id, snooze_until=snooze_until)
+    db.add(item)
+    await db.commit()
+    await db.refresh(item)
+
+    await track_simple(db, EventName.ARTICLE_SNOOZE, uid, article_id)
+
+    return {"ok": True, "id": item.id}
+
+
+@app.delete("/api/v1/articles/{article_id}/snooze")
+async def unsnooze_article(
+    article_id: str,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """取消稍后听。"""
+    uid = int(user["sub"])
+    existing = await db.scalar(
+        select(LaterListen).where(
+            LaterListen.user_id == uid,
+            LaterListen.article_id == article_id,
+        )
+    )
+    if not existing:
+        return {"ok": True, "was_snoozed": False}
+
+    await db.delete(existing)
+    await db.commit()
+    return {"ok": True}
 
 
 @app.post("/api/v1/articles/{article_id}/skip")

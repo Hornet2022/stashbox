@@ -62,6 +62,7 @@ class EventName(str, Enum):
     ARTICLE_SKIP = "article_skip"
     ARTICLE_RATE = "article_rate"
     SHARE = "share"
+    ARTICLE_SNOOZE = "article_snooze"  # CP5.5
 
     # === 订阅标签（CP6.2.2 全做）===
     TAG_SUBSCRIBE = "tag_subscribe"
