@@ -1124,13 +1124,13 @@ async def create_tag(
         name=req.name,
         category=req.category,
         is_system=False,
-        creator_id=user["id"],
+        creator_id=int(user["sub"]),
     )
     db.add(tag)
     await db.commit()
     await db.refresh(tag)
 
-    await track_simple(db, EventName.TAG_CREATE, user_id=user["id"],
+    await track_simple(db, EventName.TAG_CREATE, user_id=int(user["sub"]),
                        properties={"tag_slug": tag.slug, "category": tag.category})
 
     return {
@@ -1163,11 +1163,11 @@ async def subscribe_tag(
     if existing:
         return {"ok": True, "already_subscribed": True}
 
-    sub = TagSubscription(user_id=user["id"], tag_id=tag.id)
+    sub = TagSubscription(user_id=int(user["sub"]), tag_id=tag.id)
     db.add(sub)
     await db.commit()
 
-    await track_simple(db, EventName.TAG_SUBSCRIBE, user_id=user["id"],
+    await track_simple(db, EventName.TAG_SUBSCRIBE, user_id=int(user["sub"]),
                        properties={"tag_slug": tag.slug})
 
     return {"ok": True, "tag_id": tag.id, "tag_slug": tag.slug}
