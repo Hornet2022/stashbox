@@ -8,6 +8,7 @@ api-gateway 路由表（CP1.7.1）。
 下游 base url 走 Settings（env 可覆盖：CONTENT_SERVICE_URL 等），
 本地 dev 由 run_dev.sh 导出 localhost:810x，容器环境则是 docker 服务名。
 """
+
 from dataclasses import dataclass
 
 from stashbox.backend.common.config import settings
@@ -47,9 +48,7 @@ ROUTES: list[Route] = [
     Route("POST", "/api/v1/articles/add", "content-service", _url("content-service")),
     Route("GET", "/api/v1/articles/pending", "content-service", _url("content-service")),
     Route("GET", "/api/v1/articles/listened", "content-service", _url("content-service")),
-    Route(
-        "GET", "/api/v1/articles/{article_id}", "content-service", _url("content-service")
-    ),
+    Route("GET", "/api/v1/articles/{article_id}", "content-service", _url("content-service")),
     Route(
         "POST",
         "/api/v1/articles/{article_id}/mark-listened",
@@ -71,12 +70,21 @@ ROUTES: list[Route] = [
     # CP5.5 收藏 + 稍后听
     Route("GET", "/api/v1/favorites", "content-service", _url("content-service")),
     Route("GET", "/api/v1/favorites/folders", "content-service", _url("content-service")),
-    Route("POST", "/api/v1/articles/{article_id}/favorites", "content-service", _url("content-service")),
+    Route(
+        "POST",
+        "/api/v1/articles/{article_id}/favorites",
+        "content-service",
+        _url("content-service"),
+    ),
     Route("PATCH", "/api/v1/favorites/{favorite_id}", "content-service", _url("content-service")),
     Route("DELETE", "/api/v1/favorites/{favorite_id}", "content-service", _url("content-service")),
     Route("GET", "/api/v1/later-listens", "content-service", _url("content-service")),
-    Route("POST", "/api/v1/articles/{article_id}/snooze", "content-service", _url("content-service")),
-    Route("DELETE", "/api/v1/articles/{article_id}/snooze", "content-service", _url("content-service")),
+    Route(
+        "POST", "/api/v1/articles/{article_id}/snooze", "content-service", _url("content-service")
+    ),
+    Route(
+        "DELETE", "/api/v1/articles/{article_id}/snooze", "content-service", _url("content-service")
+    ),
     Route("GET", "/api/v1/tags", "content-service", _url("content-service")),
     Route("POST", "/api/v1/distill/start", "ai-service", _url("ai-service")),
     Route("GET", "/api/v1/distill/{task_id}", "ai-service", _url("ai-service")),
@@ -117,16 +125,35 @@ ROUTES += [
     # CP-ADMIN: admin 后台路由（admin-web 通过这些端点运营）
     Route("POST", "/api/v1/admin/auth/login", "user-service", _url("user-service")),
     Route("GET", "/api/v1/admin/users", "user-service", _url("user-service")),
-    Route("POST", "/api/v1/admin/users/{user_id}/quota-adjust", "user-service", _url("user-service")),
-    Route("POST", "/api/v1/admin/articles/{article_id}/force-retry", "content-service", _url("content-service")),
-    Route("POST", "/api/v1/admin/audio/{audio_id}/invalidate", "content-service", _url("content-service")),
+    Route(
+        "POST", "/api/v1/admin/users/{user_id}/quota-adjust", "user-service", _url("user-service")
+    ),
+    Route(
+        "POST",
+        "/api/v1/admin/articles/{article_id}/force-retry",
+        "content-service",
+        _url("content-service"),
+    ),
+    Route(
+        "POST",
+        "/api/v1/admin/audio/{audio_id}/invalidate",
+        "content-service",
+        _url("content-service"),
+    ),
     Route("GET", "/api/v1/admin/audit-log", "content-service", _url("content-service")),
     Route("GET", "/api/v1/admin/stats", "content-service", _url("content-service")),
     Route("GET", "/api/v1/admin/export/users.csv", "content-service", _url("content-service")),
     Route("GET", "/api/v1/admin/export/articles.csv", "content-service", _url("content-service")),
     Route("GET", "/api/v1/admin/export/feedback.csv", "content-service", _url("content-service")),
     Route("GET", "/api/v1/admin/export/audit-log.csv", "content-service", _url("content-service")),
-    Route("GET", "/api/v1/admin/export/subscriptions.csv", "content-service", _url("content-service")),
+    Route(
+        "GET", "/api/v1/admin/export/subscriptions.csv", "content-service", _url("content-service")
+    ),
+    # CP7.3.5: admin LLM 配置（content-service /api/v1/admin/llm/*）。此前未进路由表，
+    # fallback 的第一段路径前缀匹配里没有 admin → 8100 返回 "no downstream route" 404。
+    Route("GET", "/api/v1/admin/llm/config", "content-service", _url("content-service")),
+    Route("PUT", "/api/v1/admin/llm/config", "content-service", _url("content-service")),
+    Route("GET", "/api/v1/admin/llm/test", "content-service", _url("content-service")),
     # admin-web 用的 POST /api/v1/tags + GET /api/v1/notifications（CP3.6-A2 + CP5.4a）
     Route("POST", "/api/v1/tags", "content-service", _url("content-service")),
     Route("GET", "/api/v1/notifications", "user-service", _url("user-service")),
