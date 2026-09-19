@@ -8,6 +8,7 @@ CP1.5：全部走真实 PostgreSQL（articles 表）。
 CP1.7：D9 端到端 —— 不要求登录态 → 建文章 → 自动触发 ai-service 蒸馏 →
 客户端轮询 status / audio-url 拿音频。
 """
+
 import csv
 import io
 import json
@@ -77,11 +78,23 @@ from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common.analytics import track, track_simple
 from stashbox.backend.common.events import EventName
 
+
+def _uid(user: dict) -> int:
+    """§11.15 / CP7.x bugfix: require_user 返回的 payload 没有 id 字段，
+    统一从 sub 解析，且防御性 int()"""
+    try:
+        return int(user["sub"])
+    except (KeyError, ValueError, TypeError):
+        # 兜底：tag 端点 §11.15 用 user["id"] 会 KeyError
+        raise HTTPException(status_code=401, detail="invalid token: missing sub")
+
+
 setup_logging("content-service")
 app = FastAPI(title="stashbox-content-service", version="0.3.0")
 register_exception_handlers(app)
 app.add_middleware(RequestIDMiddleware)
 install_health_endpoints(app)
+
 
 class InvalidRequest(BizException):
     """参数 / 身份类错误（HTTP 400，业务码按场景传）。"""
@@ -222,7 +235,11 @@ def _to_raw_content(result) -> dict:
 
 
 async def _create_article(
-    url: str, user_id: int, source: str, title: str | None, db: AsyncSession,
+    url: str,
+    user_id: int,
+    source: str,
+    title: str | None,
+    db: AsyncSession,
     raw_content: dict | None = None,  # 默认为 None：其他调用点行为不变
 ) -> Article:
     art = Article(
@@ -247,7 +264,7 @@ async def _create_article(
 async def add_article(
     req: AddArticleRequest, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
 ):
-    art = await _create_article(req.url, int(user["sub"]), req.source, None, db)
+    art = await _create_article(req.url, _uid(user), req.source, None, db)
     return _to_response(art)
 
 
@@ -259,7 +276,7 @@ async def submit_article(
 
     扣减走 quota_service 乐观锁（含 Redis Lua 原子失效），配额用尽抛 3001。
     """
-    uid = int(user["sub"])
+    uid = _uid(user)
     quota = await quota_service.consume(db, uid)  # 用尽抛 QuotaExceededError(3001)
     art = await _create_article(req.url, uid, req.source, None, db)
     await cache_service.mark_article_quota(art.id)  # 打标：该文章已扣过配额
@@ -286,10 +303,12 @@ async def list_articles(
 
     admin-web Articles 页调用此端点。
     """
-    uid = int(user["sub"])
+    uid = _uid(user)
 
     total = await db.scalar(
-        select(func.count()).select_from(Article).where(
+        select(func.count())
+        .select_from(Article)
+        .where(
             Article.user_id == uid,
             Article.deleted_at.is_(None),
         )
@@ -315,7 +334,7 @@ async def list_articles(
 
 @app.get("/api/v1/articles/pending")
 async def list_pending(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
-    uid = int(user["sub"])
+    uid = _uid(user)
     cached = await cache_service.get_pending(uid)
     if cached is not None:
         return {"articles": cached, "count": len(cached), "cached": True}
@@ -338,7 +357,7 @@ async def list_pending(user: dict = Depends(require_user), db: AsyncSession = De
 async def list_listened(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(Article).where(
-            Article.user_id == int(user["sub"]),
+            Article.user_id == _uid(user),
             Article.status == "listened",
             Article.deleted_at.is_(None),
         )
@@ -356,7 +375,7 @@ async def get_article(
     if cached:
         return cached
 
-    art = await _get_owned(article_id, int(user["sub"]), db)
+    art = await _get_owned(article_id, _uid(user), db)
     payload = _to_response(art).model_dump()
     await cache_service.set_article(article_id, payload)  # ttl 300s
     return payload
@@ -366,11 +385,11 @@ async def get_article(
 async def mark_listened(
     article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
 ):
-    art = await _get_owned(article_id, int(user["sub"]), db)
+    art = await _get_owned(article_id, _uid(user), db)
     art.status = "listened"
     await db.commit()
     # CP6.2.1 埋点：audio_complete
-    await track_simple(db, EventName.AUDIO_COMPLETE, int(user["sub"]), article_id)
+    await track_simple(db, EventName.AUDIO_COMPLETE, _uid(user), article_id)
     return {"id": article_id, "status": "listened"}
 
 
@@ -426,7 +445,7 @@ async def user_retry_distill(
     if art is None:
         raise NotFound(message=f"article {article_id} not found")
 
-    if art.user_id != int(user["sub"]):
+    if art.user_id != _uid(user):
         raise Forbidden(message="not your article")
 
     if art.status != "failed":
@@ -453,7 +472,7 @@ async def user_retry_distill(
     await push_retry_message(art.user_id, article_id)
 
     # CP5.2 埋点
-    await track_simple(db, EventName.ARTICLE_RETRY_REQUESTED, int(user["sub"]), article_id)
+    await track_simple(db, EventName.ARTICLE_RETRY_REQUESTED, _uid(user), article_id)
 
     return {
         "article_id": article_id,
@@ -520,7 +539,7 @@ async def favorite(
     article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
 ):
     """收藏（v1 §3.1）：articles.favorite=True + feedback(type=favorite)，同一事务。"""
-    uid = int(user["sub"])
+    uid = _uid(user)
     art = await _get_owned(article_id, uid, db)
     art.favorite = True
     fb = await _write_feedback(db, uid, article_id, "favorite")
@@ -541,7 +560,7 @@ async def list_favorites(
     db: AsyncSession = Depends(get_db),
 ):
     """列出我的收藏（可按 folder 过滤）。"""
-    uid = int(user["sub"])
+    uid = _uid(user)
     q = select(Favorite).where(Favorite.user_id == uid)
     if folder:
         q = q.where(Favorite.folder == folder)
@@ -568,7 +587,7 @@ async def list_favorite_folders(
     db: AsyncSession = Depends(get_db),
 ):
     """列出我的所有 folder（去重 + 计数）。"""
-    uid = int(user["sub"])
+    uid = _uid(user)
     result = await db.execute(
         select(Favorite.folder, func.count(Favorite.id))
         .where(Favorite.user_id == uid)
@@ -576,12 +595,7 @@ async def list_favorite_folders(
         .order_by(Favorite.folder)
     )
     rows = result.all()
-    return {
-        "folders": [
-            {"folder": folder, "count": count}
-            for folder, count in rows
-        ]
-    }
+    return {"folders": [{"folder": folder, "count": count} for folder, count in rows]}
 
 
 @app.post("/api/v1/articles/{article_id}/favorites")
@@ -592,7 +606,7 @@ async def add_favorite(
     db: AsyncSession = Depends(get_db),
 ):
     """加收藏（带 folder + note）。"""
-    uid = int(user["sub"])
+    uid = _uid(user)
     folder = body.get("folder", "default")
     note = body.get("note")
 
@@ -618,8 +632,9 @@ async def add_favorite(
     await db.refresh(fav)
 
     # 埋点
-    await track(db, EventName.FAVORITE_ADD, user_id=uid, article_id=article_id,
-                metadata={"folder": folder})
+    await track(
+        db, EventName.FAVORITE_ADD, user_id=uid, article_id=article_id, metadata={"folder": folder}
+    )
 
     return {"ok": True, "id": fav.id, "folder": folder}
 
@@ -632,7 +647,7 @@ async def update_favorite(
     db: AsyncSession = Depends(get_db),
 ):
     """改 folder / note。"""
-    uid = int(user["sub"])
+    uid = _uid(user)
     fav = await db.get(Favorite, favorite_id)
     if not fav or fav.user_id != uid:
         raise NotFound(message="favorite 不存在")
@@ -653,7 +668,7 @@ async def delete_favorite(
     db: AsyncSession = Depends(get_db),
 ):
     """删收藏。"""
-    uid = int(user["sub"])
+    uid = _uid(user)
     fav = await db.get(Favorite, favorite_id)
     if not fav or fav.user_id != uid:
         raise NotFound(message="favorite 不存在")
@@ -673,9 +688,10 @@ async def list_later_listens(
     db: AsyncSession = Depends(get_db),
 ):
     """我的稍后听列表。"""
-    uid = int(user["sub"])
+    uid = _uid(user)
     result = await db.execute(
-        select(LaterListen).where(LaterListen.user_id == uid)
+        select(LaterListen)
+        .where(LaterListen.user_id == uid)
         .order_by(LaterListen.created_at.desc())
     )
     items = result.scalars().all()
@@ -700,7 +716,7 @@ async def snooze_article(
     db: AsyncSession = Depends(get_db),
 ):
     """标记稍后听。"""
-    uid = int(user["sub"])
+    uid = _uid(user)
     art = await db.get(Article, article_id)
     if not art:
         raise NotFound(message=f"article 不存在: {article_id}")
@@ -738,7 +754,7 @@ async def unsnooze_article(
     db: AsyncSession = Depends(get_db),
 ):
     """取消稍后听。"""
-    uid = int(user["sub"])
+    uid = _uid(user)
     existing = await db.scalar(
         select(LaterListen).where(
             LaterListen.user_id == uid,
@@ -766,7 +782,7 @@ async def skip(
     if req.reason not in SKIP_REASONS:
         raise InvalidRequest(message=f"invalid reason: {req.reason}", code=4001)
 
-    uid = int(user["sub"])
+    uid = _uid(user)
     art = await _get_owned(article_id, uid, db)
     art.skip = True
     fb = await _write_feedback(db, uid, article_id, "skip", reason=req.reason)
@@ -787,7 +803,7 @@ async def listen_complete(
     articles 表无 listened_at 列（v1 §4.3.1 未建，本期红线不动 alembic），
     故 listened_at 取 feedback.created_at —— 同一事务里 DB 侧 NOW()，语义等价。
     """
-    uid = int(user["sub"])
+    uid = _uid(user)
     await _get_owned(article_id, uid, db)
     meta = {"duration_sec": req.duration_sec} if req.duration_sec is not None else {}
     fb = await _write_feedback(db, uid, article_id, "listen_complete", metadata=meta)
@@ -816,12 +832,10 @@ async def rate(
     if not 1 <= req.rating <= 5:
         raise InvalidRequest(message="rating must be between 1 and 5", code=4001)
 
-    uid = int(user["sub"])
+    uid = _uid(user)
     await _get_owned(article_id, uid, db)
     meta = {"comment": req.comment} if req.comment else {}
-    fb = await _write_feedback(
-        db, uid, article_id, "rate", rating=req.rating, metadata=meta
-    )
+    fb = await _write_feedback(db, uid, article_id, "rate", rating=req.rating, metadata=meta)
     await db.commit()
     await db.refresh(fb)
     return {"id": article_id, "rating": req.rating, "feedback_id": fb.id}
@@ -849,7 +863,7 @@ async def create_feedback_v2(
     db: AsyncSession = Depends(get_db),
 ):
     """提交反馈（分类 + 可选评分）。"""
-    uid = int(user["sub"])
+    uid = _uid(user)
 
     # 校验 category
     if body.category not in FEEDBACK_CATEGORIES:
@@ -910,7 +924,7 @@ async def list_my_feedback_v2(
     limit: int = 50,
 ):
     """列出我提交的反馈。"""
-    uid = int(user["sub"])
+    uid = _uid(user)
     q = select(FeedbackV2).where(FeedbackV2.user_id == uid)
     if category:
         q = q.where(FeedbackV2.category == category)
@@ -951,7 +965,7 @@ async def d9_add_article(
     _validate_url(req.url)
 
     if user is not None:
-        uid = int(user["sub"])
+        uid = _uid(user)
         await quota_service.consume(db, uid)  # 用尽抛 QuotaExceededError(3001)
     else:
         uid = ANONYMOUS_USER_ID
@@ -975,7 +989,7 @@ async def article_status(
     article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
 ):
     """文章 + 蒸馏任务聚合状态（v1 §11.4 CP1.7）：客户端轮询这个端点等 ready。"""
-    art, task = await _get_owned_with_task(article_id, int(user["sub"]), db)
+    art, task = await _get_owned_with_task(article_id, _uid(user), db)
     return ArticleStatusResponse(
         article_id=art.id,
         status=_derive_status(art, task),
@@ -999,14 +1013,14 @@ async def article_audio_url(
 
     OSS 签名本期 mock（CP1.8+ 接真签名，依赖阿里云 RAM 配置）。
     """
-    art, task = await _get_owned_with_task(article_id, int(user["sub"]), db)
+    art, task = await _get_owned_with_task(article_id, _uid(user), db)
     if _derive_status(art, task) != "ready":
         raise NotFound(message=f"audio not ready for article {article_id}")
 
     expires_ts = int(time.time()) + AUDIO_URL_TTL_SEC
     base = (task.audio_url if task else None) or f"{OSS_AUDIO_BASE}/{art.id}.m4a"
     # CP6.2.1 埋点：audio_play_start
-    await track_simple(db, EventName.AUDIO_PLAY_START, int(user["sub"]), article_id)
+    await track_simple(db, EventName.AUDIO_PLAY_START, _uid(user), article_id)
     return AudioUrlResponse(
         article_id=art.id,
         audio_url=f"{base}?Expires={expires_ts}&OSSAccessKeyId=mock&Signature=mock",
@@ -1017,19 +1031,19 @@ async def article_audio_url(
 
 @app.post("/api/v1/callback/clawbot-message")
 async def clawbot_message(
-    req: ClawBotMessageRequest, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+    req: ClawBotMessageRequest,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """ClawBot 入口（mock）：接收消息，解析出 URL 则建文章。"""
     art = None
     if "http" in req.text:
-        art = await _create_article(req.text, int(user["sub"]), "clawbot", None, db)
+        art = await _create_article(req.text, _uid(user), "clawbot", None, db)
     return {"received": True, "article": _to_response(art) if art else None}
 
 
 @app.post("/api/v1/callback/wechat-mp-message")
-async def wechat_mp_message(
-    req: WechatMpMessageRequest, db: AsyncSession = Depends(get_db)
-):
+async def wechat_mp_message(req: WechatMpMessageRequest, db: AsyncSession = Depends(get_db)):
     """微信公众号服务号回调（v1 §11.2 CP2.5）。
 
     接收用户发给服务号的 URL → 路由 fetcher 抓正文 → 建文章 → 触发蒸馏。
@@ -1053,18 +1067,30 @@ async def wechat_mp_message(
     except FetcherError as exc:
         # CP6.2.2.2a: ARTICLE_CAPTURE_FAILED / ARTICLE_UNSUPPORTED 埋点
         if exc.code == FetcherErrorCode.UNSUPPORTED:
-            await track(db, EventName.ARTICLE_UNSUPPORTED,
-                        user_id=ANONYMOUS_USER_ID, article_id="n/a",
-                        metadata={"error": exc.message})
+            await track(
+                db,
+                EventName.ARTICLE_UNSUPPORTED,
+                user_id=ANONYMOUS_USER_ID,
+                article_id="n/a",
+                metadata={"error": exc.message},
+            )
         else:
-            await track(db, EventName.ARTICLE_CAPTURE_FAILED,
-                        user_id=ANONYMOUS_USER_ID, article_id="n/a",
-                        metadata={"error": exc.code.value if hasattr(exc.code, 'value') else str(exc.code)})
+            await track(
+                db,
+                EventName.ARTICLE_CAPTURE_FAILED,
+                user_id=ANONYMOUS_USER_ID,
+                article_id="n/a",
+                metadata={"error": exc.code.value if hasattr(exc.code, "value") else str(exc.code)},
+            )
         raise map_fetcher_error(exc) from exc
 
     await _ensure_anonymous_user(db)
     art = await _create_article(
-        url, ANONYMOUS_USER_ID, "wechat_mp", result.title or None, db,
+        url,
+        ANONYMOUS_USER_ID,
+        "wechat_mp",
+        result.title or None,
+        db,
         raw_content=_to_raw_content(result),  # FetchResult → JSONB，免二次抓取
     )
     task = await get_ai_client().trigger_distill(
@@ -1124,14 +1150,18 @@ async def create_tag(
         name=req.name,
         category=req.category,
         is_system=False,
-        creator_id=int(user["sub"]),
+        creator_id=_uid(user),
     )
     db.add(tag)
     await db.commit()
     await db.refresh(tag)
 
-    await track_simple(db, EventName.TAG_CREATE, user_id=int(user["sub"]),
-                       properties={"tag_slug": tag.slug, "category": tag.category})
+    await track_simple(
+        db,
+        EventName.TAG_CREATE,
+        user_id=_uid(user),
+        properties={"tag_slug": tag.slug, "category": tag.category},
+    )
 
     return {
         "id": tag.slug,
@@ -1156,19 +1186,20 @@ async def subscribe_tag(
 
     existing = await db.scalar(
         select(TagSubscription).where(
-            TagSubscription.user_id == user["id"],
+            TagSubscription.user_id == _uid(user),
             TagSubscription.tag_id == tag.id,
         )
     )
     if existing:
         return {"ok": True, "already_subscribed": True}
 
-    sub = TagSubscription(user_id=int(user["sub"]), tag_id=tag.id)
+    sub = TagSubscription(user_id=_uid(user), tag_id=tag.id)
     db.add(sub)
     await db.commit()
 
-    await track_simple(db, EventName.TAG_SUBSCRIBE, user_id=int(user["sub"]),
-                       properties={"tag_slug": tag.slug})
+    await track_simple(
+        db, EventName.TAG_SUBSCRIBE, user_id=_uid(user), properties={"tag_slug": tag.slug}
+    )
 
     return {"ok": True, "tag_id": tag.id, "tag_slug": tag.slug}
 
@@ -1189,7 +1220,7 @@ async def unsubscribe_tag(
 
     result = await db.execute(
         delete(TagSubscription).where(
-            TagSubscription.user_id == user["id"],
+            TagSubscription.user_id == _uid(user),
             TagSubscription.tag_id == tag.id,
         )
     )
@@ -1198,8 +1229,9 @@ async def unsubscribe_tag(
     if result.rowcount == 0:
         return {"ok": True, "already_unsubscribed": True}
 
-    await track_simple(db, EventName.TAG_UNSUBSCRIBE, user_id=user["id"],
-                       properties={"tag_slug": tag.slug})
+    await track_simple(
+        db, EventName.TAG_UNSUBSCRIBE, user_id=_uid(user), properties={"tag_slug": tag.slug}
+    )
 
     return {"ok": True, "tag_id": tag.id, "tag_slug": tag.slug}
 
@@ -1244,7 +1276,7 @@ async def admin_force_retry(
     art.status = "pending"
 
     log_row = AdminOperationLog(
-        admin_id=int(user["sub"]),
+        admin_id=_uid(user),
         admin_tier=user.get("tier", "unknown"),
         action="force_retry",
         target_type="article",
@@ -1303,7 +1335,7 @@ async def admin_audio_invalidate(
     audio.status = "invalidated"
 
     log_row = AdminOperationLog(
-        admin_id=int(user["sub"]),
+        admin_id=_uid(user),
         admin_tier=user.get("tier", "unknown"),
         action="audio_invalidate",
         target_type="audio",
@@ -1360,12 +1392,14 @@ async def admin_audit_log(
 
     total = await db.scalar(select(func.count()).select_from(query.subquery()))
     rows = (
-        await db.execute(
-            query.order_by(AdminOperationLog.created_at.desc())
-            .offset(offset)
-            .limit(size)
+        (
+            await db.execute(
+                query.order_by(AdminOperationLog.created_at.desc()).offset(offset).limit(size)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     items = [
         {
@@ -1425,6 +1459,7 @@ def _stream_csv(filename: str, header: list[str], fetch_rows=None) -> StreamingR
     ``Depends(get_db)``）在生成器内执行，避免请求级 session 在响应体流式发送
     期间被依赖注入提前 close。``fetch_rows=None`` 时只回 header（表缺失降级）。
     """
+
     async def _gen():
         yield "\ufeff"  # UTF-8 BOM：Excel 直接打开中文列名/内容不乱码
         yield _csv_chunk([header])
@@ -1447,7 +1482,7 @@ async def _write_export_log(
     """每次导出写一条 admin_operation_logs（响应开始前提交，客户端中断也留痕）。"""
     db.add(
         AdminOperationLog(
-            admin_id=int(user["sub"]),
+            admin_id=_uid(user),
             admin_tier=user.get("tier", "unknown"),
             action=_EXPORT_LOG_ACTION,
             target_type="export",
@@ -1488,8 +1523,16 @@ async def admin_export_users_csv(
     path = "/api/v1/admin/export/users.csv"
     filename = _csv_filename("users")
     header = [
-        "id", "email", "display_name", "role", "tier", "status",
-        "monthly_quota", "used_quota", "last_active_at", "created_at",
+        "id",
+        "email",
+        "display_name",
+        "role",
+        "tier",
+        "status",
+        "monthly_quota",
+        "used_quota",
+        "last_active_at",
+        "created_at",
     ]
     total = await db.scalar(select(func.count()).select_from(User)) or 0
     await _write_export_log(db, user, path, filename, total)
@@ -1498,8 +1541,16 @@ async def admin_export_users_csv(
         result = await session.stream(select(User).order_by(User.id))
         async for u in result.scalars():
             yield [
-                u.id, u.email, u.nickname, u.tier, u.tier, "active",
-                u.monthly_quota, u.quota_used, None, u.created_at,
+                u.id,
+                u.email,
+                u.nickname,
+                u.tier,
+                u.tier,
+                "active",
+                u.monthly_quota,
+                u.quota_used,
+                None,
+                u.created_at,
             ]
 
     return _stream_csv(filename, header, fetch)
@@ -1517,8 +1568,16 @@ async def admin_export_articles_csv(
     path = "/api/v1/admin/export/articles.csv"
     filename = _csv_filename("articles")
     header = [
-        "id", "user_id", "title", "source", "url", "status",
-        "tags", "quality_score", "listened_at", "created_at",
+        "id",
+        "user_id",
+        "title",
+        "source",
+        "url",
+        "status",
+        "tags",
+        "quality_score",
+        "listened_at",
+        "created_at",
     ]
     total = await db.scalar(select(func.count()).select_from(Article)) or 0
     await _write_export_log(db, user, path, filename, total)
@@ -1540,9 +1599,16 @@ async def admin_export_articles_csv(
         async for row in result:
             art, tags, score, listened = row
             yield [
-                art.id, art.user_id, art.title, art.source, art.url, art.status,
+                art.id,
+                art.user_id,
+                art.title,
+                art.source,
+                art.url,
+                art.status,
                 "|".join(str(t) for t in tags) if tags else "",
-                score, listened, art.created_at,
+                score,
+                listened,
+                art.created_at,
             ]
 
     return _stream_csv(filename, header, fetch)
@@ -1563,8 +1629,14 @@ async def admin_export_feedback_csv(
         result = await session.stream(select(Feedback).order_by(Feedback.id))
         async for f in result.scalars():
             yield [
-                f.id, f.user_id, f.article_id, f.type,
-                f.rating, f.reason, f.metadata_, f.created_at,
+                f.id,
+                f.user_id,
+                f.article_id,
+                f.type,
+                f.rating,
+                f.reason,
+                f.metadata_,
+                f.created_at,
             ]
 
     return _stream_csv(filename, header, fetch)
@@ -1582,7 +1654,13 @@ async def admin_export_audit_log_csv(
     path = "/api/v1/admin/export/audit-log.csv"
     filename = _csv_filename("audit-log")
     header = [
-        "id", "actor_id", "action_type", "target_type", "target_id", "payload", "created_at",
+        "id",
+        "actor_id",
+        "action_type",
+        "target_type",
+        "target_id",
+        "payload",
+        "created_at",
     ]
     total = await db.scalar(select(func.count()).select_from(AdminOperationLog)) or 0
     await _write_export_log(db, user, path, filename, total)
@@ -1594,8 +1672,13 @@ async def admin_export_audit_log_csv(
         result = await session.stream(stmt)
         async for r in result.scalars():
             yield [
-                r.id, r.admin_id, r.action, r.target_type,
-                r.target_id, r.request_body, r.created_at,
+                r.id,
+                r.admin_id,
+                r.action,
+                r.target_type,
+                r.target_id,
+                r.request_body,
+                r.created_at,
             ]
 
     return _stream_csv(filename, header, fetch)
@@ -1633,8 +1716,13 @@ async def admin_export_subscriptions_csv(
         )
         async for r in result:
             yield [
-                r.id, r.user_id, r.tier, r.started_at,
-                r.expires_at, r.status, r.auto_renew,
+                r.id,
+                r.user_id,
+                r.tier,
+                r.started_at,
+                r.expires_at,
+                r.status,
+                r.auto_renew,
             ]
 
     return _stream_csv(filename, header, fetch)
@@ -1660,7 +1748,9 @@ async def _safe_revenue(db: AsyncSession) -> float:
 
 
 @app.get("/api/v1/admin/stats")
-async def admin_stats(user: dict = Depends(require_admin_or_operator), db: AsyncSession = Depends(get_db)):
+async def admin_stats(
+    user: dict = Depends(require_admin_or_operator), db: AsyncSession = Depends(get_db)
+):
     total_users = await db.scalar(select(func.count()).select_from(User))
     total_articles = await db.scalar(select(func.count()).select_from(Article))
     pending = await db.scalar(
