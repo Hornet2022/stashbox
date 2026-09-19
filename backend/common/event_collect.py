@@ -1,8 +1,9 @@
 """客户端事件收集端点 SDK 适配层（CP6.2.2.1）。"""
+
 import time
 from typing import Any, Dict, List, Optional
 from datetime import datetime
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from stashbox.backend.common.events import EventName
@@ -28,6 +29,7 @@ class EventCollectRequest(BaseModel):
       传 track 时 0 替代 None（Feedback.user_id 非空）
     - device_id/client_ts: 按 task §4.3 末尾推荐方案，塞 properties dict，不动 schema
     """
+
     event_name: str = Field(..., min_length=1, max_length=64)
     device_id: str = Field(..., min_length=1, max_length=128)
     user_id: Optional[int] = None
@@ -59,7 +61,7 @@ def _validate_event_name(name: str) -> EventName:
 
 
 @router.post("/collect")
-async def collect_event(req: EventCollectRequest, request: Request) -> Dict[str, Any]:
+async def collect_event(req: EventCollectRequest) -> Dict[str, Any]:
     """客户端 SDK 上报事件端点（CP6.2.2.1 最小化版）。
 
     协议：device_id 必填 + event_name 在 EventName 枚举内。
@@ -75,27 +77,22 @@ async def collect_event(req: EventCollectRequest, request: Request) -> Dict[str,
         "client_ts": req.client_ts.isoformat() if req.client_ts else None,
     }
 
-    # 拿 db session —— 通过 request.app.state.db（lifespan 启动时挂上）
-    # 如 api-gateway lifespan 没挂 db，fallback 走 AsyncSessionLocal（CP1.5 已有）
-    db = getattr(request.app.state, "db", None)
-    if db is None:
-        # get_sessionmaker() fallback：task §4.3 引用 get_sessionmaker，但 CP1.5
-        # 实为 AsyncSessionLocal（async_sessionmaker），直接用 AsyncSessionLocal
-        async with AsyncSessionLocal() as session:
-            record_id = await track(
-                session,
-                event,
-                user_id=req.user_id or 0,
-                article_id=str(req.article_id) if req.article_id else "0",
-                metadata=properties_with_meta,
-            )
-    else:
+    # 本端点没有 Depends(get_db) 注入的请求级事务，自己开一个 session。
+    # 注意（CP7.3-audit-fix-2）：track() 只 flush 不 commit（见 analytics.py），
+    # 而 `async with AsyncSessionLocal() as session` 退出时只 close、不 commit
+    # （database.get_db() 同样只在 finally 里 close），未提交的事务会被回滚 ——
+    # 原来这里没有 commit，导致客户端 SDK 上报的事件 100% 静默丢失。
+    async with AsyncSessionLocal() as session:
         record_id = await track(
-            db,
+            session,
             event,
             user_id=req.user_id or 0,
             article_id=str(req.article_id) if req.article_id else "0",
             metadata=properties_with_meta,
         )
+        if record_id is None:
+            # track 内部已 rollback，事件没落库 —— 不许谎报 ok=True
+            return {"ok": False, "event_id": None}
+        await session.commit()
 
     return {"ok": True, "event_id": record_id}
