@@ -800,8 +800,22 @@ async def snooze_article(
     )
     if existing:
         existing.snooze_until = snooze_until
+        item_id = existing.id  # 局部变量前置，防 commit 后 expire
+
+        # 埋点（必须在 commit 之前：track() 只 flush，否则随 close() 隐式 rollback 丢失）
+        try:
+            await track(
+                db,
+                EventName.ARTICLE_SNOOZE,
+                user_id=uid,
+                article_id=article_id,
+                metadata={"updated": True},  # 与新建分支区分
+            )
+        except Exception as exc:
+            log.warning(f"ARTICLE_SNOOZE 埋点异常（忽略）: article={article_id} err={exc}")
+
         await db.commit()
-        return {"ok": True, "id": existing.id, "updated": True}
+        return {"ok": True, "id": item_id, "updated": True}
 
     item = LaterListen(user_id=uid, article_id=article_id, snooze_until=snooze_until)
     db.add(item)
