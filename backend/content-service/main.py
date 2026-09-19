@@ -1469,6 +1469,8 @@ class LLMConfigUpdate(BaseModel):
     provider: str
     model: str | None = None
     api_key: str | None = None  # 空/不传 = 不动已存的那把 key
+    # 不传 = 不动已存的 base_url；显式 null / "" = 清空（回落到 env）
+    base_url: str | None = None
 
 
 def _masked_llm_config(config: dict, source: str, updated_at: str | None) -> dict:
@@ -1477,6 +1479,7 @@ def _masked_llm_config(config: dict, source: str, updated_at: str | None) -> dic
     return {
         "provider": config["provider"],
         "model": config["model"],
+        "base_url": config.get("base_url") or None,
         "api_key_set": bool(api_key),
         "api_key_last4": api_key[-4:] if api_key else None,
         "source": source,  # db = 表里配了；env = 回落环境变量/默认值
@@ -1511,6 +1514,8 @@ async def admin_llm_config_put(
         stored["model"] = req.model
     if req.api_key:
         stored["api_key"] = req.api_key
+    if "base_url" in req.model_fields_set:  # 显式传了才动（null / "" = 清空）
+        stored["base_url"] = (req.base_url or "").strip() or None
 
     row = await system_config.set_config(system_config.KEY_LLM, stored, updated_by=_uid(user))
     client = await reload()  # 改完即生效，不用重启进程

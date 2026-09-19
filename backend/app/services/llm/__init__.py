@@ -37,6 +37,8 @@ def _env_config() -> dict[str, Any]:
         "provider": os.getenv("LLM_PROVIDER", "mock").lower(),
         "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         "api_key": os.getenv("OPENAI_API_KEY", ""),
+        # CP7.3.3：base_url 只做「读出来给 admin 展示」这一层，client 怎么用它不在本任务范围
+        "base_url": os.getenv("LLM_BASE_URL", ""),
     }
 
 
