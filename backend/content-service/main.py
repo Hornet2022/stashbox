@@ -1161,19 +1161,25 @@ async def create_tag(
         creator_id=_uid(user),
     )
     db.add(tag)
-    await db.commit()
-    await db.refresh(tag)
 
+    # track() 只 flush 不 commit，get_db() 收尾只 close 不 commit —— 埋点必须在
+    # commit() 之前写，否则 flush 的 feedback 行会被 close() 的隐式 rollback 丢掉。
     # 埋点失败时 track() 内部会 rollback（expire 掉 ORM 对象），故先取响应字段
     tag_slug, tag_name, tag_category = tag.slug, tag.name, tag.category
 
-    await track(
-        db,
-        EventName.TAG_CREATE,
-        user_id=_uid(user),
-        article_id="n/a",  # 标签事件无关联文章，但 feedback.article_id NOT NULL
-        metadata={"tag_slug": tag_slug, "category": tag_category},
-    )
+    try:
+        await track(
+            db,
+            EventName.TAG_CREATE,
+            user_id=_uid(user),
+            article_id="n/a",  # 标签事件无关联文章，但 feedback.article_id NOT NULL
+            metadata={"tag_slug": tag_slug, "category": tag_category},
+        )
+    except Exception as exc:
+        # track() 内部已兜底，这里是双保险：埋点失败不能拖垮业务
+        log.warning(f"TAG_CREATE 埋点异常（忽略）: slug={tag_slug} err={exc}")
+
+    await db.commit()
 
     return {
         "id": tag_slug,
@@ -1210,15 +1216,20 @@ async def subscribe_tag(
 
     sub = TagSubscription(user_id=_uid(user), tag_id=tag_id)
     db.add(sub)
-    await db.commit()
 
-    await track(
-        db,
-        EventName.TAG_SUBSCRIBE,
-        user_id=_uid(user),
-        article_id="n/a",  # 标签事件无关联文章，但 feedback.article_id NOT NULL
-        metadata={"tag_slug": tag_slug},
-    )
+    # track() 只 flush 不 commit —— 必须在 commit() 之前，否则埋点随 close() 回滚丢失
+    try:
+        await track(
+            db,
+            EventName.TAG_SUBSCRIBE,
+            user_id=_uid(user),
+            article_id="n/a",  # 标签事件无关联文章，但 feedback.article_id NOT NULL
+            metadata={"tag_slug": tag_slug},
+        )
+    except Exception as exc:
+        log.warning(f"TAG_SUBSCRIBE 埋点异常（忽略）: slug={tag_slug} err={exc}")
+
+    await db.commit()
 
     return {"ok": True, "tag_id": tag_id, "tag_slug": tag_slug}
 
@@ -1246,18 +1257,23 @@ async def unsubscribe_tag(
             TagSubscription.tag_id == tag_id,
         )
     )
-    await db.commit()
-
     if result.rowcount == 0:
+        # 无订阅可删，直接返回；delete 未 commit 也无需回滚
         return {"ok": True, "already_unsubscribed": True}
 
-    await track(
-        db,
-        EventName.TAG_UNSUBSCRIBE,
-        user_id=_uid(user),
-        article_id="n/a",  # 标签事件无关联文章，但 feedback.article_id NOT NULL
-        metadata={"tag_slug": tag_slug},
-    )
+    # track() 只 flush 不 commit —— 必须在 commit() 之前，否则埋点随 close() 回滚丢失
+    try:
+        await track(
+            db,
+            EventName.TAG_UNSUBSCRIBE,
+            user_id=_uid(user),
+            article_id="n/a",  # 标签事件无关联文章，但 feedback.article_id NOT NULL
+            metadata={"tag_slug": tag_slug},
+        )
+    except Exception as exc:
+        log.warning(f"TAG_UNSUBSCRIBE 埋点异常（忽略）: slug={tag_slug} err={exc}")
+
+    await db.commit()
 
     return {"ok": True, "tag_id": tag_id, "tag_slug": tag_slug}
 
