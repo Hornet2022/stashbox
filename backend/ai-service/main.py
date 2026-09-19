@@ -5,6 +5,7 @@ CP1.5：蒸馏任务写真实 PostgreSQL（distilled_articles 表），状态机
 本期 mock：用 asyncio.sleep(2) 模拟每步耗时，不调真实 LLM / TTS（CP3 才接）。
 不读 Article 表（CP3 才接 D9 → 蒸馏全链路）；distill/{id} 经 articles 校验归属。
 """
+
 import asyncio
 import logging
 import uuid
@@ -147,9 +148,7 @@ async def _run_pipeline(task_id: str, simulate_failure: bool = False) -> None:
             return
 
         da.status = "done"
-        da.audio_url = (
-            f"https://stashbox-audio.oss-cn-hangzhou.aliyuncs.com/{da.article_id}.m4a"
-        )
+        da.audio_url = f"https://stashbox-audio.oss-cn-hangzhou.aliyuncs.com/{da.article_id}.m4a"
         da.duration_sec = 300
         da.tags = ["科技", "商业"]
         da.quality_score = 8.5
@@ -247,9 +246,9 @@ async def distill_article(
 
     # 幂等：该文章已有蒸馏任务 → 不再扣配额
     existed = await db.scalar(
-        select(func.count()).select_from(DistilledArticle).where(
-            DistilledArticle.article_id == article_id
-        )
+        select(func.count())
+        .select_from(DistilledArticle)
+        .where(DistilledArticle.article_id == article_id)
     )
     already_charged = existed > 0
     quota_used = None
@@ -268,6 +267,12 @@ async def distill_article(
     )
     db.add(da)
     art.status = "distilling"
+    # CP6.2.1 埋点：distill_start
+    # track() 只 flush 不 commit —— 必须在 commit() 之前，否则埋点随 close() 回滚丢失
+    try:
+        await track_simple(db, EventName.DISTILL_START, uid, article_id)
+    except Exception as exc:
+        log.warning(f"DISTILL_START 埋点异常（忽略）: article={article_id} err={exc}")
     await db.commit()
 
     job_id = await get_dispatcher().enqueue_distill(
@@ -278,8 +283,7 @@ async def distill_article(
         title=art.title,
         simulate_failure=simulate_failure,
     )
-    # CP6.2.1 埋点：distill_start
-    await track_simple(db, EventName.DISTILL_START, uid, article_id)
+    # 埋点已在 commit() 之前完成（DISTILL_START）
 
     if quota_used is None:
         quota_used = (await quota_service.get_quota(db, uid))["quota_used"]
@@ -297,9 +301,7 @@ async def distill_article(
 async def distill_status(
     task_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
 ):
-    result = await db.execute(
-        select(DistilledArticle).where(DistilledArticle.id == task_id)
-    )
+    result = await db.execute(select(DistilledArticle).where(DistilledArticle.id == task_id))
     da = result.scalar_one_or_none()
     if da is None:
         raise NotFound(message=f"task {task_id} not found")
