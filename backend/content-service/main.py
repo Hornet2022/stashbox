@@ -24,6 +24,7 @@ from typing import Annotated
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select, text
@@ -52,6 +53,7 @@ from schemas import (  # noqa: E402
 )
 
 from stashbox.backend.common import cache_service, quota_service
+from stashbox.backend.common.config import settings
 from stashbox.backend.common.auth import create_access_token, require_user, require_user_optional
 from stashbox.backend.common.auth_admin import require_admin_or_operator
 from stashbox.backend.common.database import AsyncSessionLocal, get_db
@@ -102,6 +104,18 @@ app = FastAPI(title="stashbox-content-service", version="0.3.0")
 register_exception_handlers(app)
 app.add_middleware(RequestIDMiddleware)
 install_health_endpoints(app)
+# CORS（CP7.3.5）：content-service 此前没装 CORS 中间件，浏览器直连被拦，admin-web
+# 只能用 vite proxy 绕过 —— 生产部署没有 proxy，这里必须后端真支持。
+# 必须最后 add：FastAPI 中间件倒序执行（最后 add 最先 run = 最外层），
+# 这样 OPTIONS 预检在最外层就被吃掉，不会落到下游路由匹配。origin 白名单走
+# settings.cors_origins（env: CORS_ORIGINS，逗号分隔），不硬编码到代码里。
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class InvalidRequest(BizException):
