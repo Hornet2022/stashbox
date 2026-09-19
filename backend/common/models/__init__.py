@@ -1,4 +1,5 @@
 """stashbox 核心 ORM 模型。"""
+
 from .base import Base, TimestampMixin
 from .user import User
 from .article import Article
@@ -9,6 +10,7 @@ from .tag import Tag, TagSubscription
 from .admin_operation_log import AdminOperationLog
 from .favorite import Favorite
 from .later_listen import LaterListen
+from .system_config import SystemConfig
 
 __all__ = [
     "Base",
@@ -23,4 +25,5 @@ __all__ = [
     "AdminOperationLog",
     "Favorite",
     "LaterListen",
+    "SystemConfig",
 ]
