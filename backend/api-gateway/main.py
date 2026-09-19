@@ -74,6 +74,7 @@ async def lifespan(app: FastAPI):
     try:
         async with AsyncSessionLocal() as session:
             await track_simple(session, EventName.SERVICE_START, 0, "n/a")
+            await session.commit()  # track() 只 flush 不 commit
     except Exception:
         pass  # 失败不阻塞 startup
     yield
@@ -81,6 +82,7 @@ async def lifespan(app: FastAPI):
     try:
         async with AsyncSessionLocal() as session:
             await track_simple(session, EventName.SERVICE_STOP, 0, "n/a")
+            await session.commit()  # track() 只 flush 不 commit
     except Exception:
         pass
     await app.state.httpx.aclose()
