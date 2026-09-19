@@ -395,9 +395,21 @@ async def mark_listened(
 ):
     art = await _get_owned(article_id, _uid(user), db)
     art.status = "listened"
+
+    # track() 只 flush 不 commit，get_db() 收尾只 close —— 埋点必须在 commit() 之前写，
+    # 否则 flush 出来的 feedback 行被 close() 的隐式 rollback 丢掉（CP7.3.4）。
+    try:
+        await track(
+            db,
+            EventName.AUDIO_COMPLETE,
+            user_id=_uid(user),
+            article_id=article_id,
+        )
+    except Exception as exc:
+        # track() 内部已兜底，这里是双保险：埋点失败不能拖垮业务
+        log.warning(f"AUDIO_COMPLETE 埋点异常（忽略）: article={article_id} err={exc}")
+
     await db.commit()
-    # CP6.2.1 埋点：audio_complete
-    await track_simple(db, EventName.AUDIO_COMPLETE, _uid(user), article_id)
     return {"id": article_id, "status": "listened"}
 
 
@@ -465,6 +477,21 @@ async def user_retry_distill(
     art.status = "pending"
     art.retry_count = (art.retry_count or 0) + 1
 
+    # 响应字段先取局部变量：track() 失败会 rollback，rollback 会 expire ORM 对象
+    retry_count = art.retry_count
+    art_user_id = art.user_id
+
+    # CP5.2 埋点（必须在 commit 之前：track() 只 flush，否则随 close() 隐式 rollback 丢失）
+    try:
+        await track(
+            db,
+            EventName.ARTICLE_RETRY_REQUESTED,
+            user_id=_uid(user),
+            article_id=article_id,
+        )
+    except Exception as exc:
+        log.warning(f"ARTICLE_RETRY_REQUESTED 埋点异常（忽略）: article={article_id} err={exc}")
+
     try:
         await db.commit()
     except Exception:
@@ -473,19 +500,16 @@ async def user_retry_distill(
 
     # 触发蒸馏
     queued = await get_ai_client().trigger_distill(
-        article_id, auth_token=create_access_token(str(art.user_id))
+        article_id, auth_token=create_access_token(str(art_user_id))
     )
 
     # 写推送"换源重试"卡片（CP5.4b push 队列）
-    await push_retry_message(art.user_id, article_id)
-
-    # CP5.2 埋点
-    await track_simple(db, EventName.ARTICLE_RETRY_REQUESTED, _uid(user), article_id)
+    await push_retry_message(art_user_id, article_id)
 
     return {
         "article_id": article_id,
         "status": "pending",
-        "retry_count": art.retry_count,
+        "retry_count": retry_count,
         "queued_at": datetime.now(timezone.utc).isoformat(),
         "distill_triggered": queued is not None,
     }
@@ -636,15 +660,25 @@ async def add_favorite(
 
     fav = Favorite(user_id=uid, article_id=article_id, folder=folder, note=note)
     db.add(fav)
+    await db.flush()  # 先拿 id（响应字段），但事务不结束，埋点同事务一起提交
+    fav_id = fav.id
+
+    # 埋点（必须在 commit 之前：track() 只 flush，否则随 close() 隐式 rollback 丢失）
+    try:
+        await track(
+            db,
+            EventName.FAVORITE_ADD,
+            user_id=uid,
+            article_id=article_id,
+            metadata={"folder": folder},
+        )
+    except Exception as exc:
+        # track() 内部已兜底，这里是双保险：埋点失败不能拖垮业务
+        log.warning(f"FAVORITE_ADD 埋点异常（忽略）: article={article_id} err={exc}")
+
     await db.commit()
-    await db.refresh(fav)
 
-    # 埋点
-    await track(
-        db, EventName.FAVORITE_ADD, user_id=uid, article_id=article_id, metadata={"folder": folder}
-    )
-
-    return {"ok": True, "id": fav.id, "folder": folder}
+    return {"ok": True, "id": fav_id, "folder": folder}
 
 
 @app.patch("/api/v1/favorites/{favorite_id}")
@@ -681,11 +715,21 @@ async def delete_favorite(
     if not fav or fav.user_id != uid:
         raise NotFound(message="favorite 不存在")
 
-    article_id = fav.article_id
+    article_id = fav.article_id  # 响应/埋点字段先取局部变量
     await db.delete(fav)
-    await db.commit()
 
-    await track_simple(db, EventName.FAVORITE_REMOVE, uid, article_id)
+    # 埋点（必须在 commit 之前：track() 只 flush，否则随 close() 隐式 rollback 丢失）
+    try:
+        await track(
+            db,
+            EventName.FAVORITE_REMOVE,
+            user_id=uid,
+            article_id=article_id,
+        )
+    except Exception as exc:
+        log.warning(f"FAVORITE_REMOVE 埋点异常（忽略）: article={article_id} err={exc}")
+
+    await db.commit()
 
     return {"ok": True}
 
@@ -747,12 +791,23 @@ async def snooze_article(
 
     item = LaterListen(user_id=uid, article_id=article_id, snooze_until=snooze_until)
     db.add(item)
+    await db.flush()  # 先拿 id（响应字段），但事务不结束，埋点同事务一起提交
+    item_id = item.id
+
+    # 埋点（必须在 commit 之前：track() 只 flush，否则随 close() 隐式 rollback 丢失）
+    try:
+        await track(
+            db,
+            EventName.ARTICLE_SNOOZE,
+            user_id=uid,
+            article_id=article_id,
+        )
+    except Exception as exc:
+        log.warning(f"ARTICLE_SNOOZE 埋点异常（忽略）: article={article_id} err={exc}")
+
     await db.commit()
-    await db.refresh(item)
 
-    await track_simple(db, EventName.ARTICLE_SNOOZE, uid, article_id)
-
-    return {"ok": True, "id": item.id}
+    return {"ok": True, "id": item_id}
 
 
 @app.delete("/api/v1/articles/{article_id}/snooze")
