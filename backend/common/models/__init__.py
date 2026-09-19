@@ -11,6 +11,7 @@ from .admin_operation_log import AdminOperationLog
 from .favorite import Favorite
 from .later_listen import LaterListen
 from .system_config import SystemConfig
+from .push_notification import PushNotification
 
 __all__ = [
     "Base",
@@ -26,4 +27,5 @@ __all__ = [
     "Favorite",
     "LaterListen",
     "SystemConfig",
+    "PushNotification",
 ]
