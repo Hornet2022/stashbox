@@ -1,6 +1,7 @@
 """
 配置管理 - 基于 pydantic-settings 支持多环境。
 """
+
 from functools import lru_cache
 from typing import Literal
 
@@ -54,6 +55,17 @@ class Settings(BaseSettings):
     oss_bucket: str = ""
     oss_access_key_id: str = ""
     oss_access_key_secret: str = ""
+
+    # CP7.3.5: CORS 白名单（逗号分隔）。原来是 content-service 没装 CORS 中间件，
+    # admin-web 只能靠 vite proxy 绕过；生产没 proxy，这里给出 env 可覆盖的默认：
+    #   CORS_ORIGINS="https://admin.example.com,https://admin2.example.com"
+    cors_origins: str = "http://localhost:3000,http://localhost:5174"
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        """逗号分隔 → list。配了 "*" 表示放行全部 origin（dev 兜底）。"""
+        items = [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+        return items or ["*"]
 
     @property
     def database_url(self) -> str:
