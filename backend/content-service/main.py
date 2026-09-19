@@ -1156,17 +1156,21 @@ async def create_tag(
     await db.commit()
     await db.refresh(tag)
 
-    await track_simple(
+    # 埋点失败时 track() 内部会 rollback（expire 掉 ORM 对象），故先取响应字段
+    tag_slug, tag_name, tag_category = tag.slug, tag.name, tag.category
+
+    await track(
         db,
         EventName.TAG_CREATE,
         user_id=_uid(user),
-        properties={"tag_slug": tag.slug, "category": tag.category},
+        article_id="n/a",  # 标签事件无关联文章，但 feedback.article_id NOT NULL
+        metadata={"tag_slug": tag_slug, "category": tag_category},
     )
 
     return {
-        "id": tag.slug,
-        "name": tag.name,
-        "category": tag.category,
+        "id": tag_slug,
+        "name": tag_name,
+        "category": tag_category,
     }
 
 
@@ -1193,15 +1197,22 @@ async def subscribe_tag(
     if existing:
         return {"ok": True, "already_subscribed": True}
 
-    sub = TagSubscription(user_id=_uid(user), tag_id=tag.id)
+    # 埋点失败时 track() 内部会 rollback（expire 掉 ORM 对象），故先取响应字段
+    tag_id, tag_slug = tag.id, tag.slug
+
+    sub = TagSubscription(user_id=_uid(user), tag_id=tag_id)
     db.add(sub)
     await db.commit()
 
-    await track_simple(
-        db, EventName.TAG_SUBSCRIBE, user_id=_uid(user), properties={"tag_slug": tag.slug}
+    await track(
+        db,
+        EventName.TAG_SUBSCRIBE,
+        user_id=_uid(user),
+        article_id="n/a",  # 标签事件无关联文章，但 feedback.article_id NOT NULL
+        metadata={"tag_slug": tag_slug},
     )
 
-    return {"ok": True, "tag_id": tag.id, "tag_slug": tag.slug}
+    return {"ok": True, "tag_id": tag_id, "tag_slug": tag_slug}
 
 
 @app.post("/api/v1/tags/{tag_id_or_slug}/unsubscribe")
@@ -1218,10 +1229,13 @@ async def unsubscribe_tag(
     if not tag:
         raise NotFound(message=f"tag 不存在: {tag_id_or_slug}")
 
+    # 埋点失败时 track() 内部会 rollback（expire 掉 ORM 对象），故先取响应字段
+    tag_id, tag_slug = tag.id, tag.slug
+
     result = await db.execute(
         delete(TagSubscription).where(
             TagSubscription.user_id == _uid(user),
-            TagSubscription.tag_id == tag.id,
+            TagSubscription.tag_id == tag_id,
         )
     )
     await db.commit()
@@ -1229,11 +1243,15 @@ async def unsubscribe_tag(
     if result.rowcount == 0:
         return {"ok": True, "already_unsubscribed": True}
 
-    await track_simple(
-        db, EventName.TAG_UNSUBSCRIBE, user_id=_uid(user), properties={"tag_slug": tag.slug}
+    await track(
+        db,
+        EventName.TAG_UNSUBSCRIBE,
+        user_id=_uid(user),
+        article_id="n/a",  # 标签事件无关联文章，但 feedback.article_id NOT NULL
+        metadata={"tag_slug": tag_slug},
     )
 
-    return {"ok": True, "tag_id": tag.id, "tag_slug": tag.slug}
+    return {"ok": True, "tag_id": tag_id, "tag_slug": tag_slug}
 
 
 # TODO: tag_filter 埋点（CP5.3b）—— v1 §11.5 没明确 filter 触发位置，GET /api/v1/articles ?tag=xxx 是 CP5.3 后续工作，留在 [known issues] 报备
