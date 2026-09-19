@@ -10,6 +10,7 @@ CP3.5-pre-3 说明：
 - CP3-CONTENT：raw_content 不再用占位文本，改从 articles.raw_content JSONB 读
   （CP2.5 / CP-CREATE-ARTICLE 抓完落库的 FetchResult），Step 1 拿到的是真正文
 """
+
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,7 +29,9 @@ log = structlog.get_logger("ai-worker")
 
 
 async def _trigger_subscription_pushes(
-    db: AsyncSession, article_id: str, exclude_user_id: int,
+    db: AsyncSession,
+    article_id: str,
+    exclude_user_id: int,
 ) -> int:
     """蒸馏完成触发订阅推送（CP5.4b）。
 
@@ -58,9 +61,7 @@ async def _trigger_subscription_pushes(
             return 0
 
         # 2. da.tags 存的是 name（"科技"/"财经"），需映射为 slug（"tech"/"finance"）
-        tag_slugs_result = await db.execute(
-            select(Tag.slug).where(Tag.name.in_(article_tags))
-        )
+        tag_slugs_result = await db.execute(select(Tag.slug).where(Tag.name.in_(article_tags)))
         tag_slugs = [row[0] for row in tag_slugs_result.fetchall()]
         if not tag_slugs:
             return 0
@@ -68,9 +69,7 @@ async def _trigger_subscription_pushes(
         # 3. 查订阅了这些 tag 的 user_ids（去重 + 排除 exclude_user_id）
         subs_result = await db.execute(
             select(TagSubscription.user_id)
-            .where(TagSubscription.tag_id.in_(
-                select(Tag.id).where(Tag.slug.in_(tag_slugs))
-            ))
+            .where(TagSubscription.tag_id.in_(select(Tag.id).where(Tag.slug.in_(tag_slugs))))
             .where(TagSubscription.user_id != exclude_user_id)
             .distinct()
         )
@@ -200,17 +199,25 @@ async def distill_task(
         # CP6.2.2.2b 埋点：DISTILL_STEP_COMPLETE（注：步骤在 DistillPipeline 内部迭代，
         # 本文件只在外层 pipeline.run 完成后打点；如需真正 per-step 打点需改 DistillPipeline）
         async with AsyncSessionLocal() as db:
-            await track(db, EventName.DISTILL_STEP_COMPLETE,
-                        user_id=user_id, article_id=article_id,
-                        metadata={"step": "pipeline_run"})
+            await track(
+                db,
+                EventName.DISTILL_STEP_COMPLETE,
+                user_id=user_id,
+                article_id=article_id,
+                metadata={"step": "pipeline_run"},
+            )
+            await db.commit()  # track() 只 flush 不 commit
         log.info("arq_distill_completed", task_id=task_id, article_id=article_id)
         # CP6.2.1 埋点：distill_completed
         async with AsyncSessionLocal() as db:
             await track_simple(db, EventName.DISTILL_COMPLETED, user_id, article_id)
+            await db.commit()  # track() 只 flush 不 commit
         # CP5.4b：蒸馏完成触发订阅推送
         async with AsyncSessionLocal() as db:
             await _trigger_subscription_pushes(
-                db, article_id=article_id, exclude_user_id=user_id,
+                db,
+                article_id=article_id,
+                exclude_user_id=user_id,
             )
         return {"task_id": task_id, "status": "done"}
     except Exception as e:
@@ -218,12 +225,21 @@ async def distill_task(
         # CP6.2.2.2b 埋点：DISTILL_RETRY（注：Arq 自动 retry，distill_task.py 内无显式 retry 计数器，
         # 此处代表 Arq 将在该异常抛出后触发重试）
         async with AsyncSessionLocal() as db:
-            await track(db, EventName.DISTILL_RETRY, user_id=user_id, article_id=article_id,
-                        metadata={"reason": str(e)})
+            await track(
+                db,
+                EventName.DISTILL_RETRY,
+                user_id=user_id,
+                article_id=article_id,
+                metadata={"reason": str(e)},
+            )
+            await db.commit()  # track() 只 flush 不 commit
         # CP6.2.1 埋点：distill_failed + distill_quota_refund
         async with AsyncSessionLocal() as db:
-            await track(db, EventName.DISTILL_FAILED, user_id=user_id, article_id=article_id, reason=str(e))
+            await track(
+                db, EventName.DISTILL_FAILED, user_id=user_id, article_id=article_id, reason=str(e)
+            )
             await track_simple(db, EventName.DISTILL_QUOTA_REFUND, user_id, article_id)
+            await db.commit()  # track() 只 flush 不 commit
         raise  # 让 Arq 走 retry 逻辑
     finally:
         await llm.close()

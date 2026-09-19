@@ -5,6 +5,7 @@ CP1.5：wechat-login / user 走真实 PostgreSQL（users 表）；
 quota / subscription/plans 仍为 mock（配额扣减事务在 CP1.6）。
 鉴权：JWT 的 sub = users.id（整数），下游据此校验归属。
 """
+
 import asyncio
 import bcrypt
 import logging
@@ -134,7 +135,6 @@ async def lifespan(app: FastAPI):
         pass
 
 
-
 setup_logging("user-service")
 app = FastAPI(title="stashbox-user-service", version="0.2.0", lifespan=lifespan)
 register_exception_handlers(app)
@@ -256,12 +256,18 @@ async def wechat_login(req: WechatLoginRequest, db: AsyncSession = Depends(get_d
     if user is None:
         user = User(open_id=open_id, nickname="听友", tier="free")
         db.add(user)
-        await db.commit()
+        await db.flush()  # 先拿 user.id 供埋点
         await db.refresh(user)
 
     token = create_access_token(str(user.id))
     # CP6.2.1 埋点：user_login
-    await track_simple(db, EventName.USER_LOGIN, user.id, "n/a")
+    # track() 只 flush 不 commit —— 必须在 commit() 之前，否则埋点随 close() 回滚丢失
+    try:
+        await track_simple(db, EventName.USER_LOGIN, user.id, "n/a")
+    except Exception as exc:
+        log.warning(f"USER_LOGIN 埋点异常（忽略）: open_id={open_id} err={exc}")
+    await db.commit()
+
     return WechatLoginResponse(
         access_token=token,
         user_id=str(user.id),
@@ -311,7 +317,9 @@ async def get_my_quota(user: dict = Depends(require_user), db: AsyncSession = De
 
 
 @app.post("/api/v1/users/me/quota/reset-monthly")
-async def reset_quota_monthly(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
+async def reset_quota_monthly(
+    user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+):
     """手动触发月度重置（定时器见 quota_service.quota_reset_loop）。"""
     n = await quota_service.reset_monthly(db)
     # CP6.2.1 埋点：quota_reset
@@ -338,7 +346,9 @@ async def onboarding_start(
     if u.onboarding_done_at is not None:
         raise HTTPException(status_code=409, detail="onboarding already done")
 
-    await track_simple(db, EventName.ONBOARDING_STARTED, u.id, await _get_placeholder_article_id(db))
+    await track_simple(
+        db, EventName.ONBOARDING_STARTED, u.id, await _get_placeholder_article_id(db)
+    )
     return {"onboarding_started": True}
 
 
@@ -351,6 +361,7 @@ async def _get_placeholder_article_id(db: AsyncSession) -> str:
     global _PLACEHOLDER_ARTICLE_ID
     if _PLACEHOLDER_ARTICLE_ID is None:
         from sqlalchemy import select, text
+
         row = await db.execute(select(text("id")).select_from(text("articles")).limit(1))
         _PLACEHOLDER_ARTICLE_ID = row.scalar_one_or_none() or "n/a"
     return _PLACEHOLDER_ARTICLE_ID
@@ -404,13 +415,20 @@ async def onboarding_complete(
 
     u.onboarding_done_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
+    # track() 只 flush 不 commit —— 必须在 commit() 之前，否则埋点随 close() 回滚丢失
+    try:
+        await track_simple(
+            db, EventName.ONBOARDING_COMPLETED, u.id, await _get_placeholder_article_id(db)
+        )
+    except Exception as exc:
+        log.warning(f"ONBOARDING_COMPLETED 埋点异常（忽略）: user={u.id} err={exc}")
+
     try:
         await db.commit()
     except Exception:
         await db.rollback()
         raise
 
-    await track_simple(db, EventName.ONBOARDING_COMPLETED, u.id, await _get_placeholder_article_id(db))
     return {"onboarding_done": True, "onboarding_done_at": u.onboarding_done_at.isoformat()}
 
 
@@ -456,7 +474,9 @@ async def list_notifications(
             for n in notifs
         ],
         "unread_count": await db.scalar(
-            select(func.count()).select_from(PushNotification).where(
+            select(func.count())
+            .select_from(PushNotification)
+            .where(
                 PushNotification.user_id == uid,
                 PushNotification.read_at.is_(None),
             )
@@ -472,6 +492,7 @@ async def mark_notification_read(
 ):
     """标记推送已读（CP5.4a）。幂等。"""
     from datetime import datetime
+
     notif = await db.get(PushNotification, notification_id)
     if not notif:
         raise HTTPException(status_code=404, detail=f"notification {notification_id} 不存在")
