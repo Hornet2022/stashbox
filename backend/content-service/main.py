@@ -263,6 +263,7 @@ async def _create_article(
     title: str | None,
     db: AsyncSession,
     raw_content: dict | None = None,  # 默认为 None：其他调用点行为不变
+    event: EventName | None = None,  # 建库后要打的埋点（必须落在 commit 之前）
 ) -> Article:
     art = Article(
         id=_new_article_id(),
@@ -276,6 +277,14 @@ async def _create_article(
         skip=False,
     )
     db.add(art)
+    if event is not None:
+        # track() 只 flush 不 commit，get_db() 收尾只 session.close() —— close() 隐式
+        # rollback 会丢掉 flush 出来的 feedback 行，所以埋点必须写在 commit() 之前
+        # （与 7ba3221 / 4ab6b4f 同一模式）。
+        try:
+            await track(db, event, user_id=user_id, article_id=art.id)
+        except Exception as exc:
+            log.warning(f"{event} 埋点异常（忽略）: article={art.id} err={exc}")
     await db.commit()
     await db.refresh(art)
     await cache_service.invalidate_pending(user_id)  # 待听列表缓存失效
@@ -300,10 +309,8 @@ async def submit_article(
     """
     uid = _uid(user)
     quota = await quota_service.consume(db, uid)  # 用尽抛 QuotaExceededError(3001)
-    art = await _create_article(req.url, uid, req.source, None, db)
+    art = await _create_article(req.url, uid, req.source, None, db, event=EventName.ARTICLE_SUBMIT)
     await cache_service.mark_article_quota(art.id)  # 打标：该文章已扣过配额
-    # CP6.2.1 埋点：article_submit
-    await track_simple(db, EventName.ARTICLE_SUBMIT, uid, art.id)
     return {
         "article_id": art.id,
         "url": art.url,
@@ -1110,8 +1117,13 @@ async def article_audio_url(
 
     expires_ts = int(time.time()) + AUDIO_URL_TTL_SEC
     base = (task.audio_url if task else None) or f"{OSS_AUDIO_BASE}/{art.id}.m4a"
-    # CP6.2.1 埋点：audio_play_start
-    await track_simple(db, EventName.AUDIO_PLAY_START, _uid(user), article_id)
+    # CP6.2.1 埋点：audio_play_start。本端点无业务写操作，没有现成 commit —— track()
+    # 只 flush，必须由这里显式 commit() 把 feedback 行落库，否则随 close() 丢失。
+    try:
+        await track_simple(db, EventName.AUDIO_PLAY_START, _uid(user), article_id)
+        await db.commit()
+    except Exception as exc:
+        log.warning(f"AUDIO_PLAY_START 埋点异常（忽略）: article={article_id} err={exc}")
     return AudioUrlResponse(
         article_id=art.id,
         audio_url=f"{base}?Expires={expires_ts}&OSSAccessKeyId=mock&Signature=mock",
@@ -1173,6 +1185,12 @@ async def wechat_mp_message(req: WechatMpMessageRequest, db: AsyncSession = Depe
                 article_id="n/a",
                 metadata={"error": exc.code.value if hasattr(exc.code, "value") else str(exc.code)},
             )
+        # track() 只 flush 不 commit，而这里随后要 raise（get_db 会 rollback）——
+        # 显式 commit() 把 feedback 行先落库，否则埋点随 rollback 一起丢（CP7.4-prereq）。
+        try:
+            await db.commit()
+        except Exception as commit_exc:
+            log.warning(f"失败路径埋点 commit 失败（忽略）: err={commit_exc}")
         raise map_fetcher_error(exc) from exc
 
     await _ensure_anonymous_user(db)
