@@ -12,6 +12,7 @@ CP1.7：D9 端到端 —— 不要求登录态 → 建文章 → 自动触发 ai
 import csv
 import io
 import json
+import os
 import re
 import sys
 import time
@@ -60,7 +61,7 @@ from stashbox.backend.common.exceptions import (
     NotFound,
     register_exception_handlers,
 )
-from stashbox.backend.common.logging import setup_logging
+from stashbox.backend.common.logging import get_logger, setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
 from stashbox.backend.common.models import (
     AdminOperationLog,
@@ -77,6 +78,12 @@ from stashbox.backend.common.models import (
 from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common.analytics import track, track_simple
 from stashbox.backend.common.events import EventName
+from stashbox.backend.common import system_config
+from stashbox.backend.app.services.llm import (
+    SUPPORTED_PROVIDERS,
+    reload,
+    resolve_config,
+)
 
 
 def _uid(user: dict) -> int:
@@ -90,6 +97,7 @@ def _uid(user: dict) -> int:
 
 
 setup_logging("content-service")
+log = get_logger(__name__)
 app = FastAPI(title="stashbox-content-service", version="0.3.0")
 register_exception_handlers(app)
 app.add_middleware(RequestIDMiddleware)
@@ -1432,6 +1440,101 @@ async def admin_audit_log(
         for r in rows
     ]
     return {"total": total or 0, "items": items}
+
+
+# ---------------------------------------------------------------------------
+# CP7.3 admin LLM 配置（admin-web 配置页后端）
+#
+# 落库：system_config 表 key="llm"（见 common/system_config.py）。
+# 热生效：PUT 写完立刻 DEL 缓存 + `await reload()` 重建 factory 里的 client。
+# api_key 只往外吐 set/last4，明文不出现在任何响应里。
+# ---------------------------------------------------------------------------
+class LLMConfigUpdate(BaseModel):
+    provider: str
+    model: str | None = None
+    api_key: str | None = None  # 空/不传 = 不动已存的那把 key
+
+
+def _masked_llm_config(config: dict, source: str, updated_at: str | None) -> dict:
+    """把完整配置（含明文 api_key）转成可出网的响应体。"""
+    api_key = config.get("api_key") or ""
+    return {
+        "provider": config["provider"],
+        "model": config["model"],
+        "api_key_set": bool(api_key),
+        "api_key_last4": api_key[-4:] if api_key else None,
+        "source": source,  # db = 表里配了；env = 回落环境变量/默认值
+        "updated_at": updated_at,
+    }
+
+
+@app.get("/api/v1/admin/llm/config")
+async def admin_llm_config_get(user: dict = Depends(require_admin_or_operator)):
+    """当前生效的 LLM 配置（DB > env > 默认值）。"""
+    stored, updated_at = await system_config.get_config_row(system_config.KEY_LLM)
+    config = resolve_config(stored)
+    return _masked_llm_config(config, "db" if stored else "env", system_config.as_iso(updated_at))
+
+
+@app.put("/api/v1/admin/llm/config")
+async def admin_llm_config_put(
+    req: LLMConfigUpdate,
+    user: dict = Depends(require_admin_or_operator),
+):
+    """改 LLM 配置 → 落 system_config + 立即 reload factory（热生效）。"""
+    provider = req.provider.strip().lower()
+    if provider not in SUPPORTED_PROVIDERS:
+        raise InvalidRequest(
+            message=f"provider 必须是 {list(SUPPORTED_PROVIDERS)} 之一，当前 {provider!r}"
+            "（deepseek / glm 的 client 还没实现，配了也会回落到 mock）",
+        )
+
+    stored = dict(await system_config.get_config(system_config.KEY_LLM) or {})
+    stored["provider"] = provider
+    if req.model:
+        stored["model"] = req.model
+    if req.api_key:
+        stored["api_key"] = req.api_key
+
+    row = await system_config.set_config(system_config.KEY_LLM, stored, updated_by=_uid(user))
+    client = await reload()  # 改完即生效，不用重启进程
+    log.info(
+        "admin_llm_config_updated",
+        admin_id=_uid(user),
+        provider=provider,
+        model=stored.get("model"),
+        client=client.provider_name,
+    )
+    return _masked_llm_config(
+        resolve_config(row["value"]),
+        "db",
+        row["updated_at"].isoformat() if row["updated_at"] else None,
+    )
+
+
+@app.get("/api/v1/admin/llm/test")
+async def admin_llm_test(user: dict = Depends(require_admin_or_operator)):
+    """CP7.3 联调真验用：用当前 factory 的 client 发一次 chat()，确认 provider 真换了。
+
+    临时端点 —— 用 ENABLE_LLM_TEST_ENDPOINT=0 关掉（关掉后返回 404）。
+    openai client 的 chat() 还是 CP7.1 的 NotImplementedError 占位实现，
+    所以 provider=openai 时这里会 ok=false + 报错，但 provider 字段能证明切换生效。
+    """
+    if os.getenv("ENABLE_LLM_TEST_ENDPOINT", "1").lower() in {"0", "false", "no"}:
+        raise NotFound(message="llm test endpoint disabled")
+
+    client = await reload()
+    result = {
+        "provider": client.provider_name,
+        "model": getattr(client, "model", None),
+    }
+    try:
+        result["text"] = await client.chat("CP7.3 hot-reload smoke test：用一句话总结这段话。")
+        result["ok"] = True
+    except Exception as exc:
+        result["ok"] = False
+        result["error"] = f"{type(exc).__name__}: {exc}"[:300]
+    return result
 
 
 # ---------------------------------------------------------------------------
