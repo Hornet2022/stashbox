@@ -3,6 +3,7 @@
 ai-service 目录名带连字符（不是合法包名），`llm` 包只能这样被 import
 （做法同 tests/observability、tests/gateway 按文件路径加载服务代码）。
 """
+
 import sys
 from pathlib import Path
 
@@ -10,9 +11,10 @@ import uuid
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import delete
 
 from stashbox.backend.common.database import AsyncSessionLocal
-from stashbox.backend.common.models import Article, User
+from stashbox.backend.common.models import Article, Feedback, User
 
 AI_SERVICE_DIR = Path(__file__).resolve().parents[2] / "ai-service"
 
@@ -40,6 +42,9 @@ async def test_user(db_session) -> int:
     await db_session.commit()
     await db_session.refresh(user)
     yield int(user.id)
+    # CP7.3：埋点真落库后 feedback.user_id 的 FK 指向 users，直接 delete(user) 会
+    # 触发 ForeignKeyViolationError —— 先清掉该用户的 feedback 行。
+    await db_session.execute(delete(Feedback).where(Feedback.user_id == user.id))
     await db_session.delete(user)
     await db_session.commit()
 
