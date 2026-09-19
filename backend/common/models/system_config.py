@@ -10,7 +10,8 @@ admin-web 改配置（LLM 服务商 / 模型 / API key）时写这里，
 
 from datetime import datetime
 from typing import Optional
-from sqlalchemy import String, BigInteger, DateTime, ForeignKey, JSON
+from sqlalchemy import String, BigInteger, DateTime, ForeignKey
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from stashbox.backend.common.models.base import Base
 
@@ -21,7 +22,7 @@ class SystemConfig(Base):
     __tablename__ = "system_config"
 
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
-    value: Mapped[dict] = mapped_column(JSON, nullable=False)
+    value: Mapped[dict] = mapped_column(JSONB, nullable=False)
     updated_by: Mapped[Optional[int]] = mapped_column(
         # users.id 是 BigInteger，迁移 0016 也建的 BigInteger —— 这里保持一致
         BigInteger,
