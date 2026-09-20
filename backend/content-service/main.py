@@ -540,10 +540,18 @@ async def user_retry_distill(
 # CP5.5 文章反馈闭环（v1 §3.1 / §4.3.4）：4 端点写 feedback 表
 # ---------------------------------------------------------------------------
 SKIP_REASONS = ("too_long", "boring", "low_quality", "other")
+"""CP8.6: 推荐 enum（不强校验）。客户端 UI 可下拉选 4 项之一；服务端现在接受
+任意字符串（≤ 64 char），详见 /skip 端点 docstring。保留元组仅用于：① 文档 ②
+客户端 enum 来源 ③ 后续埋点分类统计。"""
 
 
 class SkipRequest(BaseModel):
-    """skip 原因（v1 §3.1）：4 选 1。字段缺失/非法走业务 400（非 422）。"""
+    """skip 原因（v1 §3.1，CP8.6 放宽为自由文本）。
+
+    CP8.6 之前字段为 Literal["too_long","boring","low_quality","other"] —— 任何其他值
+    （如客户端自定义 "not_interested"）都会被拒。现改为 str：服务端只校验「非空」
+    + 「≤ 64 char」（feedback.reason 列宽上限）。
+    """
 
     reason: str | None = None
 
@@ -591,14 +599,56 @@ async def _write_feedback(
 async def favorite(
     article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
 ):
-    """收藏（v1 §3.1）：articles.favorite=True + feedback(type=favorite)，同一事务。"""
+    """「收藏一下」快轨道（v1 §3.1 单数）。
+
+    CP8.6 Bug 3 文档化决策：与 /api/v1/favorites（复数，folder + note 双轨）
+    并存，不合并。详见下方 __doc_decision_favorite_vs_favorites__ 注释。
+
+    行为：
+      - articles.favorite = True
+      - feedback(type="favorite") —— 同一事务
+      - 写库后 invalidate article detail 缓存（CP8.6 Bug 1）
+      - 幂等：重复点 favorite 不会重复写 feedback 行（_write_feedback 只 add，
+        SQLAlchemy 同一事务内第二次 add 会抛 IntegrityError —— TODO：如果要真
+        幂等需要在 _write_feedback 加 dedup，目前客户端应避免双击）
+
+    用法：列表 / 详情页的 ❤️「收藏」按钮，点一下完成。无 folder / note。
+    """
     uid = _uid(user)
     art = await _get_owned(article_id, uid, db)
     art.favorite = True
     fb = await _write_feedback(db, uid, article_id, "favorite")
     await db.commit()
     await db.refresh(fb)  # commit 后 id/created_at 需回读（expire_on_commit）
+    await cache_service.invalidate_article(article_id)  # CP8.6 Bug 1: 失效 stale 缓存
     return {"id": article_id, "favorite": True, "feedback_id": fb.id}
+
+
+# CP8.6 Bug 3 — `/favorite`（单数）vs `/favorites`（复数）双轨设计决策
+# ============================================================================
+# 决策时间:  CP8.6
+# 决策人:    Hornet（产品）+ 后端（实现）
+# 状态:      两套并存，不替 Hornet 拍板统一（待 v2 再评估）
+#
+# 单数 `POST /api/v1/articles/{id}/favorite`（本函数上方）:
+#   用途:    「❤️ 收藏一下」快操作
+#   写入:    articles.favorite = True  +  feedback(type="favorite")
+#   是否幂等: 否（双击会重复写 feedback 行 —— 客户端 UI 应防抖）
+#   场景:    列表 / 详情页的一键收藏按钮
+#   字段:    无 folder / 无 note
+#
+# 复数 `POST /api/v1/articles/{id}/favorites`（下方 add_favorite）:
+#   用途:    「收藏到文件夹」管理操作
+#   写入:    favorites 表（user_id + article_id + folder + note，UNIQUE 约束）
+#   是否幂等: 是（同 user + article + folder 重复加返 already_favorited）
+#   场景:    收藏夹管理页 / 拖拽到 folder
+#   字段:    folder（默认 "default"） + note（可选）
+#
+# 后续清理时机（v2 再评估）:
+#   - 合并到一张表（favorites 扩展加一个特殊 folder='__quick__'）
+#   - 或者废弃单数，统一用复数（前端要改 UI）
+#   - 关键指标：用户实际用了哪个、各自的点击率
+# ============================================================================
 
 
 # ---------------------------------------------------------------------------
@@ -658,7 +708,12 @@ async def add_favorite(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """加收藏（带 folder + note）。"""
+    """加收藏（带 folder + note，复数轨道）。
+
+    CP8.6 Bug 3 文档化决策：与单数 POST /articles/{id}/favorite 并存，详见上方
+    `__doc_decision_favorite_vs_favorites__` 注释。本端点是「收藏到文件夹」管理
+    操作，写 favorites 表（UNIQUE 约束保证幂等）。
+    """
     uid = _uid(user)
     folder = body.get("folder", "default")
     note = body.get("note")
@@ -874,19 +929,27 @@ async def skip(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """跳过（v1 §3.1）：articles.skip=True + feedback(type=skip, reason=...)，同一事务。"""
-    if not req.reason:
+    """跳过（v1 §3.1）：articles.skip=True + feedback(type=skip, reason=...)，同一事务。
+
+    CP8.6 Bug 2 修复：reason 从「4 选 1 Literal」放宽为「自由文本」。
+    - 空字符串 / 缺失 → 业务 400（reason is required）
+    - 超过 64 字符 → 业务 400（feedback.reason 列宽 64）
+    - 其他任意字符串（含 "not_interested"、"too_short"、中文等）→ 200 OK
+    - SKIP_REASONS 仍保留作为推荐 enum（用于客户端 UI 分类统计），不强制。
+    """
+    if not req.reason or not req.reason.strip():
         raise InvalidRequest(message="reason is required", code=4001)
-    if req.reason not in SKIP_REASONS:
-        raise InvalidRequest(message=f"invalid reason: {req.reason}", code=4001)
+    reason = req.reason.strip()
+    if len(reason) > 64:
+        raise InvalidRequest(message="reason too long (max 64 chars)", code=4001)
 
     uid = _uid(user)
     art = await _get_owned(article_id, uid, db)
     art.skip = True
-    fb = await _write_feedback(db, uid, article_id, "skip", reason=req.reason)
+    fb = await _write_feedback(db, uid, article_id, "skip", reason=reason)
     await db.commit()
     await db.refresh(fb)
-    return {"id": article_id, "skip": True, "feedback_id": fb.id}
+    return {"id": article_id, "skip": True, "feedback_id": fb.id, "reason": reason}
 
 
 @app.post("/api/v1/articles/{article_id}/listen-complete")
