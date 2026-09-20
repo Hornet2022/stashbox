@@ -753,6 +753,7 @@ async def add_favorite(
         log.warning(f"FAVORITE_ADD 埋点异常（忽略）: article={article_id} err={exc}")
 
     await db.commit()
+    await cache_service.invalidate_article(article_id)
 
     return {"ok": True, "id": fav_id, "folder": folder}
 
@@ -775,6 +776,7 @@ async def update_favorite(
     if "note" in body:
         fav.note = body["note"]
     await db.commit()
+    await cache_service.invalidate_article(fav.article_id)
 
     return {"ok": True, "id": fav.id}
 
@@ -806,6 +808,7 @@ async def delete_favorite(
         log.warning(f"FAVORITE_REMOVE 埋点异常（忽略）: article={article_id} err={exc}")
 
     await db.commit()
+    await cache_service.invalidate_article(article_id)
 
     return {"ok": True}
 
@@ -877,6 +880,7 @@ async def snooze_article(
             log.warning(f"ARTICLE_SNOOZE 埋点异常（忽略）: article={article_id} err={exc}")
 
         await db.commit()
+        await cache_service.invalidate_article(article_id)
         return {"ok": True, "id": item_id, "updated": True}
 
     item = LaterListen(user_id=uid, article_id=article_id, snooze_until=snooze_until)
@@ -896,6 +900,7 @@ async def snooze_article(
         log.warning(f"ARTICLE_SNOOZE 埋点异常（忽略）: article={article_id} err={exc}")
 
     await db.commit()
+    await cache_service.invalidate_article(article_id)
 
     return {"ok": True, "id": item_id}
 
@@ -919,6 +924,7 @@ async def unsnooze_article(
 
     await db.delete(existing)
     await db.commit()
+    await cache_service.invalidate_article(article_id)
     return {"ok": True}
 
 
@@ -949,6 +955,7 @@ async def skip(
     fb = await _write_feedback(db, uid, article_id, "skip", reason=reason)
     await db.commit()
     await db.refresh(fb)
+    await cache_service.invalidate_article(article_id)
     return {"id": article_id, "skip": True, "feedback_id": fb.id, "reason": reason}
 
 
@@ -970,6 +977,7 @@ async def listen_complete(
     fb = await _write_feedback(db, uid, article_id, "listen_complete", metadata=meta)
     await db.commit()
     await db.refresh(fb)
+    await cache_service.invalidate_article(article_id)
     return {
         "id": article_id,
         "listened_at": fb.created_at.isoformat() if fb.created_at else None,
@@ -999,6 +1007,7 @@ async def rate(
     fb = await _write_feedback(db, uid, article_id, "rate", rating=req.rating, metadata=meta)
     await db.commit()
     await db.refresh(fb)
+    await cache_service.invalidate_article(article_id)
     return {"id": article_id, "rating": req.rating, "feedback_id": fb.id}
 
 
@@ -1073,6 +1082,8 @@ async def create_feedback_v2(
         )
 
     await db.commit()
+    if body.article_id:
+        await cache_service.invalidate_article(body.article_id)
 
     return {"ok": True, "id": fb_id, "category": fb_category}
 
@@ -1344,6 +1355,8 @@ async def create_tag(
         log.warning(f"TAG_CREATE 埋点异常（忽略）: slug={tag_slug} err={exc}")
 
     await db.commit()
+    # tag 影响用户看到的文章列表（按 tag 筛选），失效用户的待听列表缓存
+    await cache_service.invalidate_pending(_uid(user))
 
     return {
         "id": tag_slug,
@@ -1374,6 +1387,8 @@ async def subscribe_tag(
     )
     if existing:
         return {"ok": True, "already_subscribed": True}
+
+    await cache_service.invalidate_pending(_uid(user))
 
     # 埋点失败时 track() 内部会 rollback（expire 掉 ORM 对象），故先取响应字段
     tag_id, tag_slug = tag.id, tag.slug
@@ -1424,6 +1439,8 @@ async def unsubscribe_tag(
     if result.rowcount == 0:
         # 无订阅可删，直接返回；delete 未 commit 也无需回滚
         return {"ok": True, "already_unsubscribed": True}
+
+    await cache_service.invalidate_pending(_uid(user))
 
     # track() 只 flush 不 commit —— 必须在 commit() 之前，否则埋点随 close() 回滚丢失
     try:
@@ -1500,6 +1517,7 @@ async def admin_force_retry(
     except Exception:
         await db.rollback()
         raise
+    await cache_service.invalidate_article(article_id)
 
     # 触发蒸馏（ai-service 不可达返回 None，不破请求；status=pending 让 worker 自动重试）
     queued = await get_ai_client().trigger_distill(
@@ -1559,6 +1577,7 @@ async def admin_audio_invalidate(
     except Exception:
         await db.rollback()
         raise
+    await cache_service.invalidate_article(audio.article_id)
 
     return {"audio_id": audio_id, "status": "invalidated"}
 
