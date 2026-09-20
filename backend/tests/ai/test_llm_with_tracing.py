@@ -4,6 +4,7 @@
 - 成本归因走假 CostTracker（monkeypatch cost_tracker 模块属性 —— _maybe_trace 里是函数内 import，
   每次调用才取属性，所以 monkeypatch 生效）
 """
+
 import pytest
 
 from llm import ClaudeSonnetClient, MockLLMClient
@@ -137,12 +138,12 @@ async def test_enabled_stream_failure_marks_error(fake_langfuse):
 
 
 async def test_enabled_qwen_stub_reports_error(fake_langfuse):
-    """未实现的 client（qwen/claude）走同一条 error 上报路径。"""
+    """CP7.1：qwen_vl chat() 已实现，错误（401）仍走 trace 上报路径。"""
     from llm import QwenVLClient
 
     client = QwenVLClient(api_key="sk-test")
 
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(Exception):  # 401 Unauthorized，无真实 key
         await client.chat(_req(user_id=9, article_id="art_1"))
 
     assert fake_langfuse.trace_objects[0].updates[-1]["level"] == "ERROR"

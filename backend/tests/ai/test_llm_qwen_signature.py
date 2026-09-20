@@ -1,4 +1,5 @@
 """QwenVLClient 接口签名测试（任务包 §4.5 —— 本期不接 DashScope，只验证签名 + 鉴权）。"""
+
 import pytest
 
 from llm.qwen_vl import QWEN_VL_API_URL, QWEN_VL_DEFAULT_MODEL, QwenVLClient
@@ -37,14 +38,18 @@ async def test_defaults_point_to_dashscope(client):
 
 
 async def test_chat_not_implemented(client):
-    """真 DashScope 调用留 CP3.5（v1 §5.2.2 Step 1）。"""
-    with pytest.raises(NotImplementedError, match="CP3.5"):
+    """CP7.1：chat() 已实现，走 OpenAI 兼容端点。"""
+    # 真实 API 未配置 key 时会 401，这里只验证 URL 结构正确
+    with pytest.raises(Exception, match="401"):
         await client.chat(_req(model=QWEN_VL_DEFAULT_MODEL))
 
 
 async def test_stream_not_implemented(client):
-    with pytest.raises(NotImplementedError, match="CP3.5"):
-        await client.stream(_req())
+    """CP7.1：stream() 已实现，走 OpenAI 兼容端点（异步生成器，需 async for 消费）。"""
+    # 真实 API 未配置 key 时会 401，async for 触发实际请求
+    with pytest.raises(Exception, match="401"):
+        async for _ in client.stream(_req()):
+            pass
 
 
 async def test_count_tokens_is_quarter_of_length(client):

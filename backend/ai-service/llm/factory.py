@@ -3,6 +3,7 @@
 CP1.8+ 接 Nacos 动态配置时，provider 的来源从 LLMSettings 换成 Nacos，本文件对外接口不变。
 注意：claude / qwen_vl 实现持有 httpx AsyncClient，用完要 `await client.close()`（或 async with）。
 """
+
 # ai-service 目录名带连字符（不是合法包名），llm/__init__.py 已把它加进 sys.path，
 # config_llm 因此作为顶层模块导入（而不是相对导入上层的包）。
 from config_llm import llm_settings
@@ -58,6 +59,7 @@ async def get_qwen_vl_client() -> QwenVLClient:
     return QwenVLClient(
         api_key=llm_settings.qwen_vl_api_key,
         model=llm_settings.qwen_vl_model,
+        base_url=llm_settings.qwen_vl_base_url,
         timeout=llm_settings.timeout,
         max_retries=llm_settings.max_retries,
     )
