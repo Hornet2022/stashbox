@@ -12,6 +12,7 @@ import asyncio
 
 from arq import run_worker
 from arq.connections import RedisSettings
+from prometheus_client import start_http_server
 
 from arq_settings import load_arq_config
 from tasks.distill_task import distill_task
@@ -34,9 +35,23 @@ class WorkerSettings:
 
     health_check_interval = 30
 
+    async def on_startup(ctx):
+        """CP11.0.3: 启动独立的 metrics HTTP server，端口 8104。"""
+        from prometheus_client import start_http_server
+        try:
+            start_http_server(8104)
+        except Exception:
+            pass
+
 
 def main():
     """同步入口（开发用）：`python -m worker`（arq CLI 内部走的是同一条路径）。"""
+    # CP11.0.3: 启动独立的 metrics HTTP server，让 distill histogram counter 可被 ai-service 抓到
+    # worker 进程有自己的 Prometheus registry（与 FastAPI 进程隔离），需独立端口
+    try:
+        start_http_server(8104)
+    except Exception:
+        pass
     asyncio.run(run_worker(WorkerSettings))
 
 

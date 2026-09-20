@@ -13,7 +13,9 @@ from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI
+from fastapi.responses import Response
 from pydantic import BaseModel
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -101,6 +103,12 @@ app = FastAPI(title="stashbox-ai-service", version="0.2.0", lifespan=lifespan)
 register_exception_handlers(app)
 app.add_middleware(RequestIDMiddleware)
 install_health_endpoints(app)
+
+
+# CP11.0.3 Prometheus metrics endpoint（暴露 step duration / success / failure / queue size）
+@app.get("/metrics")
+def metrics() -> Response:
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 # mock 4 步蒸馏流水线（本期不落库每一步，仅用其耗时模拟）
