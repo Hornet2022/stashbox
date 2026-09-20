@@ -73,6 +73,7 @@ from stashbox.backend.common.models import (
     Feedback,
     FeedbackV2,
     LaterListen,
+    ListeningStatus,
     Tag,
     TagSubscription,
     User,
@@ -1231,6 +1232,76 @@ async def article_audio_url(
         expires_at=datetime.fromtimestamp(expires_ts, timezone.utc).isoformat(),
         duration_sec=(task.duration_sec if task else None) or 0,
     )
+
+
+# CP11.0.1 Android 断点续听
+class ProgressUpdateRequest(BaseModel):
+    position_sec: int
+    total_sec: int | None = None
+
+
+@app.post("/api/v1/articles/{article_id}/progress")
+async def update_progress(
+    article_id: str,
+    req: ProgressUpdateRequest,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """上报/更新收听进度（断点续听）。"""
+    uid = _uid(user)
+
+    # 检查 article 是否存在（归属校验）
+    art = await db.get(Article, article_id)
+    if not art:
+        raise NotFound(message=f"article {article_id} not found")
+
+    # upsert
+    existing = await db.scalar(
+        select(ListeningStatus).where(
+            ListeningStatus.user_id == uid,
+            ListeningStatus.article_id == article_id,
+        )
+    )
+    if existing:
+        existing.position_sec = req.position_sec
+        if req.total_sec is not None:
+            existing.total_sec = req.total_sec
+    else:
+        existing = ListeningStatus(
+            user_id=uid,
+            article_id=article_id,
+            position_sec=req.position_sec,
+            total_sec=req.total_sec,
+        )
+        db.add(existing)
+
+    await db.commit()
+    return {"ok": True, "article_id": article_id, "position_sec": req.position_sec}
+
+
+@app.get("/api/v1/articles/{article_id}/progress")
+async def get_progress(
+    article_id: str,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """获取收听进度（断点续听）。无记录返回 200 + null。"""
+    uid = _uid(user)
+
+    record = await db.scalar(
+        select(ListeningStatus).where(
+            ListeningStatus.user_id == uid,
+            ListeningStatus.article_id == article_id,
+        )
+    )
+    if not record:
+        return {"article_id": article_id, "position_sec": None, "total_sec": None}
+
+    return {
+        "article_id": article_id,
+        "position_sec": record.position_sec,
+        "total_sec": record.total_sec,
+    }
 
 
 @app.post("/api/v1/callback/clawbot-message")

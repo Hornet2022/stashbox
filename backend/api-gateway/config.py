@@ -123,6 +123,19 @@ ROUTES += [
         "content-service",
         _url("content-service"),
     ),
+    # CP11.0.1 Android 断点续听
+    Route(
+        "POST",
+        "/api/v1/articles/{article_id}/progress",
+        "content-service",
+        _url("content-service"),
+    ),
+    Route(
+        "GET",
+        "/api/v1/articles/{article_id}/progress",
+        "content-service",
+        _url("content-service"),
+    ),
     # CP5.5-A3 反馈分类
     Route("POST", "/api/v1/feedback-v2", "content-service", _url("content-service")),
     Route("GET", "/api/v1/feedback-v2", "content-service", _url("content-service")),
