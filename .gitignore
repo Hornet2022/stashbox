@@ -11,9 +11,17 @@
 .env
 .env.local
 .env.*.local
+.env.bak
+*.bak
 *.pem
 *.key
 secrets/
+
+# 凭据 / 调试辅助文件(任何含 password/token/key 的都不能 commit)
+.stashbox_dev_admin.json
+.ck_uid_helper.py
+.dev_admin*
+.dev_*
 
 # ===========================================
 # Python (后端 FastAPI)

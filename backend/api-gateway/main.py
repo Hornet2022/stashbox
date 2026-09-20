@@ -88,7 +88,14 @@ async def lifespan(app: FastAPI):
     await app.state.httpx.aclose()
 
 
-app = FastAPI(title="stashbox-api-gateway", version="0.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="stashbox-api-gateway",
+    version="0.1.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    lifespan=lifespan,
+)
 register_exception_handlers(app)
 app.add_middleware(RequestIDMiddleware)
 app.add_middleware(ErrorTrackingMiddleware)

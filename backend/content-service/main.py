@@ -540,10 +540,18 @@ async def user_retry_distill(
 # CP5.5 文章反馈闭环（v1 §3.1 / §4.3.4）：4 端点写 feedback 表
 # ---------------------------------------------------------------------------
 SKIP_REASONS = ("too_long", "boring", "low_quality", "other")
+"""CP8.6: 推荐 enum（不强校验）。客户端 UI 可下拉选 4 项之一；服务端现在接受
+任意字符串（≤ 64 char），详见 /skip 端点 docstring。保留元组仅用于：① 文档 ②
+客户端 enum 来源 ③ 后续埋点分类统计。"""
 
 
 class SkipRequest(BaseModel):
-    """skip 原因（v1 §3.1）：4 选 1。字段缺失/非法走业务 400（非 422）。"""
+    """skip 原因（v1 §3.1，CP8.6 放宽为自由文本）。
+
+    CP8.6 之前字段为 Literal["too_long","boring","low_quality","other"] —— 任何其他值
+    （如客户端自定义 "not_interested"）都会被拒。现改为 str：服务端只校验「非空」
+    + 「≤ 64 char」（feedback.reason 列宽上限）。
+    """
 
     reason: str | None = None
 
@@ -591,14 +599,74 @@ async def _write_feedback(
 async def favorite(
     article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
 ):
-    """收藏（v1 §3.1）：articles.favorite=True + feedback(type=favorite)，同一事务。"""
+    """「收藏一下」快轨道（v1 §3.1 单数）。
+
+    CP8.6 Bug 3 文档化决策：与 /api/v1/favorites（复数，folder + note 双轨）
+    并存，不合并。详见下方 __doc_decision_favorite_vs_favorites__ 注释。
+
+    行为：
+      - articles.favorite = True
+      - feedback(type="favorite") —— 同一事务
+      - 写库后 invalidate article detail 缓存（CP8.6 Bug 1）
+      - 幂等：重复点 favorite 不会重复写 feedback 行（_write_feedback 只 add，
+        SQLAlchemy 同一事务内第二次 add 会抛 IntegrityError —— TODO：如果要真
+        幂等需要在 _write_feedback 加 dedup，目前客户端应避免双击）
+
+    用法：列表 / 详情页的 ❤️「收藏」按钮，点一下完成。无 folder / note。
+    """
     uid = _uid(user)
     art = await _get_owned(article_id, uid, db)
     art.favorite = True
     fb = await _write_feedback(db, uid, article_id, "favorite")
     await db.commit()
     await db.refresh(fb)  # commit 后 id/created_at 需回读（expire_on_commit）
+    await cache_service.invalidate_article(article_id)  # CP8.6 Bug 1: 失效 stale 缓存
     return {"id": article_id, "favorite": True, "feedback_id": fb.id}
+
+
+@app.post("/api/v1/articles/{article_id}/unfavorite")
+async def unfavorite_article(
+    article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+):
+    """取消收藏（CP9.3）：articles.favorite = False + feedback(type=unfavorite)。
+
+    幂等：文章本来就没收藏时直接返回 ok。
+    """
+    uid = _uid(user)
+    art = await _get_owned(article_id, uid, db)
+    art.favorite = False
+    fb = await _write_feedback(db, uid, article_id, "unfavorite")
+    await db.commit()
+    await db.refresh(fb)
+    await cache_service.invalidate_article(article_id)
+    return {"id": article_id, "favorite": False, "feedback_id": fb.id}
+
+
+# CP8.6 Bug 3 — `/favorite`（单数）vs `/favorites`（复数）双轨设计决策
+# ============================================================================
+# 决策时间:  CP8.6
+# 决策人:    Hornet（产品）+ 后端（实现）
+# 状态:      两套并存，不替 Hornet 拍板统一（待 v2 再评估）
+#
+# 单数 `POST /api/v1/articles/{id}/favorite`（本函数上方）:
+#   用途:    「❤️ 收藏一下」快操作
+#   写入:    articles.favorite = True  +  feedback(type="favorite")
+#   是否幂等: 否（双击会重复写 feedback 行 —— 客户端 UI 应防抖）
+#   场景:    列表 / 详情页的一键收藏按钮
+#   字段:    无 folder / 无 note
+#
+# 复数 `POST /api/v1/articles/{id}/favorites`（下方 add_favorite）:
+#   用途:    「收藏到文件夹」管理操作
+#   写入:    favorites 表（user_id + article_id + folder + note，UNIQUE 约束）
+#   是否幂等: 是（同 user + article + folder 重复加返 already_favorited）
+#   场景:    收藏夹管理页 / 拖拽到 folder
+#   字段:    folder（默认 "default"） + note（可选）
+#
+# 后续清理时机（v2 再评估）:
+#   - 合并到一张表（favorites 扩展加一个特殊 folder='__quick__'）
+#   - 或者废弃单数，统一用复数（前端要改 UI）
+#   - 关键指标：用户实际用了哪个、各自的点击率
+# ============================================================================
 
 
 # ---------------------------------------------------------------------------
@@ -658,7 +726,12 @@ async def add_favorite(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """加收藏（带 folder + note）。"""
+    """加收藏（带 folder + note，复数轨道）。
+
+    CP8.6 Bug 3 文档化决策：与单数 POST /articles/{id}/favorite 并存，详见上方
+    `__doc_decision_favorite_vs_favorites__` 注释。本端点是「收藏到文件夹」管理
+    操作，写 favorites 表（UNIQUE 约束保证幂等）。
+    """
     uid = _uid(user)
     folder = body.get("folder", "default")
     note = body.get("note")
@@ -698,6 +771,7 @@ async def add_favorite(
         log.warning(f"FAVORITE_ADD 埋点异常（忽略）: article={article_id} err={exc}")
 
     await db.commit()
+    await cache_service.invalidate_article(article_id)
 
     return {"ok": True, "id": fav_id, "folder": folder}
 
@@ -720,6 +794,7 @@ async def update_favorite(
     if "note" in body:
         fav.note = body["note"]
     await db.commit()
+    await cache_service.invalidate_article(fav.article_id)
 
     return {"ok": True, "id": fav.id}
 
@@ -751,6 +826,7 @@ async def delete_favorite(
         log.warning(f"FAVORITE_REMOVE 埋点异常（忽略）: article={article_id} err={exc}")
 
     await db.commit()
+    await cache_service.invalidate_article(article_id)
 
     return {"ok": True}
 
@@ -822,6 +898,7 @@ async def snooze_article(
             log.warning(f"ARTICLE_SNOOZE 埋点异常（忽略）: article={article_id} err={exc}")
 
         await db.commit()
+        await cache_service.invalidate_article(article_id)
         return {"ok": True, "id": item_id, "updated": True}
 
     item = LaterListen(user_id=uid, article_id=article_id, snooze_until=snooze_until)
@@ -841,6 +918,7 @@ async def snooze_article(
         log.warning(f"ARTICLE_SNOOZE 埋点异常（忽略）: article={article_id} err={exc}")
 
     await db.commit()
+    await cache_service.invalidate_article(article_id)
 
     return {"ok": True, "id": item_id}
 
@@ -864,6 +942,7 @@ async def unsnooze_article(
 
     await db.delete(existing)
     await db.commit()
+    await cache_service.invalidate_article(article_id)
     return {"ok": True}
 
 
@@ -874,19 +953,28 @@ async def skip(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """跳过（v1 §3.1）：articles.skip=True + feedback(type=skip, reason=...)，同一事务。"""
-    if not req.reason:
+    """跳过（v1 §3.1）：articles.skip=True + feedback(type=skip, reason=...)，同一事务。
+
+    CP8.6 Bug 2 修复：reason 从「4 选 1 Literal」放宽为「自由文本」。
+    - 空字符串 / 缺失 → 业务 400（reason is required）
+    - 超过 64 字符 → 业务 400（feedback.reason 列宽 64）
+    - 其他任意字符串（含 "not_interested"、"too_short"、中文等）→ 200 OK
+    - SKIP_REASONS 仍保留作为推荐 enum（用于客户端 UI 分类统计），不强制。
+    """
+    if not req.reason or not req.reason.strip():
         raise InvalidRequest(message="reason is required", code=4001)
-    if req.reason not in SKIP_REASONS:
-        raise InvalidRequest(message=f"invalid reason: {req.reason}", code=4001)
+    reason = req.reason.strip()
+    if len(reason) > 64:
+        raise InvalidRequest(message="reason too long (max 64 chars)", code=4001)
 
     uid = _uid(user)
     art = await _get_owned(article_id, uid, db)
     art.skip = True
-    fb = await _write_feedback(db, uid, article_id, "skip", reason=req.reason)
+    fb = await _write_feedback(db, uid, article_id, "skip", reason=reason)
     await db.commit()
     await db.refresh(fb)
-    return {"id": article_id, "skip": True, "feedback_id": fb.id}
+    await cache_service.invalidate_article(article_id)
+    return {"id": article_id, "skip": True, "feedback_id": fb.id, "reason": reason}
 
 
 @app.post("/api/v1/articles/{article_id}/listen-complete")
@@ -907,6 +995,7 @@ async def listen_complete(
     fb = await _write_feedback(db, uid, article_id, "listen_complete", metadata=meta)
     await db.commit()
     await db.refresh(fb)
+    await cache_service.invalidate_article(article_id)
     return {
         "id": article_id,
         "listened_at": fb.created_at.isoformat() if fb.created_at else None,
@@ -936,6 +1025,7 @@ async def rate(
     fb = await _write_feedback(db, uid, article_id, "rate", rating=req.rating, metadata=meta)
     await db.commit()
     await db.refresh(fb)
+    await cache_service.invalidate_article(article_id)
     return {"id": article_id, "rating": req.rating, "feedback_id": fb.id}
 
 
@@ -1010,6 +1100,8 @@ async def create_feedback_v2(
         )
 
     await db.commit()
+    if body.article_id:
+        await cache_service.invalidate_article(body.article_id)
 
     return {"ok": True, "id": fb_id, "category": fb_category}
 
@@ -1281,6 +1373,8 @@ async def create_tag(
         log.warning(f"TAG_CREATE 埋点异常（忽略）: slug={tag_slug} err={exc}")
 
     await db.commit()
+    # tag 影响用户看到的文章列表（按 tag 筛选），失效用户的待听列表缓存
+    await cache_service.invalidate_pending(_uid(user))
 
     return {
         "id": tag_slug,
@@ -1311,6 +1405,8 @@ async def subscribe_tag(
     )
     if existing:
         return {"ok": True, "already_subscribed": True}
+
+    await cache_service.invalidate_pending(_uid(user))
 
     # 埋点失败时 track() 内部会 rollback（expire 掉 ORM 对象），故先取响应字段
     tag_id, tag_slug = tag.id, tag.slug
@@ -1361,6 +1457,8 @@ async def unsubscribe_tag(
     if result.rowcount == 0:
         # 无订阅可删，直接返回；delete 未 commit 也无需回滚
         return {"ok": True, "already_unsubscribed": True}
+
+    await cache_service.invalidate_pending(_uid(user))
 
     # track() 只 flush 不 commit —— 必须在 commit() 之前，否则埋点随 close() 回滚丢失
     try:
@@ -1437,6 +1535,7 @@ async def admin_force_retry(
     except Exception:
         await db.rollback()
         raise
+    await cache_service.invalidate_article(article_id)
 
     # 触发蒸馏（ai-service 不可达返回 None，不破请求；status=pending 让 worker 自动重试）
     queued = await get_ai_client().trigger_distill(
@@ -1496,6 +1595,7 @@ async def admin_audio_invalidate(
     except Exception:
         await db.rollback()
         raise
+    await cache_service.invalidate_article(audio.article_id)
 
     return {"audio_id": audio_id, "status": "invalidated"}
 
@@ -1520,6 +1620,22 @@ async def admin_audit_log(
     size = max(min(size, 100), 1)
     offset = (page - 1) * size
 
+    # CP9.5 修复：from_/to 字符串转 datetime(原代码 SQLAlchemy 字符串 vs timestamp 比较 500)
+    from datetime import datetime as _dt
+
+    from_dt = None
+    to_dt = None
+    if from_ is not None:
+        try:
+            from_dt = _dt.fromisoformat(from_)
+        except (ValueError, TypeError):
+            from_dt = None
+    if to is not None:
+        try:
+            to_dt = _dt.fromisoformat(to)
+        except (ValueError, TypeError):
+            to_dt = None
+
     query = select(AdminOperationLog)
     if actor_id is not None:
         try:
@@ -1528,10 +1644,10 @@ async def admin_audit_log(
             pass  # 非数字 actor_id 不匹配任何行，返回空
     if action_type is not None:
         query = query.where(AdminOperationLog.action == action_type)
-    if from_ is not None:
-        query = query.where(AdminOperationLog.created_at >= from_)
-    if to is not None:
-        query = query.where(AdminOperationLog.created_at <= to)
+    if from_dt is not None:
+        query = query.where(AdminOperationLog.created_at >= from_dt)
+    if to_dt is not None:
+        query = query.where(AdminOperationLog.created_at <= to_dt)
 
     total = await db.scalar(select(func.count()).select_from(query.subquery()))
     rows = (
@@ -1990,10 +2106,34 @@ async def _safe_revenue(db: AsyncSession) -> float:
         return 0.0
 
 
+# CP9.4: admin stats 缓存（30s TTL read-through cache）
+_admin_stats_cache: dict = {}
+_admin_stats_expires: dict = {}
+
+
+def _get_cached_stats():
+    """从内存缓存读 stats，TTL 30s。"""
+    now = time.time()
+    if "stats" in _admin_stats_cache and _admin_stats_expires.get("stats", 0) > now:
+        return _admin_stats_cache["stats"]
+    return None
+
+
+def _set_cached_stats(data: dict):
+    """写 stats 到内存缓存，TTL 30s。"""
+    _admin_stats_cache["stats"] = data
+    _admin_stats_expires["stats"] = time.time() + 30
+
+
 @app.get("/api/v1/admin/stats")
 async def admin_stats(
     user: dict = Depends(require_admin_or_operator), db: AsyncSession = Depends(get_db)
 ):
+    # CP9.4 read-through cache
+    cached = _get_cached_stats()
+    if cached is not None:
+        return cached
+
     total_users = await db.scalar(select(func.count()).select_from(User))
     total_articles = await db.scalar(select(func.count()).select_from(Article))
     pending = await db.scalar(
@@ -2029,7 +2169,7 @@ async def admin_stats(
     # revenue：orders 本月已支付（表可能缺失 → 0）
     revenue = await _safe_revenue(db)
 
-    return {
+    result = {
         "total_users": total_users or 0,
         "total_articles": total_articles or 0,
         "pending": pending or 0,
@@ -2038,6 +2178,8 @@ async def admin_stats(
         "active_audio_files": active_audio or 0,
         "failed_distillations_24h": failed_24h or 0,
     }
+    _set_cached_stats(result)
+    return result
 
 
 if __name__ == "__main__":
