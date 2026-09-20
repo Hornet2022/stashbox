@@ -134,17 +134,20 @@ def _new_article_id() -> str:
     return f"art_{uuid.uuid4().hex[:24]}"
 
 
-def _to_response(a: Article) -> ArticleResponse:
+def _to_response(a: Article, task: DistilledArticle | None = None) -> ArticleResponse:
     return ArticleResponse(
         id=a.id,
         url=a.url,
         source=a.source,
         title=a.title,
         owner_id=str(a.user_id),
-        status=a.status,
+        status=_derive_status(a, task),
         favorite=a.favorite,
         skip=a.skip,
         created_at=a.created_at.isoformat() if a.created_at else "",
+        audio_url=task.audio_url if task else None,
+        task_id=task.id if task else None,
+        duration_sec=task.duration_sec if task else None,
     )
 
 
@@ -296,6 +299,7 @@ async def add_article(
     req: AddArticleRequest, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
 ):
     art = await _create_article(req.url, _uid(user), req.source, None, db)
+    await get_ai_client().trigger_distill(art.id, auth_token=create_access_token(str(art.user_id)))
     return _to_response(art)
 
 
@@ -344,7 +348,8 @@ async def list_articles(
     )
 
     result = await db.execute(
-        select(Article)
+        select(Article, DistilledArticle)
+        .outerjoin(DistilledArticle, DistilledArticle.article_id == Article.id)
         .where(
             Article.user_id == uid,
             Article.deleted_at.is_(None),
@@ -353,10 +358,10 @@ async def list_articles(
         .limit(limit)
         .offset(offset)
     )
-    articles = result.scalars().all()
+    rows = result.all()
 
     return {
-        "items": [_to_response(a).model_dump() for a in articles],
+        "items": [_to_response(art, task).model_dump() for art, task in rows],
         "total": total or 0,
     }
 
@@ -369,15 +374,17 @@ async def list_pending(user: dict = Depends(require_user), db: AsyncSession = De
         return {"articles": cached, "count": len(cached), "cached": True}
 
     result = await db.execute(
-        select(Article).where(
+        select(Article, DistilledArticle)
+        .outerjoin(DistilledArticle, DistilledArticle.article_id == Article.id)
+        .where(
             Article.user_id == uid,
             Article.status.in_(["pending", "distilling", "ready"]),
             Article.skip.is_(False),
             Article.deleted_at.is_(None),
         )
     )
-    items = result.scalars().all()
-    items = [_to_response(a).model_dump() for a in items]
+    rows = result.all()
+    items = [_to_response(art, task).model_dump() for art, task in rows]
     await cache_service.set_pending(uid, items)  # 回填（ttl 60s）
     return {"articles": items, "count": len(items), "cached": False}
 
@@ -385,14 +392,16 @@ async def list_pending(user: dict = Depends(require_user), db: AsyncSession = De
 @app.get("/api/v1/articles/listened")
 async def list_listened(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
     result = await db.execute(
-        select(Article).where(
+        select(Article, DistilledArticle)
+        .outerjoin(DistilledArticle, DistilledArticle.article_id == Article.id)
+        .where(
             Article.user_id == _uid(user),
             Article.status == "listened",
             Article.deleted_at.is_(None),
         )
     )
-    items = result.scalars().all()
-    items = [_to_response(a) for a in items]
+    rows = result.all()
+    items = [_to_response(art, task).model_dump() for art, task in rows]
     return {"articles": items, "count": len(items)}
 
 
@@ -404,8 +413,8 @@ async def get_article(
     if cached:
         return cached
 
-    art = await _get_owned(article_id, _uid(user), db)
-    payload = _to_response(art).model_dump()
+    art, task = await _get_owned_with_task(article_id, _uid(user), db)
+    payload = _to_response(art, task).model_dump()
     await cache_service.set_article(article_id, payload)  # ttl 300s
     return payload
 

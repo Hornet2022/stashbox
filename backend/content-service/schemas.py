@@ -2,6 +2,7 @@
 
 从 main.py 抽出，路由只做编排，模型定义集中在此。
 """
+
 from pydantic import BaseModel
 
 
@@ -20,6 +21,9 @@ class ArticleResponse(BaseModel):
     favorite: bool
     skip: bool
     created_at: str
+    audio_url: str | None = None
+    task_id: str | None = None
+    duration_sec: int | None = None
 
 
 class D9AddRequest(BaseModel):
