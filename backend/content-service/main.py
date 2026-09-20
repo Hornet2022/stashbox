@@ -2262,6 +2262,116 @@ async def admin_stats(
     return result
 
 
+# CP11.0.3 蒸馏 P95 metrics（从 ai-service /metrics 解析）
+import re as _re
+
+_DISTILL_P95_CACHE: dict[str, float] = {}
+_DISTILL_P95_CACHE_TS: float = 0.0
+_DISTILL_P95_CACHE_TTL = 30.0  # 30 秒缓存
+
+
+async def _fetch_ai_metrics() -> str:
+    """从 ai-service /metrics + arq worker /metrics 拉 Prometheus 文本，合并。
+
+    Worker 进程的 Prometheus registry 与 FastAPI 进程隔离，需独立抓。
+    """
+    import httpx
+    fastapi_url = os.environ.get("AI_SERVICE_URL", "http://localhost:8103")
+    worker_url = os.environ.get("AI_WORKER_METRICS_URL", "http://localhost:8104")
+    async with httpx.AsyncClient(timeout=4.0) as c:
+        parts = []
+        try:
+            r = await c.get(f"{fastapi_url}/metrics")
+            parts.append(r.text)
+        except Exception:
+            pass
+        try:
+            r2 = await c.get(f"{worker_url}/metrics")
+            parts.append(r2.text)
+        except Exception:
+            pass
+    return "\n".join(parts)
+
+
+def _parse_distill_p95(metrics_text: str) -> dict:
+    """从 Prometheus 文本解析 distill_step_duration_seconds 的 P50/P95/P99。
+
+    格式：`distill_step_duration_seconds_bucket{step="step1_structure",le="..."} N`
+    """
+    result = {"by_step": {}, "overall": {"p50": None, "p95": None, "p99": None}}
+    # 按 step 分组 bucket
+    buckets_by_step: dict[str, list[tuple[float, float]]] = {}
+    for m in _re.finditer(
+        r'distill_step_duration_seconds_bucket\{le="([^"]+)",step="([^"]+)"\}\s+([0-9.e+-]+)',
+        metrics_text,
+    ):
+        le = m.group(1)
+        step = m.group(2)
+        cnt = float(m.group(3))
+        if le == "+Inf":
+            le = 1e18
+        else:
+            le = float(le)
+        buckets_by_step.setdefault(step, []).append((le, cnt))
+
+    # 计算每个 step 的 P50/P95/P99（用线性插值近似）
+    for step, buckets in buckets_by_step.items():
+        buckets.sort(key=lambda x: x[0])
+        total = buckets[-1][1] if buckets else 0
+        if total <= 0:
+            continue
+        p = {}
+        for q, label in [(0.5, "p50"), (0.95, "p95"), (0.99, "p99")]:
+            target = total * q
+            prev_le, prev_cnt = 0.0, 0.0
+            for le, cnt in buckets:
+                if cnt >= target:
+                    # 线性插值
+                    if cnt == prev_cnt:
+                        p[label] = le
+                    else:
+                        ratio = (target - prev_cnt) / (cnt - prev_cnt)
+                        p[label] = prev_le + ratio * (le - prev_le)
+                    break
+                prev_le, prev_cnt = le, cnt
+            else:
+                p[label] = buckets[-1][0]
+        result["by_step"][step] = p
+
+    # overall: 跨 step 累加 P95 的简单平均（足够看趋势）
+    if result["by_step"]:
+        for q in ("p50", "p95", "p99"):
+            vals = [s.get(q) for s in result["by_step"].values() if s.get(q) is not None]
+            if vals:
+                result["overall"][q] = sum(vals) / len(vals)
+    return result
+
+
+@app.get("/api/v1/admin/distill-p95")
+async def admin_distill_p95(
+    user: dict = Depends(require_admin_or_operator),
+):
+    """蒸馏 P50/P95/P99 耗时（秒），从 ai-service Prometheus metrics 解析。
+
+    用于 admin-web Dashboard 显示蒸馏性能。
+    """
+    global _DISTILL_P95_CACHE, _DISTILL_P95_CACHE_TS
+    import time as _t
+    now = _t.time()
+    if _DISTILL_P95_CACHE and (now - _DISTILL_P95_CACHE_TS) < _DISTILL_P95_CACHE_TTL:
+        return {"cached": True, **_DISTILL_P95_CACHE}
+
+    try:
+        metrics_text = await _fetch_ai_metrics()
+        parsed = _parse_distill_p95(metrics_text)
+        _DISTILL_P95_CACHE = parsed
+        _DISTILL_P95_CACHE_TS = now
+        return {"cached": False, **parsed}
+    except Exception as exc:
+        log.warning(f"distill-p95 fetch failed: {exc}")
+        return {"cached": False, "by_step": {}, "overall": {"p50": None, "p95": None, "p99": None}, "error": str(exc)}
+
+
 if __name__ == "__main__":
     import uvicorn
 
