@@ -2090,10 +2090,34 @@ async def _safe_revenue(db: AsyncSession) -> float:
         return 0.0
 
 
+# CP9.4: admin stats 缓存（30s TTL read-through cache）
+_admin_stats_cache: dict = {}
+_admin_stats_expires: dict = {}
+
+
+def _get_cached_stats():
+    """从内存缓存读 stats，TTL 30s。"""
+    now = time.time()
+    if "stats" in _admin_stats_cache and _admin_stats_expires.get("stats", 0) > now:
+        return _admin_stats_cache["stats"]
+    return None
+
+
+def _set_cached_stats(data: dict):
+    """写 stats 到内存缓存，TTL 30s。"""
+    _admin_stats_cache["stats"] = data
+    _admin_stats_expires["stats"] = time.time() + 30
+
+
 @app.get("/api/v1/admin/stats")
 async def admin_stats(
     user: dict = Depends(require_admin_or_operator), db: AsyncSession = Depends(get_db)
 ):
+    # CP9.4 read-through cache
+    cached = _get_cached_stats()
+    if cached is not None:
+        return cached
+
     total_users = await db.scalar(select(func.count()).select_from(User))
     total_articles = await db.scalar(select(func.count()).select_from(Article))
     pending = await db.scalar(
@@ -2129,7 +2153,7 @@ async def admin_stats(
     # revenue：orders 本月已支付（表可能缺失 → 0）
     revenue = await _safe_revenue(db)
 
-    return {
+    result = {
         "total_users": total_users or 0,
         "total_articles": total_articles or 0,
         "pending": pending or 0,
@@ -2138,6 +2162,8 @@ async def admin_stats(
         "active_audio_files": active_audio or 0,
         "failed_distillations_24h": failed_24h or 0,
     }
+    _set_cached_stats(result)
+    return result
 
 
 if __name__ == "__main__":
