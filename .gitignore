@@ -22,6 +22,8 @@ secrets/
 .ck_uid_helper.py
 .dev_admin*
 .dev_*
+# CP10.6: 临时诊断脚本(WorkBuddy 调研 bug 时建,含 JWT_SECRET 引用,不入主仓)
+_diag_repro.py
 
 # ===========================================
 # Python (后端 FastAPI)
