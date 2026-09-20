@@ -1,4 +1,5 @@
 """LLM client 抽象接口。"""
+
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -11,6 +12,7 @@ class LLMClient(ABC):
     - OpenAIClient（生产，留接口）
     - DeepSeekClient（生产，留接口）
     - GLMClient（生产，留接口）
+    - QwenVLClient（生产，Token Plan 团队版 + qwen3.6-flash）
     """
 
     @abstractmethod
