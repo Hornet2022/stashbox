@@ -196,6 +196,20 @@ async def distill_task(
 
     try:
         await pipeline.run(pipeline_ctx)
+        # CP10: 写回 articles.status=ready + audio_url（派生自 distilled_articles）
+        async with AsyncSessionLocal() as db:
+            da_result = await db.execute(
+                select(DistilledArticle).where(DistilledArticle.id == task_id)
+            )
+            da = da_result.scalar_one_or_none()
+            if da is not None:
+                art_result = await db.execute(select(Article).where(Article.id == da.article_id))
+                art = art_result.scalar_one_or_none()
+                if art is not None and da.audio_url:
+                    art.status = "ready"
+                    art.audio_url = da.audio_url
+                    await db.commit()
+                    log.info("articles.status_updated_to_ready", article_id=art.id)
         # CP6.2.2.2b 埋点：DISTILL_STEP_COMPLETE（注：步骤在 DistillPipeline 内部迭代，
         # 本文件只在外层 pipeline.run 完成后打点；如需真正 per-step 打点需改 DistillPipeline）
         async with AsyncSessionLocal() as db:

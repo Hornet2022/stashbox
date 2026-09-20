@@ -154,6 +154,13 @@ async def _run_pipeline(task_id: str, simulate_failure: bool = False) -> None:
         da.duration_sec = 300
         da.tags = ["科技", "商业"]
         da.quality_score = 8.5
+        # CP10: 写回 articles.status=ready + audio_url
+        art_result = await session.execute(select(Article).where(Article.id == da.article_id))
+        art = art_result.scalar_one_or_none()
+        if art is not None:
+            art.status = "ready"
+            art.audio_url = da.audio_url
+            await session.flush()
         await session.commit()
 
 
