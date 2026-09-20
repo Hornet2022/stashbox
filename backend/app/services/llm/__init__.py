@@ -21,11 +21,12 @@ from stashbox.backend.common.system_config import KEY_LLM, get_config
 from .base import LLMClient
 from .mock import MockLLMClient
 from .openai import OpenAIClient
+from .qwen import QwenVLClient
 
 log = get_logger(__name__)
 
 # CP7.3 实际实现了的 provider（deepseek / glm 在 base.py 里只是预留）
-SUPPORTED_PROVIDERS = ("mock", "openai")
+SUPPORTED_PROVIDERS = ("mock", "openai", "qwen_vl")
 
 _client: LLMClient | None = None
 _signature: str | None = None
@@ -39,6 +40,13 @@ def _env_config() -> dict[str, Any]:
         "api_key": os.getenv("OPENAI_API_KEY", ""),
         # CP7.3.3：base_url 只做「读出来给 admin 展示」这一层，client 怎么用它不在本任务范围
         "base_url": os.getenv("LLM_BASE_URL", ""),
+        # CP7.1：qwen_vl（Token Plan 团队版）
+        "qwen_vl_model": os.getenv("QWEN_VL_MODEL", "qwen3.6-flash"),
+        "qwen_vl_base_url": os.getenv(
+            "QWEN_VL_BASE_URL",
+            "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        ),
+        "qwen_vl_api_key": os.getenv("DASHSCOPE_API_KEY", ""),
     }
 
 
@@ -57,6 +65,13 @@ def build_client(config: dict[str, Any]) -> LLMClient:
         return OpenAIClient(
             api_key=config.get("api_key") or "",
             model=config.get("model") or "gpt-4o-mini",
+        )
+    if provider == "qwen_vl":
+        return QwenVLClient(
+            api_key=config.get("qwen_vl_api_key") or config.get("api_key") or "",
+            model=config.get("qwen_vl_model") or "qwen3.6-flash",
+            base_url=config.get("qwen_vl_base_url")
+            or "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
         )
     if provider != "mock":
         log.warning("llm_provider_unsupported", provider=provider, fallback="mock")
