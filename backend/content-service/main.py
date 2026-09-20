@@ -1149,7 +1149,7 @@ async def list_my_feedback_v2(
 async def d9_add_article(
     req: D9AddRequest,
     user: dict | None = Depends(require_user_optional),
-    device_id: Annotated[str | None, Header()] = None,
+    device_id: Annotated[str | None, Header(alias="X-Device-Id")] = None,
     db: AsyncSession = Depends(get_db),
 ):
     """D9 入口（v1 §3.5）：微信「更多打开方式」→ 听匣，不要求登录态。
