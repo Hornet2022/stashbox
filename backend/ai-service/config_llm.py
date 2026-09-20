@@ -10,6 +10,7 @@ CP3.5 接真 API 时通过环境变量注入：
 - CLAUDE_MODEL=claude-4-sonnet-20250514
 - QWEN_VL_MODEL=qwen2.5-vl-72b-instruct
 """
+
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -32,7 +33,8 @@ class LLMSettings(BaseSettings):
     qwen_vl_api_key: str = Field(
         default="", validation_alias=AliasChoices("qwen_vl_api_key", "DASHSCOPE_API_KEY")
     )
-    qwen_vl_model: str = "qwen2.5-vl-72b-instruct"
+    qwen_vl_base_url: str = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+    qwen_vl_model: str = "qwen3.6-flash"
 
     # 通用
     timeout: float = 60.0
