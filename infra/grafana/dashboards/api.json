@@ -1,0 +1,13 @@
+{
+  "dashboard": {
+    "title": "StashBox API Dashboard",
+    "panels": [
+      {
+        "title": "Placeholder Panel",
+        "type": "text",
+        "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+        "content": "Dashboard setup pending"
+      }
+    ]
+  }
+}

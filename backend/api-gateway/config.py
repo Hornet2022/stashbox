@@ -45,6 +45,10 @@ ROUTES: list[Route] = [
     Route("POST", "/api/v1/auth/wechat-login", "user-service", _url("user-service")),
     Route("POST", "/api/v1/auth/refresh-token", "user-service", _url("user-service")),
     Route("GET", "/api/v1/user", "user-service", _url("user-service")),
+    # CP5.1 onboarding (CP7.4 路由补漏,承宇 2026-09-20 真机发现)
+    Route("POST", "/api/v1/users/me/onboarding/start", "user-service", _url("user-service")),
+    Route("POST", "/api/v1/users/me/onboarding/step", "user-service", _url("user-service")),
+    Route("POST", "/api/v1/users/me/onboarding/done", "user-service", _url("user-service")),
     Route("POST", "/api/v1/articles/add", "content-service", _url("content-service")),
     Route("GET", "/api/v1/articles/pending", "content-service", _url("content-service")),
     Route("GET", "/api/v1/articles/listened", "content-service", _url("content-service")),
