@@ -1,4 +1,5 @@
 """文章表 - 用户加入的原始内容（待蒸馏）。"""
+
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -24,9 +25,7 @@ class Article(Base, TimestampMixin):
     __tablename__ = "articles"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)  # art_xxx
-    user_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("users.id"), nullable=False
-    )
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)
     url: Mapped[str] = mapped_column(Text, nullable=False)
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     source: Mapped[str] = mapped_column(
@@ -42,11 +41,12 @@ class Article(Base, TimestampMixin):
     retry_count: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0", nullable=False
     )  # CP5.2 用户端重试计数
+    audio_url: Mapped[str | None] = mapped_column(
+        String(512), nullable=True
+    )  # CP10 蒸馏完成后写回的 OSS URL
 
     # CP1.4 端点保留字段
-    favorite: Mapped[bool] = mapped_column(
-        Boolean, default=False, nullable=False
-    )
+    favorite: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     skip: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     __table_args__ = (
