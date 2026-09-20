@@ -1620,6 +1620,22 @@ async def admin_audit_log(
     size = max(min(size, 100), 1)
     offset = (page - 1) * size
 
+    # CP9.5 修复：from_/to 字符串转 datetime(原代码 SQLAlchemy 字符串 vs timestamp 比较 500)
+    from datetime import datetime as _dt
+
+    from_dt = None
+    to_dt = None
+    if from_ is not None:
+        try:
+            from_dt = _dt.fromisoformat(from_)
+        except (ValueError, TypeError):
+            from_dt = None
+    if to is not None:
+        try:
+            to_dt = _dt.fromisoformat(to)
+        except (ValueError, TypeError):
+            to_dt = None
+
     query = select(AdminOperationLog)
     if actor_id is not None:
         try:
@@ -1628,10 +1644,10 @@ async def admin_audit_log(
             pass  # 非数字 actor_id 不匹配任何行，返回空
     if action_type is not None:
         query = query.where(AdminOperationLog.action == action_type)
-    if from_ is not None:
-        query = query.where(AdminOperationLog.created_at >= from_)
-    if to is not None:
-        query = query.where(AdminOperationLog.created_at <= to)
+    if from_dt is not None:
+        query = query.where(AdminOperationLog.created_at >= from_dt)
+    if to_dt is not None:
+        query = query.where(AdminOperationLog.created_at <= to_dt)
 
     total = await db.scalar(select(func.count()).select_from(query.subquery()))
     rows = (
