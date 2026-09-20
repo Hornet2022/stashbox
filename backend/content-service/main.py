@@ -624,6 +624,24 @@ async def favorite(
     return {"id": article_id, "favorite": True, "feedback_id": fb.id}
 
 
+@app.post("/api/v1/articles/{article_id}/unfavorite")
+async def unfavorite_article(
+    article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+):
+    """取消收藏（CP9.3）：articles.favorite = False + feedback(type=unfavorite)。
+
+    幂等：文章本来就没收藏时直接返回 ok。
+    """
+    uid = _uid(user)
+    art = await _get_owned(article_id, uid, db)
+    art.favorite = False
+    fb = await _write_feedback(db, uid, article_id, "unfavorite")
+    await db.commit()
+    await db.refresh(fb)
+    await cache_service.invalidate_article(article_id)
+    return {"id": article_id, "favorite": False, "feedback_id": fb.id}
+
+
 # CP8.6 Bug 3 — `/favorite`（单数）vs `/favorites`（复数）双轨设计决策
 # ============================================================================
 # 决策时间:  CP8.6
