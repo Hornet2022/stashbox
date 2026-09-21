@@ -7,6 +7,24 @@ CP1.5：全部走真实 PostgreSQL（articles 表）。
 
 CP1.7：D9 端到端 —— 不要求登录态 → 建文章 → 自动触发 ai-service 蒸馏 →
 客户端轮询 status / audio-url 拿音频。
+
+⚠️ P2-1 文件规模警告（2026-09-21 走查）：
+
+  本文件 2388 行单文件，是项目里最大的 hot-spot。结构组成：
+    line  92-224   helpers (_uid / _new_article_id / _to_response / _validate_url / ...)
+    line  263-606  _create_article + add/list/get/mark-listened/retry（核心用户路径）
+    line  608-959  favorites / later-listens / snooze / skip
+    line  959-1572 d9 callback / clawbot / tags / admin-stats（admin 段之前）
+    line 1572-2388 admin 段（12 端点 + 9 helper）   ← P2-1 建议优先拆这 820 行
+
+  拆分路线（建议作为独立 CP，不建议混在 P0/P1 修复集里）：
+    admin_router.py        ← 拆 1572-2388（admin 端点 + helpers）
+    favorites_router.py    ← 拆 608-959
+    articles_router.py     ← 拆 263-606（含 _create_article 等）
+    d9_router.py           ← 拆 959-1572（d9/clawbot/tags/admin-stats 部分）
+
+  拆分时每个新 router 用 APIRouter() 声明，main.py 用 include_router 装上；
+  app = FastAPI(...) 仍保留在 main.py（lifespan / middleware / CORS 集中管理）。
 """
 
 import csv
@@ -23,7 +41,7 @@ from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -297,8 +315,23 @@ async def _create_article(
 
 @app.post("/api/v1/articles/add", response_model=ArticleResponse)
 async def add_article(
-    req: AddArticleRequest, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+    response: Response,
+    req: AddArticleRequest,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
 ):
+    """⚠️ Deprecated（CP11.x 走查 P2-2 标记）。
+
+    与 POST /api/v1/articles 行为不一致：
+      - 本端点：不扣配额，CP1.4 风格历史行为
+      - 新端点：扣配额、cache_service 标记、ARTICLE_SUBMIT 埋点
+
+    为兼容老版本 iOS/Android 客户端暂时保留入口，响应头加 Deprecation 提示客户端迁移。
+    下个主版本（CP12+）移除，并同步下掉 api-gateway/config.py:57 路由。
+    """
+    response.headers["Deprecation"] = "true"
+    response.headers["Sunset"] = "CP12"
+    response.headers["Link"] = '</api/v1/articles>; rel="successor-version"'
     art = await _create_article(req.url, _uid(user), req.source, None, db)
     await get_ai_client().trigger_distill(art.id, auth_token=create_access_token(str(art.user_id)))
     return _to_response(art)
