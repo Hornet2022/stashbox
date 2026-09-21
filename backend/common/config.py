@@ -5,6 +5,7 @@
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,6 +38,26 @@ class Settings(BaseSettings):
     redis_password: str = ""
 
     jwt_secret: str = "dev-secret-change-me-in-production"
+
+    @field_validator("jwt_secret")
+    @classmethod
+    def _validate_jwt_secret(cls, v: str) -> str:
+        """启动断言：禁止用默认 dev 密钥（防止生产环境误用，任何人能伪造 token）。
+
+        本地 dev 可通过环境变量 STASHBOX_ALLOW_DEV_JWT=1 显式放行（CI / 集成测试用）。
+        """
+        if v == "dev-secret-change-me-in-production":
+            import os
+
+            if not os.getenv("STASHBOX_ALLOW_DEV_JWT"):
+                raise ValueError(
+                    "jwt_secret 仍为默认值。生产必须通过环境变量 JWT_SECRET 注入强密钥；"
+                    "本地 dev 可设 STASHBOX_ALLOW_DEV_JWT=1 显式放行。"
+                )
+        if len(v) < 16:
+            raise ValueError(f"jwt_secret 太短（{len(v)} 字符 < 16），建议至少 32 字符的随机串。")
+        return v
+
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60 * 24 * 7
 

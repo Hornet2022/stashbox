@@ -26,6 +26,8 @@ if [[ -n "$EXISTING_PID" ]]; then
 fi
 
 export PYTHONPATH="$(dirname "$REPO_ROOT"):${PYTHONPATH:-}"
+# dev 环境放行默认 JWT secret；生产必须用真 JWT_SECRET 注入（见 config.py 校验）
+export STASHBOX_ALLOW_DEV_JWT="${STASHBOX_ALLOW_DEV_JWT:-1}"
 
 cd "$REPO_ROOT"
 exec "$PYTHON_BIN" -m uvicorn user-service.main:app --host 0.0.0.0 --port 8101 --log-level info

@@ -36,6 +36,8 @@ export USER_SERVICE_URL="http://localhost:8101"
 export CONTENT_SERVICE_URL="http://localhost:8102"
 export AI_SERVICE_URL="http://localhost:8103"
 export PYTHONPATH="$(dirname "$REPO_ROOT"):${PYTHONPATH:-}"
+# dev 环境放行默认 JWT secret；生产必须用真 JWT_SECRET 注入（见 config.py 校验）
+export STASHBOX_ALLOW_DEV_JWT="${STASHBOX_ALLOW_DEV_JWT:-1}"
 
 # 启动（cwd 必须是 backend 根，不是 api-gateway 子目录——sys.path[0]=cwd 才能 import api-gateway）
 cd "$REPO_ROOT"
