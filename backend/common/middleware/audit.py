@@ -1,11 +1,18 @@
 """AuditMiddleware 自动记录 admin 写操作（CP3.6-A1）。v1 §3.6 5 原则 1。"""
+
+import asyncio
 import json
 import re
 from typing import Optional
+
+import structlog
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
+
 from stashbox.backend.common.database import AsyncSessionLocal
 from stashbox.backend.common.models.admin_operation_log import AdminOperationLog
+
+_log = structlog.get_logger("audit")
 
 # 路径匹配：/api/v1/admin/* 写操作
 ADMIN_PATH_PATTERN = re.compile(r"^/api/v1/admin/")
@@ -48,6 +55,41 @@ def _extract_target(path: str) -> tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+# 全局 registry：每个 AuditMiddleware 实例 fire-and-forget 写的 task 都注册进来，
+# lifespan shutdown 时 await 全部 task，避免 asyncio 强杀任务导致 admin log 漏写。
+_pending_tasks: set[asyncio.Task] = set()
+
+
+def _track_task(coro) -> asyncio.Task:
+    """创建 task 并注册到全局 set；任务完成后自动从 set 移除。"""
+    task = asyncio.create_task(coro)
+    _pending_tasks.add(task)
+    task.add_done_callback(_pending_tasks.discard)
+    return task
+
+
+async def drain_pending_audit_tasks(timeout: float = 5.0) -> None:
+    """等待残留 audit task 完成（lifespan shutdown 时调用）。
+
+    返回前最多等 timeout 秒；超时后未完成的任务会被取消（task 取消是 asyncio 标准语义）。
+    """
+    if not _pending_tasks:
+        return
+    pending = list(_pending_tasks)
+    _log.info("audit_draining", pending=len(pending), timeout=timeout)
+    done, not_done = await asyncio.wait(pending, timeout=timeout)
+    if not_done:
+        _log.error(
+            "audit_drain_timeout",
+            pending=len(not_done),
+            note="audit log 写入超时，已强制取消 — 可能有 admin 操作未记 log",
+        )
+        for t in not_done:
+            t.cancel()
+    else:
+        _log.info("audit_drained", completed=len(done))
+
+
 class AuditMiddleware(BaseHTTPMiddleware):
     """admin 写操作自动记录（CP3.6-A1）。
 
@@ -80,7 +122,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
         # 4. 执行实际请求
         response = await call_next(request)
 
-        # 5. 异步写 log（不阻塞响应）
+        # 5. 异步写 log（不阻塞响应）；失败用 ERROR 级别（之前静默吞）
         try:
             admin_user = await _resolve_admin_user(request)
             if admin_user is None:
@@ -90,37 +132,51 @@ class AuditMiddleware(BaseHTTPMiddleware):
             reason = (body_dict or {}).get("reason", "(no reason)")
             sanitized = _sanitize_body(body_dict)
 
-            # fire-and-forget 写 log
-            import asyncio
-            asyncio.create_task(self._write_log(
-                admin_id=admin_user["id"],
-                admin_tier=admin_user.get("tier", "unknown"),
-                action=action,
-                target_type=target_type,
-                target_id=target_id,
-                reason=reason,
-                method=request.method,
+            _track_task(
+                self._write_log(
+                    admin_id=admin_user["id"],
+                    admin_tier=admin_user.get("tier", "unknown"),
+                    action=action,
+                    target_type=target_type,
+                    target_id=target_id,
+                    reason=reason,
+                    method=request.method,
+                    path=request.url.path,
+                    request_body=sanitized,
+                    response_status=response.status_code,
+                    ip=request.client.host if request.client else None,
+                    user_agent=request.headers.get("user-agent"),
+                )
+            )
+        except Exception as e:
+            _log.error(
+                "audit_dispatch_failed",
                 path=request.url.path,
-                request_body=sanitized,
-                response_status=response.status_code,
-                ip=request.client.host if request.client else None,
-                user_agent=request.headers.get("user-agent"),
-            ))
-        except Exception:
-            pass  # log 失败不破主请求
+                method=request.method,
+                err=str(e),
+                note="audit middleware 调度失败（非写 log 失败），但响应已发出",
+            )
 
         return response
 
     @staticmethod
     async def _write_log(**kwargs):
-        """独立 task 写 log（不阻塞主请求）"""
+        """独立 task 写 log（不阻塞主请求）。失败升级到 ERROR。"""
         try:
             async with AsyncSessionLocal() as db:
-                log = AdminOperationLog(**kwargs)
-                db.add(log)
+                log_row = AdminOperationLog(**kwargs)
+                db.add(log_row)
                 await db.commit()
-        except Exception:
-            pass  # log 失败静默
+        except Exception as e:
+            _log.error(
+                "audit_write_failed",
+                err=str(e),
+                kwargs_summary={
+                    k: kwargs.get(k)
+                    for k in ("action", "target_type", "target_id", "method", "path")
+                },
+                note="admin operation log 写入失败 — CP3.6-A1 合规缺口，需要排查 DB 连接 / 权限",
+            )
 
 
 async def _resolve_admin_user(request: Request) -> Optional[dict]:

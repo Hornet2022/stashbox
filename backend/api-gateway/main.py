@@ -77,6 +77,10 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass  # 失败不阻塞 startup
     yield
+    # P1-5：shutdown 时等待 audit task 写完（避免 admin log 漏写）
+    from stashbox.backend.common.middleware.audit import drain_pending_audit_tasks
+
+    await drain_pending_audit_tasks(timeout=5.0)
     # CP6.2.2.2b 埋点：SERVICE_STOP
     try:
         async with AsyncSessionLocal() as session:
