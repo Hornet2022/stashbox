@@ -65,6 +65,7 @@ def build_client(config: dict[str, Any]) -> LLMClient:
         return OpenAIClient(
             api_key=config.get("api_key") or "",
             model=config.get("model") or "gpt-4o-mini",
+            base_url=config.get("base_url") or "https://api.openai.com/v1",
         )
     if provider == "qwen_vl":
         return QwenVLClient(
