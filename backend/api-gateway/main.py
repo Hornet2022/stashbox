@@ -16,21 +16,20 @@ api-gateway（端口 8100） - 听匣统一入口 + JWT 签发 + 路由分发。
 """
 
 from contextlib import asynccontextmanager
-from pathlib import Path
-import sys
-
-# 注意：本服务不再使用 sys.path hack。stashbox 包通过 PYTHONPATH（见 run_dev.sh）
-# 或 `pip install -e` 导入。直接 `uvicorn main:app` 时需保证仓库根父目录在 PYTHONPATH 中。
-# 例外：同目录下的 config.py（路由表）是「按文件加载」的一部分 —— 单测用
-# importlib 加载 main.py 时 cwd 不在服务目录，故把自身目录加入 sys.path。
-sys.path.insert(0, str(Path(__file__).resolve().parent))  # noqa: E402
-
 import os
+import sys
+from pathlib import Path
+
+# api-gateway 没有 __init__.py，是按脚本模块加载。
+# 生产路径（uvicorn 启动）：cwd=backend/，api-gateway/ 自动在 sys.path 上。
+# 单测路径（importlib 加载 main.py）：cwd 不固定，把自身目录加入 sys.path。
+_THIS_DIR = str(Path(__file__).resolve().parent)
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
 
 import httpx
 import structlog
 from fastapi import FastAPI, Request, Response
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -105,9 +104,7 @@ install_health_endpoints(app)
 # 变量 STASHBOX_CORS_ALLOW_ORIGINS（逗号分隔）覆盖白名单。CP9.1.1 基础设施
 # 修复 — admin-web 浏览器调 /api/v1/admin/* 跨源被浏览器拦截。
 # 必须最后 add：FastAPI 中间件倒序执行（最后 add 最先 run = 最外层）。
-import os as _os  # noqa: E402
-
-_cors_env = _os.getenv("STASHBOX_CORS_ALLOW_ORIGINS", "").strip()
+_cors_env = os.getenv("STASHBOX_CORS_ALLOW_ORIGINS", "").strip()
 if _cors_env:
     _cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
 else:
@@ -120,8 +117,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-os.makedirs("/tmp/audio", exist_ok=True)
-app.mount("/audio", StaticFiles(directory="/tmp/audio"), name="audio")
+# 音频回放：v1 §3.6 明确规定「OSS 是唯一写音频的职责」，gateway 不再本地挂载。
+# 客户端拿到的 audio_url 已是 OSS 公网/签名 URL（content-service 直签 OSS 返回），
+# gateway 只做透传，不再做 static mount。
 
 
 class TokenRequest(BaseModel):
