@@ -45,6 +45,11 @@ ROUTES: list[Route] = [
     Route("POST", "/api/v1/auth/wechat-login", "user-service", _url("user-service")),
     Route("POST", "/api/v1/auth/refresh-token", "user-service", _url("user-service")),
     Route("GET", "/api/v1/user", "user-service", _url("user-service")),
+    # CP11.0.4 P1.2: 付费墙配额查询(用户自己 / 配额)。
+    # user-service 同时暴露 /api/v1/user/quota 和 /api/v1/users/me/quota,
+    # 这里两条都加,保证兼容。
+    Route("GET", "/api/v1/user/quota", "user-service", _url("user-service")),
+    Route("GET", "/api/v1/users/me/quota", "user-service", _url("user-service")),
     # CP5.1 onboarding (CP7.4 路由补漏,承宇 2026-09-20 真机发现)
     Route("POST", "/api/v1/users/me/onboarding/start", "user-service", _url("user-service")),
     Route("POST", "/api/v1/users/me/onboarding/step", "user-service", _url("user-service")),
