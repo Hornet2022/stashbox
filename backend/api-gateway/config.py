@@ -164,6 +164,8 @@ ROUTES += [
     ),
     Route("GET", "/api/v1/admin/audit-log", "content-service", _url("content-service")),
     Route("GET", "/api/v1/admin/stats", "content-service", _url("content-service")),
+    # CP11.0.7 P2.3: 蒸馏耗时 P95 分布(从 ai-service Prometheus 解析)
+    Route("GET", "/api/v1/admin/distill-p95", "content-service", _url("content-service")),
     Route("GET", "/api/v1/admin/export/users.csv", "content-service", _url("content-service")),
     Route("GET", "/api/v1/admin/export/articles.csv", "content-service", _url("content-service")),
     Route("GET", "/api/v1/admin/export/feedback.csv", "content-service", _url("content-service")),
