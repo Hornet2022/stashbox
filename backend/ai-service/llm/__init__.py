@@ -1,4 +1,4 @@
-"""LLM Client 抽象层（CP3.5-pre-1，v1 §5 L4 蒸馏引擎 + §11.5 CP3.5 前置）。
+"""ai-service 私有 LLM Client 抽象层（CP3.5-pre-1，v1 §5 L4 蒸馏引擎）。
 
 用法::
 
@@ -7,9 +7,15 @@
     client = get_llm_client()               # 默认 MockLLMClient
     resp = await client.chat(ChatRequest(messages=[ChatMessage(role="user", content="...")]))
 
-ai-service 目录名带连字符（不是合法包名），不能相对导入上层的 config_llm.py ——
+ai-service 目录名带连字符（不是合法包名），不能相对导入上层 config_llm.py ——
 这里把 ai-service 目录加进 sys.path，让 config_llm 作为顶层模块导入。
+
+⚠️ 注意：与 content-service 用的 app/services/llm/（CP7.1）是**两个独立的 LLM 抽象层**：
+  - ai-service/llm/        → L4 蒸馏引擎（4 步流水线专用，含 ClaudeSonnetClient）
+  - app/services/llm/      → content-service 摘要/分类（CP7.1，含 OpenAIClient + QwenVLClient）
+不要混用调用。
 """
+
 import sys
 from pathlib import Path
 
