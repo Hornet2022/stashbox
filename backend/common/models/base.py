@@ -1,17 +1,21 @@
 """所有 ORM 模型的基类。
 
-⚠️ TimestampMixin 覆盖现状（CP11.x 走查发现的不一致）：
-
+P1-3 修复后（CP11.x 走查）：
   - User / Article / DistilledArticle 继承 TimestampMixin（已规范化）
   - Feedback / FeedbackV2 / PushNotification / AdminOperationLog 各自手写 created_at，
-    列类型不统一：TIMESTAMP / DateTime(timezone=True) / postgresql.TIMESTAMP 三种
+    统一用 sqlalchemy.TIMESTAMP + func.now()（与 TimestampMixin 的 created_at 列
+    完全等价；只继承 created_at 字段，不引入 updated_at / deleted_at —— 业务侧无需求）
 
-统一收编到 TimestampMixin 是 P1-3 目标，但**会引入 DDL 变更 + 数据迁移**：
-  - 4 个表都要把 created_at 类型统一（推荐 TIMESTAMP）
-  - updated_at / deleted_at 是否补齐需要业务侧决策（部分表无 update 语义、部分无软删除语义）
+  - alembic 0023_unify_created_at_type 已将 push_notifications /
+    admin_operation_logs 的 created_at 显式 alter 到 timestamp without time zone，
+    与 ORM 声明对齐。
 
-短期内（CP12 前）保持现状；P1-3 推迟到"DB 治理"专项任务（建议拆为独立 PR/CP，
-避免与 P1-1~P1-5 的纯代码修复混在一起降低 review 难度）。
+  对 PushNotification / AdminOperationLog 不继承 TimestampMixin 的设计说明：
+    - 这两张表是 append-only 日志（推送队列 / 审计日志），updated_at 会让
+      「CP3.6-A1 合规审计 / 推送重试状态」语义模糊
+    - audit log 软删除（deleted_at）会破坏合规要求（监管要求保留 N 年、不可删）
+    - 若日后需要 audit log 的 deleted_at 用于「运营可撤销」（合规允许范围内），
+      再单独建一张 AdminOperationLogArchive 表而非在本表加 deleted_at
 """
 
 from sqlalchemy import Column, TIMESTAMP, func
@@ -23,7 +27,12 @@ class Base(DeclarativeBase):
 
 
 class TimestampMixin:
-    """created_at / updated_at / deleted_at 时间戳（UTC，软删除）。"""
+    """created_at / updated_at / deleted_at 时间戳（UTC，软删除）。
+
+    仅适用于业务实体表（User / Article / DistilledArticle）；日志类表
+    （Feedback / FeedbackV2 / PushNotification / AdminOperationLog）按业务
+    侧选择只继承 created_at 风格、不引 updated_at/deleted_at。
+    """
 
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
     updated_at = Column(

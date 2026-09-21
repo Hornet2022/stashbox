@@ -1,8 +1,17 @@
-"""PushNotification model（CP5.4a）。v1 §11.5 CP5.4。"""
+"""PushNotification model（CP5.4a）。v1 §11.5 CP5.4。
+
+P1-3 修复（CP11.x 走查）：
+  created_at 之前用 DateTime(timezone=True) + "NOW()"（手写字符串 default），
+  与项目其他表的 TIMESTAMP + func.now() 风格不一致。统一改用 sqlalchemy.TIMESTAMP
+  + func.now()，与其他 model 一致（底层 PG 都是 timestamptz，no-op DDL）。
+
+  read_at 保持 DateTime(timezone=True)（业务侧明确需要带时区信息）。
+  P1-3 只修 created_at 风格，不引入 updated_at / deleted_at（业务无需求）。
+"""
 
 from datetime import datetime
 from typing import Optional
-from sqlalchemy import String, Integer, Text, DateTime, ForeignKey, Index
+from sqlalchemy import String, Integer, Text, DateTime, ForeignKey, Index, TIMESTAMP, func
 from sqlalchemy.orm import Mapped, mapped_column
 from stashbox.backend.common.models.base import Base
 
@@ -27,7 +36,7 @@ class PushNotification(Base):
     deeplink: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
     read_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default="NOW()", nullable=False
+        TIMESTAMP, server_default=func.now(), nullable=False
     )
 
     __table_args__ = (
