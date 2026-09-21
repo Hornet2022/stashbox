@@ -1,4 +1,10 @@
-"""pytest 公共 fixture：把仓库根父目录加入 sys.path（stashbox 包导入路径）。"""
+"""pytest 公共 fixture：把仓库根父目录加入 sys.path（stashbox 包导入路径）。
+
+运行方式（必须）：cd backend && pytest
+  - backend 是 cwd 时 sys.path[0] 自动是 backend，所有 `from stashbox.backend...` 工作
+  - 父目录 parents[3] 是兜底：cwd 不在 backend 时也能 import stashbox 包
+"""
+
 import sys
 from pathlib import Path
 
@@ -7,13 +13,6 @@ import pytest
 REPO_PARENT = str(Path(__file__).resolve().parents[3])  # .../work
 if REPO_PARENT not in sys.path:
     sys.path.insert(0, REPO_PARENT)
-
-# ai-service 目录名带连字符（不是合法包名），只能按路径加进来 ——
-# tests/test_quota.py 用 importlib 加载 ai-service/main.py，main.py 顶层
-# `import dispatcher` 依赖这条路径（做法同 tests/ai/conftest.py）。
-AI_SERVICE_DIR = str(Path(__file__).resolve().parents[1] / "ai-service")
-if AI_SERVICE_DIR not in sys.path:
-    sys.path.append(AI_SERVICE_DIR)
 
 
 @pytest.fixture(autouse=True)
