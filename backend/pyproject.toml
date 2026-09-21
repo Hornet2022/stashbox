@@ -24,6 +24,8 @@ prometheus-client = "^0.21.0"
 structlog = "^24.1.0"
 arq = "^0.26.0"
 langfuse = "^2.57.0"
+# CP11.0.8 P3.3: PDF 抓取器依赖
+pypdf = "^6.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"

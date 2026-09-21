@@ -13,3 +13,5 @@ python-multipart>=0.0.20
 # CP6.4-pre 可观测性
 prometheus-client>=0.21
 structlog>=24.1
+# CP11.0.8 P3.3: PDF 抓取器依赖（pypdf 纯 Python，MIT license，无 native 编译）
+pypdf>=6.0
