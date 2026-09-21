@@ -1,4 +1,5 @@
 """PushNotification model（CP5.4a）。v1 §11.5 CP5.4。"""
+
 from datetime import datetime
 from typing import Optional
 from sqlalchemy import String, Integer, Text, DateTime, ForeignKey, Index
@@ -8,6 +9,7 @@ from stashbox.backend.common.models.base import Base
 
 class PushNotification(Base):
     """推送队列表（CP5.4a）。客户端拉取；真推送 CP4.6。"""
+
     __tablename__ = "push_notifications"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -15,7 +17,7 @@ class PushNotification(Base):
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     article_id: Mapped[Optional[str]] = mapped_column(
-        String(32), ForeignKey("distilled_articles.id", ondelete="CASCADE"), nullable=True
+        String(32), ForeignKey("articles.id", ondelete="CASCADE"), nullable=True
     )
     tag_slug: Mapped[Optional[str]] = mapped_column(
         String(64), ForeignKey("tags.slug", ondelete="SET NULL"), nullable=True
