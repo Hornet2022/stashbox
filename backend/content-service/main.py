@@ -2263,8 +2263,6 @@ async def admin_stats(
 
 
 # CP11.0.3 蒸馏 P95 metrics（从 ai-service /metrics 解析）
-import re as _re
-
 _DISTILL_P95_CACHE: dict[str, float] = {}
 _DISTILL_P95_CACHE_TS: float = 0.0
 _DISTILL_P95_CACHE_TTL = 30.0  # 30 秒缓存
@@ -2276,6 +2274,7 @@ async def _fetch_ai_metrics() -> str:
     Worker 进程的 Prometheus registry 与 FastAPI 进程隔离，需独立抓。
     """
     import httpx
+
     fastapi_url = os.environ.get("AI_SERVICE_URL", "http://localhost:8103")
     worker_url = os.environ.get("AI_WORKER_METRICS_URL", "http://localhost:8104")
     async with httpx.AsyncClient(timeout=4.0) as c:
@@ -2301,13 +2300,18 @@ def _parse_distill_p95(metrics_text: str) -> dict:
     result = {"by_step": {}, "overall": {"p50": None, "p95": None, "p99": None}}
     # 按 step 分组 bucket
     buckets_by_step: dict[str, list[tuple[float, float]]] = {}
-    for m in _re.finditer(
-        r'distill_step_duration_seconds_bucket\{le="([^"]+)",step="([^"]+)"\}\s+([0-9.e+-]+)',
+    for m in re.finditer(
+        r"distill_step_duration_seconds_bucket\{([^}]+)\}\s+([0-9.e+-]+)",
         metrics_text,
     ):
-        le = m.group(1)
-        step = m.group(2)
-        cnt = float(m.group(3))
+        label_block = m.group(1)
+        cnt = float(m.group(2))
+        le_m = re.search(r'le="([^"]+)"', label_block)
+        step_m = re.search(r'step="([^"]+)"', label_block)
+        if not le_m or not step_m:
+            continue
+        le = le_m.group(1)
+        step = step_m.group(1)
         if le == "+Inf":
             le = 1e18
         else:
@@ -2357,6 +2361,7 @@ async def admin_distill_p95(
     """
     global _DISTILL_P95_CACHE, _DISTILL_P95_CACHE_TS
     import time as _t
+
     now = _t.time()
     if _DISTILL_P95_CACHE and (now - _DISTILL_P95_CACHE_TS) < _DISTILL_P95_CACHE_TTL:
         return {"cached": True, **_DISTILL_P95_CACHE}
@@ -2369,7 +2374,12 @@ async def admin_distill_p95(
         return {"cached": False, **parsed}
     except Exception as exc:
         log.warning(f"distill-p95 fetch failed: {exc}")
-        return {"cached": False, "by_step": {}, "overall": {"p50": None, "p95": None, "p99": None}, "error": str(exc)}
+        return {
+            "cached": False,
+            "by_step": {},
+            "overall": {"p50": None, "p95": None, "p99": None},
+            "error": str(exc),
+        }
 
 
 if __name__ == "__main__":
