@@ -2,6 +2,7 @@
 
 全部用 FakeLLM / MockLLMClient + MockTTSClient，不接真 LLM / TTS。
 """
+
 import json
 
 import pytest
@@ -28,7 +29,11 @@ STRUCTURED_JSON = json.dumps(
         "summary": "AI 行业三件大事",
         "chapters": [
             {"title": "模型降价", "summary": "推理成本暴跌", "key_points": ["降价 90%"]},
-            {"title": "Agent 爆发", "summary": "应用层起飞", "key_points": ["工具调用", "长上下文"]},
+            {
+                "title": "Agent 爆发",
+                "summary": "应用层起飞",
+                "key_points": ["工具调用", "长上下文"],
+            },
         ],
         "entities": ["OpenAI", "Anthropic"],
         "tags": ["AI", "商业"],
@@ -186,6 +191,10 @@ async def test_step3_with_mock_tts_client(ctx, fake_llm_cls):
 
 
 async def test_step3_passes_rewrite_body_to_tts(ctx, fake_llm_cls):
+    """CP9.x：step3_tts 直接把 ctx.rewrite.body 喂给 TTS，不再套 STEP3_USER prompt。
+
+    之前实现把"分 3-5 段, 每段 ≤ 30 秒"等元指令当台词读，合成时间/音频长度都异常。
+    """
     await step1_structure(ctx, fake_llm_cls(STRUCTURED_JSON))
     await step2_rewrite(ctx, fake_llm_cls(REWRITE_JSON))
 
@@ -200,7 +209,9 @@ async def test_step3_passes_rewrite_body_to_tts(ctx, fake_llm_cls):
     tts = RecordingTTS()
     await step3_tts(ctx, tts)
 
-    assert tts.prompts[0] == STEP3_USER.format(rewrite_body=ctx.rewrite.body)
+    # CP9.x 修复：TTS 收到的是正文，不再带 STEP3_USER 模板
+    assert tts.prompts[0] == ctx.rewrite.body
+    assert STEP3_USER not in tts.prompts[0]  # 不能包含"分 3-5 段..."等元指令
     assert ctx.tts.segments[0]["audio_url"] == "https://mock/a.m4a"
 
 
@@ -213,16 +224,19 @@ async def test_step4_requires_step3_first(ctx):
 
 
 async def test_step4_builds_final_audio(ctx, fake_llm_cls):
+    """CP9.x：step4 mock 路径 audio_url 留空 + audio_bytes 为 None（让 distill_task 跳过 ready）。"""
     await step1_structure(ctx, fake_llm_cls(STRUCTURED_JSON))
     await step2_rewrite(ctx, fake_llm_cls(REWRITE_JSON))
-    await step3_tts(ctx, MockTTSClient())
+    await step3_tts(ctx, MockTTSClient())  # legacy MockTTSClient 不产 bytes → step4 走 mock
 
     await step4_concat(ctx)
 
     assert isinstance(ctx.final, AudioConcatOutput)
-    assert ctx.article_id in ctx.final.audio_url
-    assert ctx.final.audio_url.endswith(".m4a")
-    assert ctx.final.duration_sec == 1800
+    # CP9.x：mock 路径不再写占位 OSS URL，audio_url 留空
+    # （distill_task.py:208 看 audio_url 为空 → 不标 ready，避免 ready 但 404）
+    assert ctx.final.audio_url == ""
+    assert ctx.final.audio_bytes is None
+    assert ctx.final.duration_sec == 0
     assert ctx.final.format == "m4a"
 
 

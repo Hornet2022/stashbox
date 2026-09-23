@@ -24,6 +24,17 @@ class ArticleResponse(BaseModel):
     audio_url: str | None = None
     task_id: str | None = None
     duration_sec: int | None = None
+    # CP-TIME：蒸馏完成时间（status=ready/failed 时有；distilled_articles.updated_at）
+    distilled_at: str | None = None
+    # CP-TIME：文章最近一次状态更新时间（created_at 提交；distilling 时=trigger_distill 时刻；
+    # failed 时=最近一次失败；ready 时=蒸馏完成）—— 蒸馏中心失败列表用此字段
+    updated_at: str | None = None
+    # CP-TAG-FILTER：标签名（蒸馏 LLM 自动生成的中文名，如 ["科技","财经"]）；
+    # pending/distilling 时为 None（未生成）。与 GET /api/v1/articles?tag=xxx 配合。
+    tags: list[str] | None = None
+    # CP-DISTILL-TEXT：LLM 听感改写稿全文（hook/body/outro 以空行分段）。
+    # 详情页展示"整理后的正文"。蒸馏未完成时为 None。
+    script_text: str | None = None
 
 
 class D9AddRequest(BaseModel):

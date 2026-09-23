@@ -104,6 +104,19 @@ ROUTES: list[Route] = [
         "ai-service",
         _url("ai-service"),
     ),
+    # CP9.x：admin 全局视图（不按 JWT sub 过滤，admin 看全量文章）
+    Route(
+        "GET",
+        "/api/v1/admin/articles",
+        "content-service",
+        _url("content-service"),
+    ),
+    Route(
+        "GET",
+        "/api/v1/admin/articles/{article_id}",
+        "content-service",
+        _url("content-service"),
+    ),
 ]
 
 # CP1.7.1 新增：D9 callback（不要求登录态）+ status + audio-url
@@ -178,9 +191,42 @@ ROUTES += [
     Route("GET", "/api/v1/admin/llm/config", "content-service", _url("content-service")),
     Route("PUT", "/api/v1/admin/llm/config", "content-service", _url("content-service")),
     Route("GET", "/api/v1/admin/llm/test", "content-service", _url("content-service")),
+    # CP TTS-Config：admin TTS 配置（content-service /api/v1/admin/tts/*）。
+    # 同样需进路由表：admin 段不在 fallback 的第一段前缀匹配里。
+    Route("GET", "/api/v1/admin/tts/config", "content-service", _url("content-service")),
+    Route("PUT", "/api/v1/admin/tts/config", "content-service", _url("content-service")),
+    Route("GET", "/api/v1/admin/tts/test", "content-service", _url("content-service")),
     # admin-web 用的 POST /api/v1/tags + GET /api/v1/notifications（CP3.6-A2 + CP5.4a）
     Route("POST", "/api/v1/tags", "content-service", _url("content-service")),
     Route("GET", "/api/v1/notifications", "user-service", _url("user-service")),
+    # CP-DELETE：删除入口（用户端删文章 + admin 删文章/删标签）。
+    # admin 段不在 fallback 的第一段前缀匹配里，必须显式注册；
+    # 用户端 DELETE /articles/{id} 虽能被 fallback 猜中（articles→content），
+    # 仍显式入表，与其他 articles 路由保持同源可读。
+    Route(
+        "DELETE",
+        "/api/v1/articles/{article_id}",
+        "content-service",
+        _url("content-service"),
+    ),
+    Route(
+        "DELETE",
+        "/api/v1/admin/articles/{article_id}",
+        "content-service",
+        _url("content-service"),
+    ),
+    Route(
+        "GET",
+        "/api/v1/admin/tags",
+        "content-service",
+        _url("content-service"),
+    ),
+    Route(
+        "DELETE",
+        "/api/v1/admin/tags/{tag_id}",
+        "content-service",
+        _url("content-service"),
+    ),
 ]
 
 

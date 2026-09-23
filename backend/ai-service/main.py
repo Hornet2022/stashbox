@@ -261,28 +261,45 @@ async def distill_article(
     if art.user_id != uid:
         raise Forbidden(message="not the owner of this article")
 
+    # 关键修复：art 刚从 DB 载入，url/title 已在内存中。
+    # 紧邻此处捕获，赶在下方 existed 计数、quota.consume、track_simple 等
+    # 任何一次 DB 操作使 ORM 对象过期之前。否则访问 art.url 会触发 lazy
+    # 重查，在 await 上下文抛 MissingGreenlet → 500（安卓端「服务不可用」）。
+    url = art.url
+    title = art.title
+
     # 幂等：该文章已有蒸馏任务 → 不再扣配额
-    existed = await db.scalar(
-        select(func.count())
-        .select_from(DistilledArticle)
-        .where(DistilledArticle.article_id == article_id)
+    existed_da = await db.scalar(
+        select(DistilledArticle).where(DistilledArticle.article_id == article_id)
     )
-    already_charged = existed > 0
+    already_charged = existed_da is not None
     quota_used = None
     if not already_charged:
         quota = await quota_service.consume(db, uid)  # 用尽抛 3001
         quota_used = quota["quota_used"]
         await cache_service.mark_article_quota(article_id)
 
-    task_id = _new_task_id()
-    da = DistilledArticle(
-        id=task_id,
-        article_id=article_id,
-        status="queued",
-        audio_url=None,
-        script_text=None,
-    )
-    db.add(da)
+    # CP-DISTILL-DUP 修复：article_id 有唯一约束（distilled_articles_article_id_key），
+    # 二次蒸馏（failed 重试 / ready 后重蒸）不能再 INSERT —— 之前直接撞
+    # UniqueViolationError → PendingRollbackError → 500。改为复用原行并重置产物字段。
+    if existed_da is not None:
+        task_id = existed_da.id
+        existed_da.status = "queued"
+        existed_da.script_text = None
+        existed_da.audio_url = None
+        existed_da.duration_sec = None
+        existed_da.quality_score = None
+        existed_da.tags = None
+    else:
+        task_id = _new_task_id()
+        da = DistilledArticle(
+            id=task_id,
+            article_id=article_id,
+            status="queued",
+            audio_url=None,
+            script_text=None,
+        )
+        db.add(da)
     art.status = "distilling"
     # CP6.2.1 埋点：distill_start
     # track() 只 flush 不 commit —— 必须在 commit() 之前，否则埋点随 close() 回滚丢失
@@ -296,8 +313,8 @@ async def distill_article(
         task_id=task_id,
         article_id=article_id,
         user_id=uid,
-        url=art.url,
-        title=art.title,
+        url=url,
+        title=title,
         simulate_failure=simulate_failure,
     )
     # 埋点已在 commit() 之前完成（DISTILL_START）
@@ -332,7 +349,10 @@ async def distill_status(
     return {
         "task_id": da.id,
         "article_id": da.article_id,
-        "status": da.status,
+        # 状态机：内部 7 态（queued / step1-4 / done / failed）→ 外部 5 态枚举
+        # Android (DistillStatus.kt) 与 admin-web 都消费外部 5 态。
+        # 映射详见 _external_distill_status()。
+        "status": _external_distill_status(da.status),
         "audio_url": da.audio_url,
         "duration_sec": da.duration_sec,
         "tags": da.tags,
@@ -340,6 +360,26 @@ async def distill_status(
         "created_at": da.created_at.isoformat() if da.created_at else None,
         "updated_at": da.updated_at.isoformat() if da.updated_at else None,
     }
+
+
+# 蒸馏内部状态 → 跨端契约状态（CP3.5-pre-2 Android 强校验枚举需要）
+_DISTILL_STATUS_MAP: dict[str, str] = {
+    "queued": "pending",
+    "step1_structuring": "distilling",
+    "step2_rewriting": "distilling",
+    "step3_ttsing": "distilling",
+    "step4_concatenating": "distilling",
+    "done": "ready",
+    "failed": "failed",
+}
+
+
+def _external_distill_status(internal: str) -> str:
+    """把内部状态机字符串映射成跨端契约状态（5 态枚举）。
+
+    未知值（DB 被人工改、状态机错误等）→ 降级为 `distilling`，避免 Android 强校验枚举崩溃。
+    """
+    return _DISTILL_STATUS_MAP.get(internal or "", "distilling")
 
 
 if __name__ == "__main__":

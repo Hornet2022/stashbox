@@ -4,6 +4,7 @@ ai-service 目录名带连字符（不是合法包名），`llm` 包只能这样
 （做法同 tests/observability、tests/gateway 按文件路径加载服务代码）。
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -20,6 +21,20 @@ AI_SERVICE_DIR = Path(__file__).resolve().parents[2] / "ai-service"
 
 if str(AI_SERVICE_DIR) not in sys.path:
     sys.path.insert(0, str(AI_SERVICE_DIR))
+
+
+@pytest.fixture(autouse=True)
+def _ensure_ffmpeg_on_path():
+    """让 step4_concat 的 ffmpeg/ffprobe 子进程能找到二进制。
+
+    本机 ffmpeg 安装在 /opt/homebrew/bin/，但 pytest 子进程未必继承；
+    这里把常见 brew 位置 prepend 到 PATH，避免 FileNotFoundError。
+    """
+    extra = "/opt/homebrew/bin:/usr/local/bin"
+    cur = os.environ.get("PATH", "")
+    if "/opt/homebrew/bin" not in cur:
+        os.environ["PATH"] = f"{extra}:{cur}"
+    yield
 
 
 @pytest_asyncio.fixture
@@ -152,6 +167,23 @@ def _langfuse_singleton():
     LangfuseClient.reset()
     yield
     LangfuseClient.reset()
+
+
+@pytest.fixture(autouse=True)
+def _refund_quota_no_redis_lock(monkeypatch):
+    """CP9.x：pipeline._refund_quota 用 Redis SETNX 做幂等锁，
+    但测试环境用同一 task_id 重复跑会跨测试状态污染。
+    这里 mock 掉 redis_client.set 让每次 refund 都返回"未锁定"=可退。
+    生产代码路径不变（仍会调真 Redis），只是测试里旁路。
+    """
+    import redis.asyncio as redis_async
+
+    class _AlwaysUnlocked:
+        async def set(self, key, value, nx=False, ex=None):
+            return True  # 永远返回"刚锁上"，让 refund 总被调用
+
+    monkeypatch.setattr(redis_async, "Redis", _AlwaysUnlocked)
+    yield
 
 
 @pytest.fixture

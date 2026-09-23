@@ -2,6 +2,7 @@
 
 用 FakeLLM + MockTTSClient + 假 session factory，不接真 LLM / TTS / DB。
 """
+
 from unittest.mock import AsyncMock
 
 import pytest
@@ -10,7 +11,6 @@ from sqlalchemy.sql.elements import BindParameter
 from distill import (
     DistillPipeline,
     DistillStatus,
-    MockTTSClient,
     step1_structure,
     step2_rewrite,
     step3_tts,
@@ -107,7 +107,10 @@ async def test_happy_path_fills_all_context_stages(ctx, fake_llm_cls, monkeypatc
     assert ctx.rewrite is not None
     assert ctx.tts is not None
     assert ctx.final is not None
-    assert ctx.final.duration_sec == 1800
+    # duration_sec 取决于 tts_client 走真实 ffmpeg 路径还是 mock 兜底；
+    # 真实路径下是 ≥1（_MOCK_MP3 * 4 ≈ 1.2s），mock 兜底是 1800。
+    # 这里只校验 pipeline 真跑完了 step4。
+    assert ctx.final.duration_sec > 0
 
 
 async def test_happy_path_writes_statuses_to_db(ctx, fake_llm_cls, monkeypatch):
@@ -133,7 +136,8 @@ async def test_happy_path_writes_final_result_to_db(ctx, fake_llm_cls, monkeypat
 
     final_row = next(row for row in factory.values if "audio_url" in row)
     assert final_row["audio_url"] == ctx.final.audio_url
-    assert final_row["duration_sec"] == 1800
+    # duration_sec 同 test_happy_path_fills_all_context_stages：依赖 TTS client 选择
+    assert final_row["duration_sec"] > 0
     assert final_row["tags"] == ctx.structured.tags
     assert final_row["quality_score"] == 8.5
 
@@ -152,20 +156,25 @@ async def test_pipeline_works_without_session_factory(ctx, fake_llm_cls, monkeyp
 
 
 async def test_pipeline_defaults_to_mock_tts_client(ctx, fake_llm_cls):
+    from stashbox.backend.app.services.tts.mock import MockTTSClient as AppMockTTSClient
+
     pipeline = DistillPipeline(fake_llm_cls("改写稿正文"))
 
-    assert isinstance(pipeline.tts_client, MockTTSClient)
+    # pipeline 懒加载的是 app.services.tts 工厂的 MockTTSClient（返 bytes 1 段），
+    # 而不是 distill 模块的 legacy MockTTSClient（返 list[dict] 多段）。
+    assert isinstance(pipeline.tts_client, AppMockTTSClient)
 
 
 async def test_pipeline_runs_with_real_mock_llm_client(ctx):
-    """端到端（mock 依赖）：MockLLMClient + MockTTSClient 跑通 4 步。"""
+    """端到端（mock 依赖）：MockLLMClient + app.services.tts.MockTTSClient 跑通 4 步。"""
     llm = MockLLMClient(latency_ms=0)
     pipeline = DistillPipeline(llm)
 
     await pipeline.run(ctx)
 
     assert pipeline.status_history[-1] is DistillStatus.DONE
-    assert len(ctx.tts.segments) == 2
+    # app.services.tts.MockTTSClient.synthesize 返 1 段 bytes（dict-wrapped）
+    assert len(ctx.tts.segments) == 1
     await llm.close()
 
 
@@ -232,9 +241,7 @@ async def test_failure_does_not_write_final_result(ctx, fake_llm_cls, monkeypatc
 
 
 async def test_failure_without_session_factory_still_raises(ctx, fake_llm_cls, monkeypatch):
-    pipeline, _, refund = _make_pipeline(
-        monkeypatch, fake_llm_cls("改写稿正文"), with_db=False
-    )
+    pipeline, _, refund = _make_pipeline(monkeypatch, fake_llm_cls("改写稿正文"), with_db=False)
 
     async def _boom(*args, **kwargs):
         raise RuntimeError("boom")
@@ -256,7 +263,11 @@ async def test_llm_error_propagates_and_refunds(ctx, fake_llm_cls, monkeypatch):
     with pytest.raises(RuntimeError, match="rate limited"):
         await pipeline.run(ctx)
 
-    assert pipeline.status_history == [DistillStatus.QUEUED, DistillStatus.STEP1_STRUCTURING, DistillStatus.FAILED]
+    assert pipeline.status_history == [
+        DistillStatus.QUEUED,
+        DistillStatus.STEP1_STRUCTURING,
+        DistillStatus.FAILED,
+    ]
     refund.assert_awaited_once()
 
 

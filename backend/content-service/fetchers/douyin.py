@@ -24,6 +24,7 @@
 如果未来反爬加严，扩展点是 DouyinFetcher 的抓取路径（加代理 / cookie），
 不是改 fetcher 抽象层（CP2.1 契约定死）。
 """
+
 from __future__ import annotations
 
 import json
@@ -61,12 +62,8 @@ _RENDER_DATA_RE = re.compile(
     r'<script[^>]*id=["\']RENDER_DATA["\'][^>]*>(.*?)</script>',
     re.DOTALL | re.IGNORECASE,
 )
-_ROUTER_DATA_RE = re.compile(
-    r'window\._ROUTER_DATA\s*=\s*(\{.*?\})\s*</script>', re.DOTALL
-)
-_ROUTER_DATA_RE_FALLBACK = re.compile(
-    r'window\._ROUTER_DATA\s*=\s*(\{.*?\});', re.DOTALL
-)
+_ROUTER_DATA_RE = re.compile(r"window\._ROUTER_DATA\s*=\s*(\{.*?\})\s*</script>", re.DOTALL)
+_ROUTER_DATA_RE_FALLBACK = re.compile(r"window\._ROUTER_DATA\s*=\s*(\{.*?\});", re.DOTALL)
 _AWEME_ID_IN_HTML_RE = re.compile(r'"aweme_id"\s*:\s*"?(\d+)"?')
 
 # 抖音"内容不见了"类页面（视频被删 / 私密 / 违规下架）→ NOT_FOUND，不是 PARSE
@@ -156,9 +153,7 @@ class DouyinFetcher(Fetcher):
         # 兼容路径：部分桌面/分享页仍带 RENDER_DATA（BFS 找 aweme_detail）
         aweme = self._parse_render_data_aweme(html)
         if aweme is not None:
-            return self._build_result(
-                aweme, url=url, final_url=final_url, status_code=status_code
-            )
+            return self._build_result(aweme, url=url, final_url=final_url, status_code=status_code)
 
         # CP2.3.1 三路径 fallback：移动端 H5 → iesdouyin H5 → 老 iteminfo 接口
         aweme_id = await self._extract_aweme_id(final_url)
@@ -184,9 +179,7 @@ class DouyinFetcher(Fetcher):
                     message=f"抖音视频抓取全路径失败: {aweme_id}",
                     source=self.name,
                 )
-            return self._build_result(
-                aweme, url=url, final_url=final_url, status_code=status_code
-            )
+            return self._build_result(aweme, url=url, final_url=final_url, status_code=status_code)
 
     # -- 下载 ---------------------------------------------------------------
     async def _download(self, url: str, *, timeout: float) -> tuple[str, int, str]:
@@ -236,6 +229,8 @@ class DouyinFetcher(Fetcher):
         return {
             "timeout": self.FALLBACK_TIMEOUT,
             "follow_redirects": True,
+            # CP9.x fix：trust_env=False 防止 HTTP_PROXY 拦内网/本机请求
+            "trust_env": False,
             "headers": {
                 "User-Agent": self.UA,
                 "Referer": "https://www.douyin.com/",
@@ -278,9 +273,7 @@ class DouyinFetcher(Fetcher):
         return None
 
     # -- 三路径 fallback ----------------------------------------------------
-    async def _fetch_mobile_h5(
-        self, client: httpx.AsyncClient, aweme_id: str
-    ) -> dict | None:
+    async def _fetch_mobile_h5(self, client: httpx.AsyncClient, aweme_id: str) -> dict | None:
         """主路径：移动端 H5 页面抽 `window._ROUTER_DATA` → loaderData.*.itemList[0]。"""
         try:
             url = f"https://www.iesdouyin.com/share/video/{aweme_id}/"
@@ -296,9 +289,7 @@ class DouyinFetcher(Fetcher):
             logger.warning("mobile H5 fetch failed: aweme=%s err=%s", aweme_id, exc)
         return None
 
-    async def _fetch_iesdouyin_h5(
-        self, client: httpx.AsyncClient, aweme_id: str
-    ) -> dict | None:
+    async def _fetch_iesdouyin_h5(self, client: httpx.AsyncClient, aweme_id: str) -> dict | None:
         """Fallback 1：iesdouyin H5（?mid=0）抽 RENDER_DATA / _ROUTER_DATA。"""
         try:
             url = f"https://www.iesdouyin.com/share/video/{aweme_id}/?mid=0"
@@ -310,9 +301,7 @@ class DouyinFetcher(Fetcher):
             logger.warning("iesdouyin H5 fetch failed: aweme=%s err=%s", aweme_id, exc)
         return None
 
-    async def _fetch_iesdouyin_api(
-        self, client: httpx.AsyncClient, aweme_id: str
-    ) -> dict | None:
+    async def _fetch_iesdouyin_api(self, client: httpx.AsyncClient, aweme_id: str) -> dict | None:
         """Fallback 2：老 `/web/api/v2/aweme/iteminfo/` 接口（已知 401/429 限流，概率兜底）。"""
         try:
             url = f"https://www.iesdouyin.com/web/api/v2/aweme/iteminfo/?item_ids={aweme_id}"
@@ -357,9 +346,7 @@ class DouyinFetcher(Fetcher):
         return _find_aweme_detail(data)
 
     @staticmethod
-    def _build_result(
-        aweme: dict, *, url: str, final_url: str, status_code: int
-    ) -> FetchResult:
+    def _build_result(aweme: dict, *, url: str, final_url: str, status_code: int) -> FetchResult:
         """aweme_detail dict → FetchResult（测试和真抓取共用同一条解析路径）。"""
         desc = _norm(str(aweme.get("desc") or ""))
         author = aweme.get("author") or {}

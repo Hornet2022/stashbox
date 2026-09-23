@@ -1,0 +1,62 @@
+# ===========================================
+# Backend (Python/FastAPI/Poetry) 局部忽略
+# ===========================================
+# 根 stashbox/.gitignore 已覆盖 .env / .env.local / .env.*.local / .env.bak；
+# 本文件针对 backend/ 目录树特有的产物与 IDE 配置，防止只 clone backend 子目录时泄露。
+
+# —— Python ——
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# —— 测试 / 静态分析 ——
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.ruff_cache/
+.mypy_cache/
+
+# —— 虚拟环境 ——
+.venv/
+venv/
+env/
+.python-version
+
+# —— alembic 生成的临时文件 ——
+alembic/versions/__pycache__/
+
+# —— 工具产物 ——
+.mkdocs/
+.mypy_cache/
+.pyre/
+
+# —— 密钥 / 凭证（兜底，根 .gitignore 已覆盖大部分） ——
+.env
+.env.local
+.env.*.local
+.env.bak
+*.pem
+*.key
+secrets/

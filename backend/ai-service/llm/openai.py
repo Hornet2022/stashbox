@@ -1,12 +1,16 @@
-"""Qwen VL Client（文本 + 多模态，用于 v1 §5.2.2 Step 1 内容结构化）。
+"""OpenAI 兼容 LLM 客户端（CP3.5-pre-1 + CP9.x）。
 
-Token Plan 团队版（2026-09-20）—— OpenAI 兼容端点：
-`https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions`
+通用 OpenAI 协议客户端，可对接：
+- OpenAI 官方：https://api.openai.com/v1
+- Azure OpenAI：https://{r}.openai.azure.com/openai/deployments/{deployment}
+- 任何 OpenAI-compatible 端点（含第三方代理的 Claude / Qwen 等）
 
-请求体格式（OpenAI 兼容）::
+请求体（OpenAI 兼容）::
 
+    POST {base_url}/chat/completions
+    Authorization: Bearer <api_key>
     {
-        "model": "qwen3.6-flash",
+        "model": "gpt-4o-mini",
         "messages": [{"role": "user", "content": "..."}],
         "temperature": 0.7,
         "max_tokens": 4096,
@@ -19,33 +23,35 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
+import structlog
 
 from .base import LLMClient
 from .exceptions import LLMError, RateLimitError
 from .types import ChatRequest, ChatResponse, Usage
 
-
-QWEN_VL_API_URL = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
-QWEN_VL_DEFAULT_MODEL = "qwen3.6-flash"
+log = structlog.get_logger(__name__)
 
 
-class QwenVLClient(LLMClient):
-    """Qwen VL Client（文本 + 多模态，OpenAI 兼容 API）。
+OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
 
-    用途：CP3.5 Step 1 - 内容结构化（v1 §5.2.2），接收文章截图 + 文本 → 输出 JSON 结构。
-    base_url 指向 Token Plan 团队版 OpenAI 兼容端点（/chat/completions）。
+
+class OpenAIClient(LLMClient):
+    """OpenAI 兼容 LLM 客户端（HTTP POST /chat/completions，Bearer auth）。
+
+    用于 LLM_PROVIDER=openai，通过 OPENAI_LLM_BASE_URL 切底层 provider。
     """
 
     def __init__(
         self,
         api_key: str,
-        model: str = QWEN_VL_DEFAULT_MODEL,
-        base_url: str = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        model: str = OPENAI_DEFAULT_MODEL,
+        base_url: str = OPENAI_DEFAULT_BASE_URL,
         timeout: float = 60.0,
         max_retries: int = 3,
     ):
         if not api_key:
-            raise ValueError("api_key required for QwenVLClient")
+            raise ValueError("api_key required for OpenAIClient")
         self.api_key = api_key
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -61,25 +67,18 @@ class QwenVLClient(LLMClient):
 
     async def chat(self, req: ChatRequest) -> ChatResponse:
         try:
-            resp = await self._qwen_vl_chat(req)
+            resp = await self._openai_chat(req)
             await self._maybe_trace(req, resp=resp)
             return resp
         except Exception as e:
             await self._maybe_trace(req, error=e)
             raise
 
-    async def _qwen_vl_chat(self, req: ChatRequest) -> ChatResponse:
+    async def _openai_chat(self, req: ChatRequest) -> ChatResponse:
         start = time.time()
         model = req.model or self.model
 
-        # OpenAI 兼容格式：content 可以是字符串或数组（多模态：text + image_url）
-        messages = []
-        for m in req.messages:
-            if isinstance(m.content, str):
-                messages.append({"role": m.role, "content": m.content})
-            else:
-                # m.content 是 str（不会走到这里，但类型是 str），直接放
-                messages.append({"role": m.role, "content": m.content})
+        messages = [{"role": m.role, "content": m.content} for m in req.messages]
 
         body: dict[str, Any] = {
             "model": model,
@@ -87,6 +86,8 @@ class QwenVLClient(LLMClient):
             "temperature": req.temperature,
             "max_tokens": req.max_tokens,
         }
+        if req.stop:
+            body["stop"] = req.stop
 
         data = await self._post(body)
 
@@ -107,39 +108,51 @@ class QwenVLClient(LLMClient):
         )
 
     async def _post(self, body: dict[str, Any]) -> dict[str, Any]:
-        """POST + 指数退避 retry（429 直接抛 RateLimitError，不重试）。"""
+        """POST + 指数退避 retry（429 直接抛 RateLimitError，不重试）。
+
+        修复：原实现只 catch TimeoutException 且最终错误吞掉 last_err（空串），
+        导致真实失败原因（连接错误/超时/HTTP 错误体）无法排查。
+        现统一捕获 TimeoutException + TransportError，并在末次 raise 时带 repr(last_err)。
+        """
         last_err: Exception | None = None
         for attempt in range(self.max_retries):
             try:
                 resp = await self._client.post(f"{self.base_url}/chat/completions", json=body)
-            except httpx.TimeoutException as e:
+            except (httpx.TimeoutException, httpx.TransportError) as e:
                 last_err = e
+                log.warning("llm_request_transport_error", attempt=attempt, error=repr(e))
             else:
                 if resp.status_code == 429:
                     raise RateLimitError(
-                        "qwen_vl rate limit", retry_after=resp.headers.get("retry-after")
+                        "openai rate limit", retry_after=resp.headers.get("retry-after")
                     )
                 try:
                     resp.raise_for_status()
                 except httpx.HTTPStatusError as e:
                     last_err = e
+                    try:
+                        body_preview = (await resp.aread()).decode("utf-8", "replace")[:500]
+                    except Exception:
+                        body_preview = "<unreadable response body>"
+                    log.warning(
+                        "llm_request_http_error",
+                        attempt=attempt,
+                        status=resp.status_code,
+                        body=body_preview,
+                    )
                 else:
                     return resp.json()
 
             if attempt < self.max_retries - 1:
-                await asyncio.sleep(2**attempt)  # 指数退避
+                await asyncio.sleep(2**attempt)
 
-        raise LLMError(f"qwen_vl chat failed after {self.max_retries} attempts: {last_err}")
+        raise LLMError(f"openai chat failed after {self.max_retries} attempts: {last_err!r}")
 
     async def stream(self, req: ChatRequest) -> AsyncIterator[str]:
-        """SSE 流式 chat/completions，按 delta.content 增量 yield。"""
+        """SSE 流式 chat/completions。"""
         try:
             model = req.model or self.model
-
-            messages = []
-            for m in req.messages:
-                messages.append({"role": m.role, "content": m.content})
-
+            messages = [{"role": m.role, "content": m.content} for m in req.messages]
             body: dict[str, Any] = {
                 "model": model,
                 "messages": messages,
@@ -153,7 +166,7 @@ class QwenVLClient(LLMClient):
             ) as resp:
                 if resp.status_code == 429:
                     raise RateLimitError(
-                        "qwen_vl rate limit", retry_after=resp.headers.get("retry-after")
+                        "openai rate limit", retry_after=resp.headers.get("retry-after")
                     )
                 resp.raise_for_status()
 
@@ -174,7 +187,6 @@ class QwenVLClient(LLMClient):
                     content = delta.get("content")
                     if content:
                         yield content
-
         except Exception as e:
             await self._maybe_trace(req, error=e)
             raise

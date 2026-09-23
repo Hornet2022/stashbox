@@ -28,3 +28,6 @@ class OSSStorage(Storage):
 
     async def exists(self, key: str) -> bool:
         raise NotImplementedError("OSSStorage 待实现。")
+
+    async def delete(self, key: str) -> None:
+        raise NotImplementedError("OSSStorage 待实现。pip install oss2 + Bucket.delete_object。")

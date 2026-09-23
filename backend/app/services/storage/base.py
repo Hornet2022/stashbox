@@ -34,3 +34,11 @@ class Storage(ABC):
     async def exists(self, key: str) -> bool:
         """检查文件是否存在。"""
         pass
+
+    @abstractmethod
+    async def delete(self, key: str) -> None:
+        """删文件（幂等：文件不存在时静默返回，不抛错）。
+
+        用于文章硬删除时清理蒸馏音频（key 同 save，如 "audio/{article_id}.wav"）。
+        """
+        pass

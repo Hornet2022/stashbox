@@ -15,17 +15,49 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"                         # stashbox/（仓�
 REPO_PARENT="$(dirname "$REPO_ROOT")"                        # 仓库根的父目录（stashbox 包所在目录）
 export PYTHONPATH="${REPO_PARENT}:${PYTHONPATH:-}"
 
+# homebrew 工具（ffmpeg 等）加入 PATH：蒸馏 step4 拼音频时裸调 `ffmpeg` 能找到
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 # 本地下游地址覆盖（默认是 docker 服务名，本地改 localhost:810x）
+# 如果 backend/.env 里有同名变量则优先使用；env 不存在则走 :-兜底。
+# 这样：
+#   - macmini 本地默认 .env 里有 USER_SERVICE_URL=http://localhost:8101 → 自动走本地
+#   - 用户从 .env.example 拷出来但还没改 → 仍走 docker 名（避免把错误配置静默吞掉）
+#   - CI / 容器化场景：直接 export USER_SERVICE_URL=... 即可覆盖（优先级最高）
 export USER_SERVICE_URL="${USER_SERVICE_URL:-http://localhost:8101}"
 export CONTENT_SERVICE_URL="${CONTENT_SERVICE_URL:-http://localhost:8102}"
 export AI_SERVICE_URL="${AI_SERVICE_URL:-http://localhost:8103}"
+export STASHBOX_ALLOW_DEV_JWT="${STASHBOX_ALLOW_DEV_JWT:-1}"
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
-PYTHON_BIN="$REPO_ROOT/backend/.venv/bin/python"
-if [[ ! -x "$PYTHON_BIN" ]]; then
-  echo "✗ venv 不存在：$PYTHON_BIN" >&2
-  echo "  请先创建：python -m venv backend/.venv && pip install -r backend/<service>/requirements.txt" >&2
+# 自动加载 backend/.env（如果存在），覆盖同名变量后再 export。
+# 用 set -a 自动 export 所有赋值；set +a 关闭。
+# 优先级：命令行 export > .env 文件 > 脚本 :-兜底。
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/.env"
+  set +a
+  echo "▶ 已加载 backend/.env（$(wc -l < "$SCRIPT_DIR/.env" | tr -d ' ') 行）"
+fi
+
+# Python 解释器解析（按优先级回退，便于不同机器复用，不写死绝对路径）：
+#   1) $PYTHON_BIN 环境变量（可显式指向任意已装依赖的 venv）
+#   2) 工程自带 backend/.venv/bin/python
+#   3) 系统 python3（需已装 fastapi/uvicorn/arq）
+if [[ -n "${PYTHON_BIN:-}" && -x "$PYTHON_BIN" ]]; then
+  :
+elif [[ -x "$REPO_ROOT/backend/.venv/bin/python" ]]; then
+  PYTHON_BIN="$REPO_ROOT/backend/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1 && python3 -c "import uvicorn, arq" >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3)"
+else
+  echo "✗ 找不到可用的 Python 解释器（需已安装 fastapi/uvicorn/arq 等依赖）" >&2
+  echo "  方式一：创建工程 venv  →  python -m venv backend/.venv && pip install -r backend/<service>/requirements.txt" >&2
+  echo "  方式二：指定已有 venv  →  PYTHON_BIN=/path/to/venv/bin/python ./run_dev.sh" >&2
   exit 1
 fi
+echo "▶ 使用 Python: $PYTHON_BIN"
 
 PIDS=()
 start_service() {

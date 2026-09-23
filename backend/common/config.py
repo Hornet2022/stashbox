@@ -82,6 +82,16 @@ class Settings(BaseSettings):
     #   CORS_ORIGINS="https://admin.example.com,https://admin2.example.com"
     cors_origins: str = "http://localhost:3000,http://localhost:5174"
 
+    # CP9.x dev 兜底：本地音频静态挂载（gateway 把 /audio/* 挂到 LOCAL_AUDIO_DIR）
+    # 与 api-gateway/main.py 里的 ENABLE_LOCAL_AUDIO_MOUNT 一起用：
+    #   STORAGE_PROVIDER=local + ENABLE_LOCAL_AUDIO_MOUNT=1 + LOCAL_AUDIO_DIR=/tmp/audio
+    # 真机客户端拿到 audio_url 时不能是 localhost（设备本机 = 自己），
+    # 这里 PUBLIC_GATEWAY_URL 给出对外可达的 gateway 前缀。
+    storage_provider: str = "oss"
+    enable_local_audio_mount: bool = False
+    local_audio_dir: str = "/tmp/audio"
+    public_gateway_url: str = "http://localhost:8100"
+
     @property
     def cors_origins_list(self) -> list[str]:
         """逗号分隔 → list。配了 "*" 表示放行全部 origin（dev 兜底）。"""

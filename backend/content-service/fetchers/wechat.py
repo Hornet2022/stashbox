@@ -19,6 +19,7 @@
 如果未来反爬加严，扩展点是 `WechatFetcher._download()`（加代理 / cookie），
 不是改 fetcher 抽象层（CP2.1 契约定死）。
 """
+
 from __future__ import annotations
 
 import re
@@ -174,16 +175,16 @@ class WechatFetcher(Fetcher):
 
         html, status_code, final_url = await self._download(url, timeout=timeout)
         _check_wechat_block(html)
-        return self.parse_article(
-            html, url=url, final_url=final_url, status_code=status_code
-        )
+        return self.parse_article(html, url=url, final_url=final_url, status_code=status_code)
 
     # -- 下载 ---------------------------------------------------------------
     async def _download(self, url: str, *, timeout: float) -> tuple[str, int, str]:
-        """抓 HTML：iPhone UA + Referer（公众号对外站 UA 敏感），返回 (html, status, final_url)。"""
+        """抓 HTML：iPhone UA + Referer（公众号对外站 UA 敏感），返回 (html, status, final_url）。"""
         client_kwargs: dict[str, Any] = {
             "timeout": timeout,
             "follow_redirects": True,
+            # CP9.x fix：trust_env=False 防止 HTTP_PROXY 拦内网/本机请求
+            "trust_env": False,
             "headers": {
                 "User-Agent": self.UA,
                 "Referer": "https://mp.weixin.qq.com/",

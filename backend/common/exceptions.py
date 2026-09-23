@@ -5,6 +5,7 @@
     业务异常 -> 业务码 + 4xx HTTP
     未捕获 -> 500 + 内部错误码
 """
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -18,11 +19,18 @@ class BizException(Exception):
     message: str = "Business error"
     http_status: int = 400
 
-    def __init__(self, message: str | None = None, code: int | None = None):
+    def __init__(
+        self,
+        message: str | None = None,
+        code: int | None = None,
+        http_status: int | None = None,
+    ):
         if message:
             self.message = message
         if code:
             self.code = code
+        if http_status is not None:
+            self.http_status = http_status
         super().__init__(self.message)
 
 
@@ -30,6 +38,14 @@ class NotFound(BizException):
     code = 40400
     message = "Resource not found"
     http_status = 404
+
+
+class InvalidRequest(BizException):
+    """请求参数非法（CP TTS-Config：补齐之前 admin_router 隐式依赖的全局名）。"""
+
+    code = 40000
+    message = "Invalid request"
+    http_status = 400
 
 
 class Unauthorized(BizException):

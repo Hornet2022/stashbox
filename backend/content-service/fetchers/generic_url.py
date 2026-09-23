@@ -14,6 +14,7 @@
 解析部分（5 个 HTMLParser + 3 个工具函数）CP2.2 已抽到 `fetchers/parser.py`，
 本模块 `from .parser import ...` 复用，公众号抓取器共用同一套解析器。
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -38,6 +39,7 @@ from .parser import (
 )
 
 _HTML_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})  # 本模块专属，不进 parser
+
 
 class GenericURLFetcher(Fetcher):
     """通用 URL 抓取（任意网页正文抽取）。
@@ -76,6 +78,8 @@ class GenericURLFetcher(Fetcher):
         client_kwargs: dict[str, Any] = {
             "timeout": timeout,
             "follow_redirects": True,
+            # CP9.x fix：trust_env=False 防止 HTTP_PROXY 把本机/内网请求拐去系统代理而失败
+            "trust_env": False,
             "headers": {
                 "User-Agent": self.UA,
                 "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",

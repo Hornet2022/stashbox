@@ -38,7 +38,7 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Optional
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
@@ -46,7 +46,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select, text
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # content-service 目录名带连字符，不能当包导入，故把自身目录加入 sys.path
@@ -161,7 +161,23 @@ def _new_article_id() -> str:
     return f"art_{uuid.uuid4().hex[:24]}"
 
 
-def _to_response(a: Article, task: DistilledArticle | None = None) -> ArticleResponse:
+def _to_response(
+    a: Article, task: DistilledArticle | None = None, *, full_script: bool = False
+) -> ArticleResponse:
+    """CP9.x dev 兜底：本地模式（STORAGE_PROVIDER=local）下 audio_url 用
+    PUBLIC_GATEWAY_URL 拼，避免真机客户端连到 localhost（设备本机）。
+
+    生产模式（OSS / 公网）：保持 task.audio_url 原值（已是 OSS 公网/签名 URL）。
+    """
+    audio_url = task.audio_url if task else None
+    if (settings.storage_provider == "local" or settings.enable_local_audio_mount) and audio_url:
+        if "localhost" in audio_url or "127.0.0.1" in audio_url or audio_url.startswith("/"):
+            from urllib.parse import urlparse
+
+            path = urlparse(audio_url).path
+            audio_url = f"{settings.public_gateway_url.rstrip('/')}{path}"
+        # CP9.x：扫描磁盘实际存在的扩展名，避免后缀不匹配（见 _resolve_actual_audio_extension）
+        audio_url = _resolve_actual_audio_extension(audio_url, settings.local_audio_dir)
     return ArticleResponse(
         id=a.id,
         url=a.url,
@@ -172,10 +188,30 @@ def _to_response(a: Article, task: DistilledArticle | None = None) -> ArticleRes
         favorite=a.favorite,
         skip=a.skip,
         created_at=a.created_at.isoformat() if a.created_at else "",
-        audio_url=task.audio_url if task else None,
+        audio_url=audio_url,
         task_id=task.id if task else None,
         duration_sec=task.duration_sec if task else None,
+        # CP-TIME：蒸馏完成时间（distilled_articles.updated_at 在 done/failed 步骤写入，
+        # 客户端用此字段在详情页展示「蒸馏完成于 X 分钟前」）
+        distilled_at=task.updated_at.isoformat() if task and task.updated_at else None,
+        # CP-TIME：articles.updated_at —— 蒸馏中心失败列表展示「失败于」使用
+        updated_at=a.updated_at.isoformat() if a.updated_at else None,
+        # CP-TAG-FILTER：透出蒸馏 LLM 自动生成的标签列表（pending 时 None）
+        tags=list(task.tags) if task and task.tags else None,
+        # CP-DISTILL-TEXT：详情页透出听感改写稿全文；列表页用摘要前缀避免响应膨胀
+        script_text=_script_text_for(task, list_mode=not full_script),
     )
+
+
+def _script_text_for(task: DistilledArticle | None, *, list_mode: bool) -> str | None:
+    """CP-DISTILL-TEXT：详情返回全文；列表返回前 120 字摘要（卡片副标题用）。"""
+    if task is None or not task.script_text:
+        return None
+    text = task.script_text
+    if list_mode:
+        head = text.strip().replace("\n", " ")
+        return head[:120] + ("…" if len(head) > 120 else "")
+    return text
 
 
 async def _get_owned(article_id: str, user_id: int, db: AsyncSession) -> Article:
@@ -294,7 +330,39 @@ async def _create_article(
     db: AsyncSession,
     raw_content: dict | None = None,  # 默认为 None：其他调用点行为不变
     event: EventName | None = None,  # 建库后要打的埋点（必须落在 commit 之前）
+    *,
+    fetch_on_create: bool = True,  # True=建库前调 fetcher 抓 title/source/raw_content
 ) -> Article:
+    # CP11.0.7 P1.1：建库前同步抓一下页面，拿到 title/source/raw_content。
+    # 失败软降级（fetcher 抛任何错都不阻塞 add,只是没 title/source/raw_content），
+    # 客户端看到 status="pending" + title=null 就是"待抓取"，等下次重试。
+    if fetch_on_create and (title is None or source == "web" or raw_content is None):
+        try:
+            fetcher = get_fetcher(url)
+            if fetcher is not None:
+                fr = await fetcher.fetch(url, timeout=10.0)
+                if title is None and fr.title:
+                    title = fr.title
+                if source == "web" and fr.source and fr.source != "unknown":
+                    source = fr.source
+                if raw_content is None:
+                    # 必须走 _to_raw_content：asdict 不转换 datetime（publish_time），
+                    # 裸 asdict 写 JSONB 会在 INSERT 时抛 "datetime is not JSON serializable"
+                    # → flush 失败污染 session → commit/refresh 连环 InvalidRequestError → 500
+                    # （真机「剪藏文档链接→服务暂不可用」的根因，2026-09-23）。
+                    raw_content = _to_raw_content(fr)
+                log.info(
+                    "fetch_ok on add",
+                    extra={"url": url, "fetcher": fr.source, "title_len": len(fr.title or "")},
+                )
+        except FetcherError as exc:
+            log.info(f"fetch_fail on add (soft): url={url} code={exc.code.value} msg={exc.message}")
+        except Exception as exc:
+            # 任何意外（超时/SSL/解析）都不让 add 失败 —— 用户体验优先
+            log.warning(
+                f"fetch_unexpected on add (soft): url={url} err={type(exc).__name__}: {exc}"
+            )
+
     art = Article(
         id=_new_article_id(),
         user_id=user_id,
@@ -349,18 +417,41 @@ async def add_article(
 async def submit_article(
     req: AddArticleRequest, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
 ):
-    """提交链接（v1 §3.1）：扣 1 次配额 → 建文章 → 配额/待听缓存失效。
+    """提交链接（v1 §3.1）：扣 1 次配额 → 建文章 → 自动派蒸馏 → 配额/待听缓存失效。
 
     扣减走 quota_service 乐观锁（含 Redis Lua 原子失效），配额用尽抛 3001。
+
+    CP9.x fix：B1 修复 —— submit_article 必须自动调 trigger_distill，否则安卓/管理后台
+    剪藏后文章永远 pending，arq 队列空跑。原 `add_article`（deprecated）调了 trigger_distill，
+    新端点漏调，现补上。
     """
     uid = _uid(user)
     quota = await quota_service.consume(db, uid)  # 用尽抛 QuotaExceededError(3001)
     art = await _create_article(req.url, uid, req.source, None, db, event=EventName.ARTICLE_SUBMIT)
     await cache_service.mark_article_quota(art.id)  # 打标：该文章已扣过配额
+
+    # 自动派蒸馏：失败仅 log 不破请求（ai-service 不可达时文章仍 pending，等下次重试）
+    try:
+        trigger_result = await get_ai_client().trigger_distill(
+            article_id=art.id,
+            auth_token=create_access_token(str(art.user_id)),
+        )
+        if trigger_result:
+            log.info(
+                "auto_distill_triggered",
+                extra={"article_id": art.id, "task_id": trigger_result.get("task_id")},
+            )
+    except Exception as exc:
+        log.warning(
+            "auto_distill_trigger_failed",
+            extra={"article_id": art.id, "error": str(exc)},
+        )
+
     return {
         "article_id": art.id,
         "url": art.url,
         "status": art.status,
+        "task_id": (trigger_result or {}).get("task_id"),
         "quota_used": quota["quota_used"],
         "monthly_quota": quota["monthly_quota"],
         "remaining": quota["monthly_quota"] - quota["quota_used"],
@@ -373,38 +464,70 @@ async def list_articles(
     db: AsyncSession = Depends(get_db),
     limit: int = 20,
     offset: int = 0,
+    tag: Optional[str] = None,  # CP-TAG-FILTER：按 Tag.slug 过滤，None=全量
 ):
     """列出当前用户的 articles 列表（按 created_at desc 排序，分页）。
 
     admin-web Articles 页调用此端点。
+    ?tag=xxx 时只列已蒸馏过且 tags 包含该 slug 的文章（pending/distilling 不带 tags）。
+
+    CP-NOTE：articles.deleted_at 在本仓是"装饰字段" —— 删文章走硬删除（行 DELETE），
+    deleted_at 永远为 NULL。list 端保留 .is_(None) 过滤是为 alembic/ORM 历史兼容，
+    不参与语义。
     """
     uid = _uid(user)
 
-    total = await db.scalar(
-        select(func.count())
-        .select_from(Article)
-        .where(
-            Article.user_id == uid,
-            Article.deleted_at.is_(None),
+    base_filter = [Article.user_id == uid, Article.deleted_at.is_(None)]
+
+    if tag:
+        # CP-TAG-FILTER：通过 Tag.slug → tag.id 找到匹配项，再 JOIN 蒸馏表按 JSONB 包含筛
+        tag_row = await db.scalar(select(Tag).where(Tag.slug == tag))
+        if not tag_row:
+            # 不存在的 slug → 空集合（不报错，admin-web / 安卓筛选 UI 一致语义）
+            return {"items": [], "total": 0, "tag": tag, "tag_id": None}
+        tag_id = tag_row.id
+        tag_name = tag_row.name
+        # 用 EXISTS 子查询过滤 article 仅保留 tags 包含此 tag 的（按中文 name 匹配）
+        # —— 蒸馏 LLM 输出的是 name，"科技"中文；slug 用于传参。
+        tag_filter_clause = Article.id.in_(
+            select(DistilledArticle.article_id).where(
+                DistilledArticle.tags.is_not(None),
+                DistilledArticle.tags.contains([tag_name]),  # JSONB 包含数组 → 元素匹配
+            )
         )
-    )
+        base_filter.append(tag_filter_clause)
+
+    total = await db.scalar(select(func.count()).select_from(Article).where(*base_filter))
 
     result = await db.execute(
         select(Article, DistilledArticle)
         .outerjoin(DistilledArticle, DistilledArticle.article_id == Article.id)
-        .where(
-            Article.user_id == uid,
-            Article.deleted_at.is_(None),
-        )
+        .where(*base_filter)
         .order_by(Article.created_at.desc())
         .limit(limit)
         .offset(offset)
     )
     rows = result.all()
 
+    # CP-TAG-FILTER：埋点（admin-web / 安卓 UI 筛选真实发起到 TAG_FILTER）
+    if tag and rows:
+        try:
+            await track(
+                db,
+                EventName.TAG_FILTER,
+                user_id=uid,
+                article_id="n/a",  # 过滤事件无单一关联文章
+                metadata={"tag_slug": tag, "tag_id": tag_id, "result_count": total or 0},
+            )
+            await db.commit()
+        except Exception as exc:
+            log.warning(f"TAG_FILTER 埋点异常（忽略）: slug={tag} err={exc}")
+
     return {
         "items": [_to_response(art, task).model_dump() for art, task in rows],
         "total": total or 0,
+        "tag": tag,
+        "tag_id": tag_id if tag and tag_row else None,
     }
 
 
@@ -456,9 +579,44 @@ async def get_article(
         return cached
 
     art, task = await _get_owned_with_task(article_id, _uid(user), db)
-    payload = _to_response(art, task).model_dump()
+    # CP-DISTILL-TEXT：详情页返回蒸馏稿全文（列表页只要 120 字摘要）
+    payload = _to_response(art, task, full_script=True).model_dump()
     await cache_service.set_article(article_id, payload)  # ttl 300s
     return payload
+
+
+@app.delete("/api/v1/articles/{article_id}")
+async def delete_article(
+    article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+):
+    """CP-DELETE：用户删除自己的文章（硬删除）。
+
+    语义：
+    - 仅 owner 可删；非 owner → 404（删除是破坏性操作，按「越权 404」决策不泄露
+      资源存在性，与 GET 详情的 403 有意不同）
+    - 级联清理：蒸馏结果 + 音频文件 + 收藏/稍后听/收听进度；feedback_v2 断引用保留
+    - 配额不返还（蒸馏成本已发生）
+    - 删除中的蒸馏任务不做取消（worker 写回时找不到行自然失败，可接受）
+    """
+    from article_purge import finish_purge, purge_article
+
+    uid = _uid(user)
+    result = await db.execute(select(Article).where(Article.id == article_id))
+    art = result.scalar_one_or_none()
+    if art is None or art.user_id != uid:
+        raise NotFound(message=f"article {article_id} not found")
+    owner_user_id = art.user_id
+
+    await purge_article(db, article_id)
+
+    try:
+        await track_simple(db, "article_delete", uid, article_id)
+    except Exception as exc:
+        log.warning(f"ARTICLE_DELETE 埋点异常（忽略）: article={article_id} err={exc}")
+
+    await db.commit()
+    await finish_purge(article_id, owner_user_id)
+    return {"ok": True, "id": article_id, "deleted": True}
 
 
 @app.post("/api/v1/articles/{article_id}/mark-listened")
@@ -731,24 +889,29 @@ async def list_favorites(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """列出我的收藏（可按 folder 过滤）。"""
+    """列出我的收藏（可按 folder 过滤）。P1-4：LEFT JOIN articles 取 title 便于客户端展示。"""
     uid = _uid(user)
-    q = select(Favorite).where(Favorite.user_id == uid)
+    q = (
+        select(Favorite, Article.title)
+        .outerjoin(Article, Article.id == Favorite.article_id)
+        .where(Favorite.user_id == uid)
+    )
     if folder:
         q = q.where(Favorite.folder == folder)
     q = q.order_by(Favorite.created_at.desc())
     result = await db.execute(q)
-    favs = result.scalars().all()
+    rows = result.all()
     return {
         "favorites": [
             {
                 "id": f.id,
                 "article_id": f.article_id,
+                "article_title": title,  # 可能为 None（article 已删除等），客户端降级显示 article_id
                 "folder": f.folder,
                 "note": f.note,
                 "created_at": f.created_at.isoformat(),
             }
-            for f in favs
+            for f, title in rows
         ]
     }
 
@@ -887,23 +1050,25 @@ async def list_later_listens(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """我的稍后听列表。"""
+    """我的稍后听列表。P1-4：LEFT JOIN articles 取 title 便于客户端展示。"""
     uid = _uid(user)
     result = await db.execute(
-        select(LaterListen)
+        select(LaterListen, Article.title)
+        .outerjoin(Article, Article.id == LaterListen.article_id)
         .where(LaterListen.user_id == uid)
         .order_by(LaterListen.created_at.desc())
     )
-    items = result.scalars().all()
+    rows = result.all()
     return {
         "later_listens": [
             {
                 "id": i.id,
                 "article_id": i.article_id,
+                "article_title": title,  # 可能为 None（article 已删除等），客户端降级显示 article_id
                 "snooze_until": i.snooze_until.isoformat() if i.snooze_until else None,
                 "created_at": i.created_at.isoformat(),
             }
-            for i in items
+            for i, title in rows
         ]
     }
 
@@ -1253,13 +1418,39 @@ async def article_audio_url(
     """取音频播放地址：仅 status=ready 可用，其余 404。
 
     OSS 签名本期 mock（CP1.8+ 接真签名，依赖阿里云 RAM 配置）。
+    本地 dev 模式（STORAGE_PROVIDER=local / ENABLE_LOCAL_AUDIO_MOUNT=1）：
+    audio_url 用 PUBLIC_GATEWAY_URL 拼出，避开 localhost —— 真机客户端
+    连 gateway 时 localhost 指向设备自己，会 404。
+
+    CP9.x 修正：服务端 audio_url 后缀（.mp3/.m4a/.wav）必须匹配磁盘上的真实文件后缀。
+    否则 ExoPlayer 按后缀选 MP3/M4A/PCM 解码器会失败。
+    兜底策略：本地模式下扫描 LOCAL_AUDIO_DIR 下 /audio/{article_id}.{ext} 实际存在的扩展名。
     """
     art, task = await _get_owned_with_task(article_id, _uid(user), db)
     if _derive_status(art, task) != "ready":
         raise NotFound(message=f"audio not ready for article {article_id}")
 
     expires_ts = int(time.time()) + AUDIO_URL_TTL_SEC
-    base = (task.audio_url if task else None) or f"{OSS_AUDIO_BASE}/{art.id}.m4a"
+    # CP9.x dev：本地模式用 PUBLIC_GATEWAY_URL 当 host，path 沿用 task.audio_url 的 path
+    if settings.storage_provider == "local" or settings.enable_local_audio_mount:
+        task_url = task.audio_url if task else None
+        if task_url:
+            # task_url 形如 http://localhost:8100/audio/audio/{art.id}.mp3 → 用 PUBLIC_GATEWAY_URL 替换 host
+            # 或者 https://stashbox-audio.oss... → 跳过本地模式走 OSS
+            if "localhost" in task_url or "127.0.0.1" in task_url or task_url.startswith("/"):
+                from urllib.parse import urlparse
+
+                path = urlparse(task_url).path
+                base = f"{settings.public_gateway_url.rstrip('/')}{path}"
+            else:
+                base = task_url
+        else:
+            # 没 task.audio_url → 用本地音频路径兜底
+            base = f"{settings.public_gateway_url.rstrip('/')}/audio/audio/{art.id}.mp3"
+        # 关键修正：扫描磁盘上实际存在的扩展名，覆盖 URL 后缀
+        base = _resolve_actual_audio_extension(base, settings.local_audio_dir)
+    else:
+        base = (task.audio_url if task else None) or f"{OSS_AUDIO_BASE}/{art.id}.m4a"
     # CP6.2.1 埋点：audio_play_start。本端点无业务写操作，没有现成 commit —— track()
     # 只 flush，必须由这里显式 commit() 把 feedback 行落库，否则随 close() 丢失。
     try:
@@ -1273,6 +1464,41 @@ async def article_audio_url(
         expires_at=datetime.fromtimestamp(expires_ts, timezone.utc).isoformat(),
         duration_sec=(task.duration_sec if task else None) or 0,
     )
+
+
+def _resolve_actual_audio_extension(base_url: str, audio_dir: str) -> str:
+    """扫描 LOCAL_AUDIO_DIR 下 /audio/{article_id}.{ext} 实际存在的扩展名。
+
+    CP9.x：服务端 audio_url 后缀与磁盘文件后缀不一致时（例如 task_url 是
+    .mp3 但本地只存了 .wav —— placeholder 文件是 wav 因为 Python wave 模块），客户端
+    ExoPlayer 按后缀选 decoder 会失败。改用磁盘扫描兜底。
+
+    注意 LocalStorage 落盘用 key=f"audio/{article_id}.{ext}"，所以文件路径是
+    audio_dir/audio/{article_id}.{ext} —— 扫描两个候选位置（直接 + audio 子目录）。
+
+    优先级：.m4a > .mp3 > .wav（m4a 优先因为生产 OSS 通常返 m4a）
+    """
+    from urllib.parse import urlparse
+    from pathlib import Path
+
+    parsed = urlparse(base_url)
+    path = Path(parsed.path)  # e.g. /audio/audio/art_xxx.mp3
+    stem = path.stem  # art_xxx
+    parent = path.parent  # /audio/audio
+
+    audio_dir_path = Path(audio_dir)
+    # 候选位置：audio_dir 直接 + audio_dir/audio 子目录（LocalStorage key 模板）
+    candidates_root = [audio_dir_path / stem, audio_dir_path / "audio" / stem]
+    for ext in (".m4a", ".mp3", ".wav", ".ogg", ".aac"):
+        for root in candidates_root:
+            candidate = root.with_suffix(ext)
+            if candidate.exists():
+                # 替换 base_url 的后缀为真实存在的后缀
+                new_path = parent / f"{stem}{ext}"
+                new_parsed = parsed._replace(path=str(new_path))
+                return new_parsed.geturl()
+    # 没找到实际文件：保持原 URL（让客户端 404，便于调试）
+    return base_url
 
 
 # CP11.0.1 Android 断点续听
@@ -1435,17 +1661,58 @@ async def list_tags(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # CP5.3a：从 DB 读标签（不再用 mock）
-    result = await db.execute(select(Tag).order_by(Tag.category, Tag.name))
-    tags = result.scalars().all()
+    """CP5.3a：从 DB 读标签（不再用 mock）
+    P1-1：LEFT JOIN tag_subscriptions 取每 tag 的"我是否已订阅"，客户端 Switch 即时正确显示
+    CP-TAG-FILTER：article_count 一次 group by 算完（零 N+1），用户能看到该标签下已蒸馏的文章数
+    """
+    uid = _uid(user)
+    # CP-TAG-FILTER：article_count 统计「该 user 已蒸馏且打了此标签」的文章数。
+    # ⚠️ @> 条件必须放在 DistilledArticle 的 OUTER JOIN 的 **ON 子句** 里，
+    # 而不是外层 WHERE：放 WHERE 会把 LEFT JOIN 退化成 INNER JOIN ——
+    # 用户没有任何已蒸馏文章的标签（新用户尤甚）会被整行过滤掉，
+    # 订阅页拿到 {"tags":[]} 直接空白（真机反馈，2026-09-23 修复）。
+    rows = (
+        await db.execute(
+            select(
+                Tag,
+                TagSubscription.tag_id.is_not(None),
+                func.count(DistilledArticle.article_id),
+            )
+            .outerjoin(
+                TagSubscription,
+                (TagSubscription.tag_id == Tag.id) & (TagSubscription.user_id == uid),
+            )
+            .outerjoin(
+                DistilledArticle,
+                (
+                    DistilledArticle.article_id.in_(
+                        select(Article.id).where(
+                            Article.user_id == uid,
+                            Article.deleted_at.is_(None),
+                        )
+                    )
+                )
+                & DistilledArticle.tags.is_not(None)
+                # JSONB @> 数组语义："tags 数组包含 [name]"
+                # —— 因为 :name 是子查询外 Tag.name 字符串值（不是 ORM 属性），
+                # 不能直接在 Python 端 [Tag.name] bind —— SQLAlchemy 会把它当成列引用传。
+                & DistilledArticle.tags.op("@>")(func.cast(func.json_build_array(Tag.name), JSONB)),
+            )
+            .group_by(Tag.id, TagSubscription.tag_id)
+            .order_by(Tag.category, Tag.name)
+        )
+    ).all()
     return {
         "tags": [
             {
                 "id": tag.slug,  # 用 slug 作为 id（与 mock 兼容）
                 "name": tag.name,
                 "category": tag.category,
+                "subscribed": bool(is_subscribed),
+                # CP-TAG-FILTER：该 user 在此标签下已蒸馏的文章数（订阅页跳文章流用）
+                "article_count": int(cnt),
             }
-            for tag in tags
+            for tag, is_subscribed, cnt in rows
         ]
     }
 
@@ -1462,10 +1729,21 @@ async def create_tag(
     user: dict = Depends(require_admin_or_operator),
     db: AsyncSession = Depends(get_db),
 ):
-    """admin/operator 创自定义标签（CP5.3b）。"""
-    existing = await db.scalar(select(Tag).where(Tag.slug == req.slug))
-    if existing:
+    """admin/operator 创自定义标签（CP5.3b）。
+
+    CP-TAG-FILTER：检查 slug 冲突（已有）+ name 冲突（新增），避免同名歧义。
+    """
+    # slug 冲突（已有）
+    existing_slug = await db.scalar(select(Tag).where(Tag.slug == req.slug))
+    if existing_slug:
         raise HTTPException(status_code=409, detail=f"tag slug 已存在: {req.slug}")
+    # CP-TAG-FILTER：name 冲突（避免两个不同 slug 显示同样中文名，订阅推送/列表显示歧义）
+    existing_name = await db.scalar(select(Tag).where(Tag.name == req.name))
+    if existing_name:
+        raise HTTPException(
+            status_code=409,
+            detail=f"tag name 已存在（slug={existing_name.slug}）: {req.name}",
+        )
 
     tag = Tag(
         slug=req.slug,

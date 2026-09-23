@@ -25,33 +25,36 @@
 | CP7 | 内测 + 反馈 | 🔒 |
 | CP8 | 调优 + 上线 | 🔒 |
 
-## 仓库结构（monorepo）
+## 仓库结构（多仓独立，非 monorepo）
+
+> ⚠️ **听匣不是 monorepo**，而是 **3 个独立 git 仓库**，靠 Checkpoint（CP）编号人工对齐，无代码级依赖：
+> - `stashbox/`（本仓库）= 服务端
+> - `stashbox-android/`（同级）= Android 客户端
+> - `stashbox-admin-web/`（同级）= 运营后台
 
 ```
-stashbox/
-├── backend/             # FastAPI 后端（4 服务）
-│   ├── api-gateway/     # 统一入口 + JWT 鉴权
-│   ├── user-service/    # 用户 + 配额 + 登录
-│   ├── content-service/ # 文章 + 标签 + 收集
-│   ├── ai-service/      # 蒸馏 worker + 队列
-│   ├── common/          # 共享：DB / 配置 / 日志
-│   └── tests/           # pytest
-├── android/             # Android Kotlin
-│   ├── app/             # Application module
-│   ├── core/            # 网络/数据/播放器（横切关注）
-│   └── feature/         # 列表/详情/播放器/登录
-├── api-spec/            # OpenAPI 3.0 接口契约
-│   ├── openapi.yaml
-│   └── generated/       # 自动生成的客户端 SDK
-├── infra/               # 部署
-│   ├── docker/          # docker-compose.dev.yml（PG + Redis）+ docker-compose.observability.yml（Prometheus/Grafana/Alertmanager），仅本地开发用
-│   ├── k8s/             # ACK 集群 manifest（CP1.1 后）
-│   └── terraform/       # 阿里云 IaC（CP1.2 后）
-└── docs/                # 设计文档
-    ├── README.md        # 设计文档总入口
-    ├── 技术方案_v1.md    # 技术视角（CP1-CP8）
-    ├── 技术方案_v2.md    # 产品视角
-    └── decisions/       # ADR（架构决策记录，未来用）
+stashbox/                      # 仓库 A：服务端（FastAPI 四服务）
+├── backend/                  # 四服务 + 共享层（本仓库主体）
+│   ├── api-gateway/          # 统一入口 + JWT 鉴权
+│   ├── user-service/         # 用户 + 配额 + 登录
+│   ├── content-service/      # 文章 + 标签 + 收集
+│   ├── ai-service/           # 蒸馏 worker + 队列（Arq）
+│   ├── common/               # 共享：DB / 配置 / 日志
+│   ├── app/                  # 共享 app 层（services/tts 等）
+│   ├── alembic/              # 数据库迁移
+│   ├── scripts/              # 运维脚本
+│   └── tests/                # pytest
+├── docs/                     # 设计文档（技术方案 v1/v2、ADR 预留）
+├── infra/                    # 仅本地开发 docker-compose（PG+Redis）；k8s/terraform 未建
+├── tests/                    # 仓库级测试
+└── Makefile / pyproject.toml # 工程配置
+
+stashbox-android/             # 仓库 B：Android（Kotlin + Compose）
+├── app/                      # 当前仅 :app 单模块；core/feature 拆分见 CP4.2→CP4.7
+├── gradle/ settings.gradle.kts build.gradle.kts
+└── scripts/
+
+stashbox-admin-web/           # 仓库 C：运营后台（React19 + Vite8 + Tailwind3）
 ```
 
 ## 关键技术选型（v1 §0b.1）
@@ -60,7 +63,7 @@ stashbox/
 |---|---|
 | 后端框架 | FastAPI（异步 + 自动 OpenAPI） |
 | 数据库 | PostgreSQL（业务数据）+ Redis（缓存/队列）|
-| 任务队列 | Celery / Dramatiq（蒸馏 worker）|
+| 任务队列 | Arq（Redis 后端，蒸馏 worker，见 `backend/ai-service/arq_settings.py`）|
 | 多模态 LLM | Qwen2.5-VL-72B（多模态理解）|
 | 听感改写 | Claude 4 Sonnet |
 | ASR / TTS | 豆包 ASR + 豆包 TTS |
@@ -134,7 +137,8 @@ Grafana 数据源和 dashboard 都是 provisioning 自动加载，不需要手�
 
 ```bash
 # 1. 配置 SDK 路径（local.properties，已 gitignore，不提交）
-cd android
+#    注意：Android 是独立仓库 stashbox-android/，不是本仓库子目录
+cd stashbox-android
 echo "sdk.dir=/opt/homebrew/share/android-commandlinetools" > local.properties
 
 # 2. 构建 debug APK（用 Gradle Wrapper，不要系统 gradle）
@@ -149,6 +153,33 @@ export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
 
 技术栈：Kotlin 2.0.21 / Gradle 8.10.2 / AGP 8.7.2 / Compose BOM 2024.10.01 / Hilt 2.52 + KSP。
 包名 `com.tingxia.audio`（debug 包名加 `.debug` 后缀）。Media3（ExoPlayer + MediaSession）与 Retrofit 已留位，CP4.4 / CP4.6 才接入。
+
+## 接真 LLM / TTS / FFmpeg（CP3.5+）
+
+蒸馏链路默认全 mock（`LLM_PROVIDER=mock` + `TTS_PROVIDER=mock`），可零凭证本地跑通。
+切真只需配置 + 凭证，**代码已就绪**。
+
+**统一协议策略（CP9.x 决策）**：LLM 与 TTS 都走 **OpenAI 协议**（HTTP + Bearer auth），便于切换 provider。
+- LLM：阿里 token-plan 团队版 OpenAI 兼容端点（`https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions`）
+- TTS：火山方舟 ARK OpenAI 兼容端点（`https://ark.cn-beijing.volces.com/api/v3/audio/speech`）
+- LLM 与 TTS 的 API key 已拆为 `OPENAI_LLM_API_KEY` / `OPENAI_TTS_API_KEY`，避免双消费方冲突
+
+| 环节 | 实现位置 | 切真方式 | 所需凭证 |
+|---|---|---|---|
+| Step1 结构化 (Qwen-VL) | `backend/ai-service/llm/qwen_vl.py` | `LLM_PROVIDER=qwen_vl` | `DASHSCOPE_API_KEY`（token-plan API Key） |
+| Step2 改写 (OpenAI) | `backend/ai-service/llm/openai.py` | `LLM_PROVIDER=openai` | `OPENAI_LLM_API_KEY` |
+| Step3 TTS (Coding Plan 推荐) | `backend/app/services/tts/doubao.py` | `TTS_PROVIDER=doubao` | `DOUBAO_TTS_API_KEY`（Coding Plan 专属 API Key）+ `DOUBAO_TTS_RESOURCE_ID=seed-tts-2.0` + `DOUBAO_TTS_VOICE=<音色库 speaker>` |
+| Step3 TTS (OpenAI 协议，仅 OpenAI/Azure) | `backend/app/services/tts/openai.py` | `TTS_PROVIDER=openai` | `OPENAI_TTS_API_KEY`（真 OpenAI sk / Azure key；**不兼容火山 Coding Plan**）|
+| Step4 拼接 (FFmpeg) | `backend/ai-service/distill/steps.py::step4_concat` | 自动（Step3 出真实 bytes 时走 ffmpeg）| 本机装 `ffmpeg` + `ffprobe`（本机在 `/opt/homebrew/bin`）|
+| 音频存储 (OSS) | `backend/app/services/storage` | 自动（`_save_audio` 上传）| `OSS_*` 凭证（`.env`）|
+
+- LLM 客户端（Qwen-VL / OpenAI）**已是真实 OpenAI 协议 HTTP 客户端**（httpx + 指数退避、SSE 流式），仅默认 mock。**Claude（Anthropic 原生协议）已弃用**——需要 Claude 时走 `LLM_PROVIDER=openai` + 第三方 OpenAI-compatible 代理。
+- TTS 推荐 `doubao` provider（Coding Plan）：HTTP POST 单向流式走 `https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional`，鉴权 `X-Api-Key` + `X-Api-Resource-Id: seed-tts-2.0`；请求体 `{user, req_params:{text, speaker, audio_params}}`，响应 JSON `data` 字段 base64 解码为 mp3 bytes。`DOUBAO_TTS_VOICE` 必须从控制台 → 音色库 复制真实可用 speaker ID（例：`zh_female_gaolengyujie_uranus_bigtts`）。
+- `OpenAITTSClient` (`TTS_PROVIDER=openai`) 是**真 OpenAI 协议 TTS**（OpenAI 官方 / Azure），**不兼容火山方舟 Coding Plan**（后者走 openspeech.bytedance.com + X-Api-Key，不是 ARK OpenAI 端点）。
+- 免费 TTS 备选：`TTS_PROVIDER=edge`（Microsoft Edge TTS，`pip install edge-tts`，无需 key）。
+- Step4 拼接已修正：段为 mp3 时改 `-c:a aac` 转码，避免 `-c copy` 把 mp3 塞进 m4a(MP4) 容器报错（`Could not find tag for codec mp3`）；本地用 ffmpeg 实测拼接时长与分段之和一致。
+- 完整模板：`backend/.env.example`（已含所有可走方案占位符 + CORS 白名单示例）；真实凭证写 `backend/.env`（已 gitignore）。
+- **状态契约**（CP3.5-pre-2）：Android 端 `DistillStatus` 枚举 = `pending | distilling | ready | failed | listened`；后端 ai-service `main.py::_external_distill_status()` 把内部 7 态（`queued / step1-4 / done / failed`）映射到这 5 态，避免 Android 强校验枚举崩溃。
 
 ## 许可
 

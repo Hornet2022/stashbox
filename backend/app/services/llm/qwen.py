@@ -47,6 +47,7 @@ class QwenVLClient(LLMClient):
         self.max_retries = max_retries
         self._client = httpx.AsyncClient(
             timeout=timeout,
+            trust_env=False,  # 忽略沙箱/系统代理
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",

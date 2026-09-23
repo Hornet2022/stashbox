@@ -33,14 +33,18 @@ _signature: str | None = None
 
 
 def _env_config() -> dict[str, Any]:
-    """第二层：环境变量；第三层：代码默认值。"""
+    """第二层：环境变量；第三层：代码默认值。
+
+    CP9.x 决策：LLM 全 OpenAI 协议栈。OPENAI_LLM_* 与 OPENAI_TTS_* 拆分避免
+    双消费方冲突（详见 .env.example 注释）。
+    """
     return {
         "provider": os.getenv("LLM_PROVIDER", "mock").lower(),
-        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        "api_key": os.getenv("OPENAI_API_KEY", ""),
-        # CP7.3.3：base_url 只做「读出来给 admin 展示」这一层，client 怎么用它不在本任务范围
-        "base_url": os.getenv("LLM_BASE_URL", ""),
-        # CP7.1：qwen_vl（Token Plan 团队版）
+        # OpenAI provider 用的 env（与 TTS 端拆开）
+        "openai_llm_api_key": os.getenv("OPENAI_LLM_API_KEY", ""),
+        "openai_llm_model": os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini"),
+        "openai_llm_base_url": os.getenv("OPENAI_LLM_BASE_URL", "https://api.openai.com/v1"),
+        # CP7.1：qwen_vl（Token Plan 团队版，OpenAI 兼容）
         "qwen_vl_model": os.getenv("QWEN_VL_MODEL", "qwen3.6-flash"),
         "qwen_vl_base_url": os.getenv(
             "QWEN_VL_BASE_URL",
@@ -51,11 +55,36 @@ def _env_config() -> dict[str, Any]:
 
 
 def resolve_config(override: dict[str, Any] | None = None) -> dict[str, Any]:
-    """DB > env > 默认值。override 里 None/空串视为「没配」，回落到下一层。"""
+    """DB > env > 默认值。override 里 None/空串视为「没配」，回落到下一层。
+
+    CP11.x 修复：管理后台 PUT /admin/llm/config 存的是**通用字段**
+    （provider / model / api_key / base_url），而 build_client 读的是**分 provider
+    字段**（openai_llm_* / qwen_vl_*）。此前两者没接上 —— 后台配的 key/model
+    实际不生效（只有 provider 生效）。这里统一做一次映射归一化。
+    """
     config = _env_config()
     for field, value in (override or {}).items():
         if value not in (None, ""):
             config[field] = value
+
+    provider = str(config.get("provider") or "mock").lower()
+    generic_key = config.get("api_key")
+    generic_model = config.get("model")
+    generic_base = config.get("base_url")
+    if provider == "openai":
+        if generic_key:
+            config["openai_llm_api_key"] = generic_key
+        if generic_model:
+            config["openai_llm_model"] = generic_model
+        if generic_base:
+            config["openai_llm_base_url"] = generic_base
+    elif provider == "qwen_vl":
+        if generic_key:
+            config["qwen_vl_api_key"] = generic_key
+        if generic_model:
+            config["qwen_vl_model"] = generic_model
+        if generic_base:
+            config["qwen_vl_base_url"] = generic_base
     return config
 
 
@@ -63,13 +92,13 @@ def build_client(config: dict[str, Any]) -> LLMClient:
     provider = str(config.get("provider") or "mock").lower()
     if provider == "openai":
         return OpenAIClient(
-            api_key=config.get("api_key") or "",
-            model=config.get("model") or "gpt-4o-mini",
-            base_url=config.get("base_url") or "https://api.openai.com/v1",
+            api_key=config.get("openai_llm_api_key") or "",
+            model=config.get("openai_llm_model") or "gpt-4o-mini",
+            base_url=config.get("openai_llm_base_url") or "https://api.openai.com/v1",
         )
     if provider == "qwen_vl":
         return QwenVLClient(
-            api_key=config.get("qwen_vl_api_key") or config.get("api_key") or "",
+            api_key=config.get("qwen_vl_api_key") or "",
             model=config.get("qwen_vl_model") or "qwen3.6-flash",
             base_url=config.get("qwen_vl_base_url")
             or "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
@@ -100,8 +129,14 @@ async def reload() -> LLMClient:
         log.info(
             "llm_client_reloaded",
             provider=config["provider"],
-            model=config["model"],
-            api_key_set=bool(config.get("api_key")),
+            model=config.get("model")
+            or config.get("openai_llm_model")
+            or config.get("qwen_vl_model"),
+            api_key_set=bool(
+                config.get("api_key")
+                or config.get("openai_llm_api_key")
+                or config.get("qwen_vl_api_key")
+            ),
         )
     return _client
 

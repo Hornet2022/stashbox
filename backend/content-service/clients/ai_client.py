@@ -4,6 +4,7 @@ ai-service 的 `POST /api/v1/articles/{id}/distill` 只建任务就返回（mock
 的 BackgroundTask 里跑），所以本调用本身很快，D9 入口直接 await 拿 task_id。
 失败只 log 不抛 —— D9 是用户入口，ai-service 不可用也要先把文章建下来。
 """
+
 import httpx
 
 from stashbox.backend.common.config import settings
@@ -35,7 +36,9 @@ class AIServiceClient:
 
         for attempt in range(self.max_retries):
             try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                # trust_env=False 防止 HTTP_PROXY 把 localhost 拐去系统代理而 ConnectError
+                # （与 gateway 续16 / fetcher P0-2 同源修复）
+                async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
                     resp = await client.post(url, params=params, headers=headers)
                     resp.raise_for_status()
                     return resp.json()

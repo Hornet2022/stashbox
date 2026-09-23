@@ -9,6 +9,7 @@
 为什么不重 PDF OCR（图片版 PDF）：本期只支持文本型 PDF。图片版由 ai-service
 蒸馏阶段兜底（多模态 LLM 直接吃图片），不增加 fetcher 复杂度。
 """
+
 from __future__ import annotations
 
 import logging
@@ -52,7 +53,7 @@ class PdfFetcher(Fetcher):
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 StashBox/0.1"
     )
-    TIMEOUT = 60.0   # PDF 下载给 60s（大文件需要更久）
+    TIMEOUT = 60.0  # PDF 下载给 60s（大文件需要更久）
 
     def __init__(self, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
         self._transport = transport
@@ -81,6 +82,8 @@ class PdfFetcher(Fetcher):
         client_kwargs: dict[str, Any] = {
             "timeout": timeout,
             "follow_redirects": True,
+            # CP9.x fix：trust_env=False 防止 HTTP_PROXY 拦内网/本机请求
+            "trust_env": False,
             "headers": {
                 "User-Agent": self.UA,
                 "Accept": "application/pdf,*/*;q=0.8",
@@ -118,9 +121,7 @@ class PdfFetcher(Fetcher):
             )
 
         # 2. Content-Type 校验
-        content_type = (
-            response.headers.get("content-type", "").split(";")[0].strip().lower()
-        )
+        content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
         if content_type and content_type not in _PDF_CONTENT_TYPES:
             raise FetcherError(
                 code=FetcherErrorCode.PARSE,
@@ -150,7 +151,7 @@ class PdfFetcher(Fetcher):
             for page in reader.pages:
                 try:
                     page_text = page.extract_text() or ""
-                except Exception as exc:   # 单页解析失败不影响其他页
+                except Exception as exc:  # 单页解析失败不影响其他页
                     log.warning("[pdf] page extract failed: %s", exc)
                     page_text = ""
                 page_texts.append(page_text)
@@ -235,11 +236,7 @@ class PdfFetcher(Fetcher):
 
         # 2. 第一页前 3 行
         if page_texts and page_texts[0]:
-            lines = [
-                line.strip()
-                for line in page_texts[0].splitlines()[:3]
-                if line.strip()
-            ]
+            lines = [line.strip() for line in page_texts[0].splitlines()[:3] if line.strip()]
             if lines:
                 # 取最长行（通常是标题）
                 return max(lines, key=len)[:200]

@@ -31,6 +31,7 @@ import httpx
 import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -68,7 +69,12 @@ setup_logging("api-gateway")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.httpx = httpx.AsyncClient()
+    # trust_env=False：网关只代理到本机下游服务(localhost:810x)，绝不走系统 HTTP 代理。
+    # 否则在有 HTTP_PROXY 的环境里(http_proxy 指向 127.0.0.1:xxxx)，httpx 会把
+    # localhost:8102 等内网调用也转给代理，代理连不上本机 → upstream connect refused →
+    # 网关对所有代理路由返回 502/500（蒸馏/订阅/回听等功能集体报错）。下游服务自身调
+    # 外部 LLM 用的是各自独立的 client，不受此处影响。
+    app.state.httpx = httpx.AsyncClient(trust_env=False)
     # CP6.2.2.2b 埋点：SERVICE_START
     try:
         async with AsyncSessionLocal() as session:
@@ -124,6 +130,20 @@ app.add_middleware(
 # 音频回放：v1 §3.6 明确规定「OSS 是唯一写音频的职责」，gateway 不再本地挂载。
 # 客户端拿到的 audio_url 已是 OSS 公网/签名 URL（content-service 直签 OSS 返回），
 # gateway 只做透传，不再做 static mount。
+#
+# CP9.x：本地开发 / 内网测试场景下 STORAGE_PROVIDER=local，audio_url 形如
+#   http://10.0.2.2:8100/audio/{key} （或 http://172.16.x.x:8100/audio/{key} 真机）
+# 此时需要 gateway 挂 /audio/ 静态路由兜底。开启条件（任一）：
+#   - STORAGE_PROVIDER=local
+#   - ENABLE_LOCAL_AUDIO_MOUNT=1（生产也可手动开，但默认关闭）
+if (
+    os.getenv("STORAGE_PROVIDER", "oss").lower() == "local"
+    or os.getenv("ENABLE_LOCAL_AUDIO_MOUNT") == "1"
+):
+    _audio_dir = os.getenv("LOCAL_AUDIO_DIR", "/tmp/audio")
+    if os.path.isdir(_audio_dir):
+        app.mount("/audio", StaticFiles(directory=_audio_dir, check_dir=False), name="local-audio")
+        structlog.get_logger("api-gateway").info("local_audio_mounted", directory=_audio_dir)
 
 
 class TokenRequest(BaseModel):

@@ -97,6 +97,9 @@ class AuditMiddleware(BaseHTTPMiddleware):
     1. 路径匹配 /api/v1/admin/*
     2. 方法是 POST/PUT/DELETE/PATCH
     3. Authorization header 有有效 JWT
+    4. 响应头 X-Audit-Source != "explicit" —— 端点已显式写 admin_operation_logs 时
+       在响应里设此 header，避免审计双写。详见 admin_router.force_retry /
+       delete_article / delete_tag / audio_invalidate / export_csv 等显式 record 点。
 
     注意：JWT 解码失败不破主请求，middleware 静默放过。
     """
@@ -121,6 +124,38 @@ class AuditMiddleware(BaseHTTPMiddleware):
 
         # 4. 执行实际请求
         response = await call_next(request)
+
+        # CP-AUDIT-DEDUP：响应头 X-Audit-Source == "explicit" 表示端点已显式写
+        # admin_operation_logs（如 delete_article / delete_tag / force_retry 等），
+        # 此处跳过避免同事件记录两次。缺失此 header 时仍按原逻辑写一条最简记录
+        # （保 audit 覆盖；admin 端点显式 record 后会回设 header）。
+        # 路径白名单：5 个已知 admin_router 显式 record 端点跳过。
+        # 注意：call_next 之后 `request` 是 _CachedRequest，url 仍可用但 .path 属性没了。
+        path = request.url.path
+        method = request.method
+        skip = False
+        # force-retry
+        if re.match(r"^/api/v1/admin/articles/[^/]+/force-retry$", path):
+            skip = True
+        # admin DELETE article
+        elif method == "DELETE" and re.match(r"^/api/v1/admin/articles/[^/]+$", path):
+            skip = True
+        # admin audio invalidate
+        elif re.match(r"^/api/v1/admin/audio/[^/]+/invalidate$", path):
+            skip = True
+        # admin DELETE tag
+        elif method == "DELETE" and re.match(r"^/api/v1/admin/tags/[^/]+$", path):
+            skip = True
+        # admin export csv
+        elif method == "GET" and re.match(r"^/api/v1/admin/export/[^/]+\.csv$", path):
+            skip = True
+        if skip:
+            log.debug(
+                "audit_skipped_explicit_record",
+                path=path,
+                method=method,
+            )
+            return response
 
         # 5. 异步写 log（不阻塞响应）；失败用 ERROR 级别（之前静默吞）
         try:

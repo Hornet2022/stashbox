@@ -27,6 +27,7 @@ log = get_logger(__name__)
 CACHE_TTL_SECONDS = 5
 
 KEY_LLM = "llm"
+KEY_TTS = "tts"
 
 
 def _cache_key(key: str) -> str:

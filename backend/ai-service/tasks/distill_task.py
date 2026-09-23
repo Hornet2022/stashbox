@@ -17,6 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from distill import DistillContext, DistillPipeline
 from llm import get_llm_client
+from llm import reload as llm_reload
+from stashbox.backend.app.services import tts as app_tts
+from stashbox.backend.app.services.tts import reload as tts_reload
 from stashbox.backend.common.database import AsyncSessionLocal
 from stashbox.backend.common.models import Article
 from stashbox.backend.common.models.tag import Tag, TagSubscription
@@ -57,6 +60,8 @@ async def _trigger_subscription_pushes(
                 article_title = art.title[:50]
 
         article_tags = da.tags if isinstance(da.tags, list) else []
+        # CP-MOCK-SENTINEL：兜底过滤 mock 兜底标签（pipeline 已过滤，再加一层防御）
+        article_tags = [a for a in article_tags if a != "__mock__"]
         if not article_tags:
             return 0
 
@@ -178,6 +183,47 @@ async def distill_task(
     """
     log.info("arq_distill_started", task_id=task_id, article_id=article_id)
 
+    # CP11.x：每个蒸馏任务启动前主动 reload TTS client，让 admin-web 改的 TTS 配置
+    # （provider/api_key 等）通过 system_config 表 + Redis 5s 缓存 实时生效。
+    # 否则 ai-service 进程的 _client 缓存不会感知 content-service admin_router PUT 后的 reload。
+    try:
+        await tts_reload()
+    except Exception as exc:
+        log.warning("tts_reload_failed_in_distill", error=str(exc))
+
+    # CP11.x：蒸馏 LLM 同样对齐管理后台入口（system_config KEY_LLM，DB > env）。
+    # reload 只刷配置 dict（client 每任务新建，无缓存），失败回落 env 不影响蒸馏。
+    try:
+        cfg = await llm_reload()
+        log.info("llm_config_reloaded", provider=cfg.get("provider"), model=cfg.get("model"))
+    except Exception as exc:
+        log.warning("llm_reload_failed_in_distill", error=str(exc))
+
+    # CP-DELETE 兜底：文章被删除后 arq 队列里的 task 还会跑。
+    # 显式查 articles 行存在性，不存在 → 早退 + 一次性埋点 + 不抛 retry（避免重复埋 DISTILL_FAILED/RETRY）。
+    async with AsyncSessionLocal() as db:
+        article_exists = await db.scalar(select(Article.id).where(Article.id == article_id))
+        if article_exists is None:
+            log.warning(
+                "arq_distill_skipped_article_missing",
+                task_id=task_id,
+                article_id=article_id,
+            )
+            # 一次性埋点：DISTILL_FAILED 一次（让数据完整，但不重试不重抛）
+            async with AsyncSessionLocal() as db2:
+                try:
+                    await track(
+                        db2,
+                        EventName.DISTILL_FAILED,
+                        user_id=user_id,
+                        article_id=article_id,
+                        reason="article deleted before distill",
+                    )
+                    await db2.commit()
+                except Exception as exc:
+                    log.warning("DISTILL_FAILED 埋点异常（被忽略）: err={exc}".format(exc=exc))
+            return {"task_id": task_id, "status": "skipped_article_missing"}
+
     # CP2 + CP3 打通：从 articles.raw_content JSONB 读真正文（替代占位文本）
     async with AsyncSessionLocal() as db:
         raw_content = await _load_raw_content(db, article_id)
@@ -205,11 +251,24 @@ async def distill_task(
             if da is not None:
                 art_result = await db.execute(select(Article).where(Article.id == da.article_id))
                 art = art_result.scalar_one_or_none()
-                if art is not None and da.audio_url:
+                if (
+                    art is not None
+                    and da.audio_url
+                    and da.audio_url.startswith(("http://", "https://"))
+                ):
+                    # CP9.x：必须有真 HTTP(S) URL 才标 ready；mock 路径 audio_url=""
+                    # 会让文章保持 pending，等真实 TTS/ffmpeg 路径覆盖
                     art.status = "ready"
                     art.audio_url = da.audio_url
                     await db.commit()
                     log.info("articles.status_updated_to_ready", article_id=art.id)
+                elif art is not None and da.audio_url:
+                    # 非 HTTP URL（如本地临时路径）— 视为未上传，不标 ready
+                    log.warning(
+                        "articles.audio_url_not_http",
+                        article_id=art.id,
+                        audio_url=da.audio_url[:80],
+                    )
         # CP6.2.2.2b 埋点：DISTILL_STEP_COMPLETE（注：步骤在 DistillPipeline 内部迭代，
         # 本文件只在外层 pipeline.run 完成后打点；如需真正 per-step 打点需改 DistillPipeline）
         async with AsyncSessionLocal() as db:
@@ -248,9 +307,12 @@ async def distill_task(
             )
             await db.commit()  # track() 只 flush 不 commit
         # CP6.2.1 埋点：distill_failed + distill_quota_refund
+        # feedback.reason 为 VARCHAR(64)，超长会触发 StringDataRightTruncationError，
+        # 导致埋点失败（被忽略）且掩盖真实错误。截断到 60 字符并保留完整信息到 metadata。
+        reason = str(e)[:60]
         async with AsyncSessionLocal() as db:
             await track(
-                db, EventName.DISTILL_FAILED, user_id=user_id, article_id=article_id, reason=str(e)
+                db, EventName.DISTILL_FAILED, user_id=user_id, article_id=article_id, reason=reason
             )
             await track_simple(db, EventName.DISTILL_QUOTA_REFUND, user_id, article_id)
             await db.commit()  # track() 只 flush 不 commit
