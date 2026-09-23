@@ -2,8 +2,12 @@
 
 编排 4 步 + 状态机推进 + 失败退还配额。
 DB 写回在 session_factory 为 None 时跳过（单测 / 未接库场景）。
+
+CP3.6.4：每步前 try stage cache hit，hit 跳过 + 反序列化到 ctx；
+每步后 fire-and-forget 写 cache；成功后 clear stages。
 """
 
+import asyncio
 import time
 
 import structlog
@@ -11,6 +15,7 @@ import structlog
 from llm import LLMClient
 
 from .schemas import DistillContext
+from .stage_cache import clear_stages, read_stage, write_stage
 from .state_machine import DistillStatus, transition
 from .steps import step1_structure, step2_rewrite, step3_tts, step4_concat
 
@@ -67,6 +72,9 @@ class DistillPipeline:
         """跑完整 4 步流水线。
 
         状态机推进 + 异常处理（任何一步失败 → failed + 退还配额）。
+
+        CP3.6.4：每步前 try stage cache hit，hit 跳过 + 反序列化到 ctx；
+        每步后 fire-and-forget 写 cache（不阻塞主流程）；成功后 clear stages。
         """
         start = time.time()
         self._current = DistillStatus.QUEUED
@@ -74,21 +82,29 @@ class DistillPipeline:
         log.info("distill_started", task_id=ctx.task_id, article_id=ctx.article_id)
 
         try:
-            # Step 1
+            # Step 1：try cache hit，否则实跑
             await self._update_status(ctx, DistillStatus.STEP1_STRUCTURING)
-            await step1_structure(ctx, self.llm)
+            if not await self._try_load_step_from_cache(ctx, "step1_structure", "structured"):
+                await step1_structure(ctx, self.llm)
+                asyncio.create_task(write_stage(ctx.task_id, "step1_structure", ctx.structured))
 
             # Step 2
             await self._update_status(ctx, DistillStatus.STEP2_REWRITING)
-            await step2_rewrite(ctx, self.llm)
+            if not await self._try_load_step_from_cache(ctx, "step2_rewrite", "rewrite"):
+                await step2_rewrite(ctx, self.llm)
+                asyncio.create_task(write_stage(ctx.task_id, "step2_rewrite", ctx.rewrite))
 
             # Step 3
             await self._update_status(ctx, DistillStatus.STEP3_TTSING)
-            await step3_tts(ctx, self.tts_client)
+            if not await self._try_load_step_from_cache(ctx, "step3_tts", "tts"):
+                await step3_tts(ctx, self.tts_client)
+                asyncio.create_task(write_stage(ctx.task_id, "step3_tts", ctx.tts))
 
             # Step 4
             await self._update_status(ctx, DistillStatus.STEP4_CONCATENATING)
-            await step4_concat(ctx)
+            if not await self._try_load_step_from_cache(ctx, "step4_concat", "final"):
+                await step4_concat(ctx)
+                asyncio.create_task(write_stage(ctx.task_id, "step4_concat", ctx.final))
 
             # CP7.2: TTS 合成音频 → 存本地 → 更新 audio_url
             await self._save_audio(ctx)
@@ -96,6 +112,9 @@ class DistillPipeline:
             # Done
             await self._write_final_to_db(ctx)
             await self._update_status(ctx, DistillStatus.DONE)
+
+            # CP3.6.4：成功后清理 stage cache（释放 Redis 内存）
+            await clear_stages(ctx.task_id)
 
             log.info(
                 "distill_completed",
@@ -108,6 +127,53 @@ class DistillPipeline:
             await self._update_status(ctx, DistillStatus.FAILED)
             await self._refund_quota(ctx)  # 退还配额（CP1.6 已实现）
             raise
+
+    async def _try_load_step_from_cache(
+        self,
+        ctx: DistillContext,
+        step_name: str,
+        ctx_attr: str,
+    ) -> bool:
+        """CP3.6.4：尝试从 stage cache 加载 step 结果到 ctx。
+
+        Returns:
+            True 如果 cache hit（已反序列化到 ctx，跳过该步）
+            False 如果 cache miss（需要实跑）
+        """
+        cached = await read_stage(ctx.task_id, step_name)
+        if cached is None:
+            return False
+
+        # 反序列化到 ctx（cached 是 dict，需要重建 Pydantic 模型）
+        try:
+            if step_name == "step1_structure":
+                from .schemas import StructuredOutput
+
+                ctx.structured = StructuredOutput.model_validate(cached)
+            elif step_name == "step2_rewrite":
+                from .schemas import RewriteOutput
+
+                ctx.rewrite = RewriteOutput.model_validate(cached)
+            elif step_name == "step3_tts":
+                from .schemas import TTSOutput
+
+                ctx.tts = TTSOutput.model_validate(cached)
+            elif step_name == "step4_concat":
+                from .schemas import AudioConcatOutput
+
+                ctx.final = AudioConcatOutput.model_validate(cached)
+        except Exception as e:
+            # 反序列化失败（schema 演进） → 当 miss 处理
+            log.warning(
+                "stage_cache_deserialize_failed",
+                task_id=ctx.task_id,
+                step=step_name,
+                error=str(e),
+            )
+            return False
+
+        log.info("stage_cache_hit", task_id=ctx.task_id, step=step_name)
+        return True
 
     async def _update_status(self, ctx: DistillContext, status: DistillStatus) -> None:
         """推进状态机（非法转换抛 ValueError）+ 更新 DB 状态。"""
