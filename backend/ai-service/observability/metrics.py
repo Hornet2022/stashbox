@@ -6,6 +6,7 @@
 - 蒸馏成功率/失败率 → distill_success_total / distill_failure_total
 - 蒸馏 4 步耗时 → distill_step_duration_seconds histogram
 """
+
 from prometheus_client import Counter, Gauge, Histogram
 
 # 蒸馏 step 耗时（v1 §11.3 验收 P95 < 5min = 300s，bucket 上界 600s）
@@ -49,4 +50,12 @@ DISTILL_QUEUE_SIZE = Gauge(
     "distill_queue_size",
     "Arq queue length (per queue)",
     ["queue"],
+)
+
+# CP3.6.3：TTS 并行合成总耗时（per provider + per concurrent 度）
+TTS_PARALLEL_DURATION = Histogram(
+    "tts_parallel_duration_seconds",
+    "TTS parallel synthesis duration (per provider + concurrent, CP3.6.3)",
+    ["provider", "concurrent"],
+    buckets=(0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 30.0),
 )

@@ -6,10 +6,12 @@ LLM 响应按「JSON 优先、纯文本兜底」解析 —— mock client 与真
 
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 import wave
 from pathlib import Path
 
@@ -439,11 +441,45 @@ async def step3_tts(ctx: DistillContext, tts_client) -> None:
         chunk_previews=[c[:60] for c in chunks],
     )
 
+    # CP3.6.3：TTS 段并行合成（asyncio.gather + Semaphore）
+    # 5 分钟文章 ~30 段，每段 ~1s 网络往返 → 串行 30s → 并行 ~3s（10x 提升）。
+    # Semaphore(MAX_CONCURRENT_TTS) 控制突发，避免对 TTS 服务端 429。
+    # 段顺序：按 chunk index 排序后并入 segments（保 step4 拼接正确）。
+    import asyncio
+    from observability.metrics import TTS_PARALLEL_DURATION
+
+    max_concurrent = int(os.getenv("TTS_MAX_CONCURRENT", "8"))
+    sem = asyncio.Semaphore(max_concurrent)
+
+    provider_name = getattr(tts_client, "provider_name", "unknown")
+
+    async def _synth_one(i: int, ch: str, gap: int) -> tuple[int, object, int]:
+        async with sem:
+            result = await tts_client.synthesize(ch)
+        return i, result, gap
+
+    start = time.time()
+    tasks = [_synth_one(i, ch, gap_after_ms[i]) for i, ch in enumerate(chunks)]
+    results = await asyncio.gather(*tasks)
+    duration_sec = time.time() - start
+
+    TTS_PARALLEL_DURATION.labels(provider=provider_name, concurrent=str(max_concurrent)).observe(
+        duration_sec,
+    )
+    log.info(
+        "tts_parallel_completed",
+        article_id=ctx.article_id,
+        provider=provider_name,
+        chunks=len(chunks),
+        concurrent=max_concurrent,
+        duration_sec=round(duration_sec, 3),
+    )
+
+    # 按 chunk index 排序后并入 segments（保证 step4 拼接顺序与原 chunks 一致）
     segments: list[dict] = []
-    for i, ch in enumerate(chunks):
-        result = await tts_client.synthesize(ch)
+    for i, result, gap in sorted(results, key=lambda r: r[0]):
         if isinstance(result, (bytes, bytearray)):
-            segments.append({"bytes": bytes(result), "index": i, "gap_after_ms": gap_after_ms[i]})
+            segments.append({"bytes": bytes(result), "index": i, "gap_after_ms": gap})
         elif isinstance(result, list):
             # Mock 路径：client 自己返回段列表，整体并入（gap_after_ms 默认 0）
             segments.extend(result)
