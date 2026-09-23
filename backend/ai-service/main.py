@@ -16,7 +16,7 @@ from fastapi import Depends, FastAPI
 from fastapi.responses import Response
 from pydantic import BaseModel
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from stashbox.backend.common import cache_service, quota_service
@@ -89,6 +89,13 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
     await shutdown_dispatcher()
+    # CP3.6.2：lifespan shutdown 关闭所有 cached LLM clients（httpx 连接池）
+    try:
+        from llm import close_all_llm_clients
+
+        await close_all_llm_clients()
+    except Exception as exc:
+        log.warning("close_all_llm_clients_failed", error=str(exc))
     # CP6.2.2.2b 埋点：SERVICE_STOP
     try:
         async with AsyncSessionLocal() as session:
@@ -213,15 +220,30 @@ async def distill_start(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
-    task_id = _new_task_id()
-    da = DistilledArticle(
-        id=task_id,
-        article_id=req.article_id,
-        status="queued",
-        audio_url=None,
-        script_text=None,
+    # CP-DISTILL-DUP 同款修复：article_id 有唯一约束。CP9.x 起 POST /articles
+    # 会自动 trigger_distill 建好 DA 行，调用方再显式 /distill/start 必撞
+    # UniqueViolationError → 500。改为复用原行并重置产物字段（同 distill_article）。
+    existed_da = await db.scalar(
+        select(DistilledArticle).where(DistilledArticle.article_id == req.article_id)
     )
-    db.add(da)
+    if existed_da is not None:
+        task_id = existed_da.id
+        existed_da.status = "queued"
+        existed_da.script_text = None
+        existed_da.audio_url = None
+        existed_da.duration_sec = None
+        existed_da.quality_score = None
+        existed_da.tags = None
+    else:
+        task_id = _new_task_id()
+        da = DistilledArticle(
+            id=task_id,
+            article_id=req.article_id,
+            status="queued",
+            audio_url=None,
+            script_text=None,
+        )
+        db.add(da)
     await db.commit()
     # CP3.5-pre-3：BackgroundTasks.add_task → Arq 队列（独立 worker 进程消费）
     job_id = await get_dispatcher().enqueue_distill(

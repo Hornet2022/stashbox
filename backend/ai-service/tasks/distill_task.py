@@ -16,9 +16,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from distill import DistillContext, DistillPipeline
-from llm import get_llm_client
+from llm import get_llm_client, maybe_close_llm_client
 from llm import reload as llm_reload
-from stashbox.backend.app.services import tts as app_tts
 from stashbox.backend.app.services.tts import reload as tts_reload
 from stashbox.backend.common.database import AsyncSessionLocal
 from stashbox.backend.common.models import Article
@@ -318,4 +317,6 @@ async def distill_task(
             await db.commit()  # track() 只 flush 不 commit
         raise  # 让 Arq 走 retry 逻辑
     finally:
-        await llm.close()
+        # CP3.6.2：单例 client（factory `_shared=True`）→ no-op；
+        # httpx 连接池由 `factory.close_all_llm_clients()` 在 lifespan shutdown 统一关闭。
+        await maybe_close_llm_client(llm)

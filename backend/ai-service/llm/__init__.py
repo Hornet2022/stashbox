@@ -4,7 +4,7 @@
 
     from llm import get_llm_client
 
-    client = get_llm_client()               # 默认 MockLLMClient
+    client = get_llm_client()               # 默认随配置路由（openai / qwen_vl）
     resp = await client.chat(ChatRequest(messages=[ChatMessage(role="user", content="...")]))
 
 ai-service 目录名带连字符（不是合法包名），不能相对导入上层 config_llm.py ——
@@ -26,12 +26,13 @@ if _AI_SERVICE_DIR not in sys.path:
 from .base import LLMClient  # noqa: E402
 from .exceptions import LLMError, RateLimitError, TokenLimitError  # noqa: E402
 from .factory import (  # noqa: E402
+    close_all_llm_clients,
     get_llm_client,
     get_openai_client,
     get_qwen_vl_client,
+    maybe_close_llm_client,
     reload,
 )
-from .mock import MockLLMClient  # noqa: E402
 from .openai import OpenAIClient  # noqa: E402
 from .qwen_vl import QwenVLClient  # noqa: E402
 from .types import (  # noqa: E402
@@ -44,12 +45,13 @@ from .types import (  # noqa: E402
 
 __all__ = [
     "LLMClient",
-    "MockLLMClient",
     "OpenAIClient",
     "QwenVLClient",
     "get_llm_client",
     "get_openai_client",
     "get_qwen_vl_client",
+    "maybe_close_llm_client",  # CP3.6.2: 单例 client 安全关闭 helper
+    "close_all_llm_clients",  # CP3.6.2: lifespan shutdown 关闭所有 cached clients
     "reload",
     "ChatMessage",
     "ChatRequest",

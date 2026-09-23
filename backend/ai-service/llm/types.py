@@ -1,4 +1,5 @@
 """LLM 通用数据类型（CP3.5-pre-1 —— v1 §5 L4 蒸馏引擎）。"""
+
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -29,6 +30,7 @@ class ChatRequest(BaseModel):
     top_p: float = 1.0
     stop: list[str] | None = None
     tools: list[dict] | None = None
+    tool_choice: str | dict | None = None  # CP3.6.2: "auto"/"none"/{type:function,...}
     metadata: dict | None = None  # 用于 trace（langfuse / request_id）
 
 

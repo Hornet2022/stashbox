@@ -49,6 +49,7 @@ class OpenAIClient(LLMClient):
         base_url: str = OPENAI_DEFAULT_BASE_URL,
         timeout: float = 60.0,
         max_retries: int = 3,
+        _shared: bool = False,  # CP3.6.2: 单例 client 关闭时跳过 httpx aclose
     ):
         if not api_key:
             raise ValueError("api_key required for OpenAIClient")
@@ -56,6 +57,7 @@ class OpenAIClient(LLMClient):
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.max_retries = max_retries
+        self._shared = _shared
         self._client = httpx.AsyncClient(
             timeout=timeout,
             trust_env=False,  # 忽略沙箱/系统代理（漂移会打挂外网调用）
@@ -80,6 +82,13 @@ class OpenAIClient(LLMClient):
 
         messages = [{"role": m.role, "content": m.content} for m in req.messages]
 
+        # CP3.6.2: prompt caching + tools 透传
+        # 1. system 消息加 cache_control: ephemeral（OpenAI / Anthropic 都支持），
+        #    命中后 system 部分 token 直降 ~75%（cache 命中价低于 input 价）。
+        # 2. tools / tool_choice 按 OpenAI 协议透传。
+        if messages and messages[0].get("role") == "system":
+            messages[0]["cache_control"] = {"type": "ephemeral"}
+
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -88,15 +97,36 @@ class OpenAIClient(LLMClient):
         }
         if req.stop:
             body["stop"] = req.stop
+        if req.tools:
+            body["tools"] = req.tools
+        if req.tool_choice:
+            body["tool_choice"] = req.tool_choice
 
         data = await self._post(body)
 
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        message = data.get("choices", [{}])[0].get("message", {})
+        content = message.get("content", "")
+        tool_calls_raw = message.get("tool_calls")  # 可能 None / [] / [list]
         usage_data = data.get("usage", {})
         finish_reason = data.get("choices", [{}])[0].get("finish_reason", "stop")
 
+        # 解析 tool_calls → ChatResponse.tool_calls (list[ToolCall])
+        from .types import ToolCall
+
+        tool_calls: list[ToolCall] | None = None
+        if tool_calls_raw:
+            tool_calls = [
+                ToolCall(
+                    id=tc.get("id") or "",
+                    type=tc.get("type", "function"),
+                    function=tc.get("function", {}) or {},
+                )
+                for tc in tool_calls_raw
+            ]
+            # finish_reason 兼容：OpenAI 触发 tool_calls 时 finish_reason="tool_calls"
+
         return ChatResponse(
-            content=content,
+            content=content or "",
             model=model,
             usage=Usage(
                 prompt_tokens=usage_data.get("prompt_tokens", 0),
@@ -104,6 +134,7 @@ class OpenAIClient(LLMClient):
                 total_tokens=usage_data.get("total_tokens", 0),
             ),
             finish_reason=finish_reason,
+            tool_calls=tool_calls,
             latency_ms=(time.time() - start) * 1000,
         )
 
@@ -153,6 +184,9 @@ class OpenAIClient(LLMClient):
         try:
             model = req.model or self.model
             messages = [{"role": m.role, "content": m.content} for m in req.messages]
+            # CP3.6.2: 流式也加 cache_control（system 消息时）
+            if messages and messages[0].get("role") == "system":
+                messages[0]["cache_control"] = {"type": "ephemeral"}
             body: dict[str, Any] = {
                 "model": model,
                 "messages": messages,
@@ -160,6 +194,11 @@ class OpenAIClient(LLMClient):
                 "max_tokens": req.max_tokens,
                 "stream": True,
             }
+            # tools 流式暂不暴露（先 chat，等响应稳定再扩）
+            if req.tools:
+                body["tools"] = req.tools
+            if req.tool_choice:
+                body["tool_choice"] = req.tool_choice
 
             async with self._client.stream(
                 "POST", f"{self.base_url}/chat/completions", json=body
@@ -195,4 +234,7 @@ class OpenAIClient(LLMClient):
         return len(text) // 4
 
     async def close(self) -> None:
-        await self._client.aclose()
+        # CP3.6.2：单例 client（factory `_shared=True`）→ no-op；
+        # httpx 连接池由 `factory.close_all_llm_clients()` 在 lifespan shutdown 统一关闭。
+        if not self._shared:
+            await self._client.aclose()

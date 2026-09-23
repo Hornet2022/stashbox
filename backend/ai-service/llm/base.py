@@ -16,6 +16,7 @@
 - 默认走 MockLLMClient（开发环境 + 单测）
 - LLM_PROVIDER=claude / qwen_vl / mock 切换（见 config_llm.py）
 """
+
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from logging import getLogger

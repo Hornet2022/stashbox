@@ -43,6 +43,7 @@ class QwenVLClient(LLMClient):
         base_url: str = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
         timeout: float = 60.0,
         max_retries: int = 3,
+        _shared: bool = False,  # CP3.6.2: 单例 client 关闭时跳过 httpx aclose
     ):
         if not api_key:
             raise ValueError("api_key required for QwenVLClient")
@@ -50,6 +51,7 @@ class QwenVLClient(LLMClient):
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.max_retries = max_retries
+        self._shared = _shared
         self._client = httpx.AsyncClient(
             timeout=timeout,
             trust_env=False,  # 忽略沙箱/系统代理（漂移会打挂外网调用）
@@ -183,4 +185,6 @@ class QwenVLClient(LLMClient):
         return len(text) // 4
 
     async def close(self) -> None:
-        await self._client.aclose()
+        # CP3.6.2：单例 client → no-op；httpx 连接池由 `factory.close_all_llm_clients()` 统一关闭。
+        if not self._shared:
+            await self._client.aclose()

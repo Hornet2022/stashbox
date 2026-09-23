@@ -18,7 +18,7 @@ import structlog
 from llm.types import ChatMessage, ChatRequest
 from observability.decorators import trace_distill_step
 
-from .prompts import STEP1_SYSTEM, STEP1_USER, STEP2_SYSTEM, STEP2_USER, STEP3_USER
+from .prompts import STEP1_SYSTEM, STEP1_USER, STEP2_SYSTEM, STEP2_USER
 
 log = structlog.get_logger(__name__)
 from .schemas import (
@@ -149,21 +149,19 @@ async def step1_structure(ctx: DistillContext, llm) -> None:
 
 
 async def _load_tag_vocabulary() -> str:
-    """拉一次 tags.name 列表（CP-TAG-FILTER）。失败回退到「无 vocabulary」文案。"""
+    """拉一次 tags.name 列表（CP-TAG-FILTER + CP3.6.2 Redis 缓存）。
+
+    CP3.6.2：走 `tag_vocab_cache.load_tag_vocabulary()` —— 先查 Redis (5min TTL)，
+    miss 查 DB → 写回 Redis。失败兜底同原行为。
+    """
+    from stashbox.backend.common.database import AsyncSessionLocal
+    from .tag_vocab_cache import load_tag_vocabulary as _load
+
     try:
-        from sqlalchemy import select
-
-        from stashbox.backend.common.models.tag import Tag
-
-        from stashbox.backend.common.database import AsyncSessionLocal
-
         async with AsyncSessionLocal() as db:
-            names = (await db.execute(select(Tag.name).order_by(Tag.name))).scalars().all()
-        if not names:
-            return "（暂无候选标签，请自由输出 3-5 个主题词）"
-        return "、".join(names)
+            return await _load(db)
     except Exception as exc:
-        # DB 不可用也不破主流程——退化为空词汇，LLM 自由发挥
+        # 兜底文案（与 CP3.6.2 前完全一致）
         log.warning("tag_vocabulary_load_failed", error=str(exc))
         return "（候选标签暂不可用，请自由输出 3-5 个主题词）"
 
