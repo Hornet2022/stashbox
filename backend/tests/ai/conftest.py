@@ -231,28 +231,44 @@ def _refund_quota_no_redis_lock(monkeypatch):
     这里 mock 掉 redis_client.set 让每次 refund 都返回"未锁定"=可退。
     生产代码路径不变（仍会调真 Redis），只是测试里旁路。
 
-    CP11.0.8 fixture 修复：_AlwaysUnlocked 之前只有 `set()` 方法，缺 async context manager 协议；
-    后续测试如果走 `async with redis_async.Redis(...)` 会报
-    "'coroutine' object does not support the asynchronous context manager protocol"。
-    加上 `__aenter__` / `__aexit__` 让它对任何调用都安全 no-op。
+    CP11.0.8 fixture 强化：_AlwaysUnlocked 接受任意构造参数 + async context manager 协议。
+    解决跨 test 状态污染（缓存的 Redis client 跨 test 持有 _AlwaysUnlocked 引用）。
     """
     import redis.asyncio as redis_async
 
     class _AlwaysUnlocked:
+        """接受任意构造参数 + async context manager 协议 + 任意 redis 命令。"""
+
+        def __init__(self, *args, **kwargs):
+            pass
+
         async def set(self, key, value, nx=False, ex=None):
-            return True  # 永远返回"刚锁上"，让 refund 总被调用
+            return True
 
         async def get(self, key):
             return None
 
+        async def delete(self, *args, **kwargs):
+            return 0
+
         async def aclose(self):
             return None
+
+        async def ping(self):
+            return True
 
         async def __aenter__(self):
             return self
 
         async def __aexit__(self, *args):
             return False
+
+        # 兜底：任何其他 redis 命令也安全 no-op
+        async def __getattr__(self, name):
+            async def _noop(*args, **kwargs):
+                return None
+
+            return _noop
 
     monkeypatch.setattr(redis_async, "Redis", _AlwaysUnlocked)
     yield

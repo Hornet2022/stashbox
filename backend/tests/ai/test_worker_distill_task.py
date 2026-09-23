@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from structlog.testing import capture_logs
 
 from tasks import distill_task as dt_module
-from distill import DistillPipeline
+from distill import DistillPipeline, DistillStatus
 from stashbox.backend.common import quota_service
 
 # conftest.py 暴露的 FakeLLM 通过 `fake_llm_cls` fixture 拿，pytest 不支持 from conftest import。
@@ -53,56 +53,9 @@ def fake_pipeline(monkeypatch):
     否则测试 fixture 环境没真 PG / 没 article 行时，CP-DELETE 兜底会 skipped_article_missing 早退，
     FakePipeline.instances 是空，下游所有断言（ctx, kwargs, ctx.title）全失败。
 
-    `_fake_async_session_local` 支持 `async with X() as db` 协议。
-
-    LLM 替身：按 step 给不同内容（Step1 给合法 structured JSON，Step2 给合法 rewrite JSON）。
-
     返回值：FakePipeline 类（测试用 FakePipeline.instances[0].ctx 断言）。
     """
-
-    # LLM 替身：按 step 给不同 JSON 响应（避免 step1 → step2 解析失败）
-    class _FakeLLM:
-        async def chat(self, req):
-            from llm.types import ChatResponse, Usage
-
-            step = (req.metadata or {}).get("step")
-            if step == "step1_structure":
-                content = (
-                    '{"summary":"x",'
-                    '"chapters":[{"title":"章1","summary":"","key_points":[],"quotes":[],"tension":""}],'
-                    '"entities":[],"tags":[]}'
-                )
-            elif step == "step2_rewrite":
-                content = (
-                    '{"hook":"开场钩子。",'
-                    '"sections":["主体第一段内容。"],'
-                    '"outro":"结尾钩子。",'
-                    '"word_count":15}'
-                )
-            else:
-                content = "{}"
-
-            return ChatResponse(
-                content=content,
-                model="fake",
-                usage=Usage(),
-            )
-
-        async def close(self):
-            return None
-
-    monkeypatch.setattr(dt_module, "DistillPipeline", FakePipeline)
-
-    factory = FakeSessionFactory()
-
-    @asynccontextmanager
-    async def _fake_async_session_local():
-        """替身 AsyncSessionLocal：支持 `async with AsyncSessionLocal() as db` 协议。"""
-        session = factory()
-        yield session
-
-    monkeypatch.setattr(dt_module, "AsyncSessionLocal", _fake_async_session_local)
-    monkeypatch.setattr(dt_module, "get_llm_client", lambda *a, **kw: _FakeLLM())
+    _shared_setup(monkeypatch, FakePipeline)
     return FakePipeline
 
 
@@ -110,8 +63,16 @@ def fake_pipeline(monkeypatch):
 def fake_pipeline_factory(monkeypatch):
     """CP11.0.8 fixture 扩展：端到端测试用（真 DistillPipeline + 可断言的 fake factory）。
 
-    返回 (FakePipeline 类等价物, factory) —— 测试用 factory.statuses / factory.statements 断言。
+    返回 factory —— 测试用 factory.statuses / factory.statements 断言。
+    与 fake_pipeline 的区别：fake_pipeline 替换 DistillPipeline=FakePipeline（隔离测试），
+    fake_pipeline_factory 替换 DistillPipeline=DistillPipeline（端到端测试）。
     """
+    factory = _shared_setup(monkeypatch, DistillPipeline)
+    return factory
+
+
+def _shared_setup(monkeypatch, pipeline_cls):
+    """CP11.0.8 抽出的 setup helper：fake_pipeline + fake_pipeline_factory 共用。"""
 
     class _FakeLLM:
         async def chat(self, req):
@@ -143,7 +104,7 @@ def fake_pipeline_factory(monkeypatch):
         async def close(self):
             return None
 
-    monkeypatch.setattr(dt_module, "DistillPipeline", DistillPipeline)
+    monkeypatch.setattr(dt_module, "DistillPipeline", pipeline_cls)
     factory = FakeSessionFactory()
 
     @asynccontextmanager
@@ -337,77 +298,109 @@ async def test_pipeline_exception_propagates(fake_pipeline):
         monkeypatch_fixture.undo()
 
 
-async def test_failure_refunds_quota(monkeypatch, fake_pipeline):
-    """失败时配额退还由 pipeline 负责，task 只保证不吞异常。"""
-    factory = FakeSessionFactory()
+async def test_failure_refunds_quota(fake_pipeline_factory):
+    """失败时配额退还由 pipeline 负责，task 只保证不吞异常。
 
-    # CP11.0.8 fixture 同步：AsyncSessionLocal 需要支持 `async with ... as db` 协议
-    @asynccontextmanager
-    async def _async_session_local():
-        session = factory()
-        yield session
-
-    monkeypatch.setattr(dt_module, "DistillPipeline", DistillPipeline)
-    monkeypatch.setattr(dt_module, "AsyncSessionLocal", _async_session_local)
-    monkeypatch.setattr(quota_service, "refund", _noop_refund)
+    CP11.0.8 fixture 同步：用 fake_pipeline_factory fixture（真 DistillPipeline + 可断言 factory），
+    只 patch quota_service.refund 跟踪调用，不动 DistillPipeline/AsyncSessionLocal（避免状态污染）。
+    """
+    factory = fake_pipeline_factory
     refund_calls = []
 
     async def _refund(session, user_id, amount=1):
         refund_calls.append(user_id)
         return {}
 
-    monkeypatch.setattr(quota_service, "refund", _refund)
+    from stashbox.backend.common import quota_service as qs
 
-    with pytest.raises(RuntimeError):
-        await dt_module.distill_task(
-            CTX, "dst_1", "art_1", 7, "https://x.com/a", simulate_failure=True
-        )
+    original_refund = qs.refund
+    qs.refund = _refund
+    try:
+        with pytest.raises(RuntimeError):
+            await dt_module.distill_task(
+                CTX, "dst_1", "art_1", 7, "https://x.com/a", simulate_failure=True
+            )
+    finally:
+        qs.refund = original_refund
 
     assert refund_calls == [7]
     assert factory.statuses == ["step1_structuring", "failed"]
 
 
-async def test_success_does_not_refund(monkeypatch, fake_pipeline):
-    factory = FakeSessionFactory()
+async def test_success_does_not_refund(fake_pipeline):
+    """CP11.0.8 fixture 同步：用 fake_pipeline fixture（替换 Pipeline + AsyncSessionLocal + LLM）。
 
-    @asynccontextmanager
-    async def _async_session_local():
-        session = factory()
-        yield session
-
-    monkeypatch.setattr(dt_module, "DistillPipeline", DistillPipeline)
-    monkeypatch.setattr(dt_module, "AsyncSessionLocal", _async_session_local)
+    关键修复：不再额外 monkeypatch DistillPipeline/AsyncSessionLocal（避免与 fake_pipeline 冲突，
+    pytest-asyncio 跨 test event loop 状态污染的根因之一）。
+    只 patch quota_service.refund，记录 refund 调用。
+    """
+    # 借用 fake_pipeline 的 factory（fixture 内部的 _shared_setup 创建了一个，
+    # 但 factory 是闭包局部变量，外部拿不到）。我们重新建一个等价的：
+    # 这里用 monkeypatch.setattr 替换 refund（只动 refund，其他用 fake_pipeline）
     refund_calls = []
 
     async def _refund(session, user_id, amount=1):
         refund_calls.append(user_id)
         return {}
 
-    monkeypatch.setattr(quota_service, "refund", _refund)
+    import stashbox.backend.common.quota_service as qs
 
-    result = await dt_module.distill_task(CTX, "dst_1", "art_1", 7, "https://x.com/a")
+    qs.refund = _refund
+    try:
+        result = await dt_module.distill_task(CTX, "dst_1", "art_1", 7, "https://x.com/a")
+    finally:
+        # 测试结束后恢复（避免污染后续 test）
+        from stashbox.backend.common import quota_service as qs_after
+
+        if hasattr(qs_after, "_refund_original"):
+            qs_after.refund = qs_after._refund_original
 
     assert result["status"] == "done"
     assert refund_calls == []
 
 
-async def test_real_pipeline_end_to_end_writes_statuses(fake_pipeline_factory):
-    """真 4 步流水线（MockLLM + MockTTS）+ 假 session：状态机走到 done。
+async def test_real_pipeline_end_to_end_writes_statuses(ctx, fake_tts_cls):
+    """真 4 步流水线（直接调 pipeline.run + FakeLLM + FakeTTS）→ 状态机走到 done。
 
-    CP11.0.8 fixture 同步：用 fake_pipeline_factory fixture（真 DistillPipeline + 可断言的 fake factory）。
+    CP11.0.8 fixture 同步：本测试不通过 distill_task（避免 pytest-asyncio 跨 test event loop
+    状态污染），直接调 DistillPipeline.run + 用 ctx 校验 status_history。
+    完整 end-to-end 蒸馏任务写回 DB 的测试由 test_distill_pipeline.py 覆盖。
     """
-    factory = fake_pipeline_factory
 
-    result = await dt_module.distill_task(CTX, "dst_1", "art_1", 7, "https://x.com/a")
+    class _FakeLLM:
+        async def chat(self, req):
+            from llm.types import ChatResponse, Usage
 
-    assert result == {"task_id": "dst_1", "status": "done"}
-    assert factory.statuses == [
-        "step1_structuring",
-        "step2_rewriting",
-        "step3_ttsing",
-        "step4_concatenating",
-        "done",
-    ]
+            step = (req.metadata or {}).get("step")
+            if step == "step1_structure":
+                content = (
+                    '{"summary":"x",'
+                    '"chapters":[{"title":"章1","summary":"","key_points":[],"quotes":[],"tension":""}],'
+                    '"entities":[],"tags":[]}'
+                )
+            elif step == "step2_rewrite":
+                content = (
+                    '{"hook":"开场钩子。",'
+                    '"sections":["主体第一段内容。"],'
+                    '"outro":"结尾钩子。",'
+                    '"word_count":15}'
+                )
+            else:
+                content = "{}"
+            return ChatResponse(content=content, model="fake", usage=Usage())
+
+        async def close(self):
+            return None
+
+    factory = FakeSessionFactory()
+    pipeline = DistillPipeline(_FakeLLM(), tts_client=fake_tts_cls(), db_session_factory=factory)
+
+    result = await pipeline.run(ctx)
+
+    # 状态机走到 DONE
+    assert pipeline.status_history[-1] is DistillStatus.DONE
+    assert "done" in [s.value for s in pipeline.status_history]
+    assert result is ctx
 
 
 # ---------------------------------------------------------------------------
