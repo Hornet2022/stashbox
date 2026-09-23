@@ -1,7 +1,8 @@
 """LLMClient abstract base 验证（任务包 §4.1）。"""
+
 import pytest
 
-from llm import LLMClient, MockLLMClient
+from llm import LLMClient
 from llm.types import ChatRequest, ChatResponse
 
 EXPECTED_ABSTRACT = {"chat", "stream", "count_tokens"}
@@ -55,9 +56,28 @@ def test_full_subclass_instantiable():
     assert isinstance(client, LLMClient)
 
 
+class _RealClient(LLMClient):
+    """真·LLMClient 实现（替代被删除的 MockLLMClient），验证 async CM。"""
+
+    def __init__(self):
+        self._closed = False
+
+    async def chat(self, req: ChatRequest) -> ChatResponse:
+        return ChatResponse(content="x", model="x")
+
+    async def stream(self, req: ChatRequest):
+        yield "x"
+
+    async def count_tokens(self, text: str, model: str | None = None) -> int:
+        return len(text) // 4
+
+    async def close(self) -> None:
+        self._closed = True
+
+
 async def test_async_context_manager():
     """async with 进出正常，退出时 close() 被调用。"""
-    client = MockLLMClient(latency_ms=0)
+    client = _RealClient()
     async with client as c:
         assert c is client
         resp = await c.chat(ChatRequest(messages=[]))

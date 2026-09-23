@@ -150,7 +150,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
         elif method == "GET" and re.match(r"^/api/v1/admin/export/[^/]+\.csv$", path):
             skip = True
         if skip:
-            log.debug(
+            _log.debug(
                 "audit_skipped_explicit_record",
                 path=path,
                 method=method,

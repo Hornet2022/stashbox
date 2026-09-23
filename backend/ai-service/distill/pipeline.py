@@ -10,7 +10,7 @@ import structlog
 
 from llm import LLMClient
 
-from .schemas import AudioConcatOutput, DistillContext
+from .schemas import DistillContext
 from .state_machine import DistillStatus, transition
 from .steps import step1_structure, step2_rewrite, step3_tts, step4_concat
 

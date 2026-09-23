@@ -1,4 +1,5 @@
 """@trace_llm_call / @trace_distill_step 装饰器单测（任务包 §4.2）。"""
+
 import pytest
 
 from llm.types import ChatMessage, ChatRequest, ChatResponse, Usage
@@ -68,7 +69,11 @@ async def test_trace_llm_call_enabled_reports_generation(fake_langfuse):
     assert gen.name == "unit_chat"
     assert gen.kwargs["model"] == "claude-4-sonnet-20250514"
     assert gen.kwargs["output"] == "改写稿"
-    assert gen.kwargs["usage"] == {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
+    assert gen.kwargs["usage"] == {
+        "prompt_tokens": 100,
+        "completion_tokens": 50,
+        "total_tokens": 150,
+    }
     assert span.kwargs["input"][0]["content"] == "请把这篇改写一下"
 
 

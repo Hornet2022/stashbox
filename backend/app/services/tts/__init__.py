@@ -19,7 +19,6 @@ from stashbox.backend.common.logging import get_logger
 from stashbox.backend.common.system_config import KEY_TTS, get_config
 
 from .base import TTSClient
-from .mock import MockTTSClient
 from .edge import EdgeTTSClient
 from .openai import OpenAITTSClient
 from .doubao import DoubaoTTSClient
@@ -28,7 +27,7 @@ from .indextts import IndexTTSClient
 
 log = get_logger(__name__)
 
-SUPPORTED_PROVIDERS = ("mock", "edge", "openai", "doubao", "local", "indextts")
+SUPPORTED_PROVIDERS = ("edge", "openai", "doubao", "local", "indextts")
 
 _client: TTSClient | None = None
 _signature: str | None = None
@@ -37,7 +36,7 @@ _signature: str | None = None
 def _env_config() -> dict[str, Any]:
     """第二层：环境变量；第三层：代码默认值。"""
     return {
-        "provider": os.getenv("TTS_PROVIDER", "mock").lower(),
+        "provider": os.getenv("TTS_PROVIDER", "indextts").lower(),
         # edge provider
         "edge_voice": os.getenv("EDGE_TTS_VOICE", "zh-CN-XiaoxiaoNeural"),
         # openai 协议 provider（火山方舟/OpenAI/Azure 通用）
@@ -102,9 +101,9 @@ def build_client(config: dict[str, Any]) -> TTSClient:
             ref_audio_path=config.get("indextts_ref_audio") or "",
             ref_text=config.get("indextts_ref_text") or "",
         )
-    if provider != "mock":
-        log.warning("tts_provider_unsupported", provider=provider, fallback="mock")
-    return MockTTSClient()
+    raise ValueError(
+        f"unsupported tts provider: {provider!r} " f"(supported: edge/openai/doubao/local/indextts)"
+    )
 
 
 def get_tts_client() -> TTSClient:

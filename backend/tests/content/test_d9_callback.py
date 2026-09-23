@@ -4,6 +4,7 @@ CP1.7 D9 入口单测：POST /api/v1/callback/d9-add-article（6 个 case）。
 覆盖：匿名 device_id / 已登录扣配额 / 配额用尽 3001 / URL 不合法 2001 /
       无身份 4001 / ai-service 失败仍建文章。
 """
+
 import httpx
 import uuid
 
@@ -20,7 +21,8 @@ D9_URL = "/api/v1/callback/d9-add-article"
 # ---------------------------------------------------------------------------
 async def test_d9_anonymous_device_id_creates_article_without_quota(fake_ai_client):
     device_id = "device_" + uuid.uuid4().hex[:8]
-    async with client(device_id=device_id) as c:
+    # 端点 Header alias 为 X-Device-Id（大小写不敏感），helper 会把下划线转连字符
+    async with client(x_device_id=device_id) as c:
         r = await c.post(D9_URL, json={"url": "https://mp.weixin.qq.com/s/d9_anon"})
 
     assert r.status_code == 200, r.text

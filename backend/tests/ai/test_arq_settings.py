@@ -2,6 +2,7 @@
 
 只测 load_arq_config 的默认值 + 环境变量覆盖，不连 Redis。
 """
+
 import pytest
 from dataclasses import FrozenInstanceError
 

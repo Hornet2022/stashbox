@@ -2,6 +2,7 @@
 
 全部用假 SDK（`fake_langfuse` fixture 替换 sys.modules["langfuse"]），不发真网络请求。
 """
+
 import sys
 
 import pytest

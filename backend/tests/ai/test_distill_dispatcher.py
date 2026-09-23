@@ -2,6 +2,7 @@
 
 不连真 Redis：把 dispatcher.create_pool 换成假的 pool，只验证入队参数 / 幂等 / 失败传播。
 """
+
 import pytest
 
 import dispatcher as dispatcher_module
@@ -163,6 +164,7 @@ async def test_close_without_connect_is_noop(fake_pool):
 # ---------------------------------------------------------------------------
 async def test_enqueue_raises_when_redis_is_down(monkeypatch):
     """Redis 连不上 → 异常往上抛（端点据此降级，见任务包 §8）。"""
+
     async def _boom(settings, **kwargs):
         raise ConnectionError("redis down")
 

@@ -2,15 +2,32 @@
 
 前置条件：alembic upgrade 0007 已跑（dev DB 升级由 Hornet 手动执行）。
 """
+
 import uuid
-from unittest.mock import patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, select, text
 
+from helpers import content_main
 from stashbox.backend.common.database import AsyncSessionLocal
 from stashbox.backend.common.models import Tag, TagSubscription
+
+
+def _override_auth(dep_name: str, mock_user: dict):
+    """临时覆盖 content-service 的鉴权依赖（dependency_overrides）。"""
+
+    dep = getattr(content_main, dep_name)
+
+    class _Ctx:
+        def __enter__(self):
+            content_main.app.dependency_overrides[dep] = lambda: mock_user
+            return self
+
+        def __exit__(self, *exc):
+            content_main.app.dependency_overrides.pop(dep, None)
+
+    return _Ctx()
 
 
 # ---------------------------------------------------------------------------
@@ -47,14 +64,11 @@ async def test_tag_subscriptions_table_exists():
 @pytest.mark.asyncio
 async def test_admin_create_tag():
     """admin create 端点：mock user 创 tag（幂等 slug → 409）"""
-    from stashbox.backend.content_service.main import app
-
     slug = _unique_slug()
-    mock_user = {"id": 999, "tier": "admin"}
+    mock_user = {"id": 999, "sub": "999", "tier": "admin"}
 
-    with patch("stashbox.backend.content_service.main.require_admin_or_operator") as mock_auth:
-        mock_auth.return_value = mock_user
-        transport = ASGITransport(app=app)
+    with _override_auth("require_admin_or_operator", mock_user):
+        transport = ASGITransport(app=content_main.app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post(
                 "/api/v1/tags",
@@ -75,15 +89,12 @@ async def test_admin_create_tag():
 @pytest.mark.asyncio
 async def test_admin_create_tag_duplicate_409():
     """重复 slug → 409"""
-    from stashbox.backend.content_service.main import app
-
     slug = _unique_slug()
-    mock_user = {"id": 999, "tier": "admin"}
+    mock_user = {"id": 999, "sub": "999", "tier": "admin"}
 
     # 创建第一个
-    with patch("stashbox.backend.content_service.main.require_admin_or_operator") as mock_auth:
-        mock_auth.return_value = mock_user
-        transport = ASGITransport(app=app)
+    with _override_auth("require_admin_or_operator", mock_user):
+        transport = ASGITransport(app=content_main.app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             await client.post("/api/v1/tags", json={"slug": slug, "name": "标签A"})
             # 重复创建
@@ -100,8 +111,6 @@ async def test_admin_create_tag_duplicate_409():
 @pytest.mark.asyncio
 async def test_user_subscribe_tag_idempotent():
     """subscribe 端点：幂等（重复订阅返 already_subscribed）+ 写 tag_subscriptions"""
-    from stashbox.backend.content_service.main import app
-
     slug = _unique_slug()
     user_id = 1001
 
@@ -114,9 +123,8 @@ async def test_user_subscribe_tag_idempotent():
 
     mock_user = {"id": user_id, "sub": str(user_id)}
 
-    with patch("stashbox.backend.content_service.main.require_user") as mock_auth:
-        mock_auth.return_value = mock_user
-        transport = ASGITransport(app=app)
+    with _override_auth("require_user", mock_user):
+        transport = ASGITransport(app=content_main.app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             # 第一次订阅
             resp1 = await client.post(f"/api/v1/tags/{slug}/subscribe")
@@ -158,8 +166,6 @@ async def test_user_subscribe_tag_idempotent():
 @pytest.mark.asyncio
 async def test_user_unsubscribe_tag_idempotent():
     """unsubscribe 端点：幂等（本来没订阅也返 already_unsubscribed）+ 删 tag_subscriptions"""
-    from stashbox.backend.content_service.main import app
-
     slug = _unique_slug()
     user_id = 1002
 
@@ -172,9 +178,8 @@ async def test_user_unsubscribe_tag_idempotent():
 
     mock_user = {"id": user_id, "sub": str(user_id)}
 
-    with patch("stashbox.backend.content_service.main.require_user") as mock_auth:
-        mock_auth.return_value = mock_user
-        transport = ASGITransport(app=app)
+    with _override_auth("require_user", mock_user):
+        transport = ASGITransport(app=content_main.app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             # 本来就没订阅 → already_unsubscribed
             resp1 = await client.post(f"/api/v1/tags/{slug}/unsubscribe")

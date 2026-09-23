@@ -10,6 +10,7 @@ CP4.7-E2E-BACKEND 端到端集成测试（content-service → ai-service → aud
 （第一段 "articles" → content-service）路由，但 content-service 无此端点。
 实际使用 /api/v1/distill/start（显式路由到 ai-service）。
 """
+
 import asyncio
 import os
 import uuid
@@ -43,10 +44,13 @@ async def _login_via_wechat(code: str = "cp47_e2e_test") -> tuple[str, str]:
 
 
 async def _poll_task_status(
-    client: httpx.AsyncClient, task_id: str, auth: dict, timeout: int = 60
+    client: httpx.AsyncClient, task_id: str, auth: dict, timeout: int = 600
 ) -> dict:
     """轮询 GET /api/v1/distill/{task_id} 直到 status == 'done'（最多 timeout 秒）。
 
+    CP9.x 起蒸馏是真实 LLM（火山 ark）+ 真实 TTS（indextts）流水线，单任务
+    端到端需要数分钟（step1 结构化 → step2 改写 → step3 TTS → step4 拼接），
+    旧 60s 是 mock LLM 时代的设置，会误报超时。
     POST /distill/start 只创建 DistilledArticle(status=queued)，不更新 Article.status。
     因此轮询 Article.status 永远得到 'pending'。正确做法是轮询 task status。
     """
@@ -92,9 +96,10 @@ async def test_wechat_url_full_distill_pipeline():
             json={"url": url, "source": "web"},
             headers=auth,
         )
-        assert create_resp.status_code in (200, 201), (
-            f"创建文章失败: {create_resp.status_code} {create_resp.text}"
-        )
+        assert create_resp.status_code in (
+            200,
+            201,
+        ), f"创建文章失败: {create_resp.status_code} {create_resp.text}"
         create_data = create_resp.json()
         # POST /api/v1/articles 返回 {article_id, url, status, quota_used, ...}
         article_id = create_data.get("article_id") or create_data.get("id")
@@ -116,19 +121,17 @@ async def test_wechat_url_full_distill_pipeline():
             },
             headers=auth,
         )
-        assert distill_resp.status_code == 200, (
-            f"启动蒸馏失败: {distill_resp.status_code} {distill_resp.text}"
-        )
+        assert (
+            distill_resp.status_code == 200
+        ), f"启动蒸馏失败: {distill_resp.status_code} {distill_resp.text}"
         distill_data = distill_resp.json()
         task_id = distill_data.get("task_id")
         job_id = distill_data.get("job_id") or task_id
         print(f"[CP4.7] 蒸馏任务已入队: task_id={task_id}, job_id={job_id}")
 
-        # Step 3: 轮询任务状态直到 done（mock LLM 链路，最多 60s）
-        task_data = await _poll_task_status(client, task_id, auth, timeout=60)
-        assert task_data["status"] == "done", (
-            f"蒸馏未完成: status={task_data['status']}"
-        )
+        # Step 3: 轮询任务状态直到 done（真实 LLM+TTS 流水线，最多 600s）
+        task_data = await _poll_task_status(client, task_id, auth, timeout=600)
+        assert task_data["status"] == "done", f"蒸馏未完成: status={task_data['status']}"
         print(f"[CP4.7] 蒸馏完成: task_status={task_data['status']}")
 
         # Step 4: 获取 audio_url
@@ -136,18 +139,16 @@ async def test_wechat_url_full_distill_pipeline():
             f"/api/v1/articles/{article_id}/audio-url",
             headers=auth,
         )
-        assert audio_resp.status_code == 200, (
-            f"获取 audio_url 失败: {audio_resp.status_code} {audio_resp.text}"
-        )
+        assert (
+            audio_resp.status_code == 200
+        ), f"获取 audio_url 失败: {audio_resp.status_code} {audio_resp.text}"
         audio_data = audio_resp.json()
         audio_url = audio_data.get("audio_url")
         assert audio_url, f"audio_url 为空: {audio_data}"
-        assert audio_url.startswith(("http://", "https://")), (
-            f"audio_url 格式非法: {audio_url}"
-        )
-        assert any(ext in audio_url for ext in (".mp3", ".m4a", ".aac", ".wav")), (
-            f"audio_url 非音频格式: {audio_url}"
-        )
+        assert audio_url.startswith(("http://", "https://")), f"audio_url 格式非法: {audio_url}"
+        assert any(
+            ext in audio_url for ext in (".mp3", ".m4a", ".aac", ".wav")
+        ), f"audio_url 非音频格式: {audio_url}"
         print(f"[CP4.7] audio_url 合法: {audio_url}")
         print("[CP4.7] 完整链路验证通过")
 
@@ -177,6 +178,7 @@ async def test_distill_failure_refund_quota():
     需直打 ai-service（8103）。
     """
     import uuid
+
     token, _ = await _login_via_wechat(f"cp47_fail_{uuid.uuid4().hex[:8]}")
     auth = {"Authorization": f"Bearer {token}"}
 
@@ -198,9 +200,9 @@ async def test_distill_failure_refund_quota():
             headers=auth,
             params={"simulate_failure": "true"},
         )
-        assert distill_resp.status_code == 200, (
-            f"distill 触发失败: {distill_resp.status_code} {distill_resp.text}"
-        )
+        assert (
+            distill_resp.status_code == 200
+        ), f"distill 触发失败: {distill_resp.status_code} {distill_resp.text}"
         task_id = distill_resp.json().get("task_id")
         print(f"[CP4.7] 模拟失败任务已入队: task_id={task_id}")
 
@@ -211,9 +213,7 @@ async def test_distill_failure_refund_quota():
         status_resp = await ai_client.get(f"/api/v1/distill/{task_id}", headers=auth)
         assert status_resp.status_code == 200, f"任务查询失败: {status_resp.status_code}"
         status_data = status_resp.json()
-        assert status_data["status"] == "failed", (
-            f"期望任务失败，实际: {status_data['status']}"
-        )
+        assert status_data["status"] == "failed", f"期望任务失败，实际: {status_data['status']}"
         print(f"[CP4.7] 蒸馏失败验证通过: task_status={status_data['status']}")
 
 
@@ -244,9 +244,12 @@ async def test_unsupported_url_creates_pending_article():
         )
         # URL 不被 fetcher 支持 → 返回 200（文章入库，pending）
         # 实际行为以 content-service 返回为准
-        assert create_resp.status_code in (200, 201, 400, 422), (
-            f"unexpected status: {create_resp.status_code} {create_resp.text}"
-        )
+        assert create_resp.status_code in (
+            200,
+            201,
+            400,
+            422,
+        ), f"unexpected status: {create_resp.status_code} {create_resp.text}"
         print(f"[CP4.7] unsupported URL 处理: status={create_resp.status_code}")
 
 
@@ -281,7 +284,7 @@ async def test_get_audio_before_distill_returns_404():
             f"/api/v1/articles/{article_id}/audio-url",
             headers=auth,
         )
-        assert audio_resp.status_code == 404, (
-            f"未蒸馏文章应返回 404，实际 {audio_resp.status_code}: {audio_resp.text}"
-        )
+        assert (
+            audio_resp.status_code == 404
+        ), f"未蒸馏文章应返回 404，实际 {audio_resp.status_code}: {audio_resp.text}"
         print("[CP4.7] 未蒸馏 audio-url 正确返回 404")

@@ -5,6 +5,7 @@
 - CostTracker.record_llm_usage 埋点 llm_cost_usd_total counter
 - distill_queue_size gauge 正常 set
 """
+
 import pytest
 
 from observability.metrics import (
@@ -104,9 +105,11 @@ async def test_cost_tracker_inc_llm_cost(reset_metrics):
 
     tracker = CostTracker(client=FakeRedis())
     cost = await tracker.record_llm_usage(
-        user_id=1, article_id="a",
+        user_id=1,
+        article_id="a",
         model="claude-4-sonnet-20250514",
-        prompt_tokens=1000, completion_tokens=500,
+        prompt_tokens=1000,
+        completion_tokens=500,
     )
     assert cost > 0
     # 1.0 input @ 0.003 + 0.5 output @ 0.015 = 0.003 + 0.0075 = 0.0105

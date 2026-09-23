@@ -19,14 +19,13 @@ from stashbox.backend.common.logging import get_logger
 from stashbox.backend.common.system_config import KEY_LLM, get_config
 
 from .base import LLMClient
-from .mock import MockLLMClient
 from .openai import OpenAIClient
 from .qwen import QwenVLClient
 
 log = get_logger(__name__)
 
 # CP7.3 实际实现了的 provider（deepseek / glm 在 base.py 里只是预留）
-SUPPORTED_PROVIDERS = ("mock", "openai", "qwen_vl")
+SUPPORTED_PROVIDERS = ("openai", "qwen_vl")
 
 _client: LLMClient | None = None
 _signature: str | None = None
@@ -39,7 +38,7 @@ def _env_config() -> dict[str, Any]:
     双消费方冲突（详见 .env.example 注释）。
     """
     return {
-        "provider": os.getenv("LLM_PROVIDER", "mock").lower(),
+        "provider": os.getenv("LLM_PROVIDER", "openai").lower(),
         # OpenAI provider 用的 env（与 TTS 端拆开）
         "openai_llm_api_key": os.getenv("OPENAI_LLM_API_KEY", ""),
         "openai_llm_model": os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini"),
@@ -103,9 +102,7 @@ def build_client(config: dict[str, Any]) -> LLMClient:
             base_url=config.get("qwen_vl_base_url")
             or "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
         )
-    if provider != "mock":
-        log.warning("llm_provider_unsupported", provider=provider, fallback="mock")
-    return MockLLMClient()
+    raise ValueError(f"unsupported llm provider: {provider!r} (supported: openai/qwen_vl)")
 
 
 def get_llm_client() -> LLMClient:

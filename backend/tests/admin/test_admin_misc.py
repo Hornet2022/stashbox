@@ -12,6 +12,7 @@
 表），故 audio invalidate 作用于 distilled_articles。admin_operation_logs 表由 fixture
 幂等建（绕过 broken 0008 迁移链，仅建本测试相关表）。
 """
+
 import importlib.util
 import sys
 import uuid
@@ -65,6 +66,7 @@ async def _ensure_tables():
 @pytest.fixture
 def fake_ai(monkeypatch):
     """不真调 ai-service，记录调用参数（挂在 self.calls 上）。"""
+
     class _Fake:
         def __init__(self):
             self.calls = []
@@ -74,7 +76,11 @@ def fake_ai(monkeypatch):
             return {"article_id": article_id, "task_id": "dst_fake", "status": "started"}
 
     fake = _Fake()
-    # 主模块里 `from clients.ai_client import get_ai_client` 已绑定名字，须 patch 主模块属性
+    # P2-1 拆分后 force_retry 端点在 admin_router.py，其模块命名空间里
+    # `get_ai_client` 已绑定，须 patch admin_router 模块属性（main 侧同步 patch 兜底）。
+    # 注意 main.py 用 `from admin_router import router as admin_router`，
+    # content_module.admin_router 是 APIRouter 实例，真正模块在 sys.modules。
+    monkeypatch.setattr(sys.modules["admin_router"], "get_ai_client", lambda: fake)
     monkeypatch.setattr(content_module, "get_ai_client", lambda: fake)
     return fake
 

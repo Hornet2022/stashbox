@@ -20,7 +20,9 @@ P2-1 拆分（CP11.x 走查）：
 
 import csv
 import io
+import json
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -33,9 +35,12 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from clients.ai_client import get_ai_client  # noqa: E402
+
 from stashbox.backend.common import cache_service, system_config
+from stashbox.backend.common.auth import create_access_token
 from stashbox.backend.common.auth_admin import require_admin_or_operator
-from stashbox.backend.common.database import get_db
+from stashbox.backend.common.database import AsyncSessionLocal, get_db
 from stashbox.backend.common.exceptions import InvalidRequest, NotFound
 from stashbox.backend.common.logging import get_logger
 from stashbox.backend.common.models import (
@@ -88,13 +93,7 @@ class AdminActionRequest(BaseModel):
 
 
 # ─── admin 段原样搬入（@app 改 @router）─────────────────────────────────────
-
-
-class AdminActionRequest(BaseModel):
-    """admin 写操作统一 body：reason 必填（审计留痕）。"""
-
-    reason: str
-
+# （AdminActionRequest 类定义已上提至本段之前，避免 F811 重复定义）
 
 # ---------------------------------------------------------------------------
 # CP3.6-A3 admin 其他端点（v1 §3.6）

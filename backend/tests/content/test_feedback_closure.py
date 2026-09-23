@@ -5,6 +5,7 @@
 
 前置：本机 PG 5432 + Redis 6379 已起，alembic 已到 0004（feedback 表存在）。
 """
+
 import uuid
 
 from sqlalchemy import delete, select
@@ -107,7 +108,7 @@ async def test_skip_writes_feedback_with_reason_and_sets_flag():
 
 
 # ---------------------------------------------------------------------------
-# 3. skip 缺 reason → 400（且不落 feedback / 不改 article.skip）
+# 3. skip 缺 reason → 400；CP8.6 起 reason 放宽为自由文本（≤64），非空即 200
 # ---------------------------------------------------------------------------
 async def test_skip_without_reason_returns_400():
     uid, token = await new_user()
@@ -119,14 +120,16 @@ async def test_skip_without_reason_returns_400():
         assert r.status_code == 400, r.text
         assert r.json()["message"] == "reason is required"
 
-        # 非法枚举值也 400
+        # CP8.6：任意非空自由文本合法（不再是 4 选 1 枚举）→ 200
         async with client(token) as c:
             r2 = await c.post(SKIP_URL.format(art_id), json={"reason": "whatever"})
-        assert r2.status_code == 400, r2.text
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["skip"] is True
 
-        assert await _feedback_rows(art_id) == []
-        art = await _article(art_id)
-        assert art.skip is False
+        # 超过 64 字符 → 400（feedback.reason 列宽上限）
+        async with client(token) as c:
+            r3 = await c.post(SKIP_URL.format(art_id), json={"reason": "x" * 65})
+        assert r3.status_code == 400, r3.text
     finally:
         await _purge(uid)
 

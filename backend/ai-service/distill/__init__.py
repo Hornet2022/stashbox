@@ -2,7 +2,7 @@
 
 用法::
 
-    from distill import DistillContext, DistillPipeline, MockTTSClient
+    from distill import DistillContext, DistillPipeline
     from llm import get_llm_client
 
     ctx = DistillContext(task_id=..., article_id=..., user_id=..., url=..., raw_content=...)
@@ -12,6 +12,7 @@
 ai-service 目录名带连字符（不是合法包名），这里把它加进 sys.path ——
 `llm` / `config_llm` 因此作为顶层模块导入（做法同 llm/__init__.py）。
 """
+
 import sys
 from pathlib import Path
 
@@ -19,7 +20,6 @@ _AI_SERVICE_DIR = str(Path(__file__).resolve().parent.parent)
 if _AI_SERVICE_DIR not in sys.path:
     sys.path.insert(0, _AI_SERVICE_DIR)
 
-from .mock_tts import MockTTSClient  # noqa: E402
 from .pipeline import DistillPipeline  # noqa: E402
 from .schemas import (  # noqa: E402
     AudioConcatOutput,
@@ -39,7 +39,6 @@ from .steps import step1_structure, step2_rewrite, step3_tts, step4_concat  # no
 
 __all__ = [
     "DistillPipeline",
-    "MockTTSClient",
     "DistillContext",
     "StructuredChapter",
     "StructuredOutput",

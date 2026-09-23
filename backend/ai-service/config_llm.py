@@ -8,7 +8,7 @@ LLM 相关配置只服务 ai-service 蒸馏链路，CP1.8+ 接 Nacos 动态配�
 - claude 原生（x-api-key + /v1/messages）已弃用，需要时改走 qwen_vl 或 openai 代理
 
 CP3.5 接真 API 时通过环境变量注入：
-- LLM_PROVIDER=qwen_vl                # mock / openai / qwen_vl
+- LLM_PROVIDER=openai                 # openai / qwen_vl（删 mock，默认走真实 LLM）
 - QWEN_VL_BASE_URL=https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
 - DASHSCOPE_API_KEY=sk-...            # 别名：QWEN_VL_API_KEY（qwen_vl 专用）
 - QWEN_VL_MODEL=qwen3.6-flash
@@ -26,8 +26,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class LLMSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="", env_file=".env", extra="ignore")
 
-    # 全局 provider 路由：mock / openai / qwen_vl（CP9.x 决策：删 claude）
-    llm_provider: str = "mock"
+    # 全局 provider 路由：openai / qwen_vl（CP9.x 决策：删 claude，删 mock 回退）
+    llm_provider: str = "openai"
 
     # —— Qwen VL（阿里 token-plan 团队版，OpenAI 兼容）——
     qwen_vl_api_key: str = Field(

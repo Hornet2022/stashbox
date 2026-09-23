@@ -2,6 +2,7 @@
 
 覆盖 `_load_raw_content` 的 3 种返回 + distill_task 端到端（真 PG + 真 DistillPipeline）。
 """
+
 import pytest
 
 from tasks import distill_task as dt_module

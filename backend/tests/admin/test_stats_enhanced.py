@@ -9,6 +9,7 @@
 依赖真实 PG（/tmp:5432）。orders 表在仓库无独立 migration，revenue 查询缺表时返回 0；
 本测试在"有值"用例用 raw SQL 临时建 orders 表并插入本月已支付订单，验证求和逻辑。
 """
+
 import importlib.util
 import sys
 import uuid
@@ -124,7 +125,9 @@ async def test_stats_fields_present_on_empty_db():
     assert "listened" in data
     # 新增字段存在且为非负整数（共享 DB 可能已有历史数据，故不严格 == 0）
     assert isinstance(data["active_audio_files"], int) and data["active_audio_files"] >= 0
-    assert isinstance(data["failed_distillations_24h"], int) and data["failed_distillations_24h"] >= 0
+    assert (
+        isinstance(data["failed_distillations_24h"], int) and data["failed_distillations_24h"] >= 0
+    )
     # revenue：orders 表不存在 → 0
     assert data["revenue"] == 0
 
@@ -168,14 +171,22 @@ async def test_stats_fields_with_values():
         s.add(old)
         # active_audio_files：done 且有 audio_url（需先建父 article 满足 FK）
         pa1 = Article(
-            id=f"art_{uuid.uuid4().hex[:24]}", user_id=uid,
-            url="https://example.com/pa1", source="d9",
-            status="ready", favorite=False, skip=False,
+            id=f"art_{uuid.uuid4().hex[:24]}",
+            user_id=uid,
+            url="https://example.com/pa1",
+            source="d9",
+            status="ready",
+            favorite=False,
+            skip=False,
         )
         pa2 = Article(
-            id=f"art_{uuid.uuid4().hex[:24]}", user_id=uid,
-            url="https://example.com/pa2", source="d9",
-            status="ready", favorite=False, skip=False,
+            id=f"art_{uuid.uuid4().hex[:24]}",
+            user_id=uid,
+            url="https://example.com/pa2",
+            source="d9",
+            status="ready",
+            favorite=False,
+            skip=False,
         )
         s.add_all([pa1, pa2])
         await s.flush()
@@ -196,6 +207,12 @@ async def test_stats_fields_with_values():
         await s.commit()
 
     await _seed_orders()
+    # CP9.4 stats 端点有 30s 内存缓存，基线请求会写入缓存导致增量断言拿到旧值；
+    # 直接清掉 admin_router 模块级缓存（dict 跨测试模块共享，需显式清空）
+    _ar = sys.modules.get("admin_router")
+    if _ar is not None:
+        _ar._admin_stats_cache.clear()
+        _ar._admin_stats_expires.clear()
     try:
         async with _client(_token(admin)) as c:
             resp = await c.get("/api/v1/admin/stats")

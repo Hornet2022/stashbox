@@ -1,4 +1,5 @@
 """蒸馏状态机测试（任务包 §4.3）。"""
+
 import pytest
 
 from distill import DistillStatus
