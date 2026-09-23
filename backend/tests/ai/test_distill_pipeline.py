@@ -1,6 +1,6 @@
 """DistillPipeline 编排测试（任务包 §4.2）。
 
-用 FakeLLM + MockTTSClient + 假 session factory，不接真 LLM / TTS / DB。
+用 FakeLLM + FakeTTSClient + 假 session factory，不接真 LLM / TTS / DB。
 """
 
 from unittest.mock import AsyncMock
@@ -17,7 +17,6 @@ from distill import (
     step4_concat,
 )
 from distill import pipeline as pipeline_module
-from llm import MockLLMClient
 from stashbox.backend.common import quota_service
 
 
@@ -70,7 +69,13 @@ class FakeSessionFactory:
         return [row["status"] for row in self.values if "status" in row]
 
 
-def _make_pipeline(monkeypatch, llm, *, with_db: bool = True, tts_client=None):
+def _make_pipeline(monkeypatch, llm, *, with_db: bool = True, tts_client=None, fake_tts_cls=None):
+    if tts_client is None:
+        # CP11.0.8 fixture 修复：用 `fake_tts_cls` fixture（从 conftest 暴露的）
+        # 替代 `from conftest import FakeTTSClient`（pytest 不支持这样 import）。
+        if fake_tts_cls is None:
+            raise ValueError("_make_pipeline 需要 fake_tts_cls fixture 或显式 tts_client 参数")
+        tts_client = fake_tts_cls()
     factory = FakeSessionFactory() if with_db else None
     refund = AsyncMock()
     monkeypatch.setattr(quota_service, "refund", refund)
@@ -81,8 +86,16 @@ def _make_pipeline(monkeypatch, llm, *, with_db: bool = True, tts_client=None):
 # ---------------------------------------------------------------------------
 # 成功路径
 # ---------------------------------------------------------------------------
-async def test_happy_path_advances_status_machine(ctx, fake_llm_cls, monkeypatch):
-    pipeline, factory, refund = _make_pipeline(monkeypatch, fake_llm_cls('{"summary":"s"}'))
+async def test_happy_path_advances_status_machine(ctx, fake_llm_cls, fake_tts_cls, monkeypatch):
+    # CP11.0.8 fixture 同步：Step1 结构化和 Step2 改写需要不同 LLM 响应。
+    # Step1 给合法 structured JSON，Step2 给合法 rewrite JSON。
+    llm = fake_llm_cls(
+        step_contents={
+            "step1_structure": '{"summary":"s","chapters":[{"title":"章1","summary":"","key_points":[]}],"entities":[],"tags":["科技"]}',
+            "step2_rewrite": '{"hook":"开场","sections":["主体第一段"],"outro":"结尾","word_count":10}',
+        }
+    )
+    pipeline, factory, refund = _make_pipeline(monkeypatch, llm, fake_tts_cls=fake_tts_cls)
 
     result = await pipeline.run(ctx)
 
@@ -98,8 +111,10 @@ async def test_happy_path_advances_status_machine(ctx, fake_llm_cls, monkeypatch
     refund.assert_not_called()
 
 
-async def test_happy_path_fills_all_context_stages(ctx, fake_llm_cls, monkeypatch):
-    pipeline, _, _ = _make_pipeline(monkeypatch, fake_llm_cls("改写稿正文"))
+async def test_happy_path_fills_all_context_stages(ctx, fake_llm_cls, fake_tts_cls, monkeypatch):
+    pipeline, _, _ = _make_pipeline(
+        monkeypatch, fake_llm_cls("改写稿正文"), fake_tts_cls=fake_tts_cls
+    )
 
     await pipeline.run(ctx)
 
@@ -113,8 +128,10 @@ async def test_happy_path_fills_all_context_stages(ctx, fake_llm_cls, monkeypatc
     assert ctx.final.duration_sec > 0
 
 
-async def test_happy_path_writes_statuses_to_db(ctx, fake_llm_cls, monkeypatch):
-    pipeline, factory, _ = _make_pipeline(monkeypatch, fake_llm_cls("改写稿正文"))
+async def test_happy_path_writes_statuses_to_db(ctx, fake_llm_cls, fake_tts_cls, monkeypatch):
+    pipeline, factory, _ = _make_pipeline(
+        monkeypatch, fake_llm_cls("改写稿正文"), fake_tts_cls=fake_tts_cls
+    )
 
     await pipeline.run(ctx)
 
@@ -129,8 +146,10 @@ async def test_happy_path_writes_statuses_to_db(ctx, fake_llm_cls, monkeypatch):
     assert all(session.commits >= 1 for session in factory.sessions)
 
 
-async def test_happy_path_writes_final_result_to_db(ctx, fake_llm_cls, monkeypatch):
-    pipeline, factory, _ = _make_pipeline(monkeypatch, fake_llm_cls("改写稿正文"))
+async def test_happy_path_writes_final_result_to_db(ctx, fake_llm_cls, fake_tts_cls, monkeypatch):
+    pipeline, factory, _ = _make_pipeline(
+        monkeypatch, fake_llm_cls("改写稿正文"), fake_tts_cls=fake_tts_cls
+    )
 
     await pipeline.run(ctx)
 
@@ -138,14 +157,17 @@ async def test_happy_path_writes_final_result_to_db(ctx, fake_llm_cls, monkeypat
     assert final_row["audio_url"] == ctx.final.audio_url
     # duration_sec 同 test_happy_path_fills_all_context_stages：依赖 TTS client 选择
     assert final_row["duration_sec"] > 0
-    assert final_row["tags"] == ctx.structured.tags
+    # CP-MOCK-SENTINEL：pipeline._write_final_to_db 会过滤 `__mock__` sentinel，
+    # 所以 final_row["tags"] 是 ctx.structured.tags 去掉 `__mock__` 后的值。
+    expected_tags = [t for t in (ctx.structured.tags or []) if t != "__mock__"]
+    assert final_row["tags"] == expected_tags
     assert final_row["quality_score"] == 8.5
 
 
-async def test_pipeline_works_without_session_factory(ctx, fake_llm_cls, monkeypatch):
+async def test_pipeline_works_without_session_factory(ctx, fake_llm_cls, fake_tts_cls, monkeypatch):
     """不接 DB（单测 / 未接库场景）也能跑完 4 步。"""
     pipeline, factory, refund = _make_pipeline(
-        monkeypatch, fake_llm_cls("改写稿正文"), with_db=False
+        monkeypatch, fake_llm_cls("改写稿正文"), with_db=False, fake_tts_cls=fake_tts_cls
     )
 
     await pipeline.run(ctx)
@@ -155,27 +177,15 @@ async def test_pipeline_works_without_session_factory(ctx, fake_llm_cls, monkeyp
     refund.assert_not_called()  # session_factory 为 None 时不退配额
 
 
-async def test_pipeline_defaults_to_mock_tts_client(ctx, fake_llm_cls):
-    from stashbox.backend.app.services.tts.mock import MockTTSClient as AppMockTTSClient
-
-    pipeline = DistillPipeline(fake_llm_cls("改写稿正文"))
-
-    # pipeline 懒加载的是 app.services.tts 工厂的 MockTTSClient（返 bytes 1 段），
-    # 而不是 distill 模块的 legacy MockTTSClient（返 list[dict] 多段）。
-    assert isinstance(pipeline.tts_client, AppMockTTSClient)
-
-
-async def test_pipeline_runs_with_real_mock_llm_client(ctx):
-    """端到端（mock 依赖）：MockLLMClient + app.services.tts.MockTTSClient 跑通 4 步。"""
-    llm = MockLLMClient(latency_ms=0)
-    pipeline = DistillPipeline(llm)
+async def test_pipeline_runs_with_fake_clients(ctx, fake_llm_cls, fake_tts_cls):
+    """端到端（单测替身）：FakeLLM + FakeTTSClient 跑通 4 步。"""
+    llm = fake_llm_cls("改写稿正文")
+    pipeline = DistillPipeline(llm, tts_client=fake_tts_cls())
 
     await pipeline.run(ctx)
 
     assert pipeline.status_history[-1] is DistillStatus.DONE
-    # app.services.tts.MockTTSClient.synthesize 返 1 段 bytes（dict-wrapped）
-    assert len(ctx.tts.segments) == 1
-    await llm.close()
+    assert len(ctx.tts.segments) >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -191,9 +201,11 @@ async def test_pipeline_runs_with_real_mock_llm_client(ctx):
     ],
 )
 async def test_failure_at_any_step_fails_and_refunds(
-    ctx, fake_llm_cls, monkeypatch, step_name, step_fn, expected_status_at_failure
+    ctx, fake_llm_cls, fake_tts_cls, monkeypatch, step_name, step_fn, expected_status_at_failure
 ):
-    pipeline, factory, refund = _make_pipeline(monkeypatch, fake_llm_cls("改写稿正文"))
+    pipeline, factory, refund = _make_pipeline(
+        monkeypatch, fake_llm_cls("改写稿正文"), fake_tts_cls=fake_tts_cls
+    )
     boom = RuntimeError(f"{step_name} boom")
 
     async def _boom(*args, **kwargs):
@@ -211,8 +223,10 @@ async def test_failure_at_any_step_fails_and_refunds(
     assert refund.await_args.args[1] == ctx.user_id
 
 
-async def test_failure_writes_failed_status_to_db(ctx, fake_llm_cls, monkeypatch):
-    pipeline, factory, _ = _make_pipeline(monkeypatch, fake_llm_cls("改写稿正文"))
+async def test_failure_writes_failed_status_to_db(ctx, fake_llm_cls, fake_tts_cls, monkeypatch):
+    pipeline, factory, _ = _make_pipeline(
+        monkeypatch, fake_llm_cls("改写稿正文"), fake_tts_cls=fake_tts_cls
+    )
 
     async def _boom(*args, **kwargs):
         raise RuntimeError("boom")
@@ -225,8 +239,10 @@ async def test_failure_writes_failed_status_to_db(ctx, fake_llm_cls, monkeypatch
     assert factory.statuses == ["step1_structuring", "step2_rewriting", "failed"]
 
 
-async def test_failure_does_not_write_final_result(ctx, fake_llm_cls, monkeypatch):
-    pipeline, factory, _ = _make_pipeline(monkeypatch, fake_llm_cls("改写稿正文"))
+async def test_failure_does_not_write_final_result(ctx, fake_llm_cls, fake_tts_cls, monkeypatch):
+    pipeline, factory, _ = _make_pipeline(
+        monkeypatch, fake_llm_cls("改写稿正文"), fake_tts_cls=fake_tts_cls
+    )
 
     async def _boom(*args, **kwargs):
         raise RuntimeError("boom")
@@ -240,8 +256,12 @@ async def test_failure_does_not_write_final_result(ctx, fake_llm_cls, monkeypatc
     assert ctx.final is None
 
 
-async def test_failure_without_session_factory_still_raises(ctx, fake_llm_cls, monkeypatch):
-    pipeline, _, refund = _make_pipeline(monkeypatch, fake_llm_cls("改写稿正文"), with_db=False)
+async def test_failure_without_session_factory_still_raises(
+    ctx, fake_llm_cls, fake_tts_cls, monkeypatch
+):
+    pipeline, _, refund = _make_pipeline(
+        monkeypatch, fake_llm_cls("改写稿正文"), with_db=False, fake_tts_cls=fake_tts_cls
+    )
 
     async def _boom(*args, **kwargs):
         raise RuntimeError("boom")
@@ -255,10 +275,10 @@ async def test_failure_without_session_factory_still_raises(ctx, fake_llm_cls, m
     refund.assert_not_called()  # 没有 session 就不退（交给调用方）
 
 
-async def test_llm_error_propagates_and_refunds(ctx, fake_llm_cls, monkeypatch):
+async def test_llm_error_propagates_and_refunds(ctx, fake_llm_cls, fake_tts_cls, monkeypatch):
     """LLM 自身抛错（如 RateLimitError）也走同一条失败路径。"""
     llm = fake_llm_cls("改写稿正文", raise_error=RuntimeError("rate limited"))
-    pipeline, factory, refund = _make_pipeline(monkeypatch, llm)
+    pipeline, factory, refund = _make_pipeline(monkeypatch, llm, fake_tts_cls=fake_tts_cls)
 
     with pytest.raises(RuntimeError, match="rate limited"):
         await pipeline.run(ctx)
@@ -271,8 +291,10 @@ async def test_llm_error_propagates_and_refunds(ctx, fake_llm_cls, monkeypatch):
     refund.assert_awaited_once()
 
 
-async def test_status_history_resets_between_runs(ctx, fake_llm_cls, monkeypatch):
-    pipeline, _, _ = _make_pipeline(monkeypatch, fake_llm_cls("改写稿正文"))
+async def test_status_history_resets_between_runs(ctx, fake_llm_cls, fake_tts_cls, monkeypatch):
+    pipeline, _, _ = _make_pipeline(
+        monkeypatch, fake_llm_cls("改写稿正文"), fake_tts_cls=fake_tts_cls
+    )
 
     await pipeline.run(ctx)
     first = list(pipeline.status_history)

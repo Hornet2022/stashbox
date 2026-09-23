@@ -1,4 +1,5 @@
 """蒸馏 prompt 模板测试（任务包 §4.4）。"""
+
 import pytest
 
 from distill import prompts
@@ -54,8 +55,12 @@ def test_all_prompts_are_non_empty_strings(prompt):
 
 
 def test_system_prompts_have_no_placeholders():
-    """system prompt 是静态指令，format 时不该有未替换占位符。"""
-    assert "{" not in prompts.STEP1_SYSTEM
+    """system prompt 是静态指令，format 时不该有未替换占位符。
+
+    CP3.6.2 fixture 同步：STEP1_SYSTEM 含 `{tag_vocabulary}` 占位符（CP-TAG-FILTER，
+    step1_structure 运行时 format 注入）→ 不应断言 `"{" not in STEP1_SYSTEM`。
+    STEP2_SYSTEM 没被注入占位符，仍应为纯静态。
+    """
     assert "{" not in prompts.STEP2_SYSTEM
 
 

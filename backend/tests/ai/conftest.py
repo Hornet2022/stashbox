@@ -114,12 +114,32 @@ class FakeLLM:
     """返回固定内容的 LLMClient（CP3.5-pre-2 蒸馏单测用）。
 
     比 MockLLMClient 更可控：响应内容由测试直接指定，用来断言解析逻辑。
+
+    CP11.0.8 fixture 扩展：支持按 step 给不同 content（`step_contents` 参数）——
+    蒸馏 4 步需要 Step1 结构化和 Step2 改写用不同响应，单一 content 不够。
     """
 
-    def __init__(self, content: str = "mock response", *, raise_error: Exception | None = None):
+    def __init__(
+        self,
+        content: str = "mock response",
+        *,
+        raise_error: Exception | None = None,
+        step_contents: dict[str, str] | None = None,
+    ):
         self.content = content
         self.raise_error = raise_error
+        self.step_contents = step_contents or {}
         self.requests: list = []
+
+    def _resolve_content(self, req) -> str:
+        """CP11.0.8: 按 step 返回不同 content。
+
+        通过 req.metadata["step"] 判断（distill steps 都会设置 metadata["step"]）。
+        """
+        step = (req.metadata or {}).get("step")
+        if step and step in self.step_contents:
+            return self.step_contents[step]
+        return self.content
 
     async def chat(self, req):
         self.requests.append(req)
@@ -127,8 +147,9 @@ class FakeLLM:
             raise self.raise_error
         from llm.types import ChatResponse, Usage
 
+        resolved = self._resolve_content(req)
         return ChatResponse(
-            content=self.content,
+            content=resolved,
             model="fake-model",
             usage=Usage(prompt_tokens=len(req.messages[-1].content) // 4),
         )
@@ -141,6 +162,40 @@ class FakeLLM:
 
     async def close(self) -> None:
         return None
+
+
+class FakeTTSClient:
+    """返回真·静音 WAV bytes 的 TTS 替身（无网络，蒸馏单测用）。
+
+    step3_tts 期望 synthesize 返回 bytes（真实 client 契约）；这里给一段
+    合法 24k/16bit/mono 静音 WAV，让 step4_concat 走真实拼接路径、能算出时长，
+    从而验证"非 mock"的蒸馏链路。
+    """
+
+    def __init__(self):
+        import io
+        import wave
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)  # 16-bit
+            w.setframerate(24000)
+            w.writeframes(b"\x00\x00" * 24000)  # 1 秒静音
+        self._wav = buf.getvalue()
+
+    async def synthesize(self, text: str) -> bytes:
+        return self._wav
+
+    @property
+    def provider_name(self) -> str:
+        return "fake"
+
+
+@pytest.fixture
+def fake_tts_cls():
+    """返回 FakeTTSClient 类（测试里自己实例化）。"""
+    return FakeTTSClient
 
 
 def make_ctx(**overrides):
@@ -175,12 +230,29 @@ def _refund_quota_no_redis_lock(monkeypatch):
     但测试环境用同一 task_id 重复跑会跨测试状态污染。
     这里 mock 掉 redis_client.set 让每次 refund 都返回"未锁定"=可退。
     生产代码路径不变（仍会调真 Redis），只是测试里旁路。
+
+    CP11.0.8 fixture 修复：_AlwaysUnlocked 之前只有 `set()` 方法，缺 async context manager 协议；
+    后续测试如果走 `async with redis_async.Redis(...)` 会报
+    "'coroutine' object does not support the asynchronous context manager protocol"。
+    加上 `__aenter__` / `__aexit__` 让它对任何调用都安全 no-op。
     """
     import redis.asyncio as redis_async
 
     class _AlwaysUnlocked:
         async def set(self, key, value, nx=False, ex=None):
             return True  # 永远返回"刚锁上"，让 refund 总被调用
+
+        async def get(self, key):
+            return None
+
+        async def aclose(self):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
 
     monkeypatch.setattr(redis_async, "Redis", _AlwaysUnlocked)
     yield
