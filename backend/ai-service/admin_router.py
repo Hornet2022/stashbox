@@ -333,6 +333,26 @@ async def admin_tier_config_get(
         for p in tier_map
         if p not in _SUPPORTED_LLM_PROVIDERS
     ]
+
+    # 动作 1（2026-09-24 事故后加）：提示「模型名与当前 LLM 供应商不符」。
+    # 事故背景：llm 换成火山方舟 + doubao-*，tier 却留着 gpt-4o →
+    # 蒸馏调用 LLM 报 404 UnsupportedModel，整条链路 100% 失败。
+    try:
+        from stashbox.backend.common.system_config import KEY_LLM, get_config
+
+        from distill.tier_router import check_model_matches_vendor
+
+        llm_cfg = await get_config(KEY_LLM) or {}
+        active_provider = str(llm_cfg.get("provider") or "openai").lower()
+        active_base_url = llm_cfg.get("base_url")
+        for tier_map in effective.values():
+            for prov, model in tier_map.items():
+                err = check_model_matches_vendor(prov, model, active_provider, active_base_url)
+                if err:
+                    warnings.append(err)
+    except Exception:
+        pass  # 读不到 llm 配置时不提示（不阻塞 GET）
+
     return {
         "tier_model_map": effective,
         "source": source,
@@ -367,6 +387,29 @@ async def admin_tier_config_put(
         for model in tier_map.values():
             if len(model) > 128:
                 raise InvalidRequest("模型名过长（≤128 字符）")
+
+    # 动作 1（2026-09-24 事故后加）：模型名 ↔ 当前 LLM 供应商一致性校验。
+    # 背景：管理后台把 llm 配成火山方舟（doubao-*），tier 却配 gpt-4o →
+    # 蒸馏调用 LLM 报 404 UnsupportedModel，整条蒸馏链 100% 失败。
+    # 这里在**保存时**就拦掉，而不是等蒸馏跑挂。供应商无法判断时放行。
+    from stashbox.backend.common.system_config import KEY_LLM, get_config
+
+    from distill.tier_router import check_model_matches_vendor
+
+    try:
+        llm_cfg = await get_config(KEY_LLM) or {}
+    except Exception:
+        llm_cfg = {}
+    active_provider = str(llm_cfg.get("provider") or "openai").lower()
+    active_base_url = llm_cfg.get("base_url")
+    conflicts = [
+        err
+        for tier_map in validated.values()
+        for prov, model in tier_map.items()
+        if (err := check_model_matches_vendor(prov, model, active_provider, active_base_url))
+    ]
+    if conflicts:
+        raise InvalidRequest(conflicts[0])
 
     updated_by = int(user.get("sub") or 0) or None
     row = await set_config(KEY_TIER, {"tier_model_map": validated}, updated_by=updated_by)

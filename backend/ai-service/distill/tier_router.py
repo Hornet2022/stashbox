@@ -90,6 +90,17 @@ async def route_tier(
 # TIER_MODEL_MAP：CP3.6.2 配合
 # simple：轻量模型（成本 1/5，听感中等）
 # full：完整模型（成本高，听感优）
+#
+# ⚠️ 这里的 `openai` 项写的是 **OpenAI 官方模型名**，只在 base_url 指向
+# OpenAI 官方时成立。若管理后台把 llm 换成 OpenAI 兼容端点（火山方舟 /
+# 自建代理等），必须同步在管理后台配 `tier-config`（「模型路由」页），
+# 否则会回落到本默认值 → 模型名不被该供应商支持 → 蒸馏时 LLM 404。
+#
+# 2026-09-24 事故：管理后台把 llm 配成了火山方舟 + doubao-seed-2.0-lite，
+# 但 tier 从未配置 →  distill_task 选 full tier 拿到 gpt-4o → 方舟返回
+# `UnsupportedModel` 404，蒸馏 100% 失败。为消除这个陷阱，
+# `resolve_tier_map()` 的 default 分支现在会**跟随当前 LLM 模型**
+# （见 `_default_map_following_llm`）——「只改 llm 一处」也不再 404。
 TIER_MODEL_MAP: dict[str, dict[str, str]] = {
     "simple": {
         "openai": "gpt-4o-mini",
@@ -102,6 +113,59 @@ TIER_MODEL_MAP: dict[str, dict[str, str]] = {
         "claude": "claude-4-sonnet-20250514",
     },
 }
+
+# OpenAI 官方 host：只有这些（或留空 = 默认官方）才认为 TIER_MODEL_MAP 的
+# openai 模型名（gpt-4o 等）成立。其余一律视为 OpenAI 兼容第三方端点。
+OPENAI_OFFICIAL_HOSTS: tuple[str, ...] = ("api.openai.com",)
+
+
+def host_of(url: str | None) -> str:
+    """取 URL 的 host（小写）；空/非法返回空串。"""
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlparse
+
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def is_openai_official(base_url: str | None) -> bool:
+    """base_url 是否指向 OpenAI 官方（留空视为官方默认）。"""
+    host = host_of(base_url)
+    return host == "" or host in OPENAI_OFFICIAL_HOSTS
+
+
+async def _default_map_following_llm() -> dict[str, dict[str, str]]:
+    """代码默认 map；若当前 openai 供应商不是 OpenAI 官方，则把 openai 项
+    统一替换为**当前生效 LLM 模型**。
+
+    目的：让「换供应商只改管理后台 llm 一处」也不会在蒸馏时 404。
+    读不到 llm 配置（无 Redis/PG 的测试环境）时按原样返回。
+    """
+    base = {tier: dict(provs) for tier, provs in TIER_MODEL_MAP.items()}
+    try:
+        from stashbox.backend.common.system_config import KEY_LLM, get_config
+
+        llm_cfg = await get_config(KEY_LLM) or {}
+    except Exception as exc:
+        log.warning("tier_default_llm_read_failed", error=str(exc))
+        return base
+
+    provider = str(llm_cfg.get("provider") or "").lower()
+    model = llm_cfg.get("model")
+    base_url = llm_cfg.get("base_url")
+    if provider == "openai" and model and not is_openai_official(base_url):
+        for tier in base:
+            base[tier]["openai"] = str(model)
+        log.info(
+            "tier_default_follows_llm_model",
+            model=str(model),
+            base_url=str(base_url),
+            reason="base_url 不是 OpenAI 官方，避免硬编码 gpt-4o 被供应商拒（404）",
+        )
+    return base
 
 
 def get_model_for_tier(tier: str, provider: str) -> str:
@@ -118,6 +182,67 @@ def get_model_for_tier(tier: str, provider: str) -> str:
         KeyError: tier 或 provider 不在 TIER_MODEL_MAP 中
     """
     return TIER_MODEL_MAP[tier][provider]
+
+
+# ── 动作 1：模型名 ↔ base_url 供应商一致性校验 ──────────────────────────
+# 供应商 → 该供应商的模型名前缀特征。
+# 只用于「显然不符」的拦截（如 gpt-4o 打到火山方舟），不做白名单限制，
+# 未知供应商（自建代理等）一律放行，避免误伤。
+VENDOR_MODEL_PREFIXES: dict[str, tuple[str, ...]] = {
+    "openai": ("gpt-", "o1", "o3", "o4", "chatgpt", "text-davinci"),
+    "volces": ("doubao-", "ep-"),
+}
+
+
+def infer_vendor(base_url: str | None) -> str | None:
+    """从 base_url 推断 LLM 供应商；无法判断返回 None（调用方应放行）。"""
+    host = host_of(base_url)
+    if host == "" or host in OPENAI_OFFICIAL_HOSTS:
+        return "openai"
+    if "volces.com" in host:
+        return "volces"
+    return None
+
+
+def check_model_matches_vendor(
+    entry_provider: str,
+    model: str,
+    active_provider: str,
+    base_url: str | None,
+) -> str | None:
+    """校验 tier map 里的模型名是否与当前 LLM 的 base_url 供应商显然不符。
+
+    Args:
+        entry_provider: 该 model 在 tier map 里所属的 provider 键（openai/qwen_vl/…）
+        model: 模型名
+        active_provider: 当前生效的 LLM provider（llm 配置里的 provider）
+        base_url: 当前生效的 LLM base_url
+
+    Returns:
+        错误文案（应拒绝保存）；None = 通过。
+
+    只校验「当前生效 provider」对应的项 —— 其余 provider 的 base_url 未知，
+    校验它没有依据。供应商无法判断时一律放行。
+    """
+    if entry_provider != active_provider:
+        return None
+    vendor = infer_vendor(base_url)
+    if vendor is None:
+        return None
+    foreign = [
+        prefix
+        for other_vendor, prefixes in VENDOR_MODEL_PREFIXES.items()
+        if other_vendor != vendor
+        for prefix in prefixes
+    ]
+    low = model.strip().lower()
+    if any(low.startswith(p) for p in foreign):
+        return (
+            f"模型 '{model}' 属于其他供应商，但当前 LLM base_url 指向 "
+            f"{vendor}（{base_url}）。请填该供应商支持的模型名，"
+            f"否则蒸馏调用 LLM 会报 404 UnsupportedModel。"
+        )
+    return None
 
 
 def _validate_tier_map(candidate: object) -> dict[str, dict[str, str]] | None:
@@ -147,6 +272,11 @@ async def resolve_tier_map() -> tuple[dict[str, dict[str, str]], str]:
 
     Redis 5s 缓存由 system_config.get_config 统一提供；蒸馏任务无需重启即生效。
 
+    default 分支说明（2026-09-24）：不再直接返回硬编码 `TIER_MODEL_MAP`，
+    而是走 [_default_map_following_llm] —— 当 openai 的 base_url 不是
+    OpenAI 官方时，openai 项会跟随当前 LLM 模型，避免「换供应商忘改 tier」
+    导致蒸馏 404。
+
     Returns:
         (effective_map, source)  source ∈ {"db", "default"}
     """
@@ -164,10 +294,10 @@ async def resolve_tier_map() -> tuple[dict[str, dict[str, str]], str]:
     if validated is None:
         if stored:
             log.warning("tier_map_db_invalid_use_default", stored=str(stored)[:200])
-        return TIER_MODEL_MAP, "default"
+        return await _default_map_following_llm(), "default"
 
-    # 部分覆盖：DB 只改了 simple 时，full 仍用代码默认补齐
-    merged = {t: dict(provs) for t, provs in TIER_MODEL_MAP.items()}
+    # 部分覆盖：DB 只改了 simple 时，full 用「代码默认（必要时已跟随 llm）」补齐
+    merged = await _default_map_following_llm()
     for tier, prov_map in validated.items():
         merged[tier].update(prov_map)
     return merged, "db"
