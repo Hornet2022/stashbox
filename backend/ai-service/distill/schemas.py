@@ -196,3 +196,16 @@ class ColdStartState(BaseModel):
     state: Literal["fresh", "warming", "active"]
     ratings_remaining_to_personalize: int
     personalization_enabled_at: datetime | None = None
+
+
+class PoolHealthReport(BaseModel):
+    """CP5.7.0 §3.1 决策 4：few-shot 池健康度报告。"""
+
+    total_count: int
+    high_score_count: int
+    medium_score_count: int
+    low_score_count: int
+    active_count: int
+    stale_count: int
+    health_score: float
+    warning: str | None = None
