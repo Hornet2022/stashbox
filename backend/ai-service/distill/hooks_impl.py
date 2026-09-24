@@ -1,10 +1,10 @@
-"""CP3.7.2 §2.2.E：默认 hook 实现（6 个）。
+"""CP3.7.2 §2.2.E + CP3.7.3 PostHook 完整实现。
 
-按 docs/听感产品化方案_v1.md §2.2.E 严格实现 6 个默认 hook：
+按 docs/听感产品化方案_v1.md §2.2.E 严格实现 4 个默认 hook：
 - PreDistillHook (3): TierRouterHook / UserProfileHook / FewShotSelectorHook
 - PostStepHook (1): StageCacheHook（CP3.6.4 已实现，复用）
-- PostDistillHook (2): ListeningPatternUpdaterHook / FewShotPoolHook
-  + ScorePredictorHook（待 CP3.8.0 落地真实评分，本期 mock）
+- PostDistillHook (4): ScorePredictorHook + AutoRetryHook
+  + ListeningPatternUpdaterHook + FewShotPoolHook
 
 每个 hook 失败都不破主流程（try/except + log warning）。
 """
@@ -18,12 +18,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import pipeline_hooks
+from .auto_retry import should_auto_retry
+from .listening_pattern_updater import update_user_listening_pattern
 from .pipeline_hooks import PostDistillHook, PostStepHook, PreDistillHook
 from .schemas import (
     DistillContext,
     RewriteExample,
     UserListeningPattern,
 )
+from .score_predictor import MOCK_SCORE, predict_and_save_quality_score
 from .stage_cache import write_stage
 from .tier_router import route_tier
 
@@ -164,10 +167,9 @@ class StageCacheHook:
 # PostDistillHook 实现
 # ---------------------------------------------------------------------------
 class ListeningPatternUpdaterHook:
-    """CP3.7.2 §2.2.E：PostDistillHook —— 增量更新用户听感画像（30 篇窗口 + 加权平均）。
+    """CP3.7.3：PostDistillHook —— 增量更新用户听感画像（30 篇窗口 + 加权平均）。
 
-    CP3.7.3 完整实现：增量更新 + 冷启动保护
-    本期只做骨架：feedback_count += 1
+    完整实现：调 update_user_listening_pattern（含冷启动保护 / 加权平均 / 特征提取）。
     """
 
     async def __call__(self, ctx: DistillContext, db: AsyncSession) -> None:
@@ -175,23 +177,20 @@ class ListeningPatternUpdaterHook:
         if not _is_real_session(db):
             return
         try:
-            from stashbox.backend.common.models import UserListeningPattern as ULPSQL
+            # CP3.7.3：需要 DistillationEvaluation，本期 mock 创建（CP3.8.0 接真实评分）
+            from stashbox.backend.common.models import DistillationEvaluation
 
-            result = await db.execute(select(ULPSQL).where(ULPSQL.user_id == ctx.user_id))
-            pattern = result.scalar_one_or_none()
-            if pattern is None:
-                # 创建初始画像
-                pattern = ULPSQL(user_id=ctx.user_id, feedback_count=1)
-                db.add(pattern)
-            else:
-                pattern.feedback_count += 1
-                pattern.last_updated = None  # 由 server_default 重新填充
-            await db.commit()
-            log.info(
-                "listening_pattern_updated",
+            evaluation = DistillationEvaluation(
+                id=f"eval_{ctx.task_id}",
                 task_id=ctx.task_id,
-                feedback_count=pattern.feedback_count,
+                user_id=ctx.user_id,
+                overall_score=4,
             )
+            db.add(evaluation)
+            await db.flush()
+
+            await update_user_listening_pattern(db, ctx.user_id, evaluation)
+            await db.commit()
         except Exception as e:
             log.warning(
                 "listening_pattern_updater_hook_failed_continue",
@@ -201,21 +200,80 @@ class ListeningPatternUpdaterHook:
 
 
 class FewShotPoolHook:
-    """CP3.7.2 §2.2.E：PostDistillHook —— 高分改写入选 few-shot 池（score >= 4）。
+    """CP3.7.3：PostDistillHook —— 高分改写入选 few-shot 池（score >= 4）。
 
-    CP3.7.3 完整实现：Levenshtein 查重 + LRU 1000 淘汰
-    本期只做骨架：评估 ID 存在 + overall_score >= 4 → 入池
+    完整实现：调 add_high_score_to_pool（含 Levenshtein 查重 + LRU 1000 淘汰）。
+    """
+
+    async def __call__(self, ctx: DistillContext, db: AsyncSession) -> None:
+        if not _is_real_session(db):
+            return
+        try:
+            from .few_shot_pool import add_high_score_to_pool
+            from stashbox.backend.common.models import DistillationEvaluation
+
+            # CP3.7.3：mock evaluation（CP3.8.0 接真实评分）
+            evaluation = DistillationEvaluation(
+                id=f"eval_{ctx.task_id}",
+                task_id=ctx.task_id,
+                user_id=ctx.user_id,
+                overall_score=4,
+            )
+            db.add(evaluation)
+            await db.flush()
+
+            rewrite_text = ctx.rewrite.hook if ctx.rewrite and ctx.rewrite.hook else "default text"
+            await add_high_score_to_pool(db, evaluation, rewrite_text, "hook", user_id=ctx.user_id)
+            await db.commit()
+        except Exception as e:
+            log.warning(
+                "few_shot_pool_hook_failed_continue",
+                task_id=ctx.task_id,
+                error=str(e),
+            )
+
+
+class ScorePredictorHook:
+    """CP3.7.3 §2.2.E：PostDistillHook —— 听感评分预测（mock 8.5，CP3.8.0 接真实评分）。"""
+
+    async def __call__(self, ctx: DistillContext, db: AsyncSession) -> None:
+        if not _is_real_session(db):
+            return
+        try:
+            await predict_and_save_quality_score(db, ctx.task_id)
+            await db.commit()
+            log.info("score_predictor_hook_completed", task_id=ctx.task_id, score=MOCK_SCORE)
+        except Exception as e:
+            log.warning(
+                "score_predictor_hook_failed_continue",
+                task_id=ctx.task_id,
+                error=str(e),
+            )
+
+
+class AutoRetryHook:
+    """CP3.7.3 §2.2.E：PostDistillHook —— 评分 < 3 → 自动重蒸（本期骨架）。
+
+    本期只搭 should_auto_retry 判定 + 日志；
+    CP3.7.x 上线时再接 arq.enqueue_job 重新入队。
     """
 
     async def __call__(self, ctx: DistillContext, db: AsyncSession) -> None:
         try:
-            if not ctx.evaluation_id:
-                return  # 没有 evaluation ID（CP3.8.0 才有真实评分）
-            # CP3.7.3 会接 DistillationEvaluation + FewShotExample 完整入池逻辑
-            log.info("few_shot_pool_hook_called", task_id=ctx.task_id)
+            mock_score = 4.0  # 本期固定通过
+            user_daily_retry_count = 0  # 本期固定 0（CP3.7.x 接 Redis 计数）
+
+            if should_auto_retry(mock_score, user_daily_retry_count):
+                log.info(
+                    "auto_retry_triggered",
+                    task_id=ctx.task_id,
+                    score=mock_score,
+                )
+            else:
+                log.info("auto_retry_skipped", task_id=ctx.task_id, score=mock_score)
         except Exception as e:
             log.warning(
-                "few_shot_pool_hook_failed_continue",
+                "auto_retry_hook_failed_continue",
                 task_id=ctx.task_id,
                 error=str(e),
             )
@@ -235,11 +293,20 @@ def default_post_step_hooks() -> list[PostStepHook]:
 
 
 def default_post_hooks() -> list[PostDistillHook]:
-    """CP3.7.2 §2.2.E：默认 post-hooks（2 个：listening pattern + few-shot pool）。
+    """CP3.7.3 §2.2.E：默认 post-hooks（4 个：score predictor + auto retry + pattern + pool）。
 
-    注：AutoRetryHook / ScorePredictorHook 等 CP3.7.3 / CP3.8.0 上线后再加。
+    顺序：
+    1. ScorePredictorHook：先预测评分（CP3.8.0 接真实，本期 mock）
+    2. AutoRetryHook：根据评分判定是否自动重蒸
+    3. ListeningPatternUpdaterHook：增量更新用户画像
+    4. FewShotPoolHook：高分改写入池
     """
-    return [ListeningPatternUpdaterHook(), FewShotPoolHook()]
+    return [
+        ScorePredictorHook(),
+        AutoRetryHook(),
+        ListeningPatternUpdaterHook(),
+        FewShotPoolHook(),
+    ]
 
 
 __all__ = [
@@ -249,6 +316,8 @@ __all__ = [
     "StageCacheHook",
     "ListeningPatternUpdaterHook",
     "FewShotPoolHook",
+    "ScorePredictorHook",
+    "AutoRetryHook",
     "default_pre_hooks",
     "default_post_step_hooks",
     "default_post_hooks",

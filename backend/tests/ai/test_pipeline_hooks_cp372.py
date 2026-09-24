@@ -158,12 +158,16 @@ def test_default_post_step_hooks_returns_1_hook():
 # ---------------------------------------------------------------------------
 # 9. default_post_hooks 返回 2 个
 # ---------------------------------------------------------------------------
-def test_default_post_hooks_returns_2_hooks():
-    """CP3.7.2 §2.2.E：default_post_hooks 返回 [ListeningPatternUpdaterHook, FewShotPoolHook]。"""
+def test_default_post_hooks_returns_4_hooks():
+    """CP3.7.3 §2.2.E：default_post_hooks 返回 4 个（ScorePredictor + AutoRetry + ListeningPattern + FewShotPool）。"""
+    from distill.hooks_impl import AutoRetryHook, ScorePredictorHook
+
     hooks = default_post_hooks()
-    assert len(hooks) == 2
-    assert isinstance(hooks[0], ListeningPatternUpdaterHook)
-    assert isinstance(hooks[1], FewShotPoolHook)
+    assert len(hooks) == 4
+    assert isinstance(hooks[0], ScorePredictorHook)
+    assert isinstance(hooks[1], AutoRetryHook)
+    assert isinstance(hooks[2], ListeningPatternUpdaterHook)
+    assert isinstance(hooks[3], FewShotPoolHook)
 
 
 # ---------------------------------------------------------------------------
