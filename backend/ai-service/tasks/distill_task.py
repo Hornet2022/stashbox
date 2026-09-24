@@ -12,7 +12,7 @@ CP3.5-pre-3 说明：
 """
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from distill import DistillContext, DistillPipeline
@@ -223,6 +223,22 @@ async def distill_task(
                     log.warning("DISTILL_FAILED 埋点异常（被忽略）: err={exc}".format(exc=exc))
             return {"task_id": task_id, "status": "skipped_article_missing"}
 
+    # CP-DISTILL 状态回写（2026-09-24 修）：
+    # 每次执行（含 Arq retry）都置 articles.status='distilling'。
+    # 此前只有 ai-service 派任务时（main.py）设一次，而失败路径从不回写，
+    # 导致 LLM 限流等失败后文章永久停在 distilling —— 蒸馏中心一直显示
+    # 「处理中」，看不到「失败/重试」入口，用户以为卡死。
+    async with AsyncSessionLocal() as db:
+        try:
+            await db.execute(
+                update(Article).where(Article.id == article_id).values(status="distilling")
+            )
+            await db.commit()
+        except Exception as exc:
+            log.warning(
+                "articles_status_distilling_write_err", article_id=article_id, error=str(exc)
+            )
+
     # CP2 + CP3 打通：从 articles.raw_content JSONB 读真正文（替代占位文本）
     async with AsyncSessionLocal() as db:
         raw_content = await _load_raw_content(db, article_id)
@@ -321,6 +337,19 @@ async def distill_task(
             )
             await track_simple(db, EventName.DISTILL_QUOTA_REFUND, user_id, article_id)
             await db.commit()  # track() 只 flush 不 commit
+
+        # CP-DISTILL 状态回写（2026-09-24 修）：失败必须把 articles.status 置为
+        # failed，否则与 distilled_articles.status='failed' 不一致，UI 永远「处理中」。
+        # 若 Arq 还会 retry，该任务下次进入时会把状态重新置回 distilling，
+        # 因此这里不区分「是否最后一次尝试」也能收敛到正确终态。
+        try:
+            async with AsyncSessionLocal() as db:
+                await db.execute(
+                    update(Article).where(Article.id == article_id).values(status="failed")
+                )
+                await db.commit()
+        except Exception as exc:
+            log.warning("articles_status_failed_write_err", article_id=article_id, error=str(exc))
         raise  # 让 Arq 走 retry 逻辑
     finally:
         # CP3.6.2：单例 client（factory `_shared=True`）→ no-op；

@@ -324,7 +324,18 @@ async def test_failure_refunds_quota(fake_pipeline_factory):
         qs.refund = original_refund
 
     assert refund_calls == [7]
-    assert factory.statuses == ["step1_structuring", "failed"]
+    # 2026-09-24 动作 2：distill_task 开头新增「置 articles.status=distilling」
+    # （修复失败后文章永久停在 distilling、UI 一直显示「处理中」的问题），
+    # 因此状态序列多了第一条 'distilling'。
+    # 失败路径又加一次 articles.status='failed' 兜底（pipeline.run 内部写一次，
+    # task 退出 except 又写一次，第二次是给「非 pipeline 失败」（如 DB 写入失败）
+    # 用的，不会多写的情况下两次都成功）。
+    assert factory.statuses == [
+        "distilling",
+        "step1_structuring",
+        "failed",
+        "failed",
+    ]
 
 
 async def test_success_does_not_refund(fake_pipeline):
