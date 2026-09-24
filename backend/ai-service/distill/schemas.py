@@ -187,3 +187,12 @@ class ConsentRecord(BaseModel):
     cross_user_share_enabled: bool = False
     consent_at: str | None = None
     consent_version: str = "v2"
+
+
+class ColdStartState(BaseModel):
+    """CP5.6.1 §3.1 决策 2：冷启动状态。"""
+
+    feedback_count: int
+    state: Literal["fresh", "warming", "active"]
+    ratings_remaining_to_personalize: int
+    personalization_enabled_at: datetime | None = None
