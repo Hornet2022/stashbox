@@ -28,6 +28,7 @@ CACHE_TTL_SECONDS = 5
 
 KEY_LLM = "llm"
 KEY_TTS = "tts"
+KEY_TIER = "tier"  # B3/缺口A1：tier→model 映射热改（DB > 代码默认 TIER_MODEL_MAP）
 
 
 def _cache_key(key: str) -> str:

@@ -1,21 +1,29 @@
-"""B2 / 缺口 A2·A3·A5·A7：ai-service admin 只读端点（听感产品化运营看板后端）。
+"""B2/B3/B4 · ai-service admin 端点（听感产品化运营看板后端）。
+
+- B2：5 只读端点（A2/A3读/A5/A7）
+- B4：GET /admin/ab-report（A4）
+- B3：tier-config（A1）/ annotate+agreement（A3写）/ cleanup+audit（A6）/ blind-test（A8）
 
 仿 content-service/admin_router.py 拆分模式：main.py `include_router(admin_router)`，
 路径为完整 /api/v1/admin/*（不带 prefix）。鉴权统一 require_admin_or_operator。
 
-只读端点不写 admin_operation_logs（对齐 content-service 查询类现状）。
+只读端点不写 admin_operation_logs（对齐 content-service 查询类现状）；
+写端点的审计由 api-gateway 的 AuditMiddleware 统一覆盖（/api/v1/admin/* 写方法自动记录）。
 """
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from stashbox.backend.common.auth_admin import require_admin_or_operator
 from stashbox.backend.common.database import get_db
+from stashbox.backend.common.exceptions import InvalidRequest, NotFound
 from stashbox.backend.common.models import (
     ArticleAudioVariant,
     ConsentRecord,
@@ -25,6 +33,7 @@ from stashbox.backend.common.models import (
 )
 
 from distill.ab_report import compute_ab_report
+from distill.evaluation_service import validate_evaluation_payload
 from distill.pool_health import PoolHealthMonitor
 
 router = APIRouter()
@@ -298,3 +307,373 @@ async def admin_ab_report(
     ab_group=NULL 的历史行归入 pre_experiment 组（不可用于实验结论）。
     """
     return await compute_ab_report(db, date_from=date_from, date_to=date_to)
+
+
+# ---------------------------------------------------------------------------
+# B3 · A1：tier→model 映射热改（system_config KEY_TIER，DB > 代码默认）
+# ---------------------------------------------------------------------------
+
+_SUPPORTED_LLM_PROVIDERS = ("openai", "qwen_vl")  # llm/factory 实际实现 client 的 provider
+
+
+@router.get("/api/v1/admin/tier-config")
+async def admin_tier_config_get(
+    user: dict = Depends(require_admin_or_operator),
+):
+    """生效 tier 映射 + 来源（db/default）+ 代码默认 + provider 覆盖 warning。
+
+    ⚠️ 不含任何 key 字段（方案 §4-3 密钥红线）。
+    """
+    from distill.tier_router import TIER_MODEL_MAP, resolve_tier_map
+
+    effective, source = await resolve_tier_map()
+    warnings = [
+        f"provider '{p}' 已配置但 llm/factory 未实现 client，配置不会生效"
+        for tier_map in effective.values()
+        for p in tier_map
+        if p not in _SUPPORTED_LLM_PROVIDERS
+    ]
+    return {
+        "tier_model_map": effective,
+        "source": source,
+        "default_map": TIER_MODEL_MAP,
+        "supported_providers": list(_SUPPORTED_LLM_PROVIDERS),
+        "warnings": sorted(set(warnings)),
+    }
+
+
+class TierConfigPutRequest(BaseModel):
+    tier_model_map: dict[str, dict[str, str]] = Field(min_length=1)
+
+
+@router.put("/api/v1/admin/tier-config")
+async def admin_tier_config_put(
+    req: TierConfigPutRequest,
+    user: dict = Depends(require_admin_or_operator),
+):
+    """写 system_config KEY_TIER（结构校验同 resolve_tier_map）。
+
+    生效方式：蒸馏任务启动前已有 reload 链路，tier map 在 resolve 时读
+    system_config（Redis 5s 缓存 + 写后立即 invalidate）→ 无需重启。
+    """
+    from stashbox.backend.common.system_config import KEY_TIER, set_config
+
+    from distill.tier_router import _validate_tier_map
+
+    validated = _validate_tier_map(req.tier_model_map)
+    if validated is None:
+        raise InvalidRequest("tier_model_map 结构非法：须为 {simple|full: {provider: 非空模型名}}")
+    for tier_map in validated.values():
+        for model in tier_map.values():
+            if len(model) > 128:
+                raise InvalidRequest("模型名过长（≤128 字符）")
+
+    updated_by = int(user.get("sub") or 0) or None
+    row = await set_config(KEY_TIER, {"tier_model_map": validated}, updated_by=updated_by)
+    return {
+        "tier_model_map": validated,
+        "source": "db",
+        "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# B3 · A3（写）：评测员标注 + 评测员间一致性
+# ---------------------------------------------------------------------------
+
+
+class AnnotateRequest(BaseModel):
+    hook_score: int | None = None
+    section_score: int | None = None
+    outro_score: int | None = None
+    rhythm_score: int | None = None
+    overall_score: int
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+@router.post("/api/v1/admin/evaluations/{evaluation_id}/annotate")
+async def admin_evaluation_annotate(
+    evaluation_id: str,
+    req: AnnotateRequest,
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """评测员对已有用户评分做校准标注（写新行，evaluator_id=admin sub）。
+
+    口径（决策 §5.2 方案 B）：user_id 沿用被标注行的用户（保持「该任务评分人」语义），
+    evaluator_id 记录评测员归属；不修改原行。入池/画像联动不触发（标注不是用户评分）。
+    """
+    validate_evaluation_payload(req)
+
+    original = await db.get(DistillationEvaluation, evaluation_id)
+    if original is None:
+        raise NotFound(f"评分 {evaluation_id} 不存在")
+
+    admin_id = int(user.get("sub") or 0) or None
+    if admin_id is None:
+        raise InvalidRequest("admin token 缺少 sub，无法记录评测员归属")
+
+    now = datetime.now()
+    row = DistillationEvaluation(
+        id=f"eval_{uuid.uuid4().hex[:24]}",
+        task_id=original.task_id,
+        user_id=original.user_id,
+        hook_score=req.hook_score,
+        section_score=req.section_score,
+        outro_score=req.outro_score,
+        rhythm_score=req.rhythm_score,
+        overall_score=req.overall_score,
+        comment=req.comment,
+        auto_flag=False,
+        evaluator_id=admin_id,
+        # SQLite 测试兼容：模型 created_at server_default 是字符串 "now()"，
+        # 显式传值绕开 RETURNING 解析（同 evaluation_service B1 口径）
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(row)
+    await db.commit()
+    return {
+        "id": row.id,
+        "annotates": evaluation_id,
+        "task_id": row.task_id,
+        "evaluator_id": admin_id,
+        "overall_score": row.overall_score,
+    }
+
+
+@router.get("/api/v1/admin/evaluations/agreement")
+async def admin_evaluations_agreement(
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+    task_id: str | None = None,
+):
+    """评测员间一致性（0-1）。按 (evaluator_id, task) 组织 overall_score 序列。
+
+    纯聚合：只统计有 evaluator_id 的标注行（校准标注），排除用户评分。
+    """
+    from distill.evaluator import Evaluator
+
+    conds = [
+        DistillationEvaluation.evaluator_id.isnot(None),
+        DistillationEvaluation.deleted_at.is_(None),
+    ]
+    if task_id:
+        conds.append(DistillationEvaluation.task_id == task_id)
+    rows = (
+        await db.execute(
+            select(
+                DistillationEvaluation.evaluator_id,
+                DistillationEvaluation.task_id,
+                DistillationEvaluation.overall_score,
+            )
+            .where(*conds)
+            .order_by(DistillationEvaluation.task_id, DistillationEvaluation.created_at)
+        )
+    ).all()
+    per_evaluator: dict[str, list[float]] = {}
+    for evaluator_id, _tid, score in rows:
+        per_evaluator.setdefault(str(evaluator_id), []).append(float(score))
+
+    agreement = Evaluator().compute_inter_evaluator_agreement(per_evaluator)
+    return {
+        "agreement": agreement,
+        "evaluator_count": len(per_evaluator),
+        "annotated_count": len(rows),
+        "task_filter": task_id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# B3 · A6：few-shot 池运营（cleanup / 抽查采样 / 抽查结果回写）
+# ---------------------------------------------------------------------------
+
+
+@router.post("/api/v1/admin/few-shot-pool/cleanup")
+async def admin_few_shot_cleanup(
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """手动跑完整清理（stale + low_quality + duplicates）。
+
+    各子清理内部 try/except 自兜底；决策 §5.4：先手动端点，观察一周再定 cron。
+    """
+    from distill.pool_cleanup import PoolCleanupService
+
+    return await PoolCleanupService().run_full_cleanup(db)
+
+
+@router.get("/api/v1/admin/few-shot-pool/audit-sample")
+async def admin_few_shot_audit_sample(
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+    size: int = 10,
+):
+    """按 50/30/20 高/中/低分策略抽池子样本供人工评审。"""
+    from distill.pool_audit import PoolAuditService
+
+    size = _clamp_limit(size, cap=50)
+    examples = await PoolAuditService().select_for_audit(db, sample_size=size)
+    return {
+        "total": len(examples),
+        "items": [
+            {
+                "id": ex.id,
+                "kind": ex.kind,
+                "source_pattern": ex.source_pattern,
+                "rewrite_text": (ex.rewrite_text or "")[:200],
+                "score_avg": ex.score_avg,
+                "usage_count": ex.usage_count,
+            }
+            for ex in examples
+        ],
+    }
+
+
+class AuditResultRequest(BaseModel):
+    example_id: str
+    audit_score: float = Field(ge=0, le=10)
+
+
+@router.post("/api/v1/admin/few-shot-pool/audit-result")
+async def admin_few_shot_audit_result(
+    req: AuditResultRequest,
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """人工抽查结果回写 score_avg（加权平均）。auditor = admin sub。"""
+    from distill.pool_audit import PoolAuditService
+
+    ok = await PoolAuditService().record_audit_result(
+        db, req.example_id, req.audit_score, auditor_id=str(user.get("sub") or "admin")
+    )
+    if not ok:
+        raise NotFound(f"few-shot 条目 {req.example_id} 不存在或回写失败")
+    return {"example_id": req.example_id, "audit_score": req.audit_score, "updated": True}
+
+
+# ---------------------------------------------------------------------------
+# B3 · A8：TTS 盲测（进程内会话存储；重启丢失，评测周期内可接受）
+# ---------------------------------------------------------------------------
+
+_BLIND_TEST_TTL_SEC = 24 * 3600
+_blind_test_sessions: dict[str, dict] = {}  # id -> {samples, order, scores, created_at}
+
+
+def _blind_gc() -> None:
+    now = datetime.now()
+    expired = [
+        k
+        for k, v in _blind_test_sessions.items()
+        if (now - v["created_at"]).total_seconds() > _BLIND_TEST_TTL_SEC
+    ]
+    for k in expired:
+        _blind_test_sessions.pop(k, None)
+
+
+class BlindTestSetupRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=500)
+    providers: list[str] = Field(min_length=2, max_length=6)
+
+
+@router.post("/api/v1/admin/tts/blind-test")
+async def admin_tts_blind_test_setup(
+    req: BlindTestSetupRequest,
+    user: dict = Depends(require_admin_or_operator),
+):
+    """发起盲测：同文本 × N provider 合成 + 随机隐藏映射。
+
+    ⚠️ CP3.8.0 现状：setup 为 mock 合成（fake url）——真 TTS 配额接入属后续；
+    本端点先打通运营链路。盲测会话存进程内存（单 worker 前提，重启即失）。
+    """
+    from distill.tts_blind_test import TtsBlindTest
+
+    _blind_gc()
+    result = await TtsBlindTest().setup_blind_test(req.text, req.providers)
+    samples = result.get("samples") or {}
+    if not samples:
+        raise InvalidRequest("盲测样本生成失败（setup 返回空）")
+
+    blind_id = f"bt_{uuid.uuid4().hex[:16]}"
+    # TtsBlindTest.setup 语义：sample_{i+1} ↔ providers[i]（原始列表）；
+    # 返回的 order 只是随机展示序，不能作为反查映射 → 保存原始 providers
+    _blind_test_sessions[blind_id] = {
+        "samples": samples,
+        "providers": list(req.providers),
+        "order": result["order"],
+        "created_at": datetime.now(),
+    }
+    # 只回样本清单；⚠️ mock url 路径含 provider 名（tts_blind_test.py 现状），
+    # 端点层统一替换为匿名占位 URL，避免盲测泄漏 provider；真 TTS 合成接入后移除
+    anon_samples = [
+        {"key": k, "audio_url": f"https://tts-blind-test.anon/{blind_id}/{k}.m4a"}
+        for k in sorted(samples)
+    ]
+    return {
+        "blind_test_id": blind_id,
+        "samples": anon_samples,
+        "note": "provider 顺序已随机隐藏，评测员对每个样本打 1-5 听感分后 submit",
+    }
+
+
+class BlindTestScoreItem(BaseModel):
+    sample_key: str
+    score: float = Field(ge=1, le=5)
+
+
+class BlindTestSubmitRequest(BaseModel):
+    evaluator_id: str = Field(min_length=1, max_length=64)
+    scores: list[BlindTestScoreItem] = Field(min_length=1, max_length=20)
+
+
+@router.post("/api/v1/admin/tts/blind-test/{blind_id}/submit")
+async def admin_tts_blind_test_submit(
+    blind_id: str,
+    req: BlindTestSubmitRequest,
+    user: dict = Depends(require_admin_or_operator),
+):
+    """评测员提交一份盲测打分（按 evaluator_id 覆盖式更新）。"""
+    _blind_gc()
+    session = _blind_test_sessions.get(blind_id)
+    if session is None:
+        raise NotFound(f"盲测 {blind_id} 不存在或已过期（24h TTL）")
+    valid_keys = set(session["samples"])
+    for item in req.scores:
+        if item.sample_key not in valid_keys:
+            raise InvalidRequest(f"sample_key {item.sample_key} 不属于盲测 {blind_id}")
+    # 记录 per-evaluator：存 evaluator -> {sample: score}，聚合时转 sample -> [scores]
+    session.setdefault("by_evaluator", {})[req.evaluator_id] = {
+        i.sample_key: i.score for i in req.scores
+    }
+    return {"blind_test_id": blind_id, "evaluator_id": req.evaluator_id, "accepted": True}
+
+
+@router.get("/api/v1/admin/tts/blind-test/{blind_id}/results")
+async def admin_tts_blind_test_results(
+    blind_id: str,
+    user: dict = Depends(require_admin_or_operator),
+):
+    """盲测聚合：每个 provider 的中位分（compute_blind_score）。"""
+    _blind_gc()
+    session = _blind_test_sessions.get(blind_id)
+    if session is None:
+        raise NotFound(f"盲测 {blind_id} 不存在或已过期（24h TTL）")
+
+    from distill.tts_blind_test import TtsBlindTest
+
+    # provider_mapping：sample_{i+1} -> providers[i]（setup 保存的原始列表）
+    provider_mapping = {
+        f"sample_{i + 1}": session["providers"][i] for i in range(len(session["providers"]))
+    }
+    sample_scores: dict[str, list[float]] = {}
+    for per_sample in session.get("by_evaluator", {}).values():
+        for key, score in per_sample.items():
+            sample_scores.setdefault(key, []).append(score)
+
+    result = TtsBlindTest().compute_blind_score(sample_scores, provider_mapping)
+    return {
+        "blind_test_id": blind_id,
+        "evaluator_count": len(session.get("by_evaluator", {})),
+        "provider_median": result,
+        "revealed_mapping": provider_mapping,  # 结果揭晓时才暴露映射
+    }

@@ -350,7 +350,8 @@ async def test_admin_endpoints_protected_by_auth():
         dep_names = {d.call.__name__ for d in route.dependant.dependencies}
         assert "require_admin_or_operator" in dep_names, f"{route.path} 缺 admin 鉴权依赖"
         protected += 1
-    assert protected == 6  # health/list/evaluations/stats/consents/ab-report（B4 新增）
+    # 下限断言：B2 五只读 + B4 ab-report + B3 写端点（精确清单见 B3 测试 B3_PATHS）
+    assert protected >= 6
 
 
 async def test_b2_routes_registered():

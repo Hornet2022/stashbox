@@ -237,7 +237,13 @@ async def distill_task(
     )
 
     llm = _FailingLLM() if simulate_failure else get_llm_client()
-    pipeline = DistillPipeline(llm=llm, db_session_factory=AsyncSessionLocal)
+    # B3/D2：生产路径开启 tier 路由（按 ctx.target_tier + 生效 TIER_MODEL_MAP 选模型）；
+    # 失败模拟路径保持注入的 _FailingLLM，不受路由替换影响。
+    pipeline = DistillPipeline(
+        llm=llm,
+        db_session_factory=AsyncSessionLocal,
+        enable_tier_routing=not simulate_failure,
+    )
 
     try:
         await pipeline.run(pipeline_ctx)

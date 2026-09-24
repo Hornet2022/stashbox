@@ -115,6 +115,32 @@ ROUTES: list[Route] = [
     Route("GET", "/api/v1/admin/consents", "ai-service", _url("ai-service")),
     # B4: A/B 实验报表
     Route("GET", "/api/v1/admin/ab-report", "ai-service", _url("ai-service")),
+    # B3: tier-config 热改（A1）
+    Route("GET", "/api/v1/admin/tier-config", "ai-service", _url("ai-service")),
+    Route("PUT", "/api/v1/admin/tier-config", "ai-service", _url("ai-service")),
+    # B3: 评测员标注 + 一致性（A3）
+    Route(
+        "POST",
+        "/api/v1/admin/evaluations/{evaluation_id}/annotate",
+        "ai-service",
+        _url("ai-service"),
+    ),
+    Route("GET", "/api/v1/admin/evaluations/agreement", "ai-service", _url("ai-service")),
+    # B3: 池运营（A6）
+    Route("POST", "/api/v1/admin/few-shot-pool/cleanup", "ai-service", _url("ai-service")),
+    Route("GET", "/api/v1/admin/few-shot-pool/audit-sample", "ai-service", _url("ai-service")),
+    Route("POST", "/api/v1/admin/few-shot-pool/audit-result", "ai-service", _url("ai-service")),
+    # B3: TTS 盲测（A8）
+    Route("POST", "/api/v1/admin/tts/blind-test", "ai-service", _url("ai-service")),
+    Route(
+        "POST",
+        "/api/v1/admin/tts/blind-test/{blind_id}/submit",
+        "ai-service",
+        _url("ai-service"),
+    ),
+    Route(
+        "GET", "/api/v1/admin/tts/blind-test/{blind_id}/results", "ai-service", _url("ai-service")
+    ),
     # CP4.7.1: articles/{id}/distill 显式路由到 ai-service（fallback 会错误地走到 content-service）
     Route(
         "POST",

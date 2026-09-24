@@ -105,7 +105,7 @@ TIER_MODEL_MAP: dict[str, dict[str, str]] = {
 
 
 def get_model_for_tier(tier: str, provider: str) -> str:
-    """根据 tier + provider 选模型字符串。
+    """根据 tier + provider 选模型字符串（代码默认映射）。
 
     Args:
         tier: 'simple' / 'full'
@@ -118,3 +118,56 @@ def get_model_for_tier(tier: str, provider: str) -> str:
         KeyError: tier 或 provider 不在 TIER_MODEL_MAP 中
     """
     return TIER_MODEL_MAP[tier][provider]
+
+
+def _validate_tier_map(candidate: object) -> dict[str, dict[str, str]] | None:
+    """校验 DB 存的 tier map 形状：{simple|full: {provider: 非空字符串}}。
+
+    合法返回规范化 dict；非法返回 None（调用方回退代码默认）。
+    """
+    if not isinstance(candidate, dict):
+        return None
+    result: dict[str, dict[str, str]] = {}
+    for tier, prov_map in candidate.items():
+        if tier not in ("simple", "full") or not isinstance(prov_map, dict):
+            return None
+        norm: dict[str, str] = {}
+        for provider, model in prov_map.items():
+            if not isinstance(model, str) or not model.strip():
+                return None
+            norm[str(provider)] = model.strip()
+        if not norm:
+            return None
+        result[tier] = norm
+    return result or None
+
+
+async def resolve_tier_map() -> tuple[dict[str, dict[str, str]], str]:
+    """B3/缺口 A1 + D2：生效 tier→model 映射 = DB（system_config KEY_TIER）> 代码默认。
+
+    Redis 5s 缓存由 system_config.get_config 统一提供；蒸馏任务无需重启即生效。
+
+    Returns:
+        (effective_map, source)  source ∈ {"db", "default"}
+    """
+    try:
+        from stashbox.backend.common.system_config import KEY_TIER, get_config
+
+        stored = await get_config(KEY_TIER)
+    except Exception as e:
+        # 本机无 Redis/PG（测试环境）→ 静默回退代码默认
+        log.warning("tier_map_db_read_failed_use_default", error=str(e))
+        return TIER_MODEL_MAP, "default"
+
+    candidate = stored.get("tier_model_map") if isinstance(stored, dict) else None
+    validated = _validate_tier_map(candidate)
+    if validated is None:
+        if stored:
+            log.warning("tier_map_db_invalid_use_default", stored=str(stored)[:200])
+        return TIER_MODEL_MAP, "default"
+
+    # 部分覆盖：DB 只改了 simple 时，full 仍用代码默认补齐
+    merged = {t: dict(provs) for t, provs in TIER_MODEL_MAP.items()}
+    for tier, prov_map in validated.items():
+        merged[tier].update(prov_map)
+    return merged, "db"

@@ -74,10 +74,14 @@ class DistillPipeline:
         pre_hooks: list[PreDistillHook] | None = None,
         post_step_hooks: list[PostStepHook] | None = None,
         post_hooks: list[PostDistillHook] | None = None,
+        enable_tier_routing: bool = False,
     ):
         self.llm = llm
         self._tts_client = tts_client
         self.session_factory = db_session_factory
+        # B3/D2：按 ctx.target_tier 路由模型（TIER_MODEL_MAP / DB 覆盖）。
+        # 默认关闭 —— 生产 worker（distill_task）显式开启；单测 fake llm 不受影响。
+        self.enable_tier_routing = enable_tier_routing
         # CP3.7.2：hooks 默认值 = 默认 hook 列表
         self.pre_hooks = pre_hooks if pre_hooks is not None else default_pre_hooks()
         self.post_step_hooks = (
@@ -90,6 +94,49 @@ class DistillPipeline:
     @property
     def tts_client(self):
         return self._tts_client or _get_tts_client()
+
+    async def _resolve_step_llm(self, ctx: DistillContext) -> LLMClient:
+        """B3/D2：按 ctx.target_tier 解析生效模型（CP3.6.2 遗留的 tier 路由接线）。
+
+        - 开关关闭 / 无 session（未接库）→ 直接用构造注入的 self.llm
+        - 生效 tier map（resolve_tier_map：DB KEY_TIER > 代码默认）按当前 provider
+          查 model，命中则 get_llm_client(model_name=...)（factory 支持 model 覆盖，
+          且同参数返回 lru_cache 单例，无重复建连）
+        - provider 在 map 中无对应 model（如 claude 未实现 client）或任何异常
+          → 回退 self.llm 并 log warning，不破蒸馏主流程
+        """
+        if not self.enable_tier_routing or self.session_factory is None:
+            return self.llm
+        try:
+            from llm import get_llm_client
+            from llm.factory import _effective  # 生效 provider（DB > env）
+
+            from .tier_router import resolve_tier_map
+
+            tier_map, source = await resolve_tier_map()
+            provider = str(_effective().get("provider") or "openai").lower()
+            model = tier_map.get(ctx.target_tier, {}).get(provider)
+            if not model:
+                log.warning(
+                    "tier_routing_no_model_for_provider_use_default",
+                    task_id=ctx.task_id,
+                    tier=ctx.target_tier,
+                    provider=provider,
+                    tier_map_source=source,
+                )
+                return self.llm
+            log.info(
+                "tier_routing_applied",
+                task_id=ctx.task_id,
+                tier=ctx.target_tier,
+                provider=provider,
+                model=model,
+                source=source,
+            )
+            return get_llm_client(model_name=model)
+        except Exception as e:
+            log.warning("tier_routing_failed_use_default", task_id=ctx.task_id, error=str(e))
+            return self.llm
 
     async def run(self, ctx: DistillContext) -> DistillContext:
         """跑完整 4 步流水线。
@@ -113,17 +160,21 @@ class DistillPipeline:
             # CP3.7.2：pre-hooks 在 4 步前执行
             await self._invoke_pre_hooks(ctx)
 
+            # B3/D2：tier 路由 —— pre-hook（TierRouterHook）已定 ctx.target_tier，
+            # 按生效 tier map（DB > 代码默认）选 model；失败回退 self.llm
+            step_llm = await self._resolve_step_llm(ctx)
+
             # Step 1：try cache hit，否则实跑
             await self._update_status(ctx, DistillStatus.STEP1_STRUCTURING)
             if not await self._try_load_step_from_cache(ctx, "step1_structure", "structured"):
-                await step1_structure(ctx, self.llm)
+                await step1_structure(ctx, step_llm)
                 await self._invoke_post_step_hooks(ctx, "step1_structure", ctx.structured)
                 asyncio.create_task(write_stage(ctx.task_id, "step1_structure", ctx.structured))
 
             # Step 2
             await self._update_status(ctx, DistillStatus.STEP2_REWRITING)
             if not await self._try_load_step_from_cache(ctx, "step2_rewrite", "rewrite"):
-                await step2_rewrite(ctx, self.llm)
+                await step2_rewrite(ctx, step_llm)
                 await self._invoke_post_step_hooks(ctx, "step2_rewrite", ctx.rewrite)
                 asyncio.create_task(write_stage(ctx.task_id, "step2_rewrite", ctx.rewrite))
 
