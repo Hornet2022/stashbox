@@ -24,6 +24,7 @@ from stashbox.backend.common.auth import require_user
 from stashbox.backend.common.database import AsyncSessionLocal, get_db
 from stashbox.backend.common.exceptions import (
     Forbidden,
+    InvalidRequest,
     NotFound,
     register_exception_handlers,
 )
@@ -402,6 +403,65 @@ def _external_distill_status(internal: str) -> str:
     未知值（DB 被人工改、状态机错误等）→ 降级为 `distilling`，避免 Android 强校验枚举崩溃。
     """
     return _DISTILL_STATUS_MAP.get(internal or "", "distilling")
+
+
+# ---------------------------------------------------------------------------
+# CP7.3.0：多码率音频变体（§5 决策 2 路线 B = 按需转码）
+# ---------------------------------------------------------------------------
+
+
+async def _get_owned_distilled_article(
+    db: AsyncSession, task_id: str, user: dict
+) -> DistilledArticle:
+    """读蒸馏结果并校验归属（与 distill_status 同款，NotFound/Forbidden 语义一致）。"""
+    da = (
+        await db.execute(select(DistilledArticle).where(DistilledArticle.id == task_id))
+    ).scalar_one_or_none()
+    if da is None:
+        raise NotFound(message=f"task {task_id} not found")
+    art = (
+        await db.execute(select(Article).where(Article.id == da.article_id))
+    ).scalar_one_or_none()
+    if art is None or art.user_id != int(user["sub"]):
+        raise Forbidden(message="not the owner of this task")
+    return da
+
+
+@app.get("/api/v1/distill/{task_id}/variants")
+async def distill_variants(
+    task_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+):
+    """3 档码率可用性（128k 主档 + 96k/64k 按需转码）。永不 5xx：缺档 available=false。"""
+    from distill.audio_variant_service import get_variant_service
+
+    da = await _get_owned_distilled_article(db, task_id, user)
+    variants = await get_variant_service().list_variants(db, da)
+    return {"task_id": task_id, "article_id": da.article_id, "variants": variants}
+
+
+@app.post("/api/v1/distill/{task_id}/variants/{bitrate}/warm")
+async def distill_variant_warm(
+    task_id: str,
+    bitrate: int,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """预生成某码率变体（通勤 Wi-Fi 预热用；重复调用幂等）。"""
+    from distill.audio_variant_service import TRANSCODE_BITRATES, get_variant_service
+
+    if bitrate not in TRANSCODE_BITRATES:
+        raise InvalidRequest(
+            message=f"bitrate must be one of {list(TRANSCODE_BITRATES)}, got {bitrate}"
+        )
+    da = await _get_owned_distilled_article(db, task_id, user)
+    row = await get_variant_service().ensure_variant(db, da, bitrate)
+    return {
+        "task_id": task_id,
+        "bitrate": bitrate,
+        "generated": row is not None,
+        "oss_key": None if row is None else row.oss_key,
+        "file_size_bytes": None if row is None else row.file_size_bytes,
+    }
 
 
 if __name__ == "__main__":

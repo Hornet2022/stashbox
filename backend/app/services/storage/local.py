@@ -61,6 +61,20 @@ class LocalStorage(Storage):
     async def exists(self, key: str) -> bool:
         return (self.base_dir / key).exists()
 
+    async def fetch(self, key: str) -> bytes:
+        """读本地文件 bytes（CP7.3.0 按需转码用）。不存在 → FileNotFoundError。"""
+        file_path = self.base_dir / key
+        async with aiofiles.open(file_path, "rb") as f:
+            return await f.read()
+
+    def key_from_url(self, url: str) -> str:
+        """精确剥 public_url_base 前缀（比基类启发式可靠）。"""
+        base = self.public_url_base
+        if url.startswith(base):
+            return url[len(base) :].lstrip("/")
+        # 前缀不匹配（env 变过）→ 走基类启发式兜底
+        return super().key_from_url(url)
+
     async def delete(self, key: str) -> None:
         """删本地文件。missing_ok=True → 幂等，不存在不抛错。"""
         (self.base_dir / key).unlink(missing_ok=True)
