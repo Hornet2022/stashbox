@@ -109,6 +109,10 @@ async def lifespan(app: FastAPI):
 setup_logging("ai-service")
 app = FastAPI(title="stashbox-ai-service", version="0.2.0", lifespan=lifespan)
 register_exception_handlers(app)
+# B2：admin 只读看板端点（few-shot 池 / evaluations / 变体统计 / consents）
+from admin_router import router as admin_router  # noqa: E402
+
+app.include_router(admin_router)
 app.add_middleware(RequestIDMiddleware)
 install_health_endpoints(app)
 

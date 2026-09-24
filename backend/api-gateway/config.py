@@ -107,6 +107,12 @@ ROUTES: list[Route] = [
         _url("ai-service"),
     ),
     Route("POST", "/api/v1/distill/{task_id}/evaluation", "ai-service", _url("ai-service")),
+    # B2：ai-service admin 只读端点（admin 段不走 fallback，必须显式注册）
+    Route("GET", "/api/v1/admin/few-shot-pool/health", "ai-service", _url("ai-service")),
+    Route("GET", "/api/v1/admin/few-shot-pool", "ai-service", _url("ai-service")),
+    Route("GET", "/api/v1/admin/evaluations", "ai-service", _url("ai-service")),
+    Route("GET", "/api/v1/admin/audio-variants/stats", "ai-service", _url("ai-service")),
+    Route("GET", "/api/v1/admin/consents", "ai-service", _url("ai-service")),
     # CP4.7.1: articles/{id}/distill 显式路由到 ai-service（fallback 会错误地走到 content-service）
     Route(
         "POST",
