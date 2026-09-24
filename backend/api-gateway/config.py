@@ -243,6 +243,19 @@ ROUTES += [
     # admin-web 用的 POST /api/v1/tags + GET /api/v1/notifications（CP3.6-A2 + CP5.4a）
     Route("POST", "/api/v1/tags", "content-service", _url("content-service")),
     Route("GET", "/api/v1/notifications", "user-service", _url("user-service")),
+    # CP5.4a-ADMIN：admin 全量推送队列端点（v1 §端点需求_admin推送队列_v1）。
+    # admin 段不在 fallback 第一段前缀匹配里，必须显式注册，漏注册 = 8100 返 404。
+    Route("GET", "/api/v1/admin/push-notifications", "user-service", _url("user-service")),
+    # CP5.4a-ADMIN-RETRY：admin 失败推送重推（§2.3，P3 可选）。
+    # 路径参数路由必须放在字面量路由之后（网关按注册顺序匹配）——本文件
+    # `/api/v1/admin/push-notifications`（GET 字面量）已在前面注册,这里放
+    # `{notification_id}/retry` 不会吞掉字面量路由。
+    Route(
+        "POST",
+        "/api/v1/admin/push-notifications/{notification_id}/retry",
+        "user-service",
+        _url("user-service"),
+    ),
     # CP-DELETE：删除入口（用户端删文章 + admin 删文章/删标签）。
     # admin 段不在 fallback 的第一段前缀匹配里，必须显式注册；
     # 用户端 DELETE /articles/{id} 虽能被 fallback 猜中（articles→content），

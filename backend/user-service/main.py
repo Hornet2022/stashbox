@@ -243,6 +243,63 @@ class AdminLoginResponse(BaseModel):
     user: AdminLoginUser
 
 
+# ===== CP5.4a-ADMIN：admin 推送队列查询（v1 §3.6 admin 运营端点补齐） =====
+class AdminPushNotificationItem(BaseModel):
+    """GET /admin/push-notifications 单条。
+
+    字段口径（v1 §端点需求_admin推送队列_v1.md §2.1）：
+      - status / error / sent_at 以 push_notifications 表实际列为准,
+        表没有则回 None(避免前端误读假数据)。
+      - created_at / sent_at / read_at 一律 ISO 8601 字符串(None 时给 None)。
+    """
+
+    id: int
+    user_id: int
+    article_id: str | None = None
+    tag_slug: str | None = None
+    title: str
+    body: str
+    deeplink: str | None = None
+    status: str
+    error: str | None = None
+    created_at: str | None = None
+    sent_at: str | None = None
+    read_at: str | None = None
+
+
+class AdminPushNotificationListResponse(BaseModel):
+    """v1 §接口文档 v1.1 既有约定：{total, limit, offset, items}。"""
+
+    total: int
+    limit: int
+    offset: int
+    items: list[AdminPushNotificationItem]
+
+
+# ===== CP5.4a-ADMIN-RETRY：admin 失败推送重推（v1 §端点需求_admin推送队列_v1 §2.3） =====
+class AdminPushNotificationRetryRequest(BaseModel):
+    """POST /admin/push-notifications/{id}/retry body。
+
+    reason 必填且 5..200 字符——与 quota-adjust 同口径,防止审计日志被刷脏。
+    """
+
+    reason: str | None = None
+
+
+class AdminPushNotificationRetryResponse(BaseModel):
+    """POST /admin/push-notifications/{id}/retry 响应。
+
+    返回重推后的最新一行（status/error/sent_at 均刷新），让前端无需再 GET 一遍。
+    """
+
+    id: int
+    user_id: int
+    status: str
+    error: str | None = None
+    sent_at: str | None = None
+    retried_at: str  # 服务侧处理时间，与 sent_at 同点（便于 admin 视角分辨「这次 retry 落点」）
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "user-service"}
@@ -505,6 +562,184 @@ async def mark_notification_read(
         notif.read_at = datetime.now()
         await db.commit()
     return {"ok": True, "read_at": notif.read_at.isoformat()}
+
+
+# ===== CP5.4a-ADMIN：admin 推送队列端点（v1 §端点需求_admin推送队列_v1 §2.1） =====
+_ADMIN_PUSH_STATUS_VALUES = {"pending", "sent", "failed"}
+
+
+@app.get(
+    "/api/v1/admin/push-notifications",
+    response_model=AdminPushNotificationListResponse,
+)
+async def admin_list_push_notifications(
+    status: str = "",
+    user_id: int | None = None,
+    tag_slug: str = "",
+    limit: int = 50,
+    offset: int = 0,
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """v1 §3.6 admin 推送队列全量查询（运营排障）。
+
+    鉴权：require_admin_or_operator（admin / operator 通过；free/viewer 403）。
+    只读：不写 admin_operation_logs（与 /admin/consents 同口径）。
+
+    查询参数（v1 §2.1）：
+      status     pending|sent|failed；空=全部（非法值直接 400，避免误传命中 0 行）
+      user_id    int；空=全部
+      tag_slug   str；空=全部
+      limit      int；默认 50，cap 200（防单次拉爆）
+      offset     int；默认 0
+    排序：created_at DESC。
+    """
+    # 参数校验（commit 前失败不回滚——只读端点无副作用）
+    if status and status not in _ADMIN_PUSH_STATUS_VALUES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"status 必须是 pending/sent/failed 之一,收到: {status!r}",
+        )
+    limit = min(max(limit, 1), 200)
+    offset = max(offset, 0)
+
+    filters = []
+    if status:
+        filters.append(PushNotification.status == status)
+    if user_id is not None:
+        filters.append(PushNotification.user_id == user_id)
+    if tag_slug:
+        filters.append(PushNotification.tag_slug == tag_slug)
+
+    # 计数 + 查询共用过滤条件
+    count_stmt = select(func.count()).select_from(PushNotification)
+    list_stmt = select(PushNotification)
+    for f in filters:
+        count_stmt = count_stmt.where(f)
+        list_stmt = list_stmt.where(f)
+
+    total = await db.scalar(count_stmt) or 0
+    list_stmt = list_stmt.order_by(PushNotification.created_at.desc()).offset(offset).limit(limit)
+    result = await db.execute(list_stmt)
+    rows = result.scalars().all()
+
+    items = [
+        AdminPushNotificationItem(
+            id=n.id,
+            user_id=n.user_id,
+            article_id=n.article_id,
+            tag_slug=n.tag_slug,
+            title=n.title,
+            body=n.body,
+            deeplink=n.deeplink,
+            status=n.status,
+            error=n.error,
+            created_at=n.created_at.isoformat() if n.created_at else None,
+            sent_at=n.sent_at.isoformat() if n.sent_at else None,
+            read_at=n.read_at.isoformat() if n.read_at else None,
+        )
+        for n in rows
+    ]
+    return AdminPushNotificationListResponse(total=total, limit=limit, offset=offset, items=items)
+
+
+# ===== CP5.4a-ADMIN-RETRY：admin 失败推送重推（v1 §端点需求_admin推送队列_v1 §2.3） =====
+# reason 长度下限/上限与 quota-adjust 对齐（CP3.6-A2 既有约定）：
+#   - < 5：审计空间不足以让运营复盘 → 400，不落库
+#   - > 200：刷脏 admin_operation_logs.reason 列 → 400
+_ADMIN_PUSH_RETRY_REASON_MIN = 5
+_ADMIN_PUSH_RETRY_REASON_MAX = 200
+
+
+@app.post(
+    "/api/v1/admin/push-notifications/{notification_id}/retry",
+    response_model=AdminPushNotificationRetryResponse,
+)
+async def admin_retry_push_notification(
+    notification_id: int,
+    req: AdminPushNotificationRetryRequest,
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """v1 §端点需求_admin推送队列_v1 §2.3：失败推送重推。
+
+    鉴权：require_admin_or_operator（admin / operator 通过；free/viewer 403）。
+    仅 `status=failed` 可重推（pending 还在队列、sent 已成功，重推无意义）。
+    reason 必填且 5..200 字符（与 quota-adjust 同口径）。
+
+    副作用（与目标更新同事务）：
+      1. 重置 push_notifications.status='sent' / error=NULL / sent_at=now
+         （重置为「已重发」便于 admin 视角立即看效果；真推送 CP4.6 上线后
+          可改为 status='pending' 让 worker 重投,改动只需这一行）
+      2. 写 admin_operation_logs(action='retry_push_notification',target_id=str(id))
+         reason 与请求体一致——便于运营复盘「为什么重推」
+    失败整体回滚：reason 校验失败 / status 非 failed / id 不存在 都不会落库。
+    """
+    # 1) reason 校验（commit 前,失败不落库）
+    if not req.reason or not req.reason.strip():
+        raise HTTPException(status_code=400, detail="reason 必填")
+    reason = req.reason.strip()
+    if len(reason) < _ADMIN_PUSH_RETRY_REASON_MIN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"reason 至少 {_ADMIN_PUSH_RETRY_REASON_MIN} 个字符",
+        )
+    if len(reason) > _ADMIN_PUSH_RETRY_REASON_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"reason 至多 {_ADMIN_PUSH_RETRY_REASON_MAX} 个字符",
+        )
+
+    # 2) 目标存在性 + 状态校验
+    notif = await db.get(PushNotification, notification_id)
+    if notif is None:
+        raise HTTPException(status_code=404, detail=f"notification {notification_id} 不存在")
+    if notif.status != "failed":
+        # 仅 failed 可重推：pending 还在待发队列（不需重投）、sent 已成功（重投无意义）
+        raise HTTPException(
+            status_code=409,
+            detail=(f"仅 status=failed 可重推,当前 status={notif.status!r}"),
+        )
+
+    # 3) 副作用：重置状态 + 写 audit（同事务）
+    from datetime import datetime as _dt
+
+    now = _dt.now()
+    notif.status = "sent"
+    notif.error = None
+    notif.sent_at = now
+
+    log_row = AdminOperationLog(
+        admin_id=int(user["sub"]),
+        admin_tier=user.get("tier", "unknown"),
+        action="retry_push_notification",
+        target_type="push_notification",
+        target_id=str(notification_id),
+        reason=reason,
+        method="POST",
+        path=f"/api/v1/admin/push-notifications/{notification_id}/retry",
+        request_body={"reason": reason},
+        response_status=200,
+        ip=None,
+        user_agent=None,
+    )
+    db.add(log_row)
+
+    try:
+        await db.commit()
+        await db.refresh(notif)
+    except Exception:
+        await db.rollback()
+        raise
+
+    return AdminPushNotificationRetryResponse(
+        id=notif.id,
+        user_id=notif.user_id,
+        status=notif.status,
+        error=notif.error,
+        sent_at=notif.sent_at.isoformat() if notif.sent_at else None,
+        retried_at=now.isoformat(),
+    )
 
 
 @app.get("/api/v1/admin/users", response_model=AdminUserListResponse)
