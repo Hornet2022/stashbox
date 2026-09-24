@@ -9,6 +9,7 @@
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from loguru import logger  # noqa  # 简化日志
 
 
@@ -85,4 +86,28 @@ def register_exception_handlers(app: FastAPI) -> None:
                 "message": "Validation error",
                 "data": {"errors": exc.errors()},
             },
+        )
+
+    # F2（P1 接口一致性）：把裸 Starlette HTTPException（如 user-service 大量
+    # `raise HTTPException(..., detail=...)`）统一包成 {code, message, data}，
+    # 让 android 能读到业务 code 驱动 付费墙(3001)/重登(40100)/音频未就绪(40400)
+    # 等 UX 分支。BizException 由上面的 biz_exception_handler 处理，不受影响。
+    # 4 个服务（content/ai/user/gateway）都调本函数注册，一处修改全局生效。
+    _STATUS_CODE_MAP = {
+        400: 40000,
+        401: 40100,
+        403: 40300,
+        404: 40400,
+        409: 40900,
+        422: 42200,
+        429: 42900,
+        500: 50000,
+    }
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+        code = _STATUS_CODE_MAP.get(exc.status_code, exc.status_code * 100)
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"code": code, "message": str(exc.detail), "data": None},
         )
