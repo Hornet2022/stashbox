@@ -9,14 +9,22 @@ ON DELETE CASCADE，distilled_articles / favorites / later_listens /
 listening_statuses / feedback_v2 均 NO ACTION，必须应用层按序清）：
 
     1. favorites / later_listens / listening_statuses 按 article_id 删
-    2. distilled_articles 按 article_id 删（蒸馏任务 + 音频元数据）
-    3. feedback_v2.article_id 置 NULL（反馈记录保留，仅断引用）
-    4. articles 本体删除
+    2. distillation_evaluations.task_id 置 NULL（**评分保留**，仅断引用；
+       与 feedback_v2.article_id 的取舍一致 —— 评分是画像训练资产）
+    3. article_audio_variants 按 distilled_article_id 删（派生数据，
+       母体没了变体无意义；DB 亦已 0030 加 CASCADE 兜底）
+    4. distilled_articles 按 article_id 删（蒸馏任务 + 音频元数据）
+    5. feedback_v2.article_id 置 NULL（反馈记录保留，仅断引用）
+    6. articles 本体删除
     —— push_notifications 由 DB CASCADE 自动清；feedback（v1 埋点表）
     article_id 列无 FK，作为孤儿分析数据保留。
-    5.（commit 成功后）磁盘/OSS 音频文件删除 —— best-effort，失败只记
+    7.（commit 成功后）磁盘/OSS 音频文件删除 —— best-effort，失败只记
     warning 不回滚：宁可留孤儿文件等 GC，不可音频没了文章还在。
-    6. Redis 文章详情缓存 invalidate_article。
+    8. Redis 文章详情缓存 invalidate_article。
+
+> 历史坑（0030 修复）：0024/0026 建表时 FK 未声明 ondelete，步骤 2/3
+> 缺失导致删任何「有评分或有变体」的文章都 500。应用层现显式处理，
+> DB 级联作为兜底。
 
 quota 不返还：提交时扣的配额视为已消耗（蒸馏 LLM/TTS 成本已发生）。
 """
@@ -28,7 +36,9 @@ from stashbox.backend.common import cache_service
 from stashbox.backend.common.logging import get_logger
 from stashbox.backend.common.models import (
     Article,
+    ArticleAudioVariant,
     DistilledArticle,
+    DistillationEvaluation,
     Favorite,
     FeedbackV2,
     LaterListen,
@@ -41,9 +51,13 @@ log = get_logger("content-service.purge")
 # 历史数据扩展名不一（edge→m4a、indextts/local→wav），全部候选扫一遍。
 _AUDIO_EXTS = (".m4a", ".mp3", ".wav", ".ogg", ".aac")
 
+# 多码率变体文件（CP7.3.0 audio_variant_generator）：audio/{article_id}.{bitrate}k.{ext}
+# 与主档分开命名，delete_article_audio 需额外扫这些组合，否则删文章后变体文件成孤儿。
+_VARIANT_BITRATES = (128, 96, 64)
+
 
 async def delete_article_audio(article_id: str) -> None:
-    """删除文章的蒸馏音频文件（幂等、best-effort，异常只记日志）。"""
+    """删除文章的蒸馏音频文件 + 多码率变体（幂等、best-effort，异常只记日志）。"""
     try:
         from stashbox.backend.app.services.storage import get_storage
 
@@ -51,8 +65,17 @@ async def delete_article_audio(article_id: str) -> None:
     except Exception as exc:  # storage 未配置等：不影响 DB 删除结果
         log.warning("audio_storage_unavailable", article_id=article_id, error=str(exc))
         return
-    for ext in _AUDIO_EXTS:
-        key = f"audio/{article_id}{ext}"
+
+    # 主档：audio/{article_id}.{ext}
+    keys = [f"audio/{article_id}{ext}" for ext in _AUDIO_EXTS]
+    # 变体：audio/{article_id}.{bitrate}k.{ext}
+    keys += [
+        f"audio/{article_id}.{bitrate}k{ext}"
+        for bitrate in _VARIANT_BITRATES
+        for ext in _AUDIO_EXTS
+    ]
+
+    for key in keys:
         try:
             if await storage.exists(key):
                 await storage.delete(key)
@@ -74,6 +97,32 @@ async def purge_article(db: AsyncSession, article_id: str) -> Article:
     await db.execute(delete(Favorite).where(Favorite.article_id == article_id))
     await db.execute(delete(LaterListen).where(LaterListen.article_id == article_id))
     await db.execute(delete(ListeningStatus).where(ListeningStatus.article_id == article_id))
+
+    # 蒸馏产物的下游引用：先断评分引用 + 清变体，再删产物本体。
+    # （0030 前这里的缺失会让删除 500 —— 见模块 docstring 的「历史坑」）
+    distilled_ids = (
+        (
+            await db.execute(
+                select(DistilledArticle.id).where(DistilledArticle.article_id == article_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if distilled_ids:
+        # 评分保留，仅断引用（task_id 0030 起 nullable + ON DELETE SET NULL）
+        await db.execute(
+            update(DistillationEvaluation)
+            .where(DistillationEvaluation.task_id.in_(distilled_ids))
+            .values(task_id=None)
+        )
+        # 多码率变体是派生数据，随产物清理
+        await db.execute(
+            delete(ArticleAudioVariant).where(
+                ArticleAudioVariant.distilled_article_id.in_(distilled_ids)
+            )
+        )
+
     await db.execute(delete(DistilledArticle).where(DistilledArticle.article_id == article_id))
     await db.execute(
         update(FeedbackV2).where(FeedbackV2.article_id == article_id).values(article_id=None)
