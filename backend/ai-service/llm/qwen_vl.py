@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 
 from .base import LLMClient
+from .backoff import compute_backoff_seconds
 from .exceptions import LLMError, RateLimitError
 from .types import ChatRequest, ChatResponse, Usage
 
@@ -109,28 +110,43 @@ class QwenVLClient(LLMClient):
         )
 
     async def _post(self, body: dict[str, Any]) -> dict[str, Any]:
-        """POST + 指数退避 retry（429 直接抛 RateLimitError，不重试）。"""
+        """POST + 指数退避 retry（含 429 —— 动作 3，2026-09-24）。
+
+        与 openai.py 对齐：429 不再直接抛，改为退避重试；重试耗尽才抛
+        RateLimitError。
+        """
         last_err: Exception | None = None
+        rate_limited = False
+        retry_after: str | None = None
         for attempt in range(self.max_retries):
+            rate_limited = False
+            retry_after = None
             try:
                 resp = await self._client.post(f"{self.base_url}/chat/completions", json=body)
             except httpx.TimeoutException as e:
                 last_err = e
             else:
                 if resp.status_code == 429:
-                    raise RateLimitError(
-                        "qwen_vl rate limit", retry_after=resp.headers.get("retry-after")
-                    )
-                try:
-                    resp.raise_for_status()
-                except httpx.HTTPStatusError as e:
-                    last_err = e
+                    rate_limited = True
+                    retry_after = resp.headers.get("retry-after")
+                    last_err = RateLimitError("qwen_vl rate limit", retry_after=retry_after)
                 else:
-                    return resp.json()
+                    try:
+                        resp.raise_for_status()
+                    except httpx.HTTPStatusError as e:
+                        last_err = e
+                    else:
+                        return resp.json()
 
             if attempt < self.max_retries - 1:
-                await asyncio.sleep(2**attempt)  # 指数退避
+                await asyncio.sleep(
+                    compute_backoff_seconds(
+                        attempt, is_rate_limited=rate_limited, retry_after=retry_after
+                    )
+                )
 
+        if rate_limited:
+            raise RateLimitError("qwen_vl rate limit", retry_after=retry_after)
         raise LLMError(f"qwen_vl chat failed after {self.max_retries} attempts: {last_err}")
 
     async def stream(self, req: ChatRequest) -> AsyncIterator[str]:

@@ -26,6 +26,7 @@ import httpx
 import structlog
 
 from .base import LLMClient
+from .backoff import compute_backoff_seconds
 from .exceptions import LLMError, RateLimitError
 from .types import ChatRequest, ChatResponse, Usage
 
@@ -139,14 +140,23 @@ class OpenAIClient(LLMClient):
         )
 
     async def _post(self, body: dict[str, Any]) -> dict[str, Any]:
-        """POST + 指数退避 retry（429 直接抛 RateLimitError，不重试）。
+        """POST + 指数退避 retry（含 429 —— 动作 3，2026-09-24）。
 
         修复：原实现只 catch TimeoutException 且最终错误吞掉 last_err（空串），
         导致真实失败原因（连接错误/超时/HTTP 错误体）无法排查。
         现统一捕获 TimeoutException + TransportError，并在末次 raise 时带 repr(last_err)。
+
+        动作 3（2026-09-24）：**429 从「直接抛」改为纳入重试**。
+        原设计对瞬时限流极不友好 —— 实测同一时刻单发 3/3 成功、并发才 429，
+        一次 429 就让整条蒸馏失败。现在按指数退避 + 抖动 + 尊重 Retry-After
+        重试；只有重试耗尽后仍限流才抛 RateLimitError（保留上游可识别语义）。
         """
         last_err: Exception | None = None
+        rate_limited = False
+        retry_after: str | None = None
         for attempt in range(self.max_retries):
+            rate_limited = False
+            retry_after = None
             try:
                 resp = await self._client.post(f"{self.base_url}/chat/completions", json=body)
             except (httpx.TimeoutException, httpx.TransportError) as e:
@@ -154,29 +164,41 @@ class OpenAIClient(LLMClient):
                 log.warning("llm_request_transport_error", attempt=attempt, error=repr(e))
             else:
                 if resp.status_code == 429:
-                    raise RateLimitError(
-                        "openai rate limit", retry_after=resp.headers.get("retry-after")
-                    )
-                try:
-                    resp.raise_for_status()
-                except httpx.HTTPStatusError as e:
-                    last_err = e
-                    try:
-                        body_preview = (await resp.aread()).decode("utf-8", "replace")[:500]
-                    except Exception:
-                        body_preview = "<unreadable response body>"
+                    rate_limited = True
+                    retry_after = resp.headers.get("retry-after")
+                    last_err = RateLimitError("openai rate limit", retry_after=retry_after)
                     log.warning(
-                        "llm_request_http_error",
+                        "llm_request_rate_limited",
                         attempt=attempt,
-                        status=resp.status_code,
-                        body=body_preview,
+                        retry_after=retry_after,
                     )
                 else:
-                    return resp.json()
+                    try:
+                        resp.raise_for_status()
+                    except httpx.HTTPStatusError as e:
+                        last_err = e
+                        try:
+                            body_preview = (await resp.aread()).decode("utf-8", "replace")[:500]
+                        except Exception:
+                            body_preview = "<unreadable response body>"
+                        log.warning(
+                            "llm_request_http_error",
+                            attempt=attempt,
+                            status=resp.status_code,
+                            body=body_preview,
+                        )
+                    else:
+                        return resp.json()
 
             if attempt < self.max_retries - 1:
-                await asyncio.sleep(2**attempt)
+                delay = compute_backoff_seconds(
+                    attempt, is_rate_limited=rate_limited, retry_after=retry_after
+                )
+                await asyncio.sleep(delay)
 
+        # 重试耗尽：限流保留 RateLimitError 语义，其余归为 LLMError
+        if rate_limited:
+            raise RateLimitError("openai rate limit", retry_after=retry_after)
         raise LLMError(f"openai chat failed after {self.max_retries} attempts: {last_err!r}")
 
     async def stream(self, req: ChatRequest) -> AsyncIterator[str]:
