@@ -25,7 +25,7 @@ if [[ -n "$EXISTING_PID" ]]; then
   sleep 1
 fi
 
-export PYTHONPATH="$(dirname "$REPO_ROOT"):${PYTHONPATH:-}"
+export PYTHONPATH="$(dirname "$(dirname "$REPO_ROOT")"):${PYTHONPATH:-}"  # stashbox 包根在仓库父目录（run_dev.sh 同款）
 # dev 环境放行默认 JWT secret；生产必须用真 JWT_SECRET 注入（见 config.py 校验）
 export STASHBOX_ALLOW_DEV_JWT="${STASHBOX_ALLOW_DEV_JWT:-1}"
 
