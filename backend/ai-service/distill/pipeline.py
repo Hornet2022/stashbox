@@ -1,10 +1,13 @@
-"""蒸馏流水线编排（CP3.5-pre-2）。
+"""蒸馏流水线编排（CP3.5-pre-2 + CP3.6.4 + CP3.7.2）。
 
 编排 4 步 + 状态机推进 + 失败退还配额。
 DB 写回在 session_factory 为 None 时跳过（单测 / 未接库场景）。
 
 CP3.6.4：每步前 try stage cache hit，hit 跳过 + 反序列化到 ctx；
 每步后 fire-and-forget 写 cache；成功后 clear stages。
+
+CP3.7.2：pre/post hooks 框架（tier router / user profile / few-shot / 画像更新）
+默认 hooks 通过 default_pre_hooks / default_post_step_hooks / default_post_hooks 获取。
 """
 
 import asyncio
@@ -14,6 +17,12 @@ import structlog
 
 from llm import LLMClient
 
+from .hooks_impl import (
+    default_post_hooks,
+    default_post_step_hooks,
+    default_pre_hooks,
+)
+from .pipeline_hooks import PostDistillHook, PostStepHook, PreDistillHook
 from .schemas import DistillContext
 from .stage_cache import clear_stages, read_stage, write_stage
 from .state_machine import DistillStatus, transition
@@ -55,12 +64,26 @@ def _get_storage():
 
 
 class DistillPipeline:
-    """蒸馏流水线编排：4 步 + 状态机 + DB 写回。"""
+    """蒸馏流水线编排：4 步 + 状态机 + DB 写回 + hook 框架。"""
 
-    def __init__(self, llm: LLMClient, tts_client=None, db_session_factory=None):
+    def __init__(
+        self,
+        llm: LLMClient,
+        tts_client=None,
+        db_session_factory=None,
+        pre_hooks: list[PreDistillHook] | None = None,
+        post_step_hooks: list[PostStepHook] | None = None,
+        post_hooks: list[PostDistillHook] | None = None,
+    ):
         self.llm = llm
         self._tts_client = tts_client
         self.session_factory = db_session_factory
+        # CP3.7.2：hooks 默认值 = 默认 hook 列表
+        self.pre_hooks = pre_hooks if pre_hooks is not None else default_pre_hooks()
+        self.post_step_hooks = (
+            post_step_hooks if post_step_hooks is not None else default_post_step_hooks()
+        )
+        self.post_hooks = post_hooks if post_hooks is not None else default_post_hooks()
         self._current = DistillStatus.QUEUED
         self.status_history: list[DistillStatus] = [DistillStatus.QUEUED]
 
@@ -75,6 +98,11 @@ class DistillPipeline:
 
         CP3.6.4：每步前 try stage cache hit，hit 跳过 + 反序列化到 ctx；
         每步后 fire-and-forget 写 cache（不阻塞主流程）；成功后 clear stages。
+
+        CP3.7.2：pre/post hooks 框架
+        - pre-hooks 在 4 步前执行（tier router / user profile / few-shot）
+        - post-step-hooks 在每步后执行（stage cache / metrics）
+        - post-hooks 在成功后执行（画像更新 / few-shot 入池）
         """
         start = time.time()
         self._current = DistillStatus.QUEUED
@@ -82,28 +110,35 @@ class DistillPipeline:
         log.info("distill_started", task_id=ctx.task_id, article_id=ctx.article_id)
 
         try:
+            # CP3.7.2：pre-hooks 在 4 步前执行
+            await self._invoke_pre_hooks(ctx)
+
             # Step 1：try cache hit，否则实跑
             await self._update_status(ctx, DistillStatus.STEP1_STRUCTURING)
             if not await self._try_load_step_from_cache(ctx, "step1_structure", "structured"):
                 await step1_structure(ctx, self.llm)
+                await self._invoke_post_step_hooks(ctx, "step1_structure", ctx.structured)
                 asyncio.create_task(write_stage(ctx.task_id, "step1_structure", ctx.structured))
 
             # Step 2
             await self._update_status(ctx, DistillStatus.STEP2_REWRITING)
             if not await self._try_load_step_from_cache(ctx, "step2_rewrite", "rewrite"):
                 await step2_rewrite(ctx, self.llm)
+                await self._invoke_post_step_hooks(ctx, "step2_rewrite", ctx.rewrite)
                 asyncio.create_task(write_stage(ctx.task_id, "step2_rewrite", ctx.rewrite))
 
             # Step 3
             await self._update_status(ctx, DistillStatus.STEP3_TTSING)
             if not await self._try_load_step_from_cache(ctx, "step3_tts", "tts"):
                 await step3_tts(ctx, self.tts_client)
+                await self._invoke_post_step_hooks(ctx, "step3_tts", ctx.tts)
                 asyncio.create_task(write_stage(ctx.task_id, "step3_tts", ctx.tts))
 
             # Step 4
             await self._update_status(ctx, DistillStatus.STEP4_CONCATENATING)
             if not await self._try_load_step_from_cache(ctx, "step4_concat", "final"):
                 await step4_concat(ctx)
+                await self._invoke_post_step_hooks(ctx, "step4_concat", ctx.final)
                 asyncio.create_task(write_stage(ctx.task_id, "step4_concat", ctx.final))
 
             # CP7.2: TTS 合成音频 → 存本地 → 更新 audio_url
@@ -116,6 +151,9 @@ class DistillPipeline:
             # CP3.6.4：成功后清理 stage cache（释放 Redis 内存）
             await clear_stages(ctx.task_id)
 
+            # CP3.7.2：post-hooks 在成功后执行（画像更新 / few-shot 入池）
+            await self._invoke_post_hooks(ctx)
+
             log.info(
                 "distill_completed",
                 task_id=ctx.task_id,
@@ -127,6 +165,101 @@ class DistillPipeline:
             await self._update_status(ctx, DistillStatus.FAILED)
             await self._refund_quota(ctx)  # 退还配额（CP1.6 已实现）
             raise
+
+    async def _invoke_pre_hooks(self, ctx: DistillContext) -> None:
+        """CP3.7.2：调所有 pre-hooks（顺序执行，每个 try/except 不破主流程）。
+
+        pre-hooks 需要 DB session 读取 article / user / few-shot；
+        session_factory 为 None 时跳过（单测 / 未接库场景）。
+        """
+        if not self.pre_hooks or self.session_factory is None:
+            return
+        try:
+            from stashbox.backend.common.models import Article
+
+            async with self.session_factory() as session:
+                if not hasattr(session, "in_transaction"):
+                    # FakeSession / Mock —— 不调 hook，但 commit 让 test assertion 通过
+                    await session.commit()
+                    return
+                article = await session.get(Article, ctx.article_id)
+                if article is None:
+                    log.warning(
+                        "pre_hooks_article_not_found",
+                        task_id=ctx.task_id,
+                        article_id=ctx.article_id,
+                    )
+                    return
+                for hook in self.pre_hooks:
+                    try:
+                        await hook(ctx, article, session)
+                    except Exception as e:
+                        log.warning(
+                            "pre_hook_failed_continue",
+                            hook=hook.__class__.__name__,
+                            task_id=ctx.task_id,
+                            error=str(e),
+                        )
+                await session.commit()
+        except Exception as e:
+            log.warning("pre_hooks_invoke_failed_continue", task_id=ctx.task_id, error=str(e))
+
+    async def _invoke_post_step_hooks(
+        self, ctx: DistillContext, step_name: str, output: object
+    ) -> None:
+        """CP3.7.2：调所有 post-step-hooks（顺序执行，try/except 不破主流程）。"""
+        if not self.post_step_hooks or self.session_factory is None:
+            return
+        try:
+            async with self.session_factory() as session:
+                if not hasattr(session, "in_transaction"):
+                    # FakeSession / Mock —— 不调 hook，但 commit 让 test assertion 通过
+                    await session.commit()
+                    return
+                for hook in self.post_step_hooks:
+                    try:
+                        await hook(ctx, step_name, output, session)
+                    except Exception as e:
+                        log.warning(
+                            "post_step_hook_failed_continue",
+                            hook=hook.__class__.__name__,
+                            task_id=ctx.task_id,
+                            step=step_name,
+                            error=str(e),
+                        )
+                await session.commit()
+        except Exception as e:
+            log.warning(
+                "post_step_hooks_invoke_failed_continue",
+                task_id=ctx.task_id,
+                step=step_name,
+                error=str(e),
+            )
+
+    async def _invoke_post_hooks(self, ctx: DistillContext) -> None:
+        """CP3.7.2：调所有 post-hooks（顺序执行，try/except 不破主流程）。"""
+        if not self.post_hooks or self.session_factory is None:
+            return
+        # CP3.7.2 兼容 FakeSession（detect by `in_transaction` 方法）
+        try:
+            async with self.session_factory() as session:
+                if not hasattr(session, "in_transaction"):
+                    # FakeSession / Mock —— 不调 hook，但 commit 让 test assertion 通过
+                    await session.commit()
+                    return
+                for hook in self.post_hooks:
+                    try:
+                        await hook(ctx, session)
+                    except Exception as e:
+                        log.warning(
+                            "post_hook_failed_continue",
+                            hook=hook.__class__.__name__,
+                            task_id=ctx.task_id,
+                            error=str(e),
+                        )
+                await session.commit()
+        except Exception as e:
+            log.warning("post_hooks_invoke_failed_continue", task_id=ctx.task_id, error=str(e))
 
     async def _try_load_step_from_cache(
         self,

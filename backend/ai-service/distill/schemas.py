@@ -1,6 +1,7 @@
-"""蒸馏中间结果 Pydantic schema（CP3.5-pre-2 + CP-DISTILL-QUALITY + CP3.7.1）。"""
+"""蒸馏中间结果 Pydantic schema（CP3.5-pre-2 + CP-DISTILL-QUALITY + CP3.7.1 + CP3.7.2）。"""
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -84,6 +85,24 @@ class DistillContext(BaseModel):
     # 长度 == 最终 tts.segments（每段对应一次 synthesize 调用）。
     # 与 script_text 的关系：sections 内部按"句末标点"切分后拼回去 == sections 原文（按字一字不差）。
     tts_chunks: list[str] = Field(default_factory=list)
+
+    # === CP3.7.2 新增：hook 框架字段 ===
+    # §2.2.A：DistillContext 扩字段
+    user_profile: "UserListeningPattern | None" = None
+    few_shot_examples: list["RewriteExample"] = Field(default_factory=list)
+    target_tier: Literal["simple", "full"] = "full"
+    target_bitrate: list[int] = Field(default_factory=lambda: [128])
+    evaluation_id: str | None = None
+    # CP3.6.4 stage cache（stage 重试时复用）
+    stage_cache: dict[str, dict] = Field(default_factory=dict)
+
+
+class RewriteExample(BaseModel):
+    """CP3.7.2 §2.2.A：few-shot 单条样本（Step 2 prompt 注入用）。"""
+
+    kind: Literal["hook", "section", "outro"]
+    text: str
+    score_avg: float
 
 
 # ---------------------------------------------------------------------------
