@@ -36,7 +36,7 @@ from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import D9_ROUTE, ROUTES, Route  # noqa: E402
-from stashbox.backend.common.auth import create_access_token
+from stashbox.backend.common.auth import create_access_token, create_refresh_token
 from stashbox.backend.common.config import settings
 from stashbox.backend.common.exceptions import register_exception_handlers
 from stashbox.backend.common.logging import setup_logging
@@ -152,6 +152,7 @@ class TokenRequest(BaseModel):
 
 class TokenResponse(BaseModel):
     access_token: str
+    refresh_token: str
     expires_in: int
 
 
@@ -162,10 +163,12 @@ async def health():
 
 @app.post("/api/v1/auth/token", response_model=TokenResponse)
 async def issue_token(req: TokenRequest):
-    """签发 JWT（mock：直接用传入 user_id）。"""
+    """签发 JWT（mock：直接用传入 user_id）+ 配套 refresh_token。"""
     token = create_access_token(req.user_id)
+    refresh = create_refresh_token(req.user_id)
     return TokenResponse(
         access_token=token,
+        refresh_token=refresh,
         expires_in=settings.jwt_expire_minutes * 60,
     )
 

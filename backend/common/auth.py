@@ -8,6 +8,7 @@ JWT 鉴权 - 签发 + 解析 + FastAPI 依赖。
     async def get_me(user = Depends(require_user)):
         return {"user_id": user["user_id"]}
 """
+
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
@@ -38,6 +39,15 @@ def create_access_token(
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
+def create_refresh_token(user_id: str) -> str:
+    """签发 refresh token：长有效期 + type=refresh 声明，便于刷新端点识别与区分。"""
+    return create_access_token(
+        user_id,
+        extra={"type": "refresh"},
+        expire_minutes=settings.jwt_refresh_expire_minutes,
+    )
+
+
 def decode_token(token: str) -> dict:
     """解析 JWT，失败抛 401"""
     try:
@@ -53,6 +63,18 @@ def decode_token(token: str) -> dict:
             detail=f"Invalid token: {e}",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+def decode_refresh_token(token: str) -> dict:
+    """解析 refresh token：无效/过期 → 401；类型不符（非 type=refresh）→ 401。"""
+    payload = decode_token(token)  # 无效/过期 → 401
+    if payload.get("type") != "refresh":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not a refresh token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return payload
 
 
 async def require_user(

@@ -60,6 +60,7 @@ class Settings(BaseSettings):
 
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60 * 24 * 7
+    jwt_refresh_expire_minutes: int = 60 * 24 * 30  # refresh token 有效期 30 天（rotate 用）
 
     user_service_url: str = "http://user-service:8001"
     content_service_url: str = "http://content-service:8002"
