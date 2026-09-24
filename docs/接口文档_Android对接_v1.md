@@ -252,6 +252,8 @@ api-gateway 按 `config.ROUTES` 精确表转发，表外走 fallback **按第一
 
 ## 5. 缺口清单（需要后端补端点才能对接的功能）
 
+> 📐 **补齐方案已出**：《补齐方案_接口端点缺口_v1.md》——G1 属批次 B1（P0，最先落地），Android 评分 UI 可按 §5 G1 目标请求体直接开工。
+
 | # | 缺口 | 阻塞的产品功能 | 优先级 | 拟定接口（给后端参考） |
 |---|---|---|---|---|
 | G1 | **4 维评分提交端点**（hook/section/outro/rhythm + skip_reason） | CP3.7.0 评分 UI → `distillation_evaluations` 表 → 自动重蒸/few-shot 入池闭环拿不到 Android 数据 | 🔴 P0 | `POST /api/v1/distill/{task_id}/evaluation` |
