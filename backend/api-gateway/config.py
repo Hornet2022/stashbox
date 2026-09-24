@@ -97,6 +97,16 @@ ROUTES: list[Route] = [
     Route("GET", "/api/v1/tags", "content-service", _url("content-service")),
     Route("POST", "/api/v1/distill/start", "ai-service", _url("ai-service")),
     Route("GET", "/api/v1/distill/{task_id}", "ai-service", _url("ai-service")),
+    # B1/G5：distill 系端点显式注册（消除对 fallback 猜表的路径依赖，
+    # 历史坑：CP7.3.5 admin 段漏注册 → 8100 返 "no downstream route" 404）
+    Route("GET", "/api/v1/distill/{task_id}/variants", "ai-service", _url("ai-service")),
+    Route(
+        "POST",
+        "/api/v1/distill/{task_id}/variants/{bitrate}/warm",
+        "ai-service",
+        _url("ai-service"),
+    ),
+    Route("POST", "/api/v1/distill/{task_id}/evaluation", "ai-service", _url("ai-service")),
     # CP4.7.1: articles/{id}/distill 显式路由到 ai-service（fallback 会错误地走到 content-service）
     Route(
         "POST",

@@ -464,6 +464,61 @@ async def distill_variant_warm(
     }
 
 
+# ---------------------------------------------------------------------------
+# B1 / G1（CP3.7.0 配套端点）：4 维听感评分提交 → distillation_evaluations
+# ---------------------------------------------------------------------------
+
+
+class EvaluationCreateRequest(BaseModel):
+    """4 维评分（1-5，各维可 null=用户跳过该项）+ 总评必填。
+
+    校验口径对齐 /rate：手动校验 → 业务 400（code 4001），不走 422。
+    """
+
+    hook_score: int | None = None
+    section_score: int | None = None
+    outro_score: int | None = None
+    rhythm_score: int | None = None
+    overall_score: int | None = None
+    comment: str | None = None
+    skip_reason: str | None = None
+
+
+@app.post("/api/v1/distill/{task_id}/evaluation")
+async def create_evaluation(
+    task_id: str,
+    req: EvaluationCreateRequest,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """4 维评分提交（Android 评分 UI 的写入口，缺口 G1）。
+
+    薄端点：校验 → 归属 → distill.evaluation_service.submit_user_evaluation
+    （写表 + few-shot 入池 + 画像联动）→ commit。
+    """
+    from distill.evaluation_service import (
+        submit_user_evaluation,
+        validate_evaluation_payload,
+    )
+
+    validate_evaluation_payload(req)
+    da = await _get_owned_distilled_article(db, task_id, user)
+    result = await submit_user_evaluation(
+        db,
+        da,
+        int(user["sub"]),
+        hook_score=req.hook_score,
+        section_score=req.section_score,
+        outro_score=req.outro_score,
+        rhythm_score=req.rhythm_score,
+        overall_score=req.overall_score,
+        comment=req.comment,
+        skip_reason=req.skip_reason,
+    )
+    await db.commit()
+    return result
+
+
 if __name__ == "__main__":
     import uvicorn
 
