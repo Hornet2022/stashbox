@@ -431,6 +431,10 @@ class DistillPipeline:
                     # 避免历史污染再次扩散到订阅推送 / 标签过滤链路
                     tags=_strip_mock_tags(ctx.structured.tags if ctx.structured else []),
                     quality_score=MOCK_QUALITY_SCORE,  # mock 评分
+                    # B4（修 D1）：A/B 实验归因落库（FewShotSelectorHook 决策的
+                    # ab_group + 实际是否个性化 is_personalized），NULL = 未实验期
+                    ab_group=ctx.ab_group,
+                    is_personalized=ctx.is_personalized,
                     updated_at=func.now(),
                 )
             )

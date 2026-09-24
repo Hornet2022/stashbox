@@ -111,11 +111,15 @@ class FewShotSelectorHook:
         # CP3.7.2 兼容 FakeSession
         if not _is_real_session(db):
             return
+        # B4（修 D1）：A/B 分桶是用户属性（方案 §2.7-D：user_id % 100 < 30 → personalized），
+        # 与是否真正个性化无关（冷启动/未付费用户也归属组），intention-to-treat 口径。
+        # ctx.is_personalized 记录实际处理（as-treated），两列一起落库供 ab-report 对比。
+        ctx.ab_group = "personalized" if ctx.user_id % 100 < 30 else "general"
         try:
             # CP3.7.2 §2.2.E：冷启动保护（feedback_count < 5 不启用 few-shot）
             # CP5.6.0 §2.3：进一步走 PersonalizationSelector（个性化决策）
             if not ctx.user_profile or ctx.user_profile.feedback_count < 5:
-                # 冷启动：走大众化（CP3.7.2 行为）
+                # 冷启动：走大众化（CP3.7.2 行为），is_personalized 保持 False
                 return
 
             # CP5.6.0：调 PersonalizationSelector

@@ -113,6 +113,8 @@ ROUTES: list[Route] = [
     Route("GET", "/api/v1/admin/evaluations", "ai-service", _url("ai-service")),
     Route("GET", "/api/v1/admin/audio-variants/stats", "ai-service", _url("ai-service")),
     Route("GET", "/api/v1/admin/consents", "ai-service", _url("ai-service")),
+    # B4: A/B 实验报表
+    Route("GET", "/api/v1/admin/ab-report", "ai-service", _url("ai-service")),
     # CP4.7.1: articles/{id}/distill 显式路由到 ai-service（fallback 会错误地走到 content-service）
     Route(
         "POST",

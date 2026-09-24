@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +24,7 @@ from stashbox.backend.common.models import (
     FewShotExample,
 )
 
+from distill.ab_report import compute_ab_report
 from distill.pool_health import PoolHealthMonitor
 
 router = APIRouter()
@@ -275,3 +278,23 @@ async def admin_consents_list(
             for r in rows
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# B4 · 缺口 A4：A/B 实验报表
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/v1/admin/ab-report")
+async def admin_ab_report(
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+):
+    """A/B 分组四指标（复听率/完听率/评分均值/跳过率），方案 §2.7-D。
+
+    date_from / date_to 按蒸馏任务 created_at 过滤（ISO 8601）。
+    ab_group=NULL 的历史行归入 pre_experiment 组（不可用于实验结论）。
+    """
+    return await compute_ab_report(db, date_from=date_from, date_to=date_to)

@@ -1,5 +1,7 @@
 """蒸馏结果表 - L4 蒸馏后的听感稿 + 音频。"""
+
 from sqlalchemy import (
+    Boolean,
     Float,
     ForeignKey,
     Index,
@@ -32,13 +34,13 @@ class DistilledArticle(Base, TimestampMixin):
     #   step1_structuring / step2_rewriting / step3_ttsing / step4_concatenating
     #   （CP3.5-pre-3 起由 Arq worker 写库，最长 19 字符，VARCHAR(16) 装不下，见 0003 迁移）
     script_text: Mapped[str | None] = mapped_column(Text, nullable=True)  # 听感稿全文
-    audio_url: Mapped[str | None] = mapped_column(
-        String(512), nullable=True
-    )  # OSS URL
+    audio_url: Mapped[str | None] = mapped_column(String(512), nullable=True)  # OSS URL
     duration_sec: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 音频时长（秒）
     tags: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # 主题标签 ["科技","商业"]
     quality_score: Mapped[float | None] = mapped_column(Float, nullable=True)  # LLM 自评 0-10
+    # B4（修 D1）：A/B 实验分组落库。NULL = 0029 上线前的历史数据（未实验期），
+    # ab-report 按 NULL 单独一组过滤。方案 §2.7-D：user_id % 100 < 30 → personalized。
+    ab_group: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    is_personalized: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
-    __table_args__ = (
-        Index("idx_distilled_article_id", "article_id"),
-    )
+    __table_args__ = (Index("idx_distilled_article_id", "article_id"),)

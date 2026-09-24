@@ -52,6 +52,11 @@ class DistillationEvaluation(Base, TimestampMixin):
         Boolean, nullable=False, default=False
     )  # CP3.7.3 自动重蒸触发标志
     retried_task_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # B4 决策 §5.2 方案 B：评测员标注归属（admin 用户 id，users.id FK）。
+    # NULL = 普通用户评分或系统 mock；A3 annotate 端点写此列（user_id 保持原样不强塞 admin_id）。
+    evaluator_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("users.id"), nullable=True
+    )
 
     created_at = mapped_column(  # type: ignore[assignment]
         TIMESTAMP(timezone=False), nullable=False, server_default="now()"
