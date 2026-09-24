@@ -17,6 +17,7 @@ from .distillation_evaluation import DistillationEvaluation  # CP3.7.1 §2.1.A
 from .user_listening_pattern import UserListeningPattern  # CP3.7.1 §2.1.B
 from .article_audio_variant import ArticleAudioVariant  # CP3.7.1 §2.1.C
 from .few_shot_example import FewShotExample  # CP3.7.1 §2.1.D
+from .consent import ConsentRecord  # CP5.6.0 §3.1
 
 __all__ = [
     "Base",
@@ -39,4 +40,6 @@ __all__ = [
     "UserListeningPattern",
     "ArticleAudioVariant",
     "FewShotExample",
+    # CP5.6.0 个性化 + 隐私政策 v2
+    "ConsentRecord",
 ]

@@ -102,7 +102,10 @@ class UserProfileHook:
 
 
 class FewShotSelectorHook:
-    """CP3.7.2 §2.2.E：PreDistillHook —— 选 few-shot（仅 feedback_count >= 5 启用）。"""
+    """CP5.6.0 §2.3：PreDistillHook —— 选 few-shot（CP3.7.2 骨架 + CP3.7.3 完整 + CP5.6.0 个性化）。
+
+    CP5.6.0：调 PersonalizationSelector（5 条规则 + 隐私 + A/B）
+    """
 
     async def __call__(self, ctx: DistillContext, article: Any, db: AsyncSession) -> None:
         # CP3.7.2 兼容 FakeSession
@@ -110,20 +113,26 @@ class FewShotSelectorHook:
             return
         try:
             # CP3.7.2 §2.2.E：冷启动保护（feedback_count < 5 不启用 few-shot）
+            # CP5.6.0 §2.3：进一步走 PersonalizationSelector（个性化决策）
             if not ctx.user_profile or ctx.user_profile.feedback_count < 5:
+                # 冷启动：走大众化（CP3.7.2 行为）
                 return
 
-            # CP3.7.3 完整实现：select_few_shot + topic_tags 匹配
-            # 本期只做骨架（CP3.7.3 会补完实际查询）
-            from stashbox.backend.common.models import FewShotExample as FSSQL
+            # CP5.6.0：调 PersonalizationSelector
+            from .personalization_selector import PersonalizationSelector
 
-            result = await db.execute(
-                select(FSSQL)
-                .where(FSSQL.active == True)  # noqa: E712
-                .order_by(FSSQL.score_avg.desc())
-                .limit(5)
+            selector = PersonalizationSelector()
+            user_tier = getattr(article, "user_tier", None) or "free"
+            examples, is_personalized = await selector.select_personalized_few_shot(
+                db,
+                user_id=ctx.user_id,
+                user_tier=user_tier,
+                user_profile=ctx.user_profile,
+                article_topic_tags=None,
+                consent_enabled=True,  # CP5.6.0 默认 True（Android UI 推动）
+                is_minor=False,  # CP5.6.0 默认 False（学生用户走未成年路径）
+                limit=5,
             )
-            examples = result.scalars().all()
             ctx.few_shot_examples = [
                 RewriteExample(
                     kind=ex.kind if ex.kind in ("hook", "section", "outro") else "section",
@@ -132,10 +141,13 @@ class FewShotSelectorHook:
                 )
                 for ex in examples
             ]
+            # CP5.6.0：标记个性化（观测 / 调试用）
+            ctx.is_personalized = is_personalized
             log.info(
-                "few_shot_loaded",
+                "few_shot_loaded_cp560",
                 task_id=ctx.task_id,
                 count=len(ctx.few_shot_examples),
+                is_personalized=is_personalized,
             )
         except Exception as e:
             log.warning("few_shot_selector_hook_failed_continue", task_id=ctx.task_id, error=str(e))

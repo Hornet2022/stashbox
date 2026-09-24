@@ -95,6 +95,9 @@ class DistillContext(BaseModel):
     evaluation_id: str | None = None
     # CP3.6.4 stage cache（stage 重试时复用）
     stage_cache: dict[str, dict] = Field(default_factory=dict)
+    # === CP5.6.0 新增：个性化 + A/B 测试标记 ===
+    is_personalized: bool = False  # CP5.6.0 §2.7 观测
+    ab_group: Literal["personalized", "general"] | None = None  # CP5.6.0 §2.7 D
 
 
 class RewriteExample(BaseModel):
@@ -174,3 +177,13 @@ class FewShotExample(BaseModel):
     last_used_at: datetime | None = None
     active: bool = True
     created_at: datetime
+
+
+class ConsentRecord(BaseModel):
+    """CP5.6.0 §3.1：用户同意记录（个性化 + 跨用户金句 + 隐私政策 v2）。"""
+
+    user_id: int
+    personalization_enabled: bool = False  # opt-in
+    cross_user_share_enabled: bool = False
+    consent_at: str | None = None
+    consent_version: str = "v2"
