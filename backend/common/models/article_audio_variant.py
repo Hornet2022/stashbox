@@ -28,13 +28,18 @@ class ArticleAudioVariant(Base, TimestampMixin):
     - format 默认 'm4a'
     - sample_rate 24kHz / 16kHz（CP7.3.0 决策）
     - mono 默认 True（节省带宽）
+
+    ON DELETE CASCADE（0030，2026-09-24）：变体是蒸馏产物的**派生物**，
+    同生命周期 —— 母体删除后变体无意义，随 `distilled_articles` 级联清理。
     """
 
     __tablename__ = "article_audio_variants"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)  # avar_<uuid24>
     distilled_article_id: Mapped[str] = mapped_column(
-        String(32), ForeignKey("distilled_articles.id"), nullable=False
+        String(32),
+        ForeignKey("distilled_articles.id", ondelete="CASCADE"),
+        nullable=False,
     )
     bitrate: Mapped[int] = mapped_column(SmallInteger, nullable=False)  # 64 / 96 / 128 kbps
     file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)

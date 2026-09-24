@@ -65,10 +65,27 @@ class RecordingLLM:
 
 
 async def test_distill_task_uses_real_raw_content_from_db(
-    article_with_raw_content, test_user, monkeypatch
+    article_with_raw_content, test_user, monkeypatch, fake_llm_cls
 ):
-    """DB 里有真 FetchResult → Step 1 收到的是 content_text，不是占位文本。"""
-    recorder = RecordingLLM(dt_module.get_llm_client())
+    """DB 里有真 FetchResult → Step 1 收到的是 content_text，不是占位文本。
+
+    2026-09-24：改用**离线 FakeLLM**。
+    原实现是 `RecordingLLM(dt_module.get_llm_client())` —— 包的是**真实** LLM client
+    （只为记录 prompt），因此会打真实网络：LLM 限流时本用例误报失败，且动作 3 引入
+    429 退避后它会先重试 3 次、耗时明显拉长。FakeLLM 同样记录 `requests`，
+    完全满足本用例的断言需要。
+    """
+    recorder = fake_llm_cls(
+        step_contents={
+            "step1_structure": (
+                '{"summary":"s","chapters":[{"title":"章1","summary":"","key_points":[]}],'
+                '"entities":[],"tags":["科技"]}'
+            ),
+            "step2_rewrite": (
+                '{"hook":"开场","sections":["主体第一段"],"outro":"结尾","word_count":10}'
+            ),
+        }
+    )
     monkeypatch.setattr(dt_module, "get_llm_client", lambda: recorder)
 
     result = await dt_module.distill_task(

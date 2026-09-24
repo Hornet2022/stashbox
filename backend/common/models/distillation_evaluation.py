@@ -29,13 +29,21 @@ class DistillationEvaluation(Base, TimestampMixin):
     - overall_score = 4 维均值（1-5，**必填**，触发重蒸用）
     - skip_reason：用户在 Android 端选的跳过原因（CP3.7.0 同步）
     - auto_flag + retried_task_id：自动重蒸追踪
+
+    task_id 的可空语义（0030，2026-09-24）：
+    - 评分是**用户主观数据**，驱动 few_shot_examples / user_listening_patterns /
+      A/B 归因，是核心画像训练资产，删除文章时**保留**（与 feedback_v2.article_id
+      置 NULL 保留埋点一致）
+    - `ON DELETE SET NULL`：蒸馏产物被硬删后 task_id 置空，分数/评论/用户归属仍在
     """
 
     __tablename__ = "distillation_evaluations"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)  # eval_<uuid24>
-    task_id: Mapped[str] = mapped_column(
-        String(32), ForeignKey("distilled_articles.id"), nullable=False
+    task_id: Mapped[str | None] = mapped_column(
+        String(32),
+        ForeignKey("distilled_articles.id", ondelete="SET NULL"),
+        nullable=True,
     )
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)
 

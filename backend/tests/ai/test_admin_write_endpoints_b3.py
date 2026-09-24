@@ -131,7 +131,15 @@ async def test_tier_config_put_valid(b3_client, monkeypatch):
         captured["updated_by"] = updated_by
         return {"key": key, "value": value, "updated_at": datetime(2026, 9, 24, 12, 0)}
 
+    async def _fake_get(key):
+        # 动作 1 起，PUT 会读 llm 配置做「模型名 ↔ 供应商」一致性校验。
+        # 这里固定成 OpenAI 官方 → gpt-4.1 合法，避免测试依赖真实 DB 的 llm 配置。
+        if key == "llm":
+            return {"provider": "openai", "base_url": "https://api.openai.com/v1"}
+        return None
+
     monkeypatch.setattr(sc_mod, "set_config", _fake_set)
+    monkeypatch.setattr(sc_mod, "get_config", _fake_get)
 
     payload = {"tier_model_map": {"full": {"openai": "gpt-4.1", "qwen_vl": "qwen3-max"}}}
     r = await b3_client.put("/api/v1/admin/tier-config", json=payload)
@@ -139,6 +147,37 @@ async def test_tier_config_put_valid(b3_client, monkeypatch):
     assert captured["key"] == "tier"
     assert captured["updated_by"] == 999
     assert r.json()["tier_model_map"]["full"]["openai"] == "gpt-4.1"
+
+
+async def test_tier_config_put_rejects_vendor_mismatch(b3_client, monkeypatch):
+    """动作 1（2026-09-24 事故回归）：模型名与当前 LLM 供应商不符时必须拒绝保存。
+
+    事故：llm 配成火山方舟（doubao-*），tier 却配 gpt-4o →
+    蒸馏调用 LLM 报 404 UnsupportedModel，整条链 100% 失败。
+    """
+    import stashbox.backend.common.system_config as sc_mod
+
+    async def _fake_get(key):
+        if key == "llm":
+            return {
+                "provider": "openai",
+                "base_url": "https://ark.cn-beijing.volces.com/api/plan/v3",
+            }
+        return None
+
+    monkeypatch.setattr(sc_mod, "get_config", _fake_get)
+
+    payload = {"tier_model_map": {"full": {"openai": "gpt-4o"}}}
+    r = await b3_client.put("/api/v1/admin/tier-config", json=payload)
+    assert r.status_code == 400, r.text
+    assert "供应商" in r.text
+
+    # 换成该供应商支持的模型名 → 放行
+    ok = await b3_client.put(
+        "/api/v1/admin/tier-config",
+        json={"tier_model_map": {"full": {"openai": "doubao-seed-2.0-pro"}}},
+    )
+    assert ok.status_code == 200, ok.text
 
 
 async def test_tier_config_put_invalid_tier_key(b3_client):

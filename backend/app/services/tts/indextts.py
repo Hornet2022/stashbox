@@ -20,7 +20,6 @@
 - 返回是 WAV（RIFF），交给 step4/pipeline 落 .wav/.m4a 均能被 ExoPlayer 播
 """
 
-import asyncio
 import base64
 import logging
 import os
@@ -49,7 +48,7 @@ class IndexTTSClient(TTSClient):
         model: str | None = None,
         ref_audio_path: str | None = None,
         ref_text: str | None = None,
-        timeout: float = 120.0,
+        timeout: float | None = None,
     ):
         self.base_url = (base_url or os.getenv("INDEXTTS_BASE_URL", self.DEFAULT_BASE_URL)).rstrip(
             "/"
@@ -57,9 +56,14 @@ class IndexTTSClient(TTSClient):
         self.model = model or os.getenv("INDEXTTS_MODEL", self.DEFAULT_MODEL)
         self.ref_audio_path = ref_audio_path or os.getenv("INDEXTTS_REF_AUDIO", "")
         self.ref_text = ref_text or os.getenv("INDEXTTS_REF_TEXT", "")
-        self.timeout = timeout
+        # 超时可配：oMLX 首次加载 IndexTTS 模型 / 机器负载高时，单段合成可能远超
+        # 120s，硬编码会让蒸馏在 TTS 阶段必然超时失败（实测「合成超时(120.0s)」）。
+        # 默认放宽到 300s，可用 INDEXTTS_TIMEOUT 覆盖。
+        self.timeout = (
+            timeout if timeout is not None else float(os.getenv("INDEXTTS_TIMEOUT", "300"))
+        )
         # trust_env=False：忽略沙箱/系统 HTTP(S)_PROXY（代理漂移会打挂本地 127.0.0.1 请求）
-        self._client = httpx.AsyncClient(timeout=timeout, trust_env=False)
+        self._client = httpx.AsyncClient(timeout=self.timeout, trust_env=False)
         # 参考音频 base64 缓存（文件不重新读盘，除非 ref_audio_path 变化）
         self._ref_b64: str | None = None
         self._ref_b64_for: str | None = None
