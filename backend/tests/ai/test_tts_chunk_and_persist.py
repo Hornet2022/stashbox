@@ -20,10 +20,12 @@ import io
 import math
 import struct
 import sys
+import uuid
 import wave
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 if str(BACKEND_DIR) not in sys.path:
@@ -36,6 +38,62 @@ from app.services.tts.indextts import (  # noqa: E402
     _sibling_omlx_urls,
     _split_into_chunks,
 )
+
+
+@pytest_asyncio.fixture
+async def isolated_article(test_user):
+    """给持久化测试一条**独占**的 article + distilled 行，结束后整棵删掉。
+
+    为什么不能拿现成文章当靶子
+    --------------------------
+    `_persist_agent_final` 内部自己开 `AsyncSessionLocal` 并 **commit**，
+    调用方的外层事务回滚对它无效 —— 测试会真的把那一行改掉。
+
+    本文件此前直接用生产文章 `art_wxSOP_verify_0001`，实测造成过真实数据损坏：
+    真实蒸馏结果的 `script_text` 被写成 "甲稿/乙稿/丙稿" 占位符，
+    详情页在真机上直接显示 "丙稿丙稿丙稿…"。
+
+    而且"快照 → finally 还原"是个**棘轮**：第一轮把真值改成脏值并还原成功，
+    但只要有一轮进程被中断没跑到 finally，脏值就成为下一轮的快照基线，
+    此后每轮都忠实地把脏值还原回去 —— 存量永远洗不掉。
+
+    改成自建自销后，测试与生产数据之间不存在任何交集。
+    """
+    from sqlalchemy import delete
+
+    from stashbox.backend.common.database import AsyncSessionLocal
+    from stashbox.backend.common.models import Article, DistilledArticle
+
+    # id 列是 VARCHAR(32)，前缀 + 18 位 hex 必须留出余量
+    article_id = f"art_tstp_{uuid.uuid4().hex[:18]}"
+    distill_id = f"dst_tstp_{uuid.uuid4().hex[:18]}"
+
+    async with AsyncSessionLocal() as db:
+        db.add(
+            Article(
+                id=article_id,
+                user_id=test_user,
+                url="https://example.invalid/isolated-persist-test",
+                title="持久化隔离测试文章",
+                source="wechat_mp",
+                status="ready",
+            )
+        )
+        # 预置一条蒸馏行，模拟"这篇已经跑过一次"的生产形态
+        db.add(DistilledArticle(id=distill_id, article_id=article_id, status="queued"))
+        await db.commit()
+
+    try:
+        yield article_id
+    finally:
+        async with AsyncSessionLocal() as db:
+            # distilled_articles.article_id 的 FK 没有 ON DELETE CASCADE，
+            # 必须先删子行再删 article，否则外键报错
+            await db.execute(
+                delete(DistilledArticle).where(DistilledArticle.article_id == article_id)
+            )
+            await db.execute(delete(Article).where(Article.id == article_id))
+            await db.commit()
 
 
 def _make_wav(nframes: int, freq: float, rate: int = 16000) -> bytes:
@@ -217,7 +275,7 @@ def test_chunk_concurrency_is_bounded():
 
 
 @pytest.mark.asyncio
-async def test_persist_same_article_different_task_id_keeps_script():
+async def test_persist_same_article_different_task_id_keeps_script(isolated_article):
     """CP-AGENT-PERSIST-ARTICLE-KEY 的核心回归。
 
     `distilled_articles.article_id` 是 UNIQUE（一篇一结果）。旧实现只按
@@ -227,157 +285,71 @@ async def test_persist_same_article_different_task_id_keeps_script():
 
     这里连写 3 个不同 task_id，断言：仍只有 1 行，且最后一次的稿子保住了。
     """
-    from sqlalchemy import select, text
+    from sqlalchemy import select
 
     from stashbox.backend.common.database import AsyncSessionLocal
     from stashbox.backend.common.models import DistilledArticle
     from tasks.distill_task import _persist_agent_final
 
-    article_id = "art_wxSOP_verify_0001"
+    article_id = isolated_article
 
-    # 先把当前真实值存下来：这些测试跑在**真实库**上（不是 mock/fixture），
-    # `_persist_agent_final` 会真的改写这行。收尾必须把**所有**被改的字段还原，
-    # 否则测试会把生产数据的 status 写成 failed（实测踩过：跑完一轮全量测试，
-    # 一条 status=done 的真实蒸馏结果就变成了 failed）。
-    async with AsyncSessionLocal() as db:
-        snapshot = (
-            (
-                await db.execute(
-                    select(DistilledArticle).where(DistilledArticle.article_id == article_id)
-                )
-            )
-            .scalars()
-            .first()
-        )
-        saved = (
-            None
-            if snapshot is None
-            else {
-                "status": snapshot.status,
-                "script_text": snapshot.script_text,
-                "audio_url": snapshot.audio_url,
-                "duration_sec": snapshot.duration_sec,
-            }
-        )
-        await db.rollback()
-
-    try:
-        for i, script in enumerate(["甲稿" * 30, "乙稿" * 30, "丙稿" * 30], start=1):
-            await _persist_agent_final(
-                f"cp_persist_{i}",
-                article_id,
-                1,
-                {
-                    "status": "failed",
-                    "error": "IndexTTS 合成超时(300.0s)",
-                    "rewritten_script": script,
-                    "error_kind": "internal",
-                    "error_step": "tts",
-                },
-            )
-
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(
-                select(DistilledArticle).where(DistilledArticle.article_id == article_id)
-            )
-            rows = result.scalars().all()
-            assert len(rows) == 1, f"一篇一结果，应为 1 行，实得 {len(rows)}"
-            # 最后一次写入的稿子必须留存（这正是旧实现丢掉的东西）
-            assert rows[0].script_text == "丙稿" * 30
-            await db.rollback()
-    finally:
-        # 还原**全部**被改字段，不只是 script_text
-        async with AsyncSessionLocal() as db:
-            if saved is not None:
-                await db.execute(
-                    text(
-                        "UPDATE distilled_articles SET status=:st, script_text=:sc, "
-                        "audio_url=:au, duration_sec=:du WHERE article_id=:aid"
-                    ),
-                    {
-                        "st": saved["status"],
-                        "sc": saved["script_text"],
-                        "au": saved["audio_url"],
-                        "du": saved["duration_sec"],
-                        "aid": article_id,
-                    },
-                )
-            await db.commit()
-
-
-@pytest.mark.asyncio
-async def test_persist_failure_does_not_rollback_data_writes():
-    """埋点失败绝不能连带回滚业务数据行（两段事务隔离）。"""
-    from sqlalchemy import select, text
-
-    from stashbox.backend.common.database import AsyncSessionLocal
-    from stashbox.backend.common.models import DistilledArticle
-    from tasks.distill_task import _persist_agent_final
-
-    article_id = "art_wxSOP_verify_0001"
-    marker = "隔离性验证稿" * 20
-
-    async with AsyncSessionLocal() as db:
-        snapshot = (
-            (
-                await db.execute(
-                    select(DistilledArticle).where(DistilledArticle.article_id == article_id)
-                )
-            )
-            .scalars()
-            .first()
-        )
-        saved = (
-            None
-            if snapshot is None
-            else {
-                "status": snapshot.status,
-                "script_text": snapshot.script_text,
-                "audio_url": snapshot.audio_url,
-                "duration_sec": snapshot.duration_sec,
-            }
-        )
-        await db.rollback()
-
-    try:
+    for i, script in enumerate(["甲稿" * 30, "乙稿" * 30, "丙稿" * 30], start=1):
         await _persist_agent_final(
-            "cp_persist_iso",
+            f"cp_persist_{i}",
             article_id,
             1,
             {
                 "status": "failed",
-                "error": "x" * 500,  # reason 被截断到 200，写入正常
-                "rewritten_script": marker,
+                "error": "IndexTTS 合成超时(300.0s)",
+                "rewritten_script": script,
                 "error_kind": "internal",
                 "error_step": "tts",
             },
         )
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(
-                select(DistilledArticle).where(DistilledArticle.article_id == article_id)
-            )
-            rows = result.scalars().all()
-            assert len(rows) == 1
-            assert rows[0].script_text == marker
-            await db.rollback()
-    finally:
-        # 同上：跑在真实库上，必须还原全部被改字段
-        async with AsyncSessionLocal() as db:
-            if saved is not None:
-                await db.execute(
-                    text(
-                        "UPDATE distilled_articles SET status=:st, script_text=:sc, "
-                        "audio_url=:au, duration_sec=:du WHERE article_id=:aid"
-                    ),
-                    {
-                        "st": saved["status"],
-                        "sc": saved["script_text"],
-                        "au": saved["audio_url"],
-                        "du": saved["duration_sec"],
-                        "aid": article_id,
-                    },
-                )
-            await db.commit()
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(DistilledArticle).where(DistilledArticle.article_id == article_id)
+        )
+        rows = result.scalars().all()
+        assert len(rows) == 1, f"一篇一结果，应为 1 行，实得 {len(rows)}"
+        # 最后一次写入的稿子必须留存（这正是旧实现丢掉的东西）
+        assert rows[0].script_text == "丙稿" * 30
+        await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_persist_failure_does_not_rollback_data_writes(isolated_article):
+    """埋点失败绝不能连带回滚业务数据行（两段事务隔离）。"""
+    from sqlalchemy import select
+
+    from stashbox.backend.common.database import AsyncSessionLocal
+    from stashbox.backend.common.models import DistilledArticle
+    from tasks.distill_task import _persist_agent_final
+
+    article_id = isolated_article
+    marker = "隔离性验证稿" * 20
+
+    await _persist_agent_final(
+        "cp_persist_iso",
+        article_id,
+        1,
+        {
+            "status": "failed",
+            "error": "x" * 500,  # reason 被截断到 200，写入正常
+            "rewritten_script": marker,
+            "error_kind": "internal",
+            "error_step": "tts",
+        },
+    )
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(DistilledArticle).where(DistilledArticle.article_id == article_id)
+        )
+        rows = result.scalars().all()
+        assert len(rows) == 1
+        assert rows[0].script_text == marker
+        await db.rollback()
 
 
 # ==========================================================================
@@ -390,14 +362,14 @@ async def test_persist_failure_does_not_rollback_data_writes():
 
 
 @pytest.mark.asyncio
-async def test_ready_writeback_finds_row_by_article_id():
+async def test_ready_writeback_finds_row_by_article_id(isolated_article):
     """文章行 id 与 task_id 不同时，仍必须能写回 ready + audio_url。"""
     from sqlalchemy import select
 
     from stashbox.backend.common.database import AsyncSessionLocal
     from stashbox.backend.common.models import DistilledArticle
 
-    article_id = "art_wxSOP_verify_0001"
+    article_id = isolated_article
     async with AsyncSessionLocal() as db:
         by_article = (
             await db.execute(
