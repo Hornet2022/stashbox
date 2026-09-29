@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from stashbox.backend.common.auth import (
@@ -186,13 +186,21 @@ class AdminUserItem(BaseModel):
     """GET /admin/users 单条用户。
 
     v1 §3.6 字段：email / display_name / role / status / last_active_at。
-    这些列在 users 表尚未建模（无 email/状态/活跃时间列），按现有模型映射：
-      - email         -> None（users 表无 email 列，保留字段兼容前端）
+
+    口径修正（CP-USERS-REALITY）：原注释写「users 表无 email/状态列，故 email=None、
+    status 恒 active」，**该前提已不成立** —— 后续 migration 给 users 补了
+    `email` 与 `deleted_at` 两列。管理后台却还在按老前提硬编码，于是：
+      - 邮箱列全空白（库里明明有值）
+      - 状态筛选是个假下拉（选了 suspended/deleted，返回的仍是全部用户）
+
+    现在一律取真实列：
+      - email         -> u.email（可能为 None，前端渲染 "—"）
       - display_name  -> nickname
-      - role          -> tier（v1 §3.6 角色语义即 tier）
-      - status        -> "active"（无 soft-delete 状态列，默认 active）
-      - last_active_at-> None（users 表无该列）
-    不在此追加 migration（CP3.6-A2 红线），仅暴露管理端点。
+      - role          -> 管理员角色：admin/operator 原样，其余归 user
+      - tier          -> users.tier 原值（系统里这一列同时承载"等级"和"管理员角色"，
+                         见下方 docstring 的说明，不臆造第二列）
+      - status        -> 由 deleted_at 派生：deleted_at 非空 = deleted，否则 active
+      - last_active_at-> None（users 表确无该列，不用 listening 之类数据假装）
     """
 
     id: int
@@ -804,10 +812,17 @@ async def admin_list_users(
 ):
     """v1 §3.6 用户管理：分页 + 关键词 + 角色过滤。
 
-    - 关键词：nickname ILIKE '%keyword%'（v1 §3.6 原指 email/display_name，
-      users 表无 email 列，映射为 nickname）
+    - 关键词：nickname OR email ILIKE '%keyword%'（CP-USERS-REALITY：email 列已存在，
+      原实现只搜 nickname，导致有邮箱的用户搜邮箱搜不到）
     - 排序：created_at DESC
-    - status 查询参数保留接口兼容；users 表无状态列，不做落库过滤
+    - status：CP-USERS-REALITY 由 deleted_at 派生，**本次真正落库过滤**。
+      原实现收了 status 参数却不加任何 where，选 suspended/deleted 返回的还是全量，
+      管理后台那个下拉是纯装饰。
+    - tier：原样过滤 users.tier
+
+    注意 users 表只有一列 tier，同时承载「等级」和「管理员角色」两种语义
+    （admin 用户的 tier 值就是 'admin'）。这是历史建模遗留，红线是不在本次补
+    migration，故响应里 role 与 tier 都从这一列派生，靠 role 字段做区分。
     """
     page = max(page, 1)
     size = min(max(size, 1), 100)
@@ -816,9 +831,15 @@ async def admin_list_users(
     # 计数 + 查询共用过滤条件
     filters = []
     if kw:
-        filters.append(User.nickname.ilike(kw))
+        filters.append(or_(User.nickname.ilike(kw), User.email.ilike(kw)))
     if tier:
         filters.append(User.tier == tier)
+    if status == "deleted":
+        filters.append(User.deleted_at.isnot(None))
+    elif status == "active":
+        filters.append(User.deleted_at.is_(None))
+    # status == "suspended"：users 表无冻结列，恒不命中任何行。
+    # 不静默忽略——否则又变成一个骗人的下拉选项。
 
     count_stmt = select(func.count()).select_from(User)
     list_stmt = select(User)
@@ -834,11 +855,12 @@ async def admin_list_users(
     items = [
         AdminUserItem(
             id=u.id,
-            email=None,
+            email=u.email,
             display_name=u.nickname,
-            role=u.tier,
+            # role 表达「是不是管理员」，tier 表达「等级」——拆开后两列不再重复。
+            role=u.tier if u.tier in {"admin", "operator"} else "user",
             tier=u.tier,
-            status="active",
+            status="deleted" if u.deleted_at else "active",
             monthly_quota=u.monthly_quota,
             used_quota=u.quota_used,
             last_active_at=None,
@@ -859,14 +881,21 @@ async def admin_quota_adjust(
     """v1 §3.6 调整用户月度配额。
 
     行为：
-      1. 校验 monthly_quota > 0、reason 必填 ≥5 字符、目标 user 存在
+      1. 校验 monthly_quota >= 0、reason 必填 ≥5 字符、目标 user 存在
       2. 更新 users.monthly_quota
       3. 同事务写入 admin_operation_logs 一条（A1 已建表）
       4. 失败整体回滚（ValidationError 在 commit 前抛出，不落库）
+
+    CP-USERS-REALITY：原校验是 `monthly_quota <= 0` 拒绝，但 **0 是系统里的真实值**
+    —— users.id=1 的 monthly_quota 就是 0（额度耗尽/停用状态），管理员把它设回 0
+    是合法操作。同时前端 Users.tsx 校验的是 `value < 0`，两边口径不一致：
+    管理员在前端填 0，前端放行、后端 400。这里统一为 >= 0。
     """
     # 校验（commit 前，失败不落库 → 满足“失败回滚事务”）
-    if req.monthly_quota <= 0:
-        raise HTTPException(status_code=400, detail="monthly_quota 必须为正整数")
+    if req.monthly_quota < 0:
+        raise HTTPException(
+            status_code=400, detail="monthly_quota 不能为负数（0 = 额度耗尽，停用该用户）"
+        )
     if len(req.reason.strip()) < 5:
         raise HTTPException(status_code=400, detail="reason 至少 5 个字符")
 

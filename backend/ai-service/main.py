@@ -152,6 +152,39 @@ def _new_task_id() -> str:
     return f"dst_{uuid.uuid4().hex[:24]}"
 
 
+def _requeue_or_create(
+    db: AsyncSession, existed_da: DistilledArticle | None, article_id: str
+) -> str:
+    """重跑蒸馏时复用已有行，或新建一行，返回 task_id。
+
+    CP-DISTILL-NONDESTRUCTIVE：`distilled_articles.article_id` 上有唯一约束
+    （distilled_articles_article_id_key），二次蒸馏不能再 INSERT，否则撞
+    UniqueViolationError → PendingRollbackError → 500，所以必须复用原行。
+
+    但复用时**不清空产物字段**。原实现在这里把 script_text / audio_url /
+    duration_sec / quality_score / tags 一律置 None，代价是：
+      - 正在收听的用户音频立刻失效
+      - 已完成的产物元数据不可恢复（本轮验收就误伤了一篇真机在用文章，
+        script_text / tags / quality_score 全丢，只能靠重跑 TTS 找回）
+    现在只改 status，保留旧产物，等 worker 跑成功时由它覆盖。
+    这样"重跑"退化为"刷新"，失败也不会把用户已有的东西打掉。
+    """
+    if existed_da is not None:
+        existed_da.status = "queued"
+        return existed_da.id
+    task_id = _new_task_id()
+    db.add(
+        DistilledArticle(
+            id=task_id,
+            article_id=article_id,
+            status="queued",
+            audio_url=None,
+            script_text=None,
+        )
+    )
+    return task_id
+
+
 async def _run_pipeline(task_id: str, simulate_failure: bool = False) -> None:
     """mock 4 步蒸馏流水线，结果写回 distilled_articles。
 
@@ -241,38 +274,54 @@ async def distill_start(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # CP-DISTILL-DUP 同款修复：article_id 有唯一约束。CP9.x 起 POST /articles
-    # 会自动 trigger_distill 建好 DA 行，调用方再显式 /distill/start 必撞
-    # UniqueViolationError → 500。改为复用原行并重置产物字段（同 distill_article）。
+    """按 article_id 触发蒸馏。
+
+    CP-DISTILL-START-HARDEN（本轮修复的三个问题，都是实测出来的）：
+
+    1) **越权**。原实现只信请求体里的 article_id/url，从不查 Article，
+       任何人拿到别人的 article_id 就能对其重跑蒸馏。实测：以 user 9277 的
+       token 对 user 1 名下的 art_wxSOP_verify_0001 调本端点返回 200。
+       现在查库校验归属，非本人 → 403（与 /articles/{id}/distill 同口径）。
+
+    2) **不扣配额**。本端点从头到尾没碰过 quota_service，而
+       /articles/{id}/distill 扣。同一件事两条路径、两种计费口径。
+
+    3) **破坏性复用**。文章已有蒸馏行时复用原行，并把 script_text / audio_url /
+       duration_sec / quality_score / tags 一律置空。实测把一篇 status=done、
+       有音频的真机在用文章打成了 status=queued，产物元数据全部丢失，且无法找回。
+       改为**保留旧产物**：重跑期间用户仍能听旧音频，worker 跑成功才覆盖。
+
+    url / title 一律取库里的值，不用请求体传的——传什么蒸馏什么，等于允许
+    调用方把 A 文章的产物写到 B 上。
+    """
+    uid = int(user["sub"])
+
+    art = await db.scalar(select(Article).where(Article.id == req.article_id))
+    if art is None:
+        raise NotFound(message=f"article {req.article_id} not found")
+    if art.user_id != uid:
+        raise Forbidden(message="not the owner of this article")
+    url = art.url
+    title = art.title
+
+    # 配额：与 /articles/{id}/distill 同口径——该文章已有蒸馏行则视为已扣过。
     existed_da = await db.scalar(
         select(DistilledArticle).where(DistilledArticle.article_id == req.article_id)
     )
-    if existed_da is not None:
-        task_id = existed_da.id
-        existed_da.status = "queued"
-        existed_da.script_text = None
-        existed_da.audio_url = None
-        existed_da.duration_sec = None
-        existed_da.quality_score = None
-        existed_da.tags = None
-    else:
-        task_id = _new_task_id()
-        da = DistilledArticle(
-            id=task_id,
-            article_id=req.article_id,
-            status="queued",
-            audio_url=None,
-            script_text=None,
-        )
-        db.add(da)
+    if existed_da is None:
+        await quota_service.consume(db, uid)  # 用尽抛 3001
+        await cache_service.mark_article_quota(req.article_id)
+
+    task_id = _requeue_or_create(db, existed_da, req.article_id)
+    art.status = "distilling"
     await db.commit()
-    # CP3.5-pre-3：BackgroundTasks.add_task → Arq 队列（独立 worker 进程消费）
+
     job_id = await get_dispatcher().enqueue_distill(
         task_id=task_id,
         article_id=req.article_id,
-        user_id=int(user["sub"]),
-        url=req.url,
-        title=req.title,
+        user_id=uid,
+        url=url,
+        title=title,
     )
     return DistillStartResponse(
         task_id=task_id, article_id=req.article_id, status="queued", job_id=job_id
@@ -324,25 +373,9 @@ async def distill_article(
 
     # CP-DISTILL-DUP 修复：article_id 有唯一约束（distilled_articles_article_id_key），
     # 二次蒸馏（failed 重试 / ready 后重蒸）不能再 INSERT —— 之前直接撞
-    # UniqueViolationError → PendingRollbackError → 500。改为复用原行并重置产物字段。
-    if existed_da is not None:
-        task_id = existed_da.id
-        existed_da.status = "queued"
-        existed_da.script_text = None
-        existed_da.audio_url = None
-        existed_da.duration_sec = None
-        existed_da.quality_score = None
-        existed_da.tags = None
-    else:
-        task_id = _new_task_id()
-        da = DistilledArticle(
-            id=task_id,
-            article_id=article_id,
-            status="queued",
-            audio_url=None,
-            script_text=None,
-        )
-        db.add(da)
+    # UniqueViolationError → PendingRollbackError → 500。改为复用原行。
+    # CP-DISTILL-NONDESTRUCTIVE：复用时保留旧产物，不再清空（见 _requeue_or_create）。
+    task_id = _requeue_or_create(db, existed_da, article_id)
     art.status = "distilling"
     # CP6.2.1 埋点：distill_start
     # track() 只 flush 不 commit —— 必须在 commit() 之前，否则埋点随 close() 回滚丢失
