@@ -64,29 +64,73 @@ class RecordingLLM:
         return await self.inner.close()
 
 
-async def test_distill_task_uses_real_raw_content_from_db(
-    article_with_raw_content, test_user, monkeypatch, fake_llm_cls
-):
-    """DB 里有真 FetchResult → Step 1 收到的是 content_text，不是占位文本。
+class _AgentFakeLLM:
+    """CP-AGENT 同步：state-aware 替身。
 
-    2026-09-24：改用**离线 FakeLLM**。
-    原实现是 `RecordingLLM(dt_module.get_llm_client())` —— 包的是**真实** LLM client
-    （只为记录 prompt），因此会打真实网络：LLM 限流时本用例误报失败，且动作 3 引入
-    429 退避后它会先重试 3 次、耗时明显拉长。FakeLLM 同样记录 `requests`，
-    完全满足本用例的断言需要。
+    决策路由必须按当前 state 推进（否则图会 rewrite↔router 死循环），
+    所以不能像旧 pipeline 那样「按 step 返回固定内容」。
     """
-    recorder = fake_llm_cls(
-        step_contents={
-            "step1_structure": (
-                '{"summary":"s","chapters":[{"title":"章1","summary":"","key_points":[]}],'
-                '"entities":[],"tags":["科技"]}'
-            ),
-            "step2_rewrite": (
-                '{"hook":"开场","sections":["主体第一段"],"outro":"结尾","word_count":10}'
-            ),
-        }
-    )
-    monkeypatch.setattr(dt_module, "get_llm_client", lambda: recorder)
+
+    def __init__(self) -> None:
+        self.requests: list = []
+
+    async def chat(self, req):
+        self.requests.append(req)
+        from llm.types import ChatResponse, Usage
+
+        step = (req.metadata or {}).get("step")
+        user_text = req.messages[-1].content if req.messages else ""
+
+        if step == "agent_decision_router":
+            if "已拼接" in user_text:
+                content = '{"next_action": "done"}'
+            elif "已合成" in user_text:
+                content = '{"next_action": "skip_to_concat"}'
+            elif "已改写" in user_text:
+                content = '{"next_action": "skip_to_tts"}'
+            else:
+                content = '{"next_action": "rewrite"}'
+        else:
+            content = '{"hook":"开场","sections":["主体第一段"],"outro":"结尾","word_count":10}'
+
+        return ChatResponse(content=content, model="fake-agent", usage=Usage())
+
+    async def close(self) -> None:
+        return None
+
+
+async def test_distill_task_uses_real_raw_content_from_db(
+    article_with_raw_content, test_user, monkeypatch
+):
+    """DB 里有真 FetchResult → agent rewrite 收到的是 content_text，不是占位文本。
+
+    CP-AGENT-RUNNER-INTEGRATION 同步：distill_task 现在走 LangGraph agent
+    （fetch → decision_router → rewrite → ...），rewrite_node 调
+    `llm.chat(ChatRequest)`。这里用 state-aware 替身记录 ChatRequest，
+    断言 user message 里出现真抓到的正文。
+    """
+    recorder = _AgentFakeLLM()
+
+    # agent runner 通过 llm.get_llm_client()（动态模块引用）拿 client，
+    # 所以要 patch ai-service/llm 模块的属性，而不是 dt_module.get_llm_client
+    import llm as llm_module
+
+    # agent 里是 `await get_llm_client()`，所以替身必须是 async 函数
+    def _fake_get_llm_client():
+        return recorder
+
+    monkeypatch.setattr(llm_module, "get_llm_client", _fake_get_llm_client)
+
+    # CP-AGENT 同步：agent 的 tts_node 会调 tts_synthesize tool（真实 TTS）。
+    # 本用例只关心 rewrite prompt 内容，这里把 TTS tool 打成替身避免打真 TTS 网络。
+    from agent import tools as agent_tools
+
+    agent_tools._default_registry_singleton = None
+
+    async def _fake_tts(state, args):
+        return {"audio_url": "https://oss.example.com/a.mp3", "voice": "v", "duration_sec": 10}
+
+    monkeypatch.setattr(agent_tools, "tts_synthesize_tool", _fake_tts)
 
     result = await dt_module.distill_task(
         CTX,
@@ -99,7 +143,9 @@ async def test_distill_task_uses_real_raw_content_from_db(
 
     assert result == {"task_id": "dst_test0000000000000000001", "status": "done"}
 
-    # Step 1 的 user message 里必须出现真抓到的正文（占位文本已删）
-    step1_prompt = recorder.requests[0].messages[-1].content
-    assert "测试真内容 1+2=3" in step1_prompt
-    assert "CP3.5 抓取器未接入" not in step1_prompt
+    # agent rewrite 的 user message 必须出现真抓到的正文（占位文本已删）
+    prompts = [
+        req.messages[-1].content for req in recorder.requests if getattr(req, "messages", None)
+    ]
+    assert any("测试真内容 1+2=3" in p for p in prompts), prompts
+    assert not any("CP3.5 抓取器未接入" in p for p in prompts), prompts

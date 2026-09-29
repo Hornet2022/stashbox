@@ -11,11 +11,12 @@ CP3.5-pre-3 说明：
   （CP2.5 / CP-CREATE-ARTICLE 抓完落库的 FetchResult），Step 1 拿到的是真正文
 """
 
+import os
+
 import structlog
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from distill import DistillContext, DistillPipeline
 from llm import get_llm_client, maybe_close_llm_client
 from llm import reload as llm_reload
 from stashbox.backend.app.services.tts import reload as tts_reload
@@ -26,6 +27,11 @@ from stashbox.backend.common.models.push_notification import PushNotification
 from stashbox.backend.common.models.distilled_article import DistilledArticle
 from stashbox.backend.common.analytics import track_simple, track
 from stashbox.backend.common.events import EventName
+
+# CP-AGENT-RUNNER-INTEGRATION：distill_task.py 走 LangGraph agent（替代 DistillPipeline.run）
+# 向后兼容：pipeline 仍保留（被外部测试 mock / 老 arq 重试 queue 里残留任务可能用到）
+from agent.runner import agent_app as _agent_app
+from agent.state import AgentState
 
 log = structlog.get_logger("ai-worker")
 
@@ -243,32 +249,46 @@ async def distill_task(
     async with AsyncSessionLocal() as db:
         raw_content = await _load_raw_content(db, article_id)
 
-    pipeline_ctx = DistillContext(
-        task_id=task_id,
-        article_id=article_id,
-        user_id=user_id,
-        url=url,
-        title=title,
-        raw_content=raw_content,  # ← 真抓的内容（or fallback），不是占位文本
-    )
-
-    llm = _FailingLLM() if simulate_failure else get_llm_client()
-    # B3/D2：生产路径开启 tier 路由（按 ctx.target_tier + 生效 TIER_MODEL_MAP 选模型）；
-    # 失败模拟路径保持注入的 _FailingLLM，不受路由替换影响。
-    pipeline = DistillPipeline(
-        llm=llm,
-        db_session_factory=AsyncSessionLocal,
-        enable_tier_routing=not simulate_failure,
-    )
-
+    # CP-AGENT-RUNNER-INTEGRATION：distill 走 LangGraph agent（替代硬编码 pipeline）
+    # - raw_content 直接当 fetched_content 喂入（避免真实 fetch_url 调外部网络）
+    # - MemoryStore 从 PG 读 user_profile + few_shot_examples 注入 prompt
+    # - agent_app.ainvoke() 跑完后 _persist_agent_final 写回 DB
     try:
-        await pipeline.run(pipeline_ctx)
-        # CP10: 写回 articles.status=ready + audio_url（派生自 distilled_articles）
+        final = await _run_distill_via_agent(
+            task_id=task_id,
+            article_id=article_id,
+            user_id=user_id,
+            url=url,
+            raw_content=raw_content,
+            simulate_failure=simulate_failure,
+        )
+        # CP-AGENT-FAILURE-PROPAGATION：agent 失败（final.status != "done"）必须走
+        # 失败路径（退还配额 + articles.status=failed + 抛异常给 Arq retry），
+        # 否则任务会被误记为成功（旧 DistillPipeline 是靠抛异常表达失败的）。
+        if (final or {}).get("status") != "done":
+            err_kind = (final or {}).get("error_kind") or "internal"
+            err_step = (final or {}).get("error_step") or "unknown"
+            err_msg = (final or {}).get("error") or "agent 未返回 done"
+            raise RuntimeError(f"agent distill failed at {err_step} ({err_kind}): {err_msg}")
+
+        # CP10: 写回 articles.status=ready + audio_url（派生自 agent final state）
         async with AsyncSessionLocal() as db:
+            # CP-AGENT-PERSIST-ARTICLE-KEY：这里必须**按 article_id 查**，
+            # 不能只按 `id == task_id`。
+            #
+            # `_persist_agent_final` 按业务键（一篇一结果）落库：同一篇文章换新
+            # task_id 重跑时会复用既有那行（id 仍是第一次的 task_id）。若这里按
+            # `id == task_id` 查，就永远查不到 → `if da is not None` 整段跳过 →
+            # articles.status 永远停在 distilling，audio_url 也写不回 Article。
             da_result = await db.execute(
-                select(DistilledArticle).where(DistilledArticle.id == task_id)
+                select(DistilledArticle).where(DistilledArticle.article_id == article_id)
             )
             da = da_result.scalar_one_or_none()
+            if da is None:  # 兼容只认 task_id 的老数据
+                da_result = await db.execute(
+                    select(DistilledArticle).where(DistilledArticle.id == task_id)
+                )
+                da = da_result.scalar_one_or_none()
             if da is not None:
                 art_result = await db.execute(select(Article).where(Article.id == da.article_id))
                 art = art_result.scalar_one_or_none()
@@ -350,8 +370,255 @@ async def distill_task(
                 await db.commit()
         except Exception as exc:
             log.warning("articles_status_failed_write_err", article_id=article_id, error=str(exc))
+
+        # CP-AGENT-QUOTA-REFUND：配额退还原先由 DistillPipeline._refund_quota 承担，
+        # agent 路径绕过了 pipeline，必须在任务级补回（否则用户蒸馏失败白扣配额）。
+        # Redis SETNX 幂等锁：Arq 默认 retry_max=2，避免首跑 + 重试多次退双倍。
+        await _refund_quota_once(task_id=task_id, user_id=user_id)
         raise  # 让 Arq 走 retry 逻辑
     finally:
-        # CP3.6.2：单例 client（factory `_shared=True`）→ no-op；
-        # httpx 连接池由 `factory.close_all_llm_clients()` 在 lifespan shutdown 统一关闭。
-        await maybe_close_llm_client(llm)
+        # CP-AGENT-RUNNER-INTEGRATION：agent 路径下 LLM client 由 agent.runner 内部
+        # 通过 _llm_module.get_llm_client() 获取（单例），这里拿同一个实例关闭。
+        # 单例 client（factory `_shared=True`）→ close 是 no-op；
+        # httpx 连接池由 factory.close_all_llm_clients() 在 lifespan shutdown 统一关闭。
+        try:
+            _llm_for_close = get_llm_client()
+            await maybe_close_llm_client(_llm_for_close)
+        except Exception:
+            pass
+
+
+async def _refund_quota_once(task_id: str, user_id: int) -> None:
+    """CP-AGENT-QUOTA-REFUND：退还 1 次配额，Redis SETNX 保证幂等（跨 Arq retry）。
+
+    与 DistillPipeline._refund_quota 同语义，但由任务层调用（agent 路径不经过 pipeline）。
+    Redis 不可用时降级为无锁（不阻塞失败流程）。
+    """
+    from stashbox.backend.common import quota_service
+    from stashbox.backend.common.redis_client import get_redis_pool
+
+    try:
+        import redis.asyncio as redis_async
+
+        client = redis_async.Redis(connection_pool=get_redis_pool())
+        locked = await client.set(f"refund:{task_id}", "1", nx=True, ex=86400)
+        if not locked:
+            log.info("quota_refund_skipped_already_refunded", task_id=task_id, user_id=user_id)
+            return
+    except Exception as exc:
+        log.warning(
+            f"quota_refund_lock_failed_proceed_without_lock task_id={task_id} error={exc!s}"
+        )
+
+    try:
+        async with AsyncSessionLocal() as session:
+            await quota_service.refund(session, user_id)
+    except Exception as exc:
+        log.warning(f"quota_refund_failed task_id={task_id} user_id={user_id} error={exc!s}")
+
+
+# ---------------------------------------------------------------------------
+# CP-AGENT-RUNNER-INTEGRATION：通过 LangGraph agent_app.ainvoke() 跑 distill
+# ---------------------------------------------------------------------------
+
+
+async def _run_distill_via_agent(
+    task_id: str,
+    article_id: str,
+    user_id: int,
+    url: str,
+    raw_content: str,
+    source: str = "web",
+    simulate_failure: bool = False,
+) -> dict:
+    """CP-AGENT-RUNNER-RUN：把 distill 走 LangGraph agent 跑（替代 DistillPipeline.run）。
+
+    流程：
+      1) Phase 4：尝试连接 MCP echo server，把 echo/reverse 加入 default_registry
+         （失败 → 静默跳过，不影响主流程）
+      2) 从 raw_content 拼 AgentState 初始值
+      3) Phase 2：从 MemoryStore 读 user_profile + few_shot 注入到 state
+      4) await agent_app.ainvoke(state)
+      5) 把 final state 写回 articles / distilled_articles / feedback
+
+    返回 final state dict 给 distill_task 用（决定 status='done'/'failed'）。
+    """
+    from datetime import datetime, timezone
+
+    # CP-AGENT-SIMULATE-FAILURE：simulate_failure=True 走真实失败路径
+    # （FAILED + 退还配额 + 抛异常给 Arq retry），供 D9 e2e / 手工验证用。
+    if simulate_failure:
+        raise RuntimeError("simulated distill failure")
+
+    # Phase 4：MCP server 接入（CP-AGENT-MCP）。
+    # 默认关闭：每个 distill 任务起一个 MCP 子进程成本高（启动 + handshake ~200ms），
+    # 且当前 echo echo server 只是示例。生产接入真实 MCP server 时设
+    #    ENABLE_MCP_TOOLS=1
+    # 注意：anyio 在 cancel scope mismatch 时抛 RuntimeError（继承 BaseException），
+    # 所以 except 必须 catch BaseException 才能稳定吞掉 mcp 启动期错误。
+    if os.getenv("ENABLE_MCP_TOOLS", "0").lower() in {"1", "true", "yes"}:
+        try:
+            from agent.mcp_client import (
+                MCPClient,
+                register_mcp_tools_to_registry,
+                get_echo_mcp_server_command,
+            )
+
+            async with MCPClient(server_command=get_echo_mcp_server_command()) as mcp:
+                count = await register_mcp_tools_to_registry(mcp, prefix="mcp_")
+                log.info("mcp_tools_registered count=%d", count)
+        except BaseException as exc:
+            log.info(f"mcp_tools_skipped reason={type(exc).__name__}: {exc!s}")
+
+    # Phase 2：MemoryStore 读 user_profile + few_shot
+    from agent.memory import MemoryStore
+
+    store = MemoryStore(session_factory=AsyncSessionLocal)
+    user_profile = await store.load_user_profile(user_id)
+    few_shot_examples = await store.load_few_shots(topic=source, limit=3)
+
+    initial_state: AgentState = {
+        "article_id": article_id,
+        "user_id": user_id,
+        "url": url,
+        "source": source,
+        "current_step": "fetch",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "trace_id": task_id,
+        # Phase 2：memory 注入
+        "user_profile": {
+            "user_id": user_profile.user_id,
+            "tier": user_profile.tier,
+            "ab_group": user_profile.ab_group,
+            "preferences": user_profile.preferences,
+        },
+        "few_shot_examples": [
+            {
+                "input_excerpt": ex.input_excerpt,
+                "output_excerpt": ex.output_excerpt,
+                "score": ex.score,
+                "tags": ex.tags,
+            }
+            for ex in few_shot_examples
+        ],
+        # Phase 1 简化：raw_content 直接当 fetched_content 喂进 rewrite
+        # （避免真实 fetch_url 工具调外部网络；agent 后续可换 tool_registry.invoke）
+        "fetched_content": raw_content,
+    }
+
+    log.info(
+        "agent_run_started",
+        task_id=task_id,
+        article_id=article_id,
+        user_id=user_id,
+        memory_count=len(few_shot_examples),
+    )
+    final = await _agent_app.ainvoke(initial_state)
+    log.info(
+        "agent_run_completed",
+        task_id=task_id,
+        article_id=article_id,
+        status=final.get("status"),
+        error_kind=final.get("error_kind"),
+    )
+
+    # 把 final state 写回 DB
+    await _persist_agent_final(task_id, article_id, user_id, final)
+    return final
+
+
+async def _persist_agent_final(
+    task_id: str,
+    article_id: str,
+    user_id: int,
+    final: dict,
+) -> None:
+    """CP-AGENT-RUNNER-PERSIST：把 agent final state 写回 distilled_articles + feedback。
+
+    CP-AGENT-PERSIST-ARTICLE-KEY（实测修复）：
+    `distilled_articles.article_id` 上有 UNIQUE 约束（`distilled_articles_article_id_key`），
+    即「一篇文章只能有一条蒸馏结果」。旧代码只按 `id == task_id` 查行，于是：
+
+      - Arq 重试（task_id 不变）→ 命中旧行，正常；
+      - 同一篇文章换新 task_id 重跑（如我们反复验证同一篇文章）→ 查不到 →
+        INSERT → 撞唯一约束 → 整个事务被标记 rollback →
+        随后的 `db.commit()` 抛 `PendingRollbackError` →
+        **已经成功生成的 rewritten_script 一起被回滚丢弃**。
+
+    现象是日志里 `agent_persist_failed ... This Session's transaction has been
+    rolled back due to a previous exception`，而 LLM 改写的钱白花了。
+
+    修法两处：
+      1. 先按业务键 `article_id` 找行（真正的一篇一结果），找不到再按 `id == task_id`，
+         兜底才新建；
+      2. 数据行先 commit，埋点（DISTILL_FAILED）挪到**独立 session** 事后写，
+         埋点失败绝不能再回滚业务数据。
+    """
+    status = final.get("status") or "failed"
+
+    # ---- 第一步：写业务数据（独立事务，优先级最高，绝不被埋点牵连）----
+    async with AsyncSessionLocal() as db:
+        try:
+            # 业务键优先：一篇文章一条蒸馏结果
+            da_result = await db.execute(
+                select(DistilledArticle).where(DistilledArticle.article_id == article_id)
+            )
+            da = da_result.scalar_one_or_none()
+            if da is None:
+                # 兼容只认 task_id 的老数据
+                da_result = await db.execute(
+                    select(DistilledArticle).where(DistilledArticle.id == task_id)
+                )
+                da = da_result.scalar_one_or_none()
+            if da is None:
+                da = DistilledArticle(
+                    id=task_id,
+                    article_id=article_id,
+                    status="queued",  # 占位，下面会按 final 状态覆盖
+                )
+                db.add(da)
+
+            # 写 agent 产出（DistilledArticle 真实列：status/script_text/audio_url/duration_sec）
+            da.status = "done" if status == "done" else "failed"
+            if final.get("rewritten_script"):
+                da.script_text = final["rewritten_script"]
+            if final.get("tts_audio_url"):
+                da.audio_url = final["tts_audio_url"]
+            if final.get("tts_duration_sec") is not None:
+                da.duration_sec = int(final["tts_duration_sec"])
+
+            # 先 flush 让 IntegrityError 在这里暴露（而不是拖到 commit 把事务搞废）
+            await db.flush()
+            await db.commit()
+        except Exception as exc:
+            log.warning(
+                "agent_persist_failed",
+                task_id=task_id,
+                article_id=article_id,
+                error=str(exc),
+            )
+            await db.rollback()
+            return  # 数据没落上就没必要再写埋点了
+
+    # ---- 第二步：埋点（独立 session，失败只丢埋点，不影响上面的数据）----
+    # 失败 → 带 reason，让 admin dashboard 看到"为什么失败"。
+    # 注意：DistilledArticle 没有 metadata 列（见模型定义），错误详情
+    # 通过 feedback（DISTILL_FAILED.reason）持久化，不写在该行上。
+    if status == "failed" and final.get("error"):
+        async with AsyncSessionLocal() as fb_db:
+            try:
+                await track(
+                    fb_db,
+                    EventName.DISTILL_FAILED,
+                    user_id=user_id,
+                    article_id=article_id,
+                    reason=str(final["error"])[:200],
+                )
+                await fb_db.commit()
+            except Exception as exc:
+                log.warning(
+                    "agent_persist_feedback_failed",
+                    task_id=task_id,
+                    error=str(exc),
+                )
+                await fb_db.rollback()

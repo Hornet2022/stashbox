@@ -167,6 +167,15 @@ async def test_tier_config_put_rejects_vendor_mismatch(b3_client, monkeypatch):
 
     monkeypatch.setattr(sc_mod, "get_config", _fake_get)
 
+    # CP-B3-STUB-SET-CONFIG：admin_tier_config_put 里 `set_config` 是函数内 import
+    # 并直接开真 PG session（不走 get_db 依赖覆盖）。本用例只验证「供应商不匹配拒绝」
+    # 与「匹配放行」的业务判定，不需要真写库 —— 打桩掉写操作，避免依赖 PG 里
+    # system_config.updated_by FK 指向的 users 行（该行会随数据清理消失）。
+    async def _fake_set_config(key, value, updated_by=None):
+        return {"value": value, "updated_at": None}
+
+    monkeypatch.setattr(sc_mod, "set_config", _fake_set_config)
+
     payload = {"tier_model_map": {"full": {"openai": "gpt-4o"}}}
     r = await b3_client.put("/api/v1/admin/tier-config", json=payload)
     assert r.status_code == 400, r.text
