@@ -3,6 +3,8 @@
 从 main.py 抽出，路由只做编排，模型定义集中在此。
 """
 
+from typing import Optional
+
 from pydantic import BaseModel
 
 
@@ -71,8 +73,12 @@ class ArticleStatusResponse(BaseModel):
 
 class AudioUrlResponse(BaseModel):
     article_id: str
-    audio_url: str  # OSS 签名 URL（本期 mock，CP1.8+ 接真签名）
-    expires_at: str  # ISO 8601
+    audio_url: str  # 播放地址：签名 URL 或永久静态直链
+    # CP-AUDIO-URL-STATIC：静态直链不会过期，此时为 null。
+    # 客户端（Android ArticleDetailViewModel）据此跳过「过期前刷新」——
+    # 给静态地址伪造一个 expires_at 会让每次恢复播放都白跑一次本接口。
+    # 注意必须 Optional：声明成 str 时返回 null 会直接 500。
+    expires_at: Optional[str] = None  # ISO 8601；None = 永不过期
     duration_sec: int
 
 

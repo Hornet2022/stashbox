@@ -18,12 +18,18 @@ from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from stashbox.backend.common.auth import create_access_token, require_user
+from stashbox.backend.common.auth import (
+    create_access_token,
+    create_refresh_token,
+    decode_refresh_token,
+    require_user,
+)
 from stashbox.backend.common.config import settings
 from stashbox.backend.common.database import get_db
 from stashbox.backend.common.exceptions import (
     BizException,
     NotFound,
+    Unauthorized,
     register_exception_handlers,
 )
 from stashbox.backend.common.logging import setup_logging
@@ -150,6 +156,7 @@ class WechatLoginRequest(BaseModel):
 
 class WechatLoginResponse(BaseModel):
     access_token: str
+    refresh_token: str
     user_id: str
     expires_in: int
 
@@ -319,6 +326,7 @@ async def wechat_login(req: WechatLoginRequest, db: AsyncSession = Depends(get_d
         await db.refresh(user)
 
     token = create_access_token(str(user.id))
+    refresh = create_refresh_token(str(user.id))
     # CP6.2.1 埋点：user_login
     # track() 只 flush 不 commit —— 必须在 commit() 之前，否则埋点随 close() 回滚丢失
     try:
@@ -329,8 +337,50 @@ async def wechat_login(req: WechatLoginRequest, db: AsyncSession = Depends(get_d
 
     return WechatLoginResponse(
         access_token=token,
+        refresh_token=refresh,
         user_id=str(user.id),
         expires_in=settings.jwt_expire_minutes * 60,
+    )
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+
+class RefreshTokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    user_id: str
+    expires_in: int
+    tier: str = "free"
+
+
+@app.post("/api/v1/auth/refresh-token", response_model=RefreshTokenResponse)
+async def refresh_token(req: RefreshTokenRequest, db: AsyncSession = Depends(get_db)):
+    """用 refresh_token 换新 access_token + 新 refresh_token（rotate）。
+
+    网关已注册此路由（config.py:46 → user-service）。android AuthApi.refresh 调此端点；
+    access_token 过期时 AuthInterceptor 自动 refresh 一次并重放请求。
+    """
+    try:
+        payload = decode_refresh_token(req.refresh_token)
+    except HTTPException:
+        raise Unauthorized(message="invalid or expired refresh token")
+    sub = payload.get("sub")
+    if not sub:
+        raise Unauthorized(message="invalid refresh token payload")
+    result = await db.execute(select(User).where(User.id == int(sub)))
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise Unauthorized(message="user not found")
+    new_access = create_access_token(str(user.id))
+    new_refresh = create_refresh_token(str(user.id))
+    return RefreshTokenResponse(
+        access_token=new_access,
+        refresh_token=new_refresh,
+        user_id=str(user.id),
+        expires_in=settings.jwt_expire_minutes * 60,
+        tier=user.tier or "free",
     )
 
 

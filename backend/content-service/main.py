@@ -27,25 +27,21 @@ CP1.7：D9 端到端 —— 不要求登录态 → 建文章 → 自动触发 ai
   app = FastAPI(...) 仍保留在 main.py（lifespan / middleware / CORS 集中管理）。
 """
 
-import csv
-import io
 import json
-import os
 import re
 import sys
 import time
 import uuid
 from dataclasses import asdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -84,7 +80,6 @@ from stashbox.backend.common.exceptions import (
 from stashbox.backend.common.logging import get_logger, setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
 from stashbox.backend.common.models import (
-    AdminOperationLog,
     Article,
     DistilledArticle,
     Favorite,
@@ -99,12 +94,6 @@ from stashbox.backend.common.models import (
 from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common.analytics import track, track_simple
 from stashbox.backend.common.events import EventName
-from stashbox.backend.common import system_config
-from stashbox.backend.app.services.llm import (
-    SUPPORTED_PROVIDERS,
-    reload,
-    resolve_config,
-)
 
 
 def _uid(user: dict) -> int:
@@ -655,7 +644,6 @@ async def push_retry_message(user_id: int, article_id: str) -> None:
     本期卡片类型 = retry_card，data 字段含 article_id + suggested_alternative。
     注意：PushNotification 模型无 type/data 字段，简化 title+body 直接展示。
     """
-    from stashbox.backend.common.database import AsyncSessionLocal
     from stashbox.backend.common.models.push_notification import PushNotification
 
     async with AsyncSessionLocal() as session:
@@ -1417,7 +1405,14 @@ async def article_audio_url(
 ):
     """取音频播放地址：仅 status=ready 可用，其余 404。
 
-    OSS 签名本期 mock（CP1.8+ 接真签名，依赖阿里云 RAM 配置）。
+    CP-AUDIO-URL-STATIC：`audio_url` 若是**永久静态直链**（bucket 公共读 /
+    OSS_PUBLIC_BASE_URL —— 内容归属 app 账户，必须长期可播、不能擅自失效），
+    原样返回且 `expires_at=None`，客户端据此不再做「过期前刷新」。
+
+    只有当库里存的 URL **本身已带签名参数**时，才沿用阿里云 OSS 的
+    过期语义（`?Expires=...&OSSAccessKeyId=...`）。历史上的 mock 签名
+    （`Signature=mock`）仅作为签名 URL 的占位形式保留，不再无条件拼给静态直链。
+
     本地 dev 模式（STORAGE_PROVIDER=local / ENABLE_LOCAL_AUDIO_MOUNT=1）：
     audio_url 用 PUBLIC_GATEWAY_URL 拼出，避开 localhost —— 真机客户端
     连 gateway 时 localhost 指向设备自己，会 404。
@@ -1458,10 +1453,31 @@ async def article_audio_url(
         await db.commit()
     except Exception as exc:
         log.warning(f"AUDIO_PLAY_START 埋点异常（忽略）: article={article_id} err={exc}")
+    # CP-AUDIO-URL-STATIC（实测修复）：
+    # 这里的 `?Expires=...&OSSAccessKeyId=mock&Signature=mock` 是阿里云 OSS
+    # 时代的遗留（签名本期 mock，见 docstring）。现在 audio_url 多数是**永久静态
+    # 直链**（bucket 公共读 + OSS_PUBLIC_BASE_URL，内容归属 app 账户、要求长期
+    # 可播、不能擅自失效），对它做两件错事：
+    #   1. 拼上无意义的 mock 签名参数（SeaweedFS 靠"忽略未知参数"才没报错）；
+    #   2. 回报一个假的 `expires_at`，让客户端以为会过期 → 每次恢复播放/切档
+    #      都白跑一次 audio-url 接口（App 侧 isExpiringSoon() 会命中）。
+    #
+    # 现在：**只有当 URL 本来就带签名参数时**才沿用签名并回报 expires_at；
+    # 干净的静态直链原样返回、expires_at=None，客户端据此知道"不会过期"。
+    from urllib.parse import parse_qs, urlparse as _urlparse
+
+    _is_signed = bool(parse_qs(_urlparse(base).query))
+    # 已经是签名 URL → 原样返回（签名自带的过期语义照旧）
+    # 干净的静态直链   → 原样返回，expires_at=None（它不会过期）
+    _url = base
+    _expires_at = None
+    if _is_signed:  # pragma: no cover - 预留：接真签名（阿里云 RAM）后的分支
+        _expires_at = datetime.fromtimestamp(expires_ts, timezone.utc).isoformat()
+
     return AudioUrlResponse(
         article_id=art.id,
-        audio_url=f"{base}?Expires={expires_ts}&OSSAccessKeyId=mock&Signature=mock",
-        expires_at=datetime.fromtimestamp(expires_ts, timezone.utc).isoformat(),
+        audio_url=_url,
+        expires_at=_expires_at,
         duration_sec=(task.duration_sec if task else None) or 0,
     )
 
