@@ -103,6 +103,9 @@ docker-compose.override.yml
 .workbuddy/
 
 # CP-TTS-AUDIO：TTS 合成产物（每篇 15~25MB WAV），是生成物不是源码。
-# IndexTTSClient 默认写到 ai-service/data/audio/（可用 INDEXTTS_AUDIO_DIR 改）。
+# IndexTTSClient 的落盘目录是「相对 CWD 解析」的 data/audio/（可用 INDEXTTS_AUDIO_DIR 改），
+# 所以 worker 从哪个目录启动，产物就落在哪个目录下的 data/audio/。三条都要覆盖，
+# 漏掉 /data/ 的话在仓库根跑一次 worker 就会多出 12MB 未跟踪 WAV，一次 git add -A 就进去了。
 backend/ai-service/data/
 backend/data/audio/
+/data/
