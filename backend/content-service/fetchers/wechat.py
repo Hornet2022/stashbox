@@ -18,11 +18,33 @@
 本期只发 iPhone UA + Referer 单实例抓取，**不做代理池 / cookie 池**。
 如果未来反爬加严，扩展点是 `WechatFetcher._download()`（加代理 / cookie），
 不是改 fetcher 抽象层（CP2.1 契约定死）。
+
+微信抓取 4 件套（UA / Referer / Accept / Accept-Language）依据
+`docs/2026-09-28_微信公众号文章抓取SOP_v1.0.md`：
+
+- **UA 带 `MicroMessenger/`** —— 与 SOP 实战 UA 对齐。实测同一篇文章用桌面
+  Chrome UA 也能拿到 200 + 完整正文，所以 UA 不是成败分水岭；但保持
+  MicroMessenger 段是微信生态的正常形态，不亏。
+- **Referer / Accept（含 `application/xml`）/ Accept-Language（zh-CN）** ——
+  SOP §1.4「任一缺失 = 100% 失败」，照齐。
+
+真正卡死线上抓取的是**反爬判据**：旧 `_check_wechat_block()` 对整页做子串匹配，
+而真文章页的 webpack 载荷里天然含"请在微信中打开"11 处，导致 100% 正文页被误判
+AUTH。判据已改为「无 `#js_content` + 剔 script 后扫可见文本」双条件。
+
+⚠️ **不要对整页做 `unicode_escape` 解码**（SOP §1.2 的做法）：
+公众号正文是 UTF-8 中文，`s.encode('utf-8').decode('unicode_escape')`
+会把每个汉字打成 `å¾\x88å¤\x9a` 乱码。实测两篇真实文章：
+解码前 `'很多人一听到 FDE…'`，解码后 `'å¾\x88å¤\x9aäººä¸\x80…'`。
+而且 `\x3c` / `\u003c` 转义串只出现在页面尾部 webpack JS 载荷里，
+**不在 `#js_content` 正文内**（实测正文区间 `\x3c` 计数 = 0），
+所以正文抽取根本不需要解码 —— 需要时只定向替换标签相关的少数转义即可。
 """
 
 from __future__ import annotations
 
 import re
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -60,9 +82,19 @@ _JS_NAME_RE = re.compile(r'<a[^>]*id=["\']js_name["\'][^>]*>(.*?)</a>', re.DOTAL
 _PUBLISH_TIME_RE = re.compile(
     r'<em[^>]*id=["\']publish_time["\'][^>]*>(.*?)</em>', re.DOTALL | re.IGNORECASE
 )
+# 发布时间兜底：<em id="publish_time"> 常常是空的（实测两篇真实文章均为 ''），
+# 真值藏在页面尾部的 JS 变量里 `var ct = "1789965067"`（Unix 秒，UTC+8）。
+_CT_TS_RE = re.compile(r'var\s+ct\s*=\s*["\']?(\d{10})["\']?')
 _DATA_SRC_RE = re.compile(r'<img[^>]*\bdata-src=["\']([^"\']+)["\']', re.IGNORECASE)
 # <title> 的常见后缀："标题 - 公众号名" / "标题 | 公众号名"
 _TITLE_SUFFIX_RE = re.compile(r"\s*[|\-–—]\s*[^|\-–—]{1,30}$")
+
+# SOP §3 升级触发：整页 < 10KB 基本是反爬空壳 / 跳转页，不是正文。
+# 提前拦下来给"页太小"这个明确结论，避免下游误判成"文章失效"。
+MIN_SHELL_BYTES = 10 * 1024
+# 真抓取的公众号文章普遍 3.5MB 左右（大量 base64/内联资源），
+# 正文容器稳定落在页面 15%~17% 偏移处，所以这条上限留足余量不会切到 #js_content。
+MAX_HTML_CHARS = 8 * 1024 * 1024
 
 _WECHAT_BLOCKLIST_PATTERNS: list[tuple[str, FetcherErrorCode, str]] = [
     ("环境异常", FetcherErrorCode.AUTH, "wechat anti-bot environment check"),
@@ -71,11 +103,31 @@ _WECHAT_BLOCKLIST_PATTERNS: list[tuple[str, FetcherErrorCode, str]] = [
     ("此内容因违规无法查看", FetcherErrorCode.AUTH, "wechat content blocked"),
 ]
 
+# <script> / <style> 整块：判反爬前先剔掉，否则会扫进 webpack 载荷里的提示文案。
+_NONVISUAL_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
+# 有 #js_content = 这是真文章页，直接放行。
+_HAS_JS_CONTENT_RE = re.compile(r'id=["\']js_content["\']', re.IGNORECASE)
+
 
 def _check_wechat_block(html: str) -> None:
-    """命中公众号反爬 / 失效提示页 → 抛 FetcherError（AUTH / NOT_FOUND）。"""
+    """命中公众号反爬 / 失效提示页 → 抛 FetcherError（AUTH / NOT_FOUND）。
+
+    ⚠️ 判据必须是**结构 + 可见文本双条件**，不能对整页做子串匹配：
+
+    真文章页（实测 `.../s/ORtvrt9Rg_dgcGdBaPuXyQ`，3.58MB）的 webpack JS 载荷里
+    **天然带着**"请在微信中打开"等文案 11 处。整页朴素匹配会把每一篇正常文章
+    都判成 AUTH，线上等于 100% 抓取失败。
+
+    所以这里两道闸：
+      1. 页面含 `#js_content` → 一定是正文页，直接放行（反爬页没有正文容器）；
+      2. 否则先剔掉 `<script>/<style>` 再扫可见文本 —— 实测剔完后真文章里
+         这些词出现次数为 0，而真拦截页的提示文案就在 body 可见区里。
+    """
+    if _HAS_JS_CONTENT_RE.search(html):
+        return
+    visible = _NONVISUAL_RE.sub(" ", html)
     for pattern, code, msg in _WECHAT_BLOCKLIST_PATTERNS:
-        if re.search(pattern, html):
+        if re.search(pattern, visible):
             raise FetcherError(code=code, message=msg, source=SOURCE)
 
 
@@ -139,12 +191,15 @@ class WechatFetcher(Fetcher):
     - 二维码长按场景：二维码解出的 URL 也是 mp.weixin.qq.com
     """
 
+    # 必须带 MicroMessenger 段：少了这一段微信会回"请在微信中打开"壳页（实测）。
     UA = (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
-        "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1 WechatFetcher/0.1"
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.45(0x18002d39) "
+        "NetType/WIFI Language/zh_CN"
     )
     TIMEOUT = 30.0
-    MAX_HTML_CHARS = 2 * 1024 * 1024  # 解析前 HTML 截断（对齐 generic_url 的防爆上限）
+    MAX_HTML_CHARS = MAX_HTML_CHARS  # 8MB：真实公众号文章普遍 3.5MB 左右
+    MIN_SHELL_BYTES = MIN_SHELL_BYTES  # 低于 10KB 判定为空壳
 
     def __init__(self, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
         # transport 只是测试注入点（httpx.MockTransport），生产走默认 transport
@@ -179,7 +234,7 @@ class WechatFetcher(Fetcher):
 
     # -- 下载 ---------------------------------------------------------------
     async def _download(self, url: str, *, timeout: float) -> tuple[str, int, str]:
-        """抓 HTML：iPhone UA + Referer（公众号对外站 UA 敏感），返回 (html, status, final_url）。"""
+        """抓 HTML：微信 4 件套齐发，返回 (html, status, final_url)。"""
         client_kwargs: dict[str, Any] = {
             "timeout": timeout,
             "follow_redirects": True,
@@ -188,8 +243,9 @@ class WechatFetcher(Fetcher):
             "headers": {
                 "User-Agent": self.UA,
                 "Referer": "https://mp.weixin.qq.com/",
-                "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                # application/xml 不能省：缺了部分 CDN 返 406（SOP §1.4）
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9",
             },
         }
         if self._transport is not None:
@@ -258,9 +314,17 @@ class WechatFetcher(Fetcher):
         time_match = _PUBLISH_TIME_RE.search(html)
         if time_match:
             raw_local = _norm(time_match.group(1))
-            if publish_time is None:
+            if publish_time is None and raw_local:
                 publish_time = _parse_datetime(raw_local.replace(" ", "T"))
                 publish_time_raw = raw_local
+        # 再兜底 `var ct = "<unix>"`：<em id="publish_time"> 真实文章里常是空的
+        # （实测两篇均为 ''），真发布时间只在页面尾部 JS 变量里。
+        if publish_time is None:
+            ct_match = _CT_TS_RE.search(html)
+            if ct_match:
+                ts = int(ct_match.group(1))
+                publish_time = datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=8)))
+                publish_time_raw = f"var_ct:{ts}"
 
         # media：og:image + 正文里懒加载的 <img data-src>（公众号真图链接）
         media_urls = list(media_ex.urls)
@@ -310,9 +374,16 @@ class WechatFetcher(Fetcher):
         """取 `<div id="js_content">` 内容；拿不到就是反爬页 / 结构变了 → PARSE。"""
         match = _JS_CONTENT_RE.search(html) or _JS_CONTENT_FALLBACK_RE.search(html)
         if not match:
+            # SOP §3 升级触发：整页 < 10KB 几乎必是反爬空壳 / 跳转页。
+            # 不在前置下载阶段拦（短文/测试 fixture 也可能很小），而是在这里
+            # 确认"抽不到正文"之后补上这个结论，让排障方向明确。
+            size = len(html.encode("utf-8", errors="ignore"))
+            hint = ""
+            if size < MIN_SHELL_BYTES:
+                hint = f" (page too small: {size}B < {MIN_SHELL_BYTES}B — 反爬空壳/跳转页)"
             raise FetcherError(
                 code=FetcherErrorCode.PARSE,
-                message="wechat article body (#js_content) not found",
+                message=f"wechat article body (#js_content) not found{hint}",
                 source=SOURCE,
             )
         return match.group(1).strip()

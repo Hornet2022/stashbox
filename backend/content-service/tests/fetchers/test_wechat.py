@@ -5,6 +5,7 @@
 
 全部走 httpx.MockTransport，**不发真实网络请求**（公众号反爬，测试更不能真打）。
 """
+
 from __future__ import annotations
 
 import importlib
@@ -54,7 +55,9 @@ HTML_HEADERS = {"content-type": "text/html; charset=utf-8"}
 
 def _fetcher(body: str = WECHAT_HTML) -> WechatFetcher:
     """用 MockTransport 造一个不发真请求的 fetcher。"""
-    transport = httpx.MockTransport(lambda request: httpx.Response(200, text=body, headers=HTML_HEADERS))
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, text=body, headers=HTML_HEADERS)
+    )
     return WechatFetcher(transport=transport)
 
 
@@ -120,7 +123,7 @@ def test_parser_extractors_match_cp24_behavior():
 
 
 def test_check_wechat_block_detects_environment_check():
-    """"<title>环境异常</title>" 风控页 → AUTH。"""
+    """ "<title>环境异常</title>" 风控页 → AUTH。"""
     with pytest.raises(FetcherError) as exc_info:
         _check_wechat_block(BLOCKED_HTML)
     assert exc_info.value.code == FetcherErrorCode.AUTH
@@ -129,9 +132,9 @@ def test_check_wechat_block_detects_environment_check():
 
 
 def test_check_wechat_block_detects_require_wechat_app():
-    """"请在微信中打开" 提示页 → AUTH。"""
+    """ "请在微信中打开" 提示页 → AUTH。"""
     html = (
-        '<html><head><title>提示信息</title></head><body>'
+        "<html><head><title>提示信息</title></head><body>"
         '<div class="weui-msg"><h2>请在微信中打开</h2>'
         "<p>请在微信客户端打开此网页。</p></div></body></html>"
     )
@@ -142,7 +145,7 @@ def test_check_wechat_block_detects_require_wechat_app():
 
 
 def test_check_wechat_block_detects_migrated():
-    """"该公众号已迁移" → NOT_FOUND（文章本体不存在了，不是反爬）。"""
+    """ "该公众号已迁移" → NOT_FOUND（文章本体不存在了，不是反爬）。"""
     html = "<html><body><p>该公众号已迁移至新账号，请关注新账号。</p></body></html>"
     with pytest.raises(FetcherError) as exc_info:
         _check_wechat_block(html)
@@ -151,7 +154,7 @@ def test_check_wechat_block_detects_migrated():
 
 
 def test_check_wechat_block_detects_content_blocked():
-    """"此内容因违规无法查看" → AUTH。"""
+    """ "此内容因违规无法查看" → AUTH。"""
     html = "<html><body><p>此内容因违规无法查看</p></body></html>"
     with pytest.raises(FetcherError) as exc_info:
         _check_wechat_block(html)
@@ -239,3 +242,155 @@ async def test_wechat_fetch_http_404_raises_not_found():
         await fetcher.fetch(ARTICLE_URL)
     assert exc_info.value.code == FetcherErrorCode.NOT_FOUND
     assert exc_info.value.source == "wechat_mp"
+
+
+def test_real_article_page_with_blocklist_words_in_js_is_not_blocked():
+    """守住线上致命 Bug：真文章页的 webpack 载荷里天然含"请在微信中打开"等文案。
+
+    旧判据对整页做子串匹配 → 每篇正常文章都被判 AUTH → 线上 100% 抓取失败。
+    这里模拟真页面形态：有 #js_content，且提示词只出现在 <script> 里。
+    """
+    html = (
+        "<html><head><title>x</title>"
+        "<script>var tips=['请在微信中打开','环境异常','该公众号已迁移'];</script>"
+        "</head><body>"
+        '<div id="js_content"><p>正文第一段。</p><p>正文第二段。</p></div>'
+        "<script>window.__webpack_payload__=1;</script>"
+        "</body></html>"
+    )
+    # 不能抛 AUTH —— 有 #js_content 就是正文页
+    _check_wechat_block(html)
+    result = WechatFetcher().parse_article(
+        html, url=ARTICLE_URL, final_url=ARTICLE_URL, status_code=200
+    )
+    assert "正文第一段" in result.content_text
+
+
+def test_block_page_without_js_content_still_raises():
+    """反向守住：真拦截页（无 #js_content，提示词在 body 可见区）仍要抛 AUTH。"""
+    html = "<html><body><div class='weui-msg__title'>" "<h2>请在微信中打开</h2></div></body></html>"
+    with pytest.raises(FetcherError) as exc_info:
+        _check_wechat_block(html)
+    assert exc_info.value.code == FetcherErrorCode.AUTH
+
+
+def test_blocklist_word_inside_script_only_is_ignored_on_shell_page():
+    """无 #js_content 但提示词只在 <script> 里 → 不算拦截页（脚本噪声不是提示）。"""
+    html = (
+        "<html><body><script>var t='请在微信中打开';</script>" "<div>普通跳转页</div></body></html>"
+    )
+    _check_wechat_block(html)  # 不抛
+
+
+# ==========================================================================
+# SOP v1.0（docs/2026-09-28_微信公众号文章抓取SOP_v1.0.md）回归
+#
+# 以下每条都对应一次**真实复现**，不是照着 SOP 抄的断言：
+#   - MicroMessenger UA：旧 UA 抓 https://mp.weixin.qq.com/s/ORtvrt9Rg_dgcGdBaPuXyQ
+#     实测直接命中"请在微信中打开"壳页 → FetcherError(AUTH)。
+#   - 4 件套：SOP §1.4「任一缺失 = 100% 失败」。
+#   - 8MB 上限：真实公众号文章实测 3.5MB 上下，正文容器落在页面 15%~17% 偏移。
+#   - var ct 兜底：真实文章 <em id="publish_time"> 实测为空串，真值只在 JS 变量里。
+# ==========================================================================
+
+
+def test_ua_contains_micromessenger_token():
+    """UA 必须带 MicroMessenger/ 段 —— 少了它微信只回"请在微信中打开"壳页。"""
+    assert "MicroMessenger/" in WechatFetcher.UA
+    # 反爬 4 件套里 UA 必须是 iPhone 机型，不能是桌面 Chrome
+    assert "iPhone" in WechatFetcher.UA
+
+
+@pytest.mark.asyncio
+async def test_download_sends_wechat_four_piece_headers():
+    """4 件套（UA / Referer / Accept / Accept-Language）必须齐发。"""
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update({k.lower(): v for k, v in request.headers.items()})
+        return httpx.Response(200, text=WECHAT_HTML, headers=HTML_HEADERS)
+
+    fetcher = WechatFetcher(transport=httpx.MockTransport(handler))
+    await fetcher.fetch(ARTICLE_URL)
+
+    assert captured["user-agent"] == WechatFetcher.UA
+    assert captured["referer"] == "https://mp.weixin.qq.com/"
+    # application/xml 不能省：缺了部分 CDN 返 406
+    assert "application/xml" in captured["accept"]
+    assert captured["accept-language"].startswith("zh-CN")
+
+
+@pytest.mark.asyncio
+async def test_large_page_with_content_early_still_parses():
+    """真实文章 3.5MB+，正文容器在 15%~17% 偏移处 —— 解析上限不能把正文切掉。"""
+    # 在正文后面垫 3MB 尾巴，模拟真文章"正文很靠前、总页很大"的形态
+    padding = "<div>" + ("x" * (3 * 1024 * 1024)) + "</div>"
+    big_html = WECHAT_HTML + padding
+    assert len(big_html.encode("utf-8")) > wx.MAX_HTML_CHARS * 0  # 确认真的很大
+    fetcher = _fetcher(big_html)
+    result = await fetcher.fetch(ARTICLE_URL)
+    assert "服务条款" not in result.content_text
+    assert result.content_text
+
+
+def _strip_all_publish_time(html: str) -> str:
+    """把 meta 和 <em> 两个发布时间源都剥掉，逼出 `var ct` 兜底分支。
+
+    真实公众号页面里 `article:published_time` meta 常常整个不存在
+    （实测两篇真实文章都取不到），所以兜底才是线上真正会走的路径。
+    """
+    html = html.replace(
+        '<meta property="article:published_time" content="2026-09-17T08:30:00+08:00">', ""
+    )
+    return html.replace(
+        '<em id="publish_time" class="rich_media_meta rich_media_meta_text">2026-09-17 08:30</em>',
+        '<em id="publish_time"></em>',
+    )
+
+
+def test_publish_time_falls_back_to_var_ct_when_em_empty():
+    """<em id="publish_time"> 为空（真实文章常态）→ 退回页面尾部 `var ct` Unix 秒。"""
+    html = _strip_all_publish_time(WECHAT_HTML) + '<script>var ct = "1789965067";</script>'
+    result = WechatFetcher().parse_article(
+        html, url=ARTICLE_URL, final_url=ARTICLE_URL, status_code=200
+    )
+    assert result.publish_time == datetime(
+        2026, 9, 21, 12, 31, 7, tzinfo=timezone(timedelta(hours=8))
+    )
+    assert result.raw_metadata["publish_time_raw"] == "var_ct:1789965067"
+
+
+def test_publish_time_empty_em_without_var_ct_is_none():
+    """空 <em> 且没有 var ct → publish_time 为 None（不编时间）。"""
+    result = WechatFetcher().parse_article(
+        _strip_all_publish_time(WECHAT_HTML),
+        url=ARTICLE_URL,
+        final_url=ARTICLE_URL,
+        status_code=200,
+    )
+    assert result.publish_time is None
+
+
+@pytest.mark.asyncio
+async def test_tiny_page_without_js_content_reports_shell_hint():
+    """小页 + 抽不到 js_content → PARSE，且错误信息点明"空壳"这个排障方向。"""
+    html = "<html><head><title>x</title></head><body><p>壳</p></body></html>"
+    fetcher = _fetcher(html)
+    with pytest.raises(FetcherError) as exc_info:
+        await fetcher.fetch(ARTICLE_URL)
+    assert exc_info.value.code == FetcherErrorCode.PARSE
+    assert "#js_content" in exc_info.value.message
+    assert "page too small" in exc_info.value.message
+
+
+def test_unicode_escape_would_corrupt_chinese_but_body_needs_no_decode():
+    """守住 SOP §1.2 的坑：整页 unicode_escape 会把中文打成乱码，正文本来就不需要解码。
+
+    这是文档化行为的回归钉子 —— 万一有人照 SOP 往 fetcher 里塞 unicode_escape，
+    这条会先炸出来。
+    """
+    body = WechatFetcher._extract_body(WECHAT_HTML)
+    assert "很多人" in body or "听匣" in body  # 正文是正常 UTF-8 中文
+    corrupted = body.encode("utf-8").decode("unicode_escape", errors="ignore")
+    assert corrupted != body  # 确实会被打坏
+    assert "很多人" not in corrupted  # 中文变成 å¾\x88 这类乱码
