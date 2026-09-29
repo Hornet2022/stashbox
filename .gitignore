@@ -101,3 +101,8 @@ docker-compose.override.yml
 .aliyun/
 *.icp-record
 .workbuddy/
+
+# CP-TTS-AUDIO：TTS 合成产物（每篇 15~25MB WAV），是生成物不是源码。
+# IndexTTSClient 默认写到 ai-service/data/audio/（可用 INDEXTTS_AUDIO_DIR 改）。
+backend/ai-service/data/
+backend/data/audio/
