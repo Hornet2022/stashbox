@@ -23,17 +23,19 @@ import io
 import json
 import os
 import re
-import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from redis.asyncio import Redis
+
+from stashbox.backend.common.redis_client import get_redis_pool
 
 from clients.ai_client import get_ai_client  # noqa: E402
 
@@ -57,7 +59,6 @@ from stashbox.backend.app.services.llm import (
     reload,
     resolve_config,
 )
-from stashbox.backend.app.services import tts as tts_service
 from stashbox.backend.app.services.tts import (
     SUPPORTED_PROVIDERS as TTS_SUPPORTED_PROVIDERS,
     reload as tts_reload,
@@ -529,28 +530,175 @@ async def admin_llm_config_put(
     )
 
 
+# ---------------------------------------------------------------------------
+# CP-LLM-TEST-ERR：/admin/llm/test 错误分类
+#
+# 之前直接把 f"{type(exc).__name__}: {exc}"[:300] 吐给前端，401/403/404/超时/网络错
+# 全混在一起，用户看不出是 API key 错、模型不存在、欠费还是网络问题。
+# 这里归一到 error_kind + status_code + 给一段「能直接照着做」的中文 hint；
+# 同时去脱敏（httpx 异常里偶尔会带上 Authorization header）。
+# ---------------------------------------------------------------------------
+
+# 错误分类。前端按 kind 渲染不同 toast 引导：
+#   auth      API key 无效 / 过期 / 权限不足（401）
+#   forbidden 账号受限：欠费 / 无该模型权限 / 区域不允许（403）
+#   notfound  模型不存在 / base_url 路径错（404）
+#   badreq    参数非法（400/422）—— 一般是模型名拼错、temperature 越界等
+#   ratelimit 触发限流（429）；hint 里有 retry-after 秒数（如果有）
+#   timeout   第三方服务在 timeout 内未响应
+#   connect   无法连到 base_url（DNS / 端口不通 / 跨网段）
+#   network   其他传输错误（SSL、TLS、连接重置等）
+#   internal  内部代码错误（KeyError、JSONDecode、未实现等），不该被运维看到原样
+LLM_TEST_ERROR_KINDS = frozenset(
+    {
+        "auth",
+        "forbidden",
+        "notfound",
+        "badreq",
+        "ratelimit",
+        "timeout",
+        "connect",
+        "network",
+        "internal",
+    }
+)
+
+# 默认引导文案（按场景给"下一步干啥"）。error_kind -> 一句话中文。
+# 注意这是 hint（提示用户），不是原始异常的复述 —— 原始异常放 detail 字段。
+_LLM_ERROR_HINTS: dict[str, str] = {
+    "auth": "API key 无效或已过期，请检查后重新保存配置",
+    "forbidden": "账号被限制使用该模型（可能欠费、无模型权限或区域受限），请到供应商后台核查",
+    "notfound": "模型不存在或 Base URL 路径错误，请核对「模型名」和「Base URL」",
+    "badreq": "请求参数不合法（通常是模型名格式不对或参数越界），请检查配置",
+    "ratelimit": "请求过于频繁，请稍后再试",
+    "timeout": "第三方服务未在 timeout 内响应，可能正在排队或服务卡死，请稍后重试",
+    "connect": "无法连接到 LLM 服务端，请检查 Base URL（含端口、协议）是否可访问",
+    "network": "网络传输异常（SSL/连接重置等），请检查网络环境或代理设置",
+    "internal": "服务端处理异常（响应格式非预期），请联系开发排查并附上 detail",
+}
+
+
+def _classify_llm_error(exc: BaseException) -> dict[str, Any]:
+    """把任意异常压成 {kind, status_code, hint, detail}。
+
+    - kind: 上方 LLM_TEST_ERROR_KINDS 之一，前端用它选 toast 文案
+    - status_code: 第三方服务实际返回的 HTTP 状态码（如果有）
+    - hint: 给操作员看的「下一步干啥」中文提示
+    - detail: 原始异常字符串（脱敏后），技术排查用
+
+    特别注意 httpx.ConnectError / TimeoutException / HTTPStatusError 的区分；
+    同时脱敏 Authorization / Bearer token，避免 API key 跟着错误回显出去。
+    """
+    # 嵌套异常：openai / qwen client 在 3 次 retry 后抛
+    #   RuntimeError("... after 3 attempts: <last_err>")
+    # last_err 通常是 HTTPStatusError 或 TimeoutException，但被 str() 包了一层；
+    # 我们先取最里层的 cause 来分类。
+    inner = exc
+    while inner.__cause__ is not None and inner.__cause__ is not inner:
+        inner = inner.__cause__
+    # httpx.HTTPStatusError: 看 status_code；httpx.TimeoutException: timeout；
+    # httpx.ConnectError / NetworkError: connect / network。
+    status_code: int | None = None
+    retry_after: str | None = None
+    kind = "internal"
+    if isinstance(inner, httpx.HTTPStatusError):
+        status_code = inner.response.status_code
+        retry_after = inner.response.headers.get("retry-after")
+        sc = inner.response.status_code
+        if sc == 401:
+            kind = "auth"
+        elif sc == 403:
+            kind = "forbidden"
+        elif sc == 404:
+            kind = "notfound"
+        elif sc in (400, 422):
+            kind = "badreq"
+        elif sc == 429:
+            kind = "ratelimit"
+        elif sc >= 500:
+            kind = "internal"  # 服务端 5xx 当成"内部"（不是用户配置问题）
+        else:
+            kind = "badreq"
+    elif isinstance(inner, httpx.TimeoutException):
+        kind = "timeout"
+    elif isinstance(inner, httpx.ConnectError):
+        kind = "connect"
+    elif isinstance(inner, httpx.NetworkError):
+        kind = "network"
+    elif isinstance(inner, httpx.HTTPError):
+        # 兜底 httpx 家族异常
+        kind = "network"
+
+    hint = _LLM_ERROR_HINTS.get(kind, _LLM_ERROR_HINTS["internal"])
+    if kind == "ratelimit" and retry_after:
+        hint = f"{hint}（Retry-After: {retry_after}s）"
+
+    # 原始异常字符串（脱敏：去掉 Authorization / Bearer xxx）
+    raw = f"{type(inner).__name__}: {inner}"
+    # httpx 的 Request URL 形式：for url 'https://...' —— 把 URL 里 query 中的 key
+    # （罕见但有）也一起去掉。简单起见，把 Authorization: Bearer xxxx 整段删。
+    detail = re.sub(r"Authorization:\s*Bearer\s+\S+", "Authorization: Bearer ***", raw)
+    # 防御：万一 URL 里塞了 api_key 参数也清掉
+    detail = re.sub(r"(api_key|access_token)=[^&\s]+", r"\1=***", detail)
+    # 限长保护：500 字，避免特殊响应体塞爆日志和前端
+    if len(detail) > 500:
+        detail = detail[:500] + "…"
+
+    return {
+        "kind": kind,
+        "status_code": status_code,
+        "hint": hint,
+        "detail": detail,
+    }
+
+
 @router.get("/api/v1/admin/llm/test")
 async def admin_llm_test(user: dict = Depends(require_admin_or_operator)):
     """CP7.3 联调真验用：用当前 factory 的 client 发一次 chat()，确认 provider 真换了。
 
     临时端点 —— 用 ENABLE_LLM_TEST_ENDPOINT=0 关掉（关掉后返回 404）。
-    openai client 的 chat() 还是 CP7.1 的 NotImplementedError 占位实现，
-    所以 provider=openai 时这里会 ok=false + 报错，但 provider 字段能证明切换生效。
+    openai client 的 chat() 是 CP7.3.4 真实现；provider=openai 也会真发请求，
+    所以这里的 ok / error_kind 是这次"调通与否"的真实信号。
+
+    响应字段：
+        ok             bool 是否成功拿到 chat() 返回
+        provider       当前生效的 provider 名
+        model          当前生效的模型名
+        text           成功时的 LLM 返回文本（成功才有）
+        error_kind     失败时的分类（auth/forbidden/notfound/badreq/ratelimit/
+                       timeout/connect/network/internal，前端按 kind 渲染 toast）
+        status_code    第三方服务返回的 HTTP 状态码（如果是 HTTP 类错误；否则 null）
+        hint           给操作员的「下一步干啥」中文提示
+        detail         原始异常的脱敏字符串，技术排查用（不再 300 字截断）
     """
     if os.getenv("ENABLE_LLM_TEST_ENDPOINT", "1").lower() in {"0", "false", "no"}:
         raise NotFound(message="llm test endpoint disabled")
 
     client = await reload()
-    result = {
+    result: dict[str, Any] = {
         "provider": client.provider_name,
         "model": getattr(client, "model", None),
     }
     try:
-        result["text"] = await client.chat("CP7.3 hot-reload smoke test：用一句话总结这段话。")
+        text = await client.chat("CP7.3 hot-reload smoke test：用一句话总结这段话。")
         result["ok"] = True
+        result["text"] = text
+        # 成功也回 null 字段，保证前端 schema 一致（兼容字段 error 也置 null，
+        # 避免老前端区分"无 error 键"与"error=null"时出 bug）
+        result["error"] = None
+        result["error_kind"] = None
+        result["status_code"] = None
+        result["hint"] = None
+        result["detail"] = None
     except Exception as exc:
+        cls = _classify_llm_error(exc)
         result["ok"] = False
-        result["error"] = f"{type(exc).__name__}: {exc}"[:300]
+        result["error"] = cls["hint"]  # 兼容老前端字段（直接展示这一行 hint）
+        result["error_kind"] = cls["kind"]
+        result["status_code"] = cls["status_code"]
+        result["hint"] = cls["hint"]
+        result["detail"] = cls["detail"]
+        # 失败时 text 不返回（避免和 error 含义冲突）
     return result
 
 
@@ -689,7 +837,7 @@ async def admin_tts_test(user: dict = Depends(require_admin_or_operator)):
         raise NotFound(message="tts test endpoint disabled")
 
     client = await tts_reload()
-    result = {
+    result: dict[str, Any] = {
         "provider": client.provider_name,
         "voice": getattr(client, "voice", None),
     }
@@ -701,10 +849,231 @@ async def admin_tts_test(user: dict = Depends(require_admin_or_operator)):
         )
         result["bytes_len"] = len(b or b"")
         result["ok"] = bool(b)
+        # 成功也回 null 字段，保证前端 schema 一致
+        result["error"] = None
+        result["error_kind"] = None
+        result["status_code"] = None
+        result["hint"] = None
+        result["detail"] = None
     except Exception as exc:
+        cls = _classify_tts_error(exc, client.provider_name)
         result["ok"] = False
-        result["error"] = f"{type(exc).__name__}: {exc}"[:300]
+        result["bytes_len"] = None
+        # 兼容老字段：error 直接展示 hint 文案
+        result["error"] = cls["hint"]
+        result["error_kind"] = cls["kind"]
+        result["status_code"] = cls["status_code"]
+        result["hint"] = cls["hint"]
+        result["detail"] = cls["detail"]
     return result
+
+
+# ---------------------------------------------------------------------------
+# CP-TTS-TEST-ERR：/admin/tts/test 错误分类
+#
+# 之前和 LLM 一样直接吐 `f"{type(exc).__name__}: {exc}"[:300]`，5 个 provider
+# （mock/edge/openai/doubao/local/indextts）错误全混在一起：
+#   - openai / doubao / indextts 把 httpx 异常包成 RuntimeError(...)：
+#     `RuntimeError("OpenAITTS 错误 401: {...}")`、
+#     `IndexTTSError("参考音频文件不存在: ...")`，
+#     单纯 isinstance(httpx.HTTPStatusError) 判不出来。
+#   - edge 是 `RuntimeError("edge-tts 未安装")` / `RuntimeError("Edge TTS 返回空 bytes")`，
+#     无 HTTP 概念。
+#   - local 是子进程失败：`RuntimeError("say 合成失败...")` / `RuntimeError("ffmpeg 转码失败...")`。
+#
+# 分类策略：先看 cause 链（httpx.TimeoutException / ConnectError / NetworkError），
+# 兜底再正则匹配 RuntimeError 消息字符串提取 HTTP 状态码 / provider 专属关键词。
+# ---------------------------------------------------------------------------
+
+# TTS 错误分类。复用 LLM 大部分 kind，新增 4 个 TTS 专属：
+#   empty            返回 200 但 audio bytes 为空（4 个 provider 都会抛"返回空音频/bytes"）
+#   missing_dep      缺 Python 包（如 edge-tts 没装）
+#   subprocess       本地子进程失败（say / ffmpeg）
+#   business_code    火山引擎业务错误码（code=4xxxxxxx，HTTP 是 200 但业务失败）
+TTS_TEST_ERROR_KINDS = frozenset(
+    {
+        "auth",
+        "forbidden",
+        "notfound",
+        "badreq",
+        "ratelimit",
+        "timeout",
+        "connect",
+        "network",
+        "empty",
+        "missing_dep",
+        "subprocess",
+        "business_code",
+        "internal",
+    }
+)
+
+# 错误分类 → 中文引导文案。error_kind → "下一步干啥"。
+_TTS_ERROR_HINTS: dict[str, str] = {
+    "auth": "API Key 无效或缺失，请检查后重新保存配置",
+    "forbidden": "账号被限制（可能欠费、无该模型权限或区域受限），请到供应商后台核查",
+    "notfound": "资源不存在 —— 模型/音色 ID 错、Base URL 路径错或参考音频文件找不到",
+    "badreq": "请求参数非法（通常是模型名/音色 ID 格式不对），请检查配置",
+    "ratelimit": "请求过于频繁，请稍后再试",
+    "timeout": "TTS 服务在 timeout 内未响应，可能正在排队或服务卡死，请稍后重试",
+    "connect": "无法连接到 TTS 服务端，请检查 Base URL（含端口、协议）和网络",
+    "network": "网络传输异常（SSL/连接重置等），请检查网络环境或代理设置",
+    "empty": "TTS 服务返回了 200 但音频为空（可能音色 ID 不对或服务端异常），请检查配置或重试",
+    "missing_dep": "依赖 Python 包未安装，请按提示 pip install 后重启 ai-service",
+    "subprocess": "本地子进程失败 —— 检查 ffmpeg 是否在路径中、`say` 是否可用、或磁盘剩余空间",
+    "business_code": "供应商业务错误码（HTTP 200 但业务失败），通常是无权限/欠费/参数错，请到供应商后台核查",
+    "internal": "服务端处理异常（响应格式非预期），请联系开发排查并附上 detail",
+}
+
+# 从 RuntimeError 字符串里抠出 HTTP 状态码的正则（兜底用）。
+# 覆盖 4 个 provider 的 4 种写法：
+#   OpenAITTS 错误 401: {...}
+#   Doubao TTS HTTP 401: ...
+#   IndexTTS HTTP 401: ...
+#   Client error '401 Unauthorized' for url '...'
+_TTS_HTTP_CODE_RE = re.compile(r"(?:HTTP\s+|\u9519\u8bef\s+|Client error ')(\d{3})")
+
+# 火山引擎业务错误码（HTTP 200 但 code 非 0 / 20000000）：
+#   Doubao TTS 错误: code=4500000 message="..."
+# 火山引擎 code 是 7 位数字（4xxxxxxx / 20000000），用 \d{5,7} 兼容历史 5 位格式。
+_TTS_TSCODE_RE = re.compile(r"code=(\d{5,7})")
+
+
+def _classify_tts_error(exc: BaseException, provider: str) -> dict[str, Any]:
+    """把任意 TTS 异常压成 {kind, status_code, hint, detail}。
+
+    分类优先级：
+      1) cause 链里有 HTTPStatusError → 按状态码分（auth/forbidden/...）
+      2) cause 链里有 TimeoutException → timeout
+      3) cause 链里有 ConnectError → connect
+      4) cause 链里有 NetworkError → network
+      5) 字符串匹配 provider 专属关键词（未安装/返回空/子进程错/参考音频/业务码）
+      6) 字符串里抠 HTTP 状态码按数字分
+      7) 兜底 internal
+
+    注意：openai/doubao/indextts 把 httpx 异常包了 RuntimeError，
+    所以优先级 1-4 通常需要在 __cause__ 链上找；edge/local 没有 HTTP 概念，
+    走优先级 5。
+    """
+    # 把 cause 链展开成列表（去掉自引用）
+    chain: list[BaseException] = []
+    cur: BaseException | None = exc
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        chain.append(cur)
+        seen.add(id(cur))
+        cur = cur.__cause__
+
+    # 沿 cause 链找 HTTPStatusError（拿状态码）
+    status_code: int | None = None
+    retry_after: str | None = None
+    for e in chain:
+        if isinstance(e, httpx.HTTPStatusError):
+            status_code = e.response.status_code
+            retry_after = e.response.headers.get("retry-after")
+            break
+
+    kind = "internal"
+    if any(isinstance(e, httpx.HTTPStatusError) for e in chain):
+        # 优先级 1：按 HTTPStatusError 的状态码分
+        sc = status_code or 0
+        if sc == 401:
+            kind = "auth"
+        elif sc == 403:
+            kind = "forbidden"
+        elif sc == 404:
+            kind = "notfound"
+        elif sc in (400, 422):
+            kind = "badreq"
+        elif sc == 429:
+            kind = "ratelimit"
+        elif sc >= 500:
+            kind = "internal"
+        else:
+            kind = "badreq"
+    elif any(isinstance(e, httpx.TimeoutException) for e in chain):
+        kind = "timeout"
+    elif any(isinstance(e, httpx.ConnectError) for e in chain):
+        kind = "connect"
+    elif any(isinstance(e, httpx.NetworkError) for e in chain):
+        kind = "network"
+    else:
+        # 优先级 5：字符串匹配（兜底 —— openai/doubao/indextts 都用 RuntimeError 把
+        # 真实 HTTP 状态码埋进字符串里，正则提不出来就走 internal）
+        msg = str(exc) or ""
+        msg_lc = msg.lower()
+        # missing_dep
+        if "未安装" in msg or "未装" in msg:
+            kind = "missing_dep"
+        # subprocess（local provider 专属）
+        elif "say 合成失败" in msg or "ffmpeg 转码失败" in msg:
+            kind = "subprocess"
+        # empty
+        elif "返回空音频" in msg or "返回空 bytes" in msg:
+            kind = "empty"
+        # notfound（indextts 参考音频路径错 / 模型不存在）
+        elif (
+            "参考音频文件不存在" in msg
+            or "参考音频太小" in msg
+            or (provider == "indextts" and "参考音频" in msg)
+        ):
+            kind = "notfound"
+        # auth（缺凭证）：openai 写"需要 api_key"、doubao 写"需要 Coding Plan 专属 API Key"
+        # 用正则覆盖"需要" + 中间 ≤40 字 + "api_key|API Key|凭证|API_KEY"
+        elif re.search(r"需要.{0,40}?(api[_ ]?key|API Key|API_KEY|凭证)", msg, re.DOTALL):
+            kind = "auth"
+        # business_code（火山引擎业务码）
+        elif "doubao tts 错误: code=" in msg_lc:
+            kind = "business_code"
+        elif status_code is None:
+            # 优先级 6：字符串里抠 HTTP 状态码
+            m = _TTS_HTTP_CODE_RE.search(msg)
+            if m:
+                sc = int(m.group(1))
+                status_code = sc
+                if sc == 401:
+                    kind = "auth"
+                elif sc == 403:
+                    kind = "forbidden"
+                elif sc == 404:
+                    kind = "notfound"
+                elif sc in (400, 422):
+                    kind = "badreq"
+                elif sc == 429:
+                    kind = "ratelimit"
+                elif sc >= 500:
+                    kind = "internal"
+                else:
+                    kind = "badreq"
+
+    hint = _TTS_ERROR_HINTS.get(kind, _TTS_ERROR_HINTS["internal"])
+    if kind == "ratelimit" and retry_after:
+        hint = f"{hint}（Retry-After: {retry_after}s）"
+    # business_code 把码值带进 hint，方便操作员一眼看到
+    if kind == "business_code":
+        code_match = _TTS_TSCODE_RE.search(str(exc))
+        if code_match:
+            hint = f"{hint}（code={code_match.group(1)}）"
+
+    # 脱敏：去 Authorization / Bearer / api_key query 参数 / X-Api-Key / env 变量
+    raw = f"{type(exc).__name__}: {exc}"
+    detail = re.sub(r"Authorization:\s*Bearer\s+\S+", "Authorization: Bearer ***", raw)
+    detail = re.sub(r"(api_key|access_token)=[^&\s]+", r"\1=***", detail)
+    detail = re.sub(r"X-Api-Key:\s*\S+", "X-Api-Key: ***", detail)
+    detail = re.sub(
+        r"(DOUBAO_TTS_API_KEY|DOUBAO_TTS_TOKEN|OPENAI_TTS_API_KEY)=\S+",
+        r"\1=***",
+        detail,
+    )
+    if len(detail) > 500:
+        detail = detail[:500] + "…"
+
+    return {
+        "kind": kind,
+        "status_code": status_code,
+        "hint": hint,
+        "detail": detail,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1019,11 +1388,15 @@ async def admin_export_subscriptions_csv(
     return _stream_csv(filename, header, fetch)
 
 
-async def _safe_revenue(db: AsyncSession) -> float:
+async def _safe_revenue(db: AsyncSession) -> tuple[float, bool]:
     """本月已支付订单金额合计（revenue）。
 
     orders 表在部分部署可能不存在（无独立 migration 约束），缺表/缺列时返回 0
-    而非让 stats 端点整体 500。
+    而非让 stats 端点整体 500。第二返回值表示数据是否可获取（False = 表缺失），
+    前端用 revenue_available=false 触发 tooltip 提示 admin「数据源缺失」。
+
+    重要：PG 在 SQL 失败时会将当前事务置为 abort 状态；except 必须显式 rollback
+    重置事务，否则调用方后续所有 SQL 都会 InFailedSQLTransactionError。
     """
     try:
         val = await db.scalar(
@@ -1033,41 +1406,121 @@ async def _safe_revenue(db: AsyncSession) -> float:
                 "AND date_trunc('month', created_at) = date_trunc('month', now())"
             )
         )
-        return float(val or 0)
+        return float(val or 0), True
     except Exception:
-        return 0.0
+        # 重置事务状态（PG 失败后会把整个事务打废，后续 SQL 必须显式 rollback）
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        return 0.0, False
 
 
-# CP9.4: admin stats 缓存（30s TTL read-through cache）
-_admin_stats_cache: dict = {}
-_admin_stats_expires: dict = {}
+# CP-STATS-REDIS：admin stats 缓存从进程内 dict 升级到 Redis。
+# - 多 uvicorn worker 共享缓存（之前每 worker 各算一遍 → 重复 4-8 倍 DB 查询）
+# - 进程重启缓存不丢（之前 dict 清零 → 30s 内集中击穿 DB）
+# - key 加 :v3 后缀：新版字段（comparison/trends/by_source/...）上线时清掉老 key 自动重建
+ADMIN_STATS_KEY = "admin:stats:v3"
+ADMIN_STATS_TTL = 30  # 秒
 
 
-def _get_cached_stats():
-    """从内存缓存读 stats，TTL 30s。"""
-    now = time.time()
-    if "stats" in _admin_stats_cache and _admin_stats_expires.get("stats", 0) > now:
-        return _admin_stats_cache["stats"]
-    return None
+def _redis_client() -> Redis:
+    return Redis(connection_pool=get_redis_pool())
 
 
-def _set_cached_stats(data: dict):
-    """写 stats 到内存缓存，TTL 30s。"""
-    _admin_stats_cache["stats"] = data
-    _admin_stats_expires["stats"] = time.time() + 30
+async def _get_cached_stats() -> dict | None:
+    pool = get_redis_pool()
+    r = Redis(connection_pool=pool)
+    try:
+        raw = await r.get(ADMIN_STATS_KEY)
+    finally:
+        await r.aclose()
+    return json.loads(raw) if raw else None
+
+
+async def _set_cached_stats(data: dict) -> None:
+    pool = get_redis_pool()
+    r = Redis(connection_pool=pool)
+    try:
+        await r.set(ADMIN_STATS_KEY, json.dumps(data, default=str), ex=ADMIN_STATS_TTL)
+    finally:
+        await r.aclose()
+
+
+async def _invalidate_stats_cache() -> None:
+    """手动清缓存：当前端点还没写端点触发（admin 改配置后看 stats 立即生效的需求暂未提）。
+    这里保留入口，方便后续接 admin 操作 hook 调用。
+    """
+    pool = get_redis_pool()
+    r = Redis(connection_pool=pool)
+    try:
+        await r.delete(ADMIN_STATS_KEY)
+    finally:
+        await r.aclose()
+
+
+def _pct_delta(now_val: int, prev_val: int) -> float | None:
+    """环比百分比（now vs prev）；prev=0 时 None（避免除零）；返回 0.15 表示 +15%。"""
+    if prev_val is None or prev_val <= 0:
+        return None
+    return round((now_val - prev_val) / prev_val, 4)
+
+
+# 告警阈值常量：admin 在 .env 里能覆盖就更好；先写死常量 + 注释 why
+DISTILL_FAILURE_24H_ALERT_THRESHOLD = 5  # 24h 蒸馏失败超过这个数 → warning
 
 
 @router.get("/api/v1/admin/stats")
 async def admin_stats(
     user: dict = Depends(require_admin_or_operator), db: AsyncSession = Depends(get_db)
 ):
-    # CP9.4 read-through cache
-    cached = _get_cached_stats()
+    """管理后台总览统计数据。
+
+    字段（按"真实统计要求"重做，CP-STATS-REWORK）：
+      总量
+        total_users / total_articles / pending / listened
+      真实失败口径
+        failed_distillations_24h  来自 DistilledArticle.status='failed' AND updated_at > 24h
+        failed_articles_24h        来自 Article.status='failed' AND deleted_at IS NULL AND created_at > 24h
+      蒸馏成功率
+        distill_success_rate       done_count / (done + failed) DistilledArticle 全量
+      音频
+        active_audio_files         DistilledArticle.status='done' AND audio_url IS NOT NULL
+      营收
+        revenue                    本月已支付订单金额合计
+        revenue_available          True=数据可获取；False=orders 表缺失（不要误以为 0）
+      来源分布
+        by_source                  {wechat: n, douyin: n, ...}（article.source 聚合）
+      趋势
+        trends.articles_created_7d  [{date: 2026-01-01, count: 5}, ...]（按 day 分桶）
+        trends.users_created_7d     同上（users 表）
+        trends.distill_completed_7d 同上（DistilledArticle.status='done' AND updated_at）
+      环比
+        comparison.new_articles_24h     {today, yesterday, delta_pct}
+        comparison.new_users_24h        同上
+        comparison.distill_completed_24h 同上
+      告警
+        warning                    None 或 {code, message}（failed > N 时填）
+      元
+        generated_at               ISO8601 时间戳（前端可显示"X 秒前更新"）
+
+    缓存：Redis v3 key，TTL 30s。多 worker 共享，进程重启不丢。
+    """
+    # Redis read-through cache
+    cached = await _get_cached_stats()
     if cached is not None:
         return cached
 
+    now = func.now()
+    day_ago = now - timedelta(days=1)
+    two_days_ago = now - timedelta(days=2)
+    seven_days_ago = now - timedelta(days=7)
+
+    # --- 总量（修 #1：total_articles 排除 deleted_at） ---
     total_users = await db.scalar(select(func.count()).select_from(User))
-    total_articles = await db.scalar(select(func.count()).select_from(Article))
+    total_articles = await db.scalar(
+        select(func.count()).select_from(Article).where(Article.deleted_at.is_(None))
+    )
     pending = await db.scalar(
         select(func.count())
         .select_from(Article)
@@ -1079,17 +1532,30 @@ async def admin_stats(
         .where(Article.status == "listened", Article.deleted_at.is_(None))
     )
 
-    # CP3.6-A3 新增字段（不破坏现有结构，仅加字段）
-    # failed_distillations_24h：articles 近 24h 失败
-    failed_24h = await db.scalar(
+    # --- 真实失败口径（修 #2） ---
+    # failed_distillations_24h: 蒸馏步骤失败（DistilledArticle.status='failed'），
+    # 用 updated_at 不用 created_at —— 失败重试时 created_at 是首次创建时间。
+    failed_distillations_24h = await db.scalar(
+        select(func.count())
+        .select_from(DistilledArticle)
+        .where(
+            DistilledArticle.status == "failed",
+            DistilledArticle.updated_at > day_ago,
+        )
+    )
+    # failed_articles_24h: 文章侧失败（URL 抓不到 / 内容异常 / 配额耗尽）。
+    # 排除 deleted_at 非空的（用户已删的 article 失败不影响运维观察）。
+    failed_articles_24h = await db.scalar(
         select(func.count())
         .select_from(Article)
         .where(
             Article.status == "failed",
-            Article.created_at > (func.now() - timedelta(days=1)),
+            Article.deleted_at.is_(None),
+            Article.created_at > day_ago,
         )
     )
-    # active_audio_files：distilled_articles done 且有 audio_url（映射 audio_files ready）
+
+    # --- 音频 ---
     active_audio = await db.scalar(
         select(func.count())
         .select_from(DistilledArticle)
@@ -1098,19 +1564,196 @@ async def admin_stats(
             DistilledArticle.audio_url.isnot(None),
         )
     )
-    # revenue：orders 本月已支付（表可能缺失 → 0）
-    revenue = await _safe_revenue(db)
+
+    # --- 蒸馏成功率（#6）---
+    done_total = (
+        await db.scalar(
+            select(func.count())
+            .select_from(DistilledArticle)
+            .where(DistilledArticle.status == "done")
+        )
+        or 0
+    )
+    failed_total = (
+        await db.scalar(
+            select(func.count())
+            .select_from(DistilledArticle)
+            .where(DistilledArticle.status == "failed")
+        )
+        or 0
+    )
+    total_attempted = done_total + failed_total
+    distill_success_rate = round(done_total / total_attempted, 4) if total_attempted else 1.0
+
+    # --- 营收（修 #3：表缺时不静默返 0，加 availability 标志）---
+    revenue_value, revenue_available = await _safe_revenue(db)
+
+    # --- 按 source 拆分（#5）---
+    by_source_rows = (
+        await db.execute(
+            select(Article.source, func.count().label("n"))
+            .where(Article.deleted_at.is_(None))
+            .group_by(Article.source)
+        )
+    ).all()
+    by_source = {row.source: int(row.n) for row in by_source_rows}
+
+    # --- 趋势（#7）：最近 7 天按 day 分桶 ---
+    # 用 PG 的 date_trunc('day', ts)；过滤 deleted_at 排除用户删除噪音
+    articles_trend_rows = (
+        await db.execute(
+            select(
+                func.date_trunc("day", Article.created_at).label("day"),
+                func.count().label("n"),
+            )
+            .where(Article.deleted_at.is_(None), Article.created_at > seven_days_ago)
+            .group_by("day")
+            .order_by("day")
+        )
+    ).all()
+    users_trend_rows = (
+        await db.execute(
+            select(
+                func.date_trunc("day", User.created_at).label("day"),
+                func.count().label("n"),
+            )
+            .where(User.created_at > seven_days_ago)
+            .group_by("day")
+            .order_by("day")
+        )
+    ).all()
+    distill_done_trend_rows = (
+        await db.execute(
+            select(
+                func.date_trunc("day", DistilledArticle.updated_at).label("day"),
+                func.count().label("n"),
+            )
+            .where(
+                DistilledArticle.status == "done",
+                DistilledArticle.updated_at > seven_days_ago,
+            )
+            .group_by("day")
+            .order_by("day")
+        )
+    ).all()
+
+    def _to_daily(rows) -> list[dict[str, Any]]:
+        return [{"date": row.day.date().isoformat(), "count": int(row.n)} for row in rows]
+
+    trends = {
+        "articles_created_7d": _to_daily(articles_trend_rows),
+        "users_created_7d": _to_daily(users_trend_rows),
+        "distill_completed_7d": _to_daily(distill_done_trend_rows),
+    }
+
+    # --- 环比（#4）---
+    # "今天" = now-1d ~ now；"昨天" = now-2d ~ now-1d
+    today_articles = (
+        await db.scalar(
+            select(func.count())
+            .select_from(Article)
+            .where(Article.deleted_at.is_(None), Article.created_at > day_ago)
+        )
+        or 0
+    )
+    yesterday_articles = (
+        await db.scalar(
+            select(func.count())
+            .select_from(Article)
+            .where(
+                Article.deleted_at.is_(None),
+                Article.created_at > two_days_ago,
+                Article.created_at <= day_ago,
+            )
+        )
+        or 0
+    )
+    today_users = (
+        await db.scalar(select(func.count()).select_from(User).where(User.created_at > day_ago))
+        or 0
+    )
+    yesterday_users = (
+        await db.scalar(
+            select(func.count())
+            .select_from(User)
+            .where(User.created_at > two_days_ago, User.created_at <= day_ago)
+        )
+        or 0
+    )
+    today_distill_done = (
+        await db.scalar(
+            select(func.count())
+            .select_from(DistilledArticle)
+            .where(
+                DistilledArticle.status == "done",
+                DistilledArticle.updated_at > day_ago,
+            )
+        )
+        or 0
+    )
+    yesterday_distill_done = (
+        await db.scalar(
+            select(func.count())
+            .select_from(DistilledArticle)
+            .where(
+                DistilledArticle.status == "done",
+                DistilledArticle.updated_at > two_days_ago,
+                DistilledArticle.updated_at <= day_ago,
+            )
+        )
+        or 0
+    )
+
+    comparison = {
+        "new_articles_24h": {
+            "today": int(today_articles),
+            "yesterday": int(yesterday_articles),
+            "delta_pct": _pct_delta(int(today_articles), int(yesterday_articles)),
+        },
+        "new_users_24h": {
+            "today": int(today_users),
+            "yesterday": int(yesterday_users),
+            "delta_pct": _pct_delta(int(today_users), int(yesterday_users)),
+        },
+        "distill_completed_24h": {
+            "today": int(today_distill_done),
+            "yesterday": int(yesterday_distill_done),
+            "delta_pct": _pct_delta(int(today_distill_done), int(yesterday_distill_done)),
+        },
+    }
+
+    # --- 告警（#10）---
+    warning = None
+    if failed_distillations_24h and failed_distillations_24h > DISTILL_FAILURE_24H_ALERT_THRESHOLD:
+        warning = {
+            "code": "high_distill_failure",
+            "message": (
+                f"近 24h 蒸馏失败 {failed_distillations_24h} 条 "
+                f"（阈值 {DISTILL_FAILURE_24H_ALERT_THRESHOLD}），"
+                "建议检查 ai-service 日志 / 第三方 LLM（TTS）服务可用性"
+            ),
+            "threshold": DISTILL_FAILURE_24H_ALERT_THRESHOLD,
+            "actual": int(failed_distillations_24h),
+        }
 
     result = {
-        "total_users": total_users or 0,
-        "total_articles": total_articles or 0,
-        "pending": pending or 0,
-        "listened": listened or 0,
-        "revenue": revenue,
-        "active_audio_files": active_audio or 0,
-        "failed_distillations_24h": failed_24h or 0,
+        "total_users": int(total_users or 0),
+        "total_articles": int(total_articles or 0),
+        "pending": int(pending or 0),
+        "listened": int(listened or 0),
+        "active_audio_files": int(active_audio or 0),
+        "failed_distillations_24h": int(failed_distillations_24h or 0),
+        "failed_articles_24h": int(failed_articles_24h or 0),
+        "distill_success_rate": distill_success_rate,
+        "revenue": revenue_value,
+        "revenue_available": revenue_available,
+        "by_source": by_source,
+        "trends": trends,
+        "comparison": comparison,
+        "warning": warning,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
     }
-    _set_cached_stats(result)
+    await _set_cached_stats(result)
     return result
 
 
@@ -1147,28 +1790,50 @@ async def _fetch_ai_metrics() -> str:
 def _parse_distill_p95(metrics_text: str) -> dict:
     """从 Prometheus 文本解析 distill_step_duration_seconds 的 P50/P95/P99。
 
-    格式：`distill_step_duration_seconds_bucket{step="step1_structure",le="..."} N`
+    CP-DISTILL-PROM-SDK：用 prometheus_client.parser 替换之前的正则手写解析：
+      - SDK 自动处理 _bucket/_count/_sum 三种 sample，结构化 labels
+      - 鲁棒性：label 顺序、+Inf、空 metrics 都不再让正则崩
+      - 0 依赖：prometheus_client 已在 poetry 依赖里（producer 端 ai-service 在用）
+
+    输入：/metrics 文本（含 ai-service FastAPI 进程 + arq worker 进程的合并）
+    输出：
+      {
+        "by_step": {"step1_structure": {"p50": ..., "p95": ..., "p99": ...}, ...},
+        "overall": {"p50": ..., "p95": ..., "p99": ...}
+      }
     """
-    result = {"by_step": {}, "overall": {"p50": None, "p95": None, "p99": None}}
-    # 按 step 分组 bucket
+    from prometheus_client.parser import text_string_to_metric_families
+
+    result: dict[str, Any] = {
+        "by_step": {},
+        "overall": {"p50": None, "p95": None, "p99": None},
+    }
+    # 按 step 分组 bucket：{step: [(le, cumulative_count), ...]}
     buckets_by_step: dict[str, list[tuple[float, float]]] = {}
-    for m in re.finditer(
-        r"distill_step_duration_seconds_bucket\{([^}]+)\}\s+([0-9.e+-]+)",
-        metrics_text,
-    ):
-        label_block = m.group(1)
-        cnt = float(m.group(2))
-        le_m = re.search(r'le="([^"]+)"', label_block)
-        step_m = re.search(r'step="([^"]+)"', label_block)
-        if not le_m or not step_m:
+    try:
+        families = list(text_string_to_metric_families(metrics_text))
+    except Exception:
+        # 解析失败返回空（前端 Dashboard 卡片显示"暂无数据"，不 500）
+        return result
+
+    for family in families:
+        # family.name 不带 _bucket/_count/_sum 后缀
+        if family.name != "distill_step_duration_seconds":
             continue
-        le = le_m.group(1)
-        step = step_m.group(1)
-        if le == "+Inf":
-            le = 1e18
-        else:
-            le = float(le)
-        buckets_by_step.setdefault(step, []).append((le, cnt))
+        for sample in family.samples:
+            # 只关心 bucket（cumulative），count/sum 由 SDK 解析但本函数不用
+            if not sample.name.endswith("_bucket"):
+                continue
+            step = sample.labels.get("step")
+            le_label = sample.labels.get("le")
+            if step is None or le_label is None:
+                continue
+            try:
+                le = 1e18 if le_label == "+Inf" else float(le_label)
+                cnt = float(sample.value)
+            except (TypeError, ValueError):
+                continue
+            buckets_by_step.setdefault(step, []).append((le, cnt))
 
     # 计算每个 step 的 P50/P95/P99（用线性插值近似）
     for step, buckets in buckets_by_step.items():

@@ -105,9 +105,25 @@ async def _make_notification(
     error: str | None = None,
     sent_at: datetime | None = None,
 ) -> int:
-    """插一条推送，返回 id。"""
+    """插一条推送，返回 id。
+
+    CP-DRIFT-FIX 同步（迁移 0032）：push_notifications.tag_slug 现在有
+    FK → tags(slug)。生产路径（distill_task）始终取真实 Tag 行的 slug，
+    所以这里也要先确保 tags 里有该 slug，否则插入会 IntegrityError。
+    """
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     async with AsyncSessionLocal() as s:
+        if tag_slug:
+            # ON CONFLICT：多次调用同一 slug 时不重复建行
+            await s.execute(
+                text(
+                    "INSERT INTO tags (slug, name, category, is_system) "
+                    "VALUES (:slug, :name, 'test', false) "
+                    "ON CONFLICT (slug) DO NOTHING"
+                ),
+                {"slug": tag_slug, "name": tag_slug},
+            )
+            await s.commit()
         n = PushNotification(
             user_id=user_id,
             article_id=None,
