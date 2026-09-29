@@ -265,3 +265,38 @@ async def test_non_shared_client_close_releases_httpx():
     # httpx.AsyncClient.aclose() 后再访问会抛 RuntimeError
     # 这里只验证 close 不抛异常
     assert True
+
+
+@pytest.mark.asyncio
+async def test_thinking_disabled_by_default():
+    """CP-LLM-NO-THINK：默认下发 thinking.type=disabled。
+
+    实测（doubao-seed-2.0-lite，长文改写）：基线 106.4s / 思考 4273 tok，
+    关掉后 45.7s / 0 tok。推理模型的思维链会把总墙钟死线吃穿，
+    蒸馏改写不是需要推理的任务，关掉无质量损失。
+    """
+    c = OpenAIClient(api_key="k", base_url="https://mock", timeout=10)
+    captured: dict = {}
+
+    async def fake_post(*args, **kwargs):
+        captured.update(kwargs.get("json", {}))
+        return _mock_response(_body_text_response("hi"))
+
+    with patch.object(c._client, "post", new=AsyncMock(side_effect=fake_post)):
+        await c.chat(ChatRequest(messages=[ChatMessage(role="user", content="改写一下")]))
+    assert captured.get("thinking") == {"type": "disabled"}
+
+
+@pytest.mark.asyncio
+async def test_thinking_can_be_re_enabled():
+    """显式关掉开关时不应下发 thinking 字段（留给真需要推理的场景）。"""
+    c = OpenAIClient(api_key="k", base_url="https://mock", timeout=10, disable_thinking=False)
+    captured: dict = {}
+
+    async def fake_post(*args, **kwargs):
+        captured.update(kwargs.get("json", {}))
+        return _mock_response(_body_text_response("hi"))
+
+    with patch.object(c._client, "post", new=AsyncMock(side_effect=fake_post)):
+        await c.chat(ChatRequest(messages=[ChatMessage(role="user", content="改写一下")]))
+    assert "thinking" not in captured

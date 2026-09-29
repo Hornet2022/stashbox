@@ -50,6 +50,7 @@ class OpenAIClient(LLMClient):
         base_url: str = OPENAI_DEFAULT_BASE_URL,
         timeout: float = 60.0,
         max_retries: int = 3,
+        disable_thinking: bool = True,
         _shared: bool = False,  # CP3.6.2: 单例 client 关闭时跳过 httpx aclose
     ):
         if not api_key:
@@ -60,6 +61,7 @@ class OpenAIClient(LLMClient):
         self.max_retries = max_retries
         self._shared = _shared
         self.timeout = timeout
+        self.disable_thinking = disable_thinking
         self._client = httpx.AsyncClient(
             timeout=timeout,
             trust_env=False,  # 忽略沙箱/系统代理（漂移会打挂外网调用）
@@ -103,6 +105,22 @@ class OpenAIClient(LLMClient):
             body["tools"] = req.tools
         if req.tool_choice:
             body["tool_choice"] = req.tool_choice
+        # CP-LLM-NO-THINK：关掉推理模型的思维链，否则长文改写必超总墙钟死线。
+        #
+        # 实测（doubao-seed-2.0-lite，2250 字输入 / 要求 3000 字输出）：
+        #     基线                    106.4s  思考 4273 tok
+        #     thinking.type=disabled   45.7s  思考    0 tok   ← 快 2.3 倍
+        #     enable_thinking=False    76.4s  思考 2948 tok   （参数不被该网关识别）
+        #     reasoning_effort=low    102.6s  思考 3616 tok   （基本没降）
+        #
+        # 蒸馏改写是"把长文转成播客稿"的生成任务，不是需要推理的任务；
+        # 关掉思维链后输出长度和质量都没损失（4105 字 vs 基线 3800 字），
+        # 但单次耗时从 100s+ 降到 45s 级别，给 300s 死线留出足够余量。
+        #
+        # 只认 `thinking: {"type": "disabled"}` —— 实测另两个参数名都不生效，
+        # 写了也只是让 body 多两个被忽略的字段。
+        if self.disable_thinking:
+            body["thinking"] = {"type": "disabled"}
 
         data = await self._post(body)
 
