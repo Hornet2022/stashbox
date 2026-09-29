@@ -523,6 +523,75 @@ async def create_evaluation(
     return result
 
 
+@app.get("/api/v1/distill/{task_id}/evaluation")
+async def get_my_evaluation(
+    task_id: str,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """读回**当前用户**对这篇的最新一条听感评分（评分闭环的读侧）。
+
+    为什么必须有这个端点
+    -------------------
+    `POST .../evaluation` 只写不读，而 `distillation_evaluations` 长期只有
+    `/api/v1/admin/evaluations` 一个读入口（admin 专用）。于是移动端提交完
+    只能关弹窗，界面上不留任何"已评分"痕迹；重进文章不知道评过没有，接口
+    又不幂等，再点一次就多写一行 —— 这就是"提交评分没有闭环"。
+
+    语义：
+    - 只返回 `user_id = 当前用户` 且 `auto_flag=false` 的记录
+      （自动/评测员评分不属于"我的评分"，不该污染用户视图）
+    - 取**最新一条**（同一篇允许重复提交，客户端也可能重试）
+    - 没评过 → 200 + `null` 字段，**不返回 404**
+      （404 在这里语义歧义：既可能"没评过"，也可能是"这篇不存在/不是你的"；
+      这两种情况调用方要做的决策完全不同。前者要弹评分，后者要报错）
+    - 归属校验仍走 `_get_owned_distilled_article`，非 owner 一律 403
+    """
+    from sqlalchemy import select as _select
+
+    from stashbox.backend.common.models import DistillationEvaluation
+
+    da = await _get_owned_distilled_article(db, task_id, user)
+    ev = (
+        await db.execute(
+            _select(DistillationEvaluation)
+            .where(
+                DistillationEvaluation.task_id == da.id,
+                DistillationEvaluation.user_id == int(user["sub"]),
+                DistillationEvaluation.auto_flag.is_(False),
+            )
+            .order_by(DistillationEvaluation.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    if ev is None:
+        return {
+            "id": None,
+            "task_id": da.id,
+            "hook_score": None,
+            "section_score": None,
+            "outro_score": None,
+            "rhythm_score": None,
+            "overall_score": None,
+            "comment": None,
+            "skip_reason": None,
+            "created_at": None,
+        }
+    return {
+        "id": ev.id,
+        "task_id": ev.task_id,
+        "hook_score": ev.hook_score,
+        "section_score": ev.section_score,
+        "outro_score": ev.outro_score,
+        "rhythm_score": ev.rhythm_score,
+        "overall_score": ev.overall_score,
+        "comment": ev.comment,
+        "skip_reason": ev.skip_reason,
+        "created_at": ev.created_at.isoformat() if ev.created_at else None,
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
 

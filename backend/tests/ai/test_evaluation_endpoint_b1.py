@@ -383,5 +383,164 @@ async def test_gateway_routes_registered():
         assert ("GET", "/api/v1/distill/{task_id}/variants") in paths
         assert ("POST", "/api/v1/distill/{task_id}/variants/{bitrate}/warm") in paths
         assert ("POST", "/api/v1/distill/{task_id}/evaluation") in paths
+        assert ("GET", "/api/v1/distill/{task_id}/evaluation") in paths
     finally:
         sys.path.remove(str(BACKEND_DIR / "api-gateway"))
+
+
+# ---------------------------------------------------------------------------
+# 4. 读回端点 GET .../evaluation（评分闭环读侧）
+# ---------------------------------------------------------------------------
+
+
+async def test_get_evaluation_returns_latest_own(ai_client):
+    """POST 过两条 → GET 只回**自己**最新那条，且带 created_at。"""
+    module = ai_client
+    from stashbox.backend.common.models import DistillationEvaluation
+
+    engine, sf = await _make_db()
+    da = _da()
+
+    async def _own(*a, **k):
+        return da
+
+    orig = module._get_owned_distilled_article
+    module._get_owned_distilled_article = _own
+    try:
+        async with sf() as db:
+            db.add_all(
+                [
+                    DistillationEvaluation(
+                        id="eval_old",
+                        task_id=da.id,
+                        user_id=7,
+                        overall_score=2,
+                        auto_flag=False,
+                        created_at=datetime(2026, 1, 1),
+                        updated_at=datetime(2026, 1, 1),
+                    ),
+                    DistillationEvaluation(
+                        id="eval_new",
+                        task_id=da.id,
+                        user_id=7,
+                        hook_score=5,
+                        overall_score=5,
+                        comment="改完更好",
+                        auto_flag=False,
+                        created_at=datetime(2026, 9, 1),
+                        updated_at=datetime(2026, 9, 1),
+                    ),
+                ]
+            )
+            await db.commit()
+
+        client = await _client_with_db(module, sf)
+        async with client:
+            r = await client.get(f"/api/v1/distill/{da.id}/evaluation")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["id"] == "eval_new"  # 最新那条，不是第一条
+        assert body["overall_score"] == 5
+        assert body["hook_score"] == 5
+        assert body["comment"] == "改完更好"
+        assert body["created_at"] is not None
+    finally:
+        module._get_owned_distilled_article = orig
+        await engine.dispose()
+
+
+async def test_get_evaluation_empty_returns_200_null(ai_client):
+    """没评过 → 200 + 全 null，**不是 404**（调用方要区分"没评"和"没这篇"）。"""
+    module = ai_client
+    engine, sf = await _make_db()
+    da = _da()
+
+    async def _own(*a, **k):
+        return da
+
+    orig = module._get_owned_distilled_article
+    module._get_owned_distilled_article = _own
+    try:
+        client = await _client_with_db(module, sf)
+        async with client:
+            r = await client.get(f"/api/v1/distill/{da.id}/evaluation")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["id"] is None
+        assert body["overall_score"] is None
+        assert body["task_id"] == da.id  # 仍回显 task_id，客户端好判"这篇存在但没评"
+    finally:
+        module._get_owned_distilled_article = orig
+        await engine.dispose()
+
+
+async def test_get_evaluation_excludes_other_users_and_auto(ai_client):
+    """别人的评分 + auto_flag=true 的自动评分都不该出现在"我的评分"里。"""
+    module = ai_client
+    from stashbox.backend.common.models import DistillationEvaluation
+
+    engine, sf = await _make_db()
+    da = _da()
+
+    async def _own(*a, **k):
+        return da
+
+    orig = module._get_owned_distilled_article
+    module._get_owned_distilled_article = _own
+    try:
+        async with sf() as db:
+            db.add_all(
+                [
+                    DistillationEvaluation(
+                        id="eval_other_user",
+                        task_id=da.id,
+                        user_id=999,
+                        overall_score=1,
+                        auto_flag=False,
+                        created_at=datetime(2026, 9, 2),
+                        updated_at=datetime(2026, 9, 2),
+                    ),
+                    DistillationEvaluation(
+                        id="eval_auto",
+                        task_id=da.id,
+                        user_id=7,
+                        overall_score=4,
+                        auto_flag=True,
+                        created_at=datetime(2026, 9, 3),
+                        updated_at=datetime(2026, 9, 3),
+                    ),
+                ]
+            )
+            await db.commit()
+
+        client = await _client_with_db(module, sf)
+        async with client:
+            r = await client.get(f"/api/v1/distill/{da.id}/evaluation")
+        assert r.status_code == 200
+        # 两条都不该被返回 → 视为"没评过"
+        assert r.json()["id"] is None
+    finally:
+        module._get_owned_distilled_article = orig
+        await engine.dispose()
+
+
+async def test_get_evaluation_forbidden_propagates(ai_client):
+    """非 owner → 403 透传（不能因为"没评过"就 200，那会泄露文章存在性）。"""
+    module = ai_client
+    from stashbox.backend.common.exceptions import Forbidden
+
+    engine, sf = await _make_db()
+
+    async def _forb(*a, **k):
+        raise Forbidden(message="not the owner")
+
+    orig = module._get_owned_distilled_article
+    module._get_owned_distilled_article = _forb
+    try:
+        client = await _client_with_db(module, sf)
+        async with client:
+            r = await client.get("/api/v1/distill/dst_other/evaluation")
+        assert r.status_code == 403
+    finally:
+        module._get_owned_distilled_article = orig
+        await engine.dispose()

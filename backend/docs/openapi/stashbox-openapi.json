@@ -24,6 +24,25 @@
     }
   ],
   "paths": {
+    "/api/v1/admin/ab-report": {
+      "get": {
+        "summary": "Proxy Get /Api/V1/Admin/Ab-Report",
+        "operationId": "proxy_get__api_v1_admin_ab_report_api_v1_admin_ab_report_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      }
+    },
     "/api/v1/admin/articles": {
       "get": {
         "summary": "Admin List Articles",
@@ -120,6 +139,7 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -178,6 +198,7 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -244,6 +265,7 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -312,7 +334,27 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/audio-variants/stats": {
+      "get": {
+        "summary": "Proxy Get /Api/V1/Admin/Audio-Variants/Stats",
+        "operationId": "proxy_get__api_v1_admin_audio_variants_stats_api_v1_admin_audio_variants_stats_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
           "api-gateway"
         ]
       }
@@ -380,6 +422,7 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -513,6 +556,7 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -561,6 +605,25 @@
         ]
       }
     },
+    "/api/v1/admin/consents": {
+      "get": {
+        "summary": "Proxy Get /Api/V1/Admin/Consents",
+        "operationId": "proxy_get__api_v1_admin_consents_api_v1_admin_consents_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      }
+    },
     "/api/v1/admin/distill-p95": {
       "get": {
         "summary": "Admin Distill P95",
@@ -605,10 +668,78 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
       }
+    },
+    "/api/v1/admin/evaluations": {
+      "get": {
+        "summary": "Proxy Get /Api/V1/Admin/Evaluations",
+        "operationId": "proxy_get__api_v1_admin_evaluations_api_v1_admin_evaluations_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/evaluations/agreement": {
+      "get": {
+        "summary": "Proxy Get /Api/V1/Admin/Evaluations/Agreement",
+        "operationId": "proxy_get__api_v1_admin_evaluations_agreement_api_v1_admin_evaluations_agreement_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/evaluations/{evaluation_id}/annotate": {
+      "post": {
+        "summary": "Proxy Post /Api/V1/Admin/Evaluations/{Evaluation Id}/Annotate",
+        "operationId": "proxy_post__api_v1_admin_evaluations__evaluation_id__annotate_api_v1_admin_evaluations__evaluation_id__annotate_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      },
+      "parameters": [
+        {
+          "name": "evaluation_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ]
     },
     "/api/v1/admin/export/articles.csv": {
       "get": {
@@ -654,6 +785,7 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -703,6 +835,7 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -752,6 +885,7 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -801,6 +935,7 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -850,7 +985,103 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/few-shot-pool": {
+      "get": {
+        "summary": "Proxy Get /Api/V1/Admin/Few-Shot-Pool",
+        "operationId": "proxy_get__api_v1_admin_few_shot_pool_api_v1_admin_few_shot_pool_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/few-shot-pool/audit-result": {
+      "post": {
+        "summary": "Proxy Post /Api/V1/Admin/Few-Shot-Pool/Audit-Result",
+        "operationId": "proxy_post__api_v1_admin_few_shot_pool_audit_result_api_v1_admin_few_shot_pool_audit_result_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/few-shot-pool/audit-sample": {
+      "get": {
+        "summary": "Proxy Get /Api/V1/Admin/Few-Shot-Pool/Audit-Sample",
+        "operationId": "proxy_get__api_v1_admin_few_shot_pool_audit_sample_api_v1_admin_few_shot_pool_audit_sample_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/few-shot-pool/cleanup": {
+      "post": {
+        "summary": "Proxy Post /Api/V1/Admin/Few-Shot-Pool/Cleanup",
+        "operationId": "proxy_post__api_v1_admin_few_shot_pool_cleanup_api_v1_admin_few_shot_pool_cleanup_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/few-shot-pool/health": {
+      "get": {
+        "summary": "Proxy Get /Api/V1/Admin/Few-Shot-Pool/Health",
+        "operationId": "proxy_get__api_v1_admin_few_shot_pool_health_api_v1_admin_few_shot_pool_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
           "api-gateway"
         ]
       }
@@ -899,6 +1130,7 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -956,6 +1188,7 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -964,7 +1197,7 @@
     "/api/v1/admin/llm/test": {
       "get": {
         "summary": "Admin Llm Test",
-        "description": "CP7.3 联调真验用：用当前 factory 的 client 发一次 chat()，确认 provider 真换了。\n\n临时端点 —— 用 ENABLE_LLM_TEST_ENDPOINT=0 关掉（关掉后返回 404）。\nopenai client 的 chat() 还是 CP7.1 的 NotImplementedError 占位实现，\n所以 provider=openai 时这里会 ok=false + 报错，但 provider 字段能证明切换生效。",
+        "description": "CP7.3 联调真验用：用当前 factory 的 client 发一次 chat()，确认 provider 真换了。\n\n临时端点 —— 用 ENABLE_LLM_TEST_ENDPOINT=0 关掉（关掉后返回 404）。\nopenai client 的 chat() 是 CP7.3.4 真实现；provider=openai 也会真发请求，\n所以这里的 ok / error_kind 是这次\"调通与否\"的真实信号。\n\n响应字段：\n    ok             bool 是否成功拿到 chat() 返回\n    provider       当前生效的 provider 名\n    model          当前生效的模型名\n    text           成功时的 LLM 返回文本（成功才有）\n    error_kind     失败时的分类（auth/forbidden/notfound/badreq/ratelimit/\n                   timeout/connect/network/internal，前端按 kind 渲染 toast）\n    status_code    第三方服务返回的 HTTP 状态码（如果是 HTTP 类错误；否则 null）\n    hint           给操作员的「下一步干啥」中文提示\n    detail         原始异常的脱敏字符串，技术排查用（不再 300 字截断）",
         "operationId": "admin_llm_test_api_v1_admin_llm_test_get",
         "parameters": [
           {
@@ -1005,7 +1238,185 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/push-notifications": {
+      "get": {
+        "summary": "Admin List Push Notifications",
+        "description": "v1 §3.6 admin 推送队列全量查询（运营排障）。\n\n鉴权：require_admin_or_operator（admin / operator 通过；free/viewer 403）。\n只读：不写 admin_operation_logs（与 /admin/consents 同口径）。\n\n查询参数（v1 §2.1）：\n  status     pending|sent|failed；空=全部（非法值直接 400，避免误传命中 0 行）\n  user_id    int；空=全部\n  tag_slug   str；空=全部\n  limit      int；默认 50，cap 200（防单次拉爆）\n  offset     int；默认 0\n排序：created_at DESC。",
+        "operationId": "admin_list_push_notifications_api_v1_admin_push_notifications_get",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Status"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "tag_slug",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Tag Slug"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminPushNotificationListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/push-notifications/{notification_id}/retry": {
+      "post": {
+        "summary": "Admin Retry Push Notification",
+        "description": "v1 §端点需求_admin推送队列_v1 §2.3：失败推送重推。\n\n鉴权：require_admin_or_operator（admin / operator 通过；free/viewer 403）。\n仅 `status=failed` 可重推（pending 还在队列、sent 已成功，重推无意义）。\nreason 必填且 5..200 字符（与 quota-adjust 同口径）。\n\n副作用（与目标更新同事务）：\n  1. 重置 push_notifications.status='sent' / error=NULL / sent_at=now\n     （重置为「已重发」便于 admin 视角立即看效果；真推送 CP4.6 上线后\n      可改为 status='pending' 让 worker 重投,改动只需这一行）\n  2. 写 admin_operation_logs(action='retry_push_notification',target_id=str(id))\n     reason 与请求体一致——便于运营复盘「为什么重推」\n失败整体回滚：reason 校验失败 / status 非 failed / id 不存在 都不会落库。",
+        "operationId": "admin_retry_push_notification_api_v1_admin_push_notifications__notification_id__retry_post",
+        "parameters": [
+          {
+            "name": "notification_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Notification Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminPushNotificationRetryRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminPushNotificationRetryResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service",
           "api-gateway"
         ]
       }
@@ -1013,6 +1424,7 @@
     "/api/v1/admin/stats": {
       "get": {
         "summary": "Admin Stats",
+        "description": "管理后台总览统计数据。\n\n字段（按\"真实统计要求\"重做，CP-STATS-REWORK）：\n  总量\n    total_users / total_articles / pending / listened\n  真实失败口径\n    failed_distillations_24h  来自 DistilledArticle.status='failed' AND updated_at > 24h\n    failed_articles_24h        来自 Article.status='failed' AND deleted_at IS NULL AND created_at > 24h\n  蒸馏成功率\n    distill_success_rate       done_count / (done + failed) DistilledArticle 全量\n  音频\n    active_audio_files         DistilledArticle.status='done' AND audio_url IS NOT NULL\n  营收\n    revenue                    本月已支付订单金额合计\n    revenue_available          True=数据可获取；False=orders 表缺失（不要误以为 0）\n  来源分布\n    by_source                  {wechat: n, douyin: n, ...}（article.source 聚合）\n  趋势\n    trends.articles_created_7d  [{date: 2026-01-01, count: 5}, ...]（按 day 分桶）\n    trends.users_created_7d     同上（users 表）\n    trends.distill_completed_7d 同上（DistilledArticle.status='done' AND updated_at）\n  环比\n    comparison.new_articles_24h     {today, yesterday, delta_pct}\n    comparison.new_users_24h        同上\n    comparison.distill_completed_24h 同上\n  告警\n    warning                    None 或 {code, message}（failed > N 时填）\n  元\n    generated_at               ISO8601 时间戳（前端可显示\"X 秒前更新\"）\n\n缓存：Redis v3 key，TTL 30s。多 worker 共享，进程重启不丢。",
         "operationId": "admin_stats_api_v1_admin_stats_get",
         "parameters": [
           {
@@ -1053,6 +1465,7 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -1102,6 +1515,7 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -1170,10 +1584,124 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
       }
+    },
+    "/api/v1/admin/tier-config": {
+      "get": {
+        "summary": "Proxy Get /Api/V1/Admin/Tier-Config",
+        "operationId": "proxy_get__api_v1_admin_tier_config_api_v1_admin_tier_config_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      },
+      "put": {
+        "summary": "Proxy Put /Api/V1/Admin/Tier-Config",
+        "operationId": "proxy_put__api_v1_admin_tier_config_api_v1_admin_tier_config_put",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/tts/blind-test": {
+      "post": {
+        "summary": "Proxy Post /Api/V1/Admin/Tts/Blind-Test",
+        "operationId": "proxy_post__api_v1_admin_tts_blind_test_api_v1_admin_tts_blind_test_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/tts/blind-test/{blind_id}/results": {
+      "get": {
+        "summary": "Proxy Get /Api/V1/Admin/Tts/Blind-Test/{Blind Id}/Results",
+        "operationId": "proxy_get__api_v1_admin_tts_blind_test__blind_id__results_api_v1_admin_tts_blind_test__blind_id__results_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      },
+      "parameters": [
+        {
+          "name": "blind_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/api/v1/admin/tts/blind-test/{blind_id}/submit": {
+      "post": {
+        "summary": "Proxy Post /Api/V1/Admin/Tts/Blind-Test/{Blind Id}/Submit",
+        "operationId": "proxy_post__api_v1_admin_tts_blind_test__blind_id__submit_api_v1_admin_tts_blind_test__blind_id__submit_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "api-gateway"
+        ]
+      },
+      "parameters": [
+        {
+          "name": "blind_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ]
     },
     "/api/v1/admin/tts/config": {
       "get": {
@@ -1219,6 +1747,7 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -1276,6 +1805,7 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -1325,6 +1855,7 @@
           }
         },
         "tags": [
+          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -1916,7 +2447,7 @@
     "/api/v1/articles/{article_id}/audio-url": {
       "get": {
         "summary": "Article Audio Url",
-        "description": "取音频播放地址：仅 status=ready 可用，其余 404。\n\nOSS 签名本期 mock（CP1.8+ 接真签名，依赖阿里云 RAM 配置）。\n本地 dev 模式（STORAGE_PROVIDER=local / ENABLE_LOCAL_AUDIO_MOUNT=1）：\naudio_url 用 PUBLIC_GATEWAY_URL 拼出，避开 localhost —— 真机客户端\n连 gateway 时 localhost 指向设备自己，会 404。\n\nCP9.x 修正：服务端 audio_url 后缀（.mp3/.m4a/.wav）必须匹配磁盘上的真实文件后缀。\n否则 ExoPlayer 按后缀选 MP3/M4A/PCM 解码器会失败。\n兜底策略：本地模式下扫描 LOCAL_AUDIO_DIR 下 /audio/{article_id}.{ext} 实际存在的扩展名。",
+        "description": "取音频播放地址：仅 status=ready 可用，其余 404。\n\nCP-AUDIO-URL-STATIC：`audio_url` 若是**永久静态直链**（bucket 公共读 /\nOSS_PUBLIC_BASE_URL —— 内容归属 app 账户，必须长期可播、不能擅自失效），\n原样返回且 `expires_at=None`，客户端据此不再做「过期前刷新」。\n\n只有当库里存的 URL **本身已带签名参数**时，才沿用阿里云 OSS 的\n过期语义（`?Expires=...&OSSAccessKeyId=...`）。历史上的 mock 签名\n（`Signature=mock`）仅作为签名 URL 的占位形式保留，不再无条件拼给静态直链。\n\n本地 dev 模式（STORAGE_PROVIDER=local / ENABLE_LOCAL_AUDIO_MOUNT=1）：\naudio_url 用 PUBLIC_GATEWAY_URL 拼出，避开 localhost —— 真机客户端\n连 gateway 时 localhost 指向设备自己，会 404。\n\nCP9.x 修正：服务端 audio_url 后缀（.mp3/.m4a/.wav）必须匹配磁盘上的真实文件后缀。\n否则 ExoPlayer 按后缀选 MP3/M4A/PCM 解码器会失败。\n兜底策略：本地模式下扫描 LOCAL_AUDIO_DIR 下 /audio/{article_id}.{ext} 实际存在的扩展名。",
         "operationId": "article_audio_url_api_v1_articles__article_id__audio_url_get",
         "parameters": [
           {
@@ -2854,19 +3385,43 @@
     },
     "/api/v1/auth/refresh-token": {
       "post": {
-        "summary": "Proxy Post /Api/V1/Auth/Refresh-Token",
-        "operationId": "proxy_post__api_v1_auth_refresh_token_api_v1_auth_refresh_token_post",
+        "summary": "Refresh Token",
+        "description": "用 refresh_token 换新 access_token + 新 refresh_token（rotate）。\n\n网关已注册此路由（config.py:46 → user-service）。android AuthApi.refresh 调此端点；\naccess_token 过期时 AuthInterceptor 自动 refresh 一次并重放请求。",
+        "operationId": "refresh_token_api_v1_auth_refresh_token_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/RefreshTokenResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
               }
             }
           }
         },
         "tags": [
+          "user-service",
           "api-gateway"
         ]
       }
@@ -2874,7 +3429,7 @@
     "/api/v1/auth/token": {
       "post": {
         "summary": "Issue Token",
-        "description": "签发 JWT（mock：直接用传入 user_id）。",
+        "description": "签发 JWT（mock：直接用传入 user_id）+ 配套 refresh_token。",
         "operationId": "issue_token_api_v1_auth_token_post",
         "requestBody": {
           "content": {
@@ -3203,6 +3758,255 @@
             "schema": {
               "type": "string",
               "title": "Task Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "ai-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/distill/{task_id}/evaluation": {
+      "get": {
+        "summary": "Get My Evaluation",
+        "description": "读回**当前用户**对这篇的最新一条听感评分（评分闭环的读侧）。\n\n为什么必须有这个端点\n-------------------\n`POST .../evaluation` 只写不读，而 `distillation_evaluations` 长期只有\n`/api/v1/admin/evaluations` 一个读入口（admin 专用）。于是移动端提交完\n只能关弹窗，界面上不留任何\"已评分\"痕迹；重进文章不知道评过没有，接口\n又不幂等，再点一次就多写一行 —— 这就是\"提交评分没有闭环\"。\n\n语义：\n- 只返回 `user_id = 当前用户` 且 `auto_flag=false` 的记录\n  （自动/评测员评分不属于\"我的评分\"，不该污染用户视图）\n- 取**最新一条**（同一篇允许重复提交，客户端也可能重试）\n- 没评过 → 200 + `null` 字段，**不返回 404**\n  （404 在这里语义歧义：既可能\"没评过\"，也可能是\"这篇不存在/不是你的\"；\n  这两种情况调用方要做的决策完全不同。前者要弹评分，后者要报错）\n- 归属校验仍走 `_get_owned_distilled_article`，非 owner 一律 403",
+        "operationId": "get_my_evaluation_api_v1_distill__task_id__evaluation_get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "ai-service",
+          "api-gateway"
+        ]
+      },
+      "post": {
+        "summary": "Create Evaluation",
+        "description": "4 维评分提交（Android 评分 UI 的写入口，缺口 G1）。\n\n薄端点：校验 → 归属 → distill.evaluation_service.submit_user_evaluation\n（写表 + few-shot 入池 + 画像联动）→ commit。",
+        "operationId": "create_evaluation_api_v1_distill__task_id__evaluation_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvaluationCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "ai-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/distill/{task_id}/variants": {
+      "get": {
+        "summary": "Distill Variants",
+        "description": "3 档码率可用性（128k 主档 + 96k/64k 按需转码）。永不 5xx：缺档 available=false。",
+        "operationId": "distill_variants_api_v1_distill__task_id__variants_get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "ai-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/distill/{task_id}/variants/{bitrate}/warm": {
+      "post": {
+        "summary": "Distill Variant Warm",
+        "description": "预生成某码率变体（通勤 Wi-Fi 预热用；重复调用幂等）。",
+        "operationId": "distill_variant_warm_api_v1_distill__task_id__variants__bitrate__warm_post",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "bitrate",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Bitrate"
             }
           },
           {
@@ -4850,6 +5654,10 @@
             "type": "string",
             "title": "Access Token"
           },
+          "refresh_token": {
+            "type": "string",
+            "title": "Refresh Token"
+          },
           "expires_in": {
             "type": "integer",
             "title": "Expires In"
@@ -4858,6 +5666,7 @@
         "type": "object",
         "required": [
           "access_token",
+          "refresh_token",
           "expires_in"
         ],
         "title": "TokenResponse"
@@ -4998,6 +5807,218 @@
         ],
         "title": "AdminLoginUser"
       },
+      "AdminPushNotificationItem": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "user_id": {
+            "type": "integer",
+            "title": "User Id"
+          },
+          "article_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Article Id"
+          },
+          "tag_slug": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tag Slug"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "body": {
+            "type": "string",
+            "title": "Body"
+          },
+          "deeplink": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deeplink"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "sent_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sent At"
+          },
+          "read_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Read At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "user_id",
+          "title",
+          "body",
+          "status"
+        ],
+        "title": "AdminPushNotificationItem",
+        "description": "GET /admin/push-notifications 单条。\n\n字段口径（v1 §端点需求_admin推送队列_v1.md §2.1）：\n  - status / error / sent_at 以 push_notifications 表实际列为准,\n    表没有则回 None(避免前端误读假数据)。\n  - created_at / sent_at / read_at 一律 ISO 8601 字符串(None 时给 None)。"
+      },
+      "AdminPushNotificationListResponse": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AdminPushNotificationItem"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "total",
+          "limit",
+          "offset",
+          "items"
+        ],
+        "title": "AdminPushNotificationListResponse",
+        "description": "v1 §接口文档 v1.1 既有约定：{total, limit, offset, items}。"
+      },
+      "AdminPushNotificationRetryRequest": {
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "title": "AdminPushNotificationRetryRequest",
+        "description": "POST /admin/push-notifications/{id}/retry body。\n\nreason 必填且 5..200 字符——与 quota-adjust 同口径,防止审计日志被刷脏。"
+      },
+      "AdminPushNotificationRetryResponse": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "user_id": {
+            "type": "integer",
+            "title": "User Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "sent_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sent At"
+          },
+          "retried_at": {
+            "type": "string",
+            "title": "Retried At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "user_id",
+          "status",
+          "retried_at"
+        ],
+        "title": "AdminPushNotificationRetryResponse",
+        "description": "POST /admin/push-notifications/{id}/retry 响应。\n\n返回重推后的最新一行（status/error/sent_at 均刷新），让前端无需再 GET 一遍。"
+      },
       "AdminUserItem": {
         "properties": {
           "id": {
@@ -5120,6 +6141,52 @@
         ],
         "title": "QuotaAdjustRequest"
       },
+      "RefreshTokenRequest": {
+        "properties": {
+          "refresh_token": {
+            "type": "string",
+            "title": "Refresh Token"
+          }
+        },
+        "type": "object",
+        "required": [
+          "refresh_token"
+        ],
+        "title": "RefreshTokenRequest"
+      },
+      "RefreshTokenResponse": {
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "title": "Access Token"
+          },
+          "refresh_token": {
+            "type": "string",
+            "title": "Refresh Token"
+          },
+          "user_id": {
+            "type": "string",
+            "title": "User Id"
+          },
+          "expires_in": {
+            "type": "integer",
+            "title": "Expires In"
+          },
+          "tier": {
+            "type": "string",
+            "title": "Tier",
+            "default": "free"
+          }
+        },
+        "type": "object",
+        "required": [
+          "access_token",
+          "refresh_token",
+          "user_id",
+          "expires_in"
+        ],
+        "title": "RefreshTokenResponse"
+      },
       "UserInfo": {
         "properties": {
           "user_id": {
@@ -5196,6 +6263,10 @@
             "type": "string",
             "title": "Access Token"
           },
+          "refresh_token": {
+            "type": "string",
+            "title": "Refresh Token"
+          },
           "user_id": {
             "type": "string",
             "title": "User Id"
@@ -5208,6 +6279,7 @@
         "type": "object",
         "required": [
           "access_token",
+          "refresh_token",
           "user_id",
           "expires_in"
         ],
@@ -5504,7 +6576,14 @@
             "title": "Audio Url"
           },
           "expires_at": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Expires At"
           },
           "duration_sec": {
@@ -5516,7 +6595,6 @@
         "required": [
           "article_id",
           "audio_url",
-          "expires_at",
           "duration_sec"
         ],
         "title": "AudioUrlResponse"
@@ -6127,6 +7205,90 @@
           "status"
         ],
         "title": "DistillStartResponse"
+      },
+      "EvaluationCreateRequest": {
+        "properties": {
+          "hook_score": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hook Score"
+          },
+          "section_score": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Section Score"
+          },
+          "outro_score": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outro Score"
+          },
+          "rhythm_score": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rhythm Score"
+          },
+          "overall_score": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Overall Score"
+          },
+          "comment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Comment"
+          },
+          "skip_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skip Reason"
+          }
+        },
+        "type": "object",
+        "title": "EvaluationCreateRequest",
+        "description": "4 维评分（1-5，各维可 null=用户跳过该项）+ 总评必填。\n\n校验口径对齐 /rate：手动校验 → 业务 400（code 4001），不走 422。"
       }
     },
     "securitySchemes": {}

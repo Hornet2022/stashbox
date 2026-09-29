@@ -422,3 +422,135 @@ def test_default_post_hooks_returns_4_hooks_cp373():
     assert isinstance(hooks[1], AutoRetryHook)
     assert isinstance(hooks[2], ListeningPatternUpdaterHook)
     assert isinstance(hooks[3], FewShotPoolHook)
+
+
+# ---------------------------------------------------------------------------
+# 16. post-hook 不得伪造评分（CP3.8.0 清理）
+# ---------------------------------------------------------------------------
+# 背景：这几个 hook 早期版本 `DistillationEvaluation(overall_score=4)` 造一条
+# 假评分再喂画像 / few-shot 池 / 重蒸判定。真机数据上表现为
+# distillation_evaluations 全是 score=4 的水货，而用户真实打的 1 星被稀释；
+# feedback_count 随蒸馏次数增长，冷启动保护（<5）形同虚设。
+# 下面 4 个用例锁住"没有真实评分就不动"。
+def _ctx(task_id="dst_hook", user_id=1, hook="真实改写的开场句"):
+    from distill.schemas import DistillContext, RewriteOutput
+
+    return DistillContext(
+        task_id=task_id,
+        article_id=f"art_{task_id}",
+        user_id=user_id,
+        url="https://example.com",
+        raw_content="原文正文",
+        rewrite=RewriteOutput(hook=hook, sections=["正文"], outro="结尾"),
+    )
+
+
+async def test_hooks_do_not_fabricate_evaluation_when_none_exists(session):
+    """没有真实评分 → 三个 hook 都不写表、不建画像、不入池。"""
+    from sqlalchemy import func, select
+
+    from distill.hooks_impl import (
+        AutoRetryHook,
+        FewShotPoolHook,
+        ListeningPatternUpdaterHook,
+    )
+
+    ctx = _ctx()
+    for hook in (AutoRetryHook(), ListeningPatternUpdaterHook(), FewShotPoolHook()):
+        await hook(ctx, session)
+    await session.commit()
+
+    assert await session.scalar(select(func.count()).select_from(DistillationEvaluation)) == 0
+    assert await session.scalar(select(func.count()).select_from(UserListeningPattern)) == 0
+    assert await session.scalar(select(func.count()).select_from(FewShotExample)) == 0
+
+
+async def test_hooks_use_real_evaluation_when_exists(session):
+    """用户真打了 5 星 → 画像更新 + 入池，且只依据这条真评分。"""
+    from sqlalchemy import func, select
+
+    from distill.hooks_impl import FewShotPoolHook, ListeningPatternUpdaterHook
+
+    now = datetime.now()
+    session.add(
+        DistillationEvaluation(
+            id="eval_real_1",
+            task_id="dst_hook",
+            user_id=1,
+            overall_score=5,
+            auto_flag=False,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    await session.commit()
+
+    ctx = _ctx()
+    await ListeningPatternUpdaterHook()(ctx, session)
+    await FewShotPoolHook()(ctx, session)
+    await session.commit()
+
+    # 评分行仍是原来那 1 条（hook 不再自己造第 2 条）
+    assert await session.scalar(select(func.count()).select_from(DistillationEvaluation)) == 1
+    pat = await session.scalar(
+        select(UserListeningPattern).where(UserListeningPattern.user_id == 1)
+    )
+    assert pat is not None
+    assert pat.feedback_count == 1
+    ex = await session.scalar(select(func.count()).select_from(FewShotExample))
+    assert ex == 1
+
+
+async def test_few_shot_pool_hook_ignores_auto_flag_evaluation(session):
+    """auto_flag=true（自动/评测员评分）不算用户信号，不入池。"""
+    from sqlalchemy import func, select
+
+    from distill.hooks_impl import FewShotPoolHook, ListeningPatternUpdaterHook
+
+    now = datetime.now()
+    session.add(
+        DistillationEvaluation(
+            id="eval_auto_1",
+            task_id="dst_hook",
+            user_id=1,
+            overall_score=5,
+            auto_flag=True,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    await session.commit()
+
+    ctx = _ctx()
+    await ListeningPatternUpdaterHook()(ctx, session)
+    await FewShotPoolHook()(ctx, session)
+    await session.commit()
+
+    assert await session.scalar(select(func.count()).select_from(FewShotExample)) == 0
+    assert await session.scalar(select(func.count()).select_from(UserListeningPattern)) == 0
+
+
+async def test_few_shot_pool_hook_never_inserts_default_text(session):
+    """hook 文本为空时跳过，绝不把字面量 "default text" 塞进池子喂给 LLM。"""
+    from sqlalchemy import func, select
+
+    from distill.hooks_impl import FewShotPoolHook
+
+    now = datetime.now()
+    session.add(
+        DistillationEvaluation(
+            id="eval_real_2",
+            task_id="dst_hook",
+            user_id=1,
+            overall_score=5,
+            auto_flag=False,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    await session.commit()
+
+    await FewShotPoolHook()(_ctx(hook=""), session)
+    await session.commit()
+
+    assert await session.scalar(select(func.count()).select_from(FewShotExample)) == 0

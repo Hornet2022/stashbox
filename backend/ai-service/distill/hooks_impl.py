@@ -42,6 +42,39 @@ def _is_real_session(db: object) -> bool:
     return hasattr(db, "in_transaction")
 
 
+async def _latest_user_evaluation(db: AsyncSession, task_id: str) -> Any:
+    """取这篇**真实**的用户最新一条听感评分；没有则 None。
+
+    为什么必须查真值，不能造一条 overall_score=4 的
+    --------------------------------------------
+    这两个 hook 早期版本直接 `DistillationEvaluation(overall_score=4)` 造一条
+    假评分再喂给画像 / few-shot 池，理由是"CP3.8.0 接真实评分之前先占位"。
+    实际后果是把"用户偏好"信号污染成"每次蒸馏都投一票 4 分"：
+
+    - `update_user_listening_pattern` 的 `feedback_count` 会随**蒸馏次数**增长，
+      不是随用户反馈增长 → 冷启动门槛（<5）5 次蒸馏就跨过，等于画像"永远热启动"
+    - `avg_overall_score` 被假 4 分持续拉高，用户真实打的 1 星被稀释
+    - few-shot 池里塞满"没人喜欢过"的 hook 片段（门槛只有 score>=4），
+      下次蒸馏 `MemoryStore.load_few_shots` 读到它们当范例喂给 LLM
+
+    所以这里改成：只认用户真的提交过的评分（`auto_flag=false`），
+    没有就不更新 —— 没有真实信号时保持空，而不是用假信号假装有。
+    """
+    from sqlalchemy import select as _select
+
+    from stashbox.backend.common.models import DistillationEvaluation
+
+    return await db.scalar(
+        _select(DistillationEvaluation)
+        .where(
+            DistillationEvaluation.task_id == task_id,
+            DistillationEvaluation.auto_flag.is_(False),
+        )
+        .order_by(DistillationEvaluation.created_at.desc())
+        .limit(1)
+    )
+
+
 # ---------------------------------------------------------------------------
 # PreDistillHook 实现
 # ---------------------------------------------------------------------------
@@ -185,7 +218,9 @@ class StageCacheHook:
 class ListeningPatternUpdaterHook:
     """CP3.7.3：PostDistillHook —— 增量更新用户听感画像（30 篇窗口 + 加权平均）。
 
-    完整实现：调 update_user_listening_pattern（含冷启动保护 / 加权平均 / 特征提取）。
+    只在用户**真的**提交过听感评分时更新（见 [_latest_user_evaluation]）。
+    早期版本在这里造 overall_score=4 的假评分，会让 feedback_count 随蒸馏次数
+    增长、冷启动保护形同虚设，已移除。
     """
 
     async def __call__(self, ctx: DistillContext, db: AsyncSession) -> None:
@@ -193,17 +228,15 @@ class ListeningPatternUpdaterHook:
         if not _is_real_session(db):
             return
         try:
-            # CP3.7.3：需要 DistillationEvaluation，本期 mock 创建（CP3.8.0 接真实评分）
-            from stashbox.backend.common.models import DistillationEvaluation
-
-            evaluation = DistillationEvaluation(
-                id=f"eval_{ctx.task_id}",
-                task_id=ctx.task_id,
-                user_id=ctx.user_id,
-                overall_score=4,
-            )
-            db.add(evaluation)
-            await db.flush()
+            evaluation = await _latest_user_evaluation(db, ctx.task_id)
+            if evaluation is None:
+                # 用户还没评过这篇 → 没有真实信号可更新，保持原样
+                log.info(
+                    "listening_pattern_hook_skipped_no_real_eval",
+                    task_id=ctx.task_id,
+                    user_id=ctx.user_id,
+                )
+                return
 
             await update_user_listening_pattern(db, ctx.user_id, evaluation)
             await db.commit()
@@ -218,7 +251,9 @@ class ListeningPatternUpdaterHook:
 class FewShotPoolHook:
     """CP3.7.3：PostDistillHook —— 高分改写入选 few-shot 池（score >= 4）。
 
-    完整实现：调 add_high_score_to_pool（含 Levenshtein 查重 + LRU 1000 淘汰）。
+    同样只认真实评分（见 [_latest_user_evaluation]）。早期版本造 overall_score=4
+    的假评分，等于每次蒸馏都往池里塞一条"用户从没认可过"的 hook 片段，
+    而 few-shot 池的入选门槛只有 score>=4，池会被假信号灌满。
     """
 
     async def __call__(self, ctx: DistillContext, db: AsyncSession) -> None:
@@ -226,19 +261,23 @@ class FewShotPoolHook:
             return
         try:
             from .few_shot_pool import add_high_score_to_pool
-            from stashbox.backend.common.models import DistillationEvaluation
 
-            # CP3.7.3：mock evaluation（CP3.8.0 接真实评分）
-            evaluation = DistillationEvaluation(
-                id=f"eval_{ctx.task_id}",
-                task_id=ctx.task_id,
-                user_id=ctx.user_id,
-                overall_score=4,
-            )
-            db.add(evaluation)
-            await db.flush()
+            evaluation = await _latest_user_evaluation(db, ctx.task_id)
+            if evaluation is None:
+                log.info(
+                    "few_shot_pool_hook_skipped_no_real_eval",
+                    task_id=ctx.task_id,
+                    user_id=ctx.user_id,
+                )
+                return
 
-            rewrite_text = ctx.rewrite.hook if ctx.rewrite and ctx.rewrite.hook else "default text"
+            rewrite_text = ctx.rewrite.hook if ctx.rewrite and ctx.rewrite.hook else ""
+            if not rewrite_text:
+                # 早期版本这里 fallback 成字面量 "default text"，
+                # 会把一个无意义的字符串当范例喂给 LLM
+                log.info("few_shot_pool_hook_skipped_no_hook_text", task_id=ctx.task_id)
+                return
+
             await add_high_score_to_pool(db, evaluation, rewrite_text, "hook", user_id=ctx.user_id)
             await db.commit()
         except Exception as e:
@@ -270,23 +309,31 @@ class ScorePredictorHook:
 class AutoRetryHook:
     """CP3.7.3 §2.2.E：PostDistillHook —— 评分 < 3 → 自动重蒸（本期骨架）。
 
-    本期只搭 should_auto_retry 判定 + 日志；
-    CP3.7.x 上线时再接 arq.enqueue_job 重新入队。
+    早期版本写死 mock_score=4.0，等于"永远判定不用重试"，真实低分（用户打 1-2 星）
+    永远不会触发重蒸。改成读真实评分；用户没评过就没有重蒸依据，跳过。
+    真正入队（arq.enqueue_job）仍留 CP3.7.x。
     """
 
     async def __call__(self, ctx: DistillContext, db: AsyncSession) -> None:
         try:
-            mock_score = 4.0  # 本期固定通过
+            if not _is_real_session(db):
+                return
+            evaluation = await _latest_user_evaluation(db, ctx.task_id)
+            if evaluation is None or evaluation.overall_score is None:
+                log.info("auto_retry_skipped_no_real_eval", task_id=ctx.task_id)
+                return
+
+            score = float(evaluation.overall_score)
             user_daily_retry_count = 0  # 本期固定 0（CP3.7.x 接 Redis 计数）
 
-            if should_auto_retry(mock_score, user_daily_retry_count):
+            if should_auto_retry(score, user_daily_retry_count):
                 log.info(
                     "auto_retry_triggered",
                     task_id=ctx.task_id,
-                    score=mock_score,
+                    score=score,
                 )
             else:
-                log.info("auto_retry_skipped", task_id=ctx.task_id, score=mock_score)
+                log.info("auto_retry_skipped", task_id=ctx.task_id, score=score)
         except Exception as e:
             log.warning(
                 "auto_retry_hook_failed_continue",

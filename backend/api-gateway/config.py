@@ -107,6 +107,10 @@ ROUTES: list[Route] = [
         _url("ai-service"),
     ),
     Route("POST", "/api/v1/distill/{task_id}/evaluation", "ai-service", _url("ai-service")),
+    # 读回自己的最新评分（评分闭环读侧）。与上面 POST 同路径不同 method，
+    # 必须显式注册 —— fallback 猜表只认路径段前缀，distill 段会落到 ai-service，
+    # 但显式注册避免以后 fallback 规则调整时静默丢失。
+    Route("GET", "/api/v1/distill/{task_id}/evaluation", "ai-service", _url("ai-service")),
     # B2：ai-service admin 只读端点（admin 段不走 fallback，必须显式注册）
     Route("GET", "/api/v1/admin/few-shot-pool/health", "ai-service", _url("ai-service")),
     Route("GET", "/api/v1/admin/few-shot-pool", "ai-service", _url("ai-service")),
