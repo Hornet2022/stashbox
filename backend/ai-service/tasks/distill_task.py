@@ -43,17 +43,35 @@ async def _trigger_subscription_pushes(
 ) -> int:
     """蒸馏完成触发订阅推送（CP5.4b）。
 
-    1. 读 distilled_articles.tags（蒸馏时写入的标签，name 列表如 ["科技","商业"]）
-    2. 对每个 tag，查 tag_subscriptions 找 user_ids
+    1. 按 articles.id 查 distilled_articles 行，读它蒸馏时写入的标签
+       （name 列表如 ["科技","商业"]）
+    2. name → slug 映射，查 tag_subscriptions 找 user_ids
     3. 排除 exclude_user_id（自己蒸馏不推自己）
     4. 批量 INSERT push_notifications 行
     5. 失败不破主流程
 
     Returns: 写入的推送数
+
+    id 口径（真机排查出来的两处错配）
+    ----------------------------------
+    调用方（[distill_task]）传的 `article_id` 是 **articles.id**（art_xxx），
+    而这里原来 `db.get(DistilledArticle, article_id)` 是按 **主键**
+    distilled_articles.id（dst_xxx）查 —— 传进来必然查不到，函数每次都在
+    第一行 return 0。
+
+    就算把调用方改成传 dst_xxx 让第 1 步查得到，第 4 步 INSERT 又会炸：
+    push_notifications.article_id 上有指向 **articles(id)** 的外键
+    （push_notifications_article_id_fkey，ON DELETE CASCADE），塞 dst_xxx
+    直接 ForeignKeyViolationError；又被下面的 except 吞成一行 warning。
+
+    也就是说这个函数**没有任何一种入参能跑通** —— 这就是管理后台「推送队列」
+    永远空着的根因。现在两处都按 articles.id 统一。
     """
     try:
-        # 1. 读 DistilledArticle（id 是 str: dst_xxx）
-        da = await db.get(DistilledArticle, article_id)
+        # 1. 按 articles.id 找蒸馏结果（不是按 DistilledArticle 主键）
+        da = await db.scalar(
+            select(DistilledArticle).where(DistilledArticle.article_id == article_id)
+        )
         if not da or not da.tags:
             return 0
 
@@ -93,7 +111,9 @@ async def _trigger_subscription_pushes(
         notifs = [
             PushNotification(
                 user_id=sub_id,
-                article_id=article_id,  # DistilledArticle.id (dst_xxx)
+                # 必须是 articles.id：push_notifications_article_id_fkey 指向
+                # articles(id)。写 dst_xxx 会 ForeignKeyViolation（见函数 docstring）
+                article_id=article_id,
                 tag_slug=primary_tag_slug,
                 title=f"新文章：{article_title[:50]}",
                 body=f"你订阅的 {primary_tag_slug} 标签有新文章蒸馏完成",

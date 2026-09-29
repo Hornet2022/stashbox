@@ -17,13 +17,22 @@ Phase 2（当前）已经把 fetch_url / tts_synthesize 抽成 ToolRegistry 调�
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
+import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
+
+from observability.metrics import (
+    DISTILL_ATTEMPT_TOTAL,
+    DISTILL_FAILURE_TOTAL,
+    DISTILL_STEP_DURATION,
+    DISTILL_SUCCESS_TOTAL,
+)
 
 from .state import AgentState
 from .tools import ToolError, get_default_registry
@@ -42,6 +51,48 @@ log = logging.getLogger("agent.runner")
 # ---------------------------------------------------------------------------
 
 
+def _observe_step(step_name: str) -> Callable[[Any], Any]:
+    """给 agent 节点补 CP3.6 埋点：耗时 histogram + 成功/失败 counter。
+
+    为什么需要它
+    ------------
+    原来只有 `observability.decorators.trace_distill_step` 埋这些点，而它只挂在
+    `distill/steps.py` 的 step1~step4 上 —— 那 4 个函数只被 `DistillPipeline.run`
+    调用。生产蒸馏早已改成走 LangGraph agent（distill_task 用 agent 替代
+    pipeline.run），**这 4 个函数在生产一次都不执行**。
+
+    结果就是：`distill_step_duration_seconds` 只有 HELP/TYPE、没有任何 sample，
+    管理后台「蒸馏耗时」的 P50/P95/P99 永远是空。实测 ai-service /metrics 里
+    同一批的 `distill_queue_size` 有值（那是 worker 直接写的），一对比就露馅。
+
+    失败也记耗时 —— P95 统计要覆盖慢的失败请求，只记成功会低估耗时。
+    """
+
+    def _decorator(func: Any) -> Any:
+        @functools.wraps(func)
+        async def _wrapped(state: AgentState) -> dict[str, Any]:
+            start = time.monotonic()
+            DISTILL_ATTEMPT_TOTAL.labels(step=step_name).inc()
+            try:
+                result = await func(state)
+            except Exception as exc:
+                DISTILL_STEP_DURATION.labels(step=step_name).observe(time.monotonic() - start)
+                DISTILL_FAILURE_TOTAL.labels(step=step_name, reason=exc.__class__.__name__).inc()
+                raise
+            DISTILL_STEP_DURATION.labels(step=step_name).observe(time.monotonic() - start)
+            # 节点自己走 _error_update 返回时不算"成功"，按失败计
+            if result.get("status") == "failed":
+                DISTILL_FAILURE_TOTAL.labels(step=step_name, reason="tool_error").inc()
+            else:
+                DISTILL_SUCCESS_TOTAL.labels(step=step_name).inc()
+            return result
+
+        return _wrapped
+
+    return _decorator
+
+
+@_observe_step("step1_structure")
 async def fetch_node(state: AgentState) -> dict[str, Any]:
     """CP-AGENT-NODE-FETCH：调用 fetch_url tool，写 AgentState。
 
@@ -69,6 +120,7 @@ async def fetch_node(state: AgentState) -> dict[str, Any]:
         return _error_update(state, "fetch", e)
 
 
+@_observe_step("step2_rewrite")
 async def rewrite_node(state: AgentState) -> dict[str, Any]:
     """CP-AGENT-NODE-REWRITE：调 LLM 改写。
 
@@ -186,6 +238,7 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
         return _error_update(state, "rewrite", wrapped)
 
 
+@_observe_step("step3_tts")
 async def tts_node(state: AgentState) -> dict[str, Any]:
     """CP-AGENT-NODE-TTS：调 tts_synthesize tool。"""
     log.info("agent_node_tts article_id=%s", state.get("article_id"))
@@ -245,6 +298,7 @@ async def tts_node(state: AgentState) -> dict[str, Any]:
         return _error_update(state, "tts", e)
 
 
+@_observe_step("step4_concat")
 async def concat_node(state: AgentState) -> dict[str, Any]:
     """CP-AGENT-NODE-CONCAT：拼接音频（Phase 1 简化版：直接 done）。
 
