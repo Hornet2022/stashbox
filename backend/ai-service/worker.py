@@ -8,6 +8,7 @@
 都是顶层模块 —— 所以要么 cwd 是 ai-service（`python -m` 会把 cwd 加进 sys.path），
 要么把 ai-service 目录放进 PYTHONPATH。
 """
+
 import asyncio
 
 from arq import run_worker
@@ -36,8 +37,23 @@ class WorkerSettings:
     health_check_interval = 30
 
     async def on_startup(ctx):
-        """CP11.0.3: 启动独立的 metrics HTTP server，端口 8104。"""
+        """CP11.0.3: 启动独立的 metrics HTTP server，端口 8104。
+
+        CP-LOGGING-WORKER：必须在这里调 setup_logging。
+        arq worker 不经过 FastAPI 启动流程，之前**从未**初始化过日志：
+
+          - structlog 靠自带默认 PrintLogger 还能输出（所以 distill_task 的日志看得见）；
+          - 标准库 logging 完全没 handler，于是 agent/runner.py 里
+            `logging.getLogger("agent.runner")` 的日志**全部被静默丢弃** ——
+            agent 节点层在生产日志里完全不可见，排障时分不清
+            「节点没执行」还是「执行了但没打日志」。
+        """
+        from stashbox.backend.common.logging import setup_logging
+
+        setup_logging("ai-worker")
+
         from prometheus_client import start_http_server
+
         try:
             start_http_server(8104)
         except Exception:

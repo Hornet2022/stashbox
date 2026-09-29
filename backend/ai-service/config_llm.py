@@ -19,12 +19,34 @@ CP3.5 接真 API 时通过环境变量注入：
 - LLM_MAX_RETRIES=3
 """
 
+from pathlib import Path
+
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# CP-LLM-ENV-PATH：`.env` 必须按**模块位置**解析，不能靠 cwd。
+#
+# 之前写的是 `env_file=".env"`（相对当前工作目录），而各进程的 cwd 并不一致：
+#   - uvicorn / pytest 跑在 backend/        → 读到 backend/.env，timeout=300
+#   - arq worker 跑在 backend/ai-service/  → 那里没有 .env，**静默回退到代码默认值**，
+#                                           timeout=60、max_retries=3
+#
+# 实测踩过：同一份配置，backend 视角 LLM 调用 18s/33.6s 正常通过，
+# worker 视角 timeout=60 余量太薄，上游一抖动就 `llm_request_transport_error`，
+# 整条蒸馏在 rewrite 阶段失败。改 .env 对 worker 更是完全无效。
+#
+# 这里固定指向仓库内的 backend/.env，无论从哪个目录启动都能读到同一份。
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
+_ENV_FILE = _BACKEND_DIR / ".env"
+
 
 class LLMSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=str(_ENV_FILE),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     # 全局 provider 路由：openai / qwen_vl（CP9.x 决策：删 claude，删 mock 回退）
     llm_provider: str = "openai"

@@ -12,8 +12,10 @@
     log = get_logger(__name__)
     log.info("xxx_done", article_id=aid)   # kwargs 进 JSON 字段
 """
+
 import logging
 import sys
+import time
 import uuid
 from contextvars import ContextVar
 
@@ -28,6 +30,38 @@ def _stdout_logger_factory(*_args, **_kwargs):
     """每次都解析当前 sys.stdout —— 否则模块 import 时就把 stdout 定死了，
     pytest capsys / run_dev.sh 重定向都拿不到输出。"""
     return structlog.PrintLogger(file=sys.stdout)
+
+
+def _bridge_stdlib_to_structlog(log_level: int) -> None:
+    """把 stdlib logging 的记录也输出出来（CP-LOGGING-STDLIB-BRIDGE）。
+
+    没有这一步的话，用 `logging.getLogger(...)` 的模块（如 agent/runner.py）
+    的日志不会出现在任何输出里 —— 它们既不走 structlog 的 logger_factory，
+    也没有自己的 handler，等于被静默吞掉。
+
+    这里不用 ProcessorFormatter（不同 structlog 版本的 API 差异太大，
+    实测 0.32.x 下 foreign_pre_chain 会把 event_dict 变成 tuple 直接炸），
+    改用一个带前缀的普通 Handler：格式统一性让给 structlog 那边，
+    这里只保证"能看见"。
+    """
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(_StdlibBridgeFormatter())
+    root.addHandler(handler)
+    root.setLevel(log_level)
+
+
+class _StdlibBridgeFormatter(logging.Formatter):
+    """stdlib 记录的轻量渲染：`2026-09-29T10:00:00 [info] logger.name: message`。"""
+
+    converter = time.localtime
+
+    def format(self, record: logging.LogRecord) -> str:
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S", self.converter(record.created))
+        return f"{ts} [{record.levelname.lower():<7}] {record.name}: {record.getMessage()}"
 
 
 def setup_logging(service_name: str = "unknown", level: str | None = None) -> None:
@@ -54,6 +88,18 @@ def setup_logging(service_name: str = "unknown", level: str | None = None) -> No
 
     # service 进 context：后续所有日志自动带 "service": "content-service"
     structlog.contextvars.bind_contextvars(service=service_name)
+
+    # CP-LOGGING-STDLIB-BRIDGE：把**标准库 logging** 也接到 structlog 的输出。
+    #
+    # 实测踩过：agent/runner.py 用的是 `logging.getLogger("agent.runner")`（stdlib），
+    # 而 worker/服务日志走 structlog。之前只 configure 了 structlog，stdlib 那边
+    # 没有任何 handler，于是 `agent_node_fetch` / `agent_decision_router` /
+    # `agent_router_rule_fastpath` 这些行**全部被静默丢弃** ——
+    # 整个 agent 节点层在生产日志里完全不可见，排障时根本分不清
+    # 「节点没执行」和「节点执行了但没打日志」。
+    #
+    # ProcessorFormatter 让 stdlib record 也走同一套 processor，格式统一。
+    _bridge_stdlib_to_structlog(log_level)
 
     # 降噪（uvicorn / sqlalchemy 走 stdlib logging，这里只压级别）
     logging.getLogger("uvicorn.access").setLevel("WARNING")

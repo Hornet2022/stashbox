@@ -59,6 +59,7 @@ class OpenAIClient(LLMClient):
         self.base_url = base_url.rstrip("/")
         self.max_retries = max_retries
         self._shared = _shared
+        self.timeout = timeout
         self._client = httpx.AsyncClient(
             timeout=timeout,
             trust_env=False,  # 忽略沙箱/系统代理（漂移会打挂外网调用）
@@ -158,8 +159,19 @@ class OpenAIClient(LLMClient):
             rate_limited = False
             retry_after = None
             try:
-                resp = await self._client.post(f"{self.base_url}/chat/completions", json=body)
-            except (httpx.TimeoutException, httpx.TransportError) as e:
+                # CP-LLM-DEADLINE：httpx 的 timeout 是**每次 I/O 操作**的超时，
+                # 不是整个请求的总时长 —— 上游只要持续缓慢吐字节，读超时就会
+                # 不断重置，请求可以无限期挂着。
+                #
+                # 实测踩过：蒸馏任务在 attempt=0 超时后就不再有任何日志，
+                # worker 进程 CPU 0.3% / 状态 S / 日志 22 分钟零增长，
+                # 一直挂到 Arq job_timeout 强杀为止。
+                #
+                # 这里套一层 asyncio.timeout 做**总墙钟死线**，与传输层超时正交，
+                # 两者都超时才算失败。外层再乘 max_retries 得到单次 chat 的总预算。
+                async with asyncio.timeout(self.timeout):
+                    resp = await self._client.post(f"{self.base_url}/chat/completions", json=body)
+            except (TimeoutError, httpx.TimeoutException, httpx.TransportError) as e:
                 last_err = e
                 log.warning("llm_request_transport_error", attempt=attempt, error=repr(e))
             else:
