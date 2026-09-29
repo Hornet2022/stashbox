@@ -71,6 +71,25 @@ def _load_ai_app():
     return module
 
 
+def _load_ai_admin_router():
+    """按文件路径加载 **ai-service** 的 admin_router。
+
+    不能写 `import admin_router`：ai-service 和 content-service 各有一个同名
+    `admin_router.py`，两边都是顶层 import，谁先加载谁占住 sys.modules。
+    同时跑 tests/ai + tests/gateway 时，gateway 的 conftest 经 helpers 先加载了
+    content-service，裸 import 就会拿到 content-service 那个（路由表不同，
+    鉴权断言数出来的数也不对）。详见 b3 同名 helper 的注释。
+    """
+    name = "_b2_ai_admin_router"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, AI_DIR / "admin_router.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.fixture
 async def client():
     module = _load_ai_app()
@@ -343,7 +362,7 @@ async def test_admin_endpoints_protected_by_auth():
 
     轻量校验路由签名，不发请求 —— 绕开 app 单例 override 污染问题。
     """
-    import admin_router
+    admin_router = _load_ai_admin_router()
 
     protected = 0
     for route in admin_router.router.routes:

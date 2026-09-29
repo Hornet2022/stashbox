@@ -8,8 +8,10 @@ CP1.5：蒸馏任务写真实 PostgreSQL（distilled_articles 表），状态机
 
 import asyncio
 import logging
+import sys
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI
@@ -110,7 +112,21 @@ setup_logging("ai-service")
 app = FastAPI(title="stashbox-ai-service", version="0.2.0", lifespan=lifespan)
 register_exception_handlers(app)
 # B2：admin 只读看板端点（few-shot 池 / evaluations / 变体统计 / consents）
-from admin_router import router as admin_router  # noqa: E402
+#
+# 按文件路径加载而不是 `from admin_router import router`：content-service 也有
+# 一个同名 admin_router.py，两边都是顶层 import 会共享 sys.modules["admin_router"]。
+# 同时跑 tests/ai + tests/gateway 时 gateway 的 conftest 先加载 content-service，
+# 这里就会把 content-service 的 admin 路由挂进 ai-service 的 app。
+# 唯一模块名把这个共享状态消除（content-service 那边同样处理了）。
+import importlib.util as _ilu  # noqa: E402
+
+_spec = _ilu.spec_from_file_location(
+    "ai_service_admin_router", Path(__file__).resolve().parent / "admin_router.py"
+)
+_mod = _ilu.module_from_spec(_spec)
+sys.modules["ai_service_admin_router"] = _mod
+_spec.loader.exec_module(_mod)
+admin_router = _mod.router
 
 app.include_router(admin_router)
 app.add_middleware(RequestIDMiddleware)

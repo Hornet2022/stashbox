@@ -335,6 +335,25 @@ def _load_ai_app_b4():
     return module
 
 
+def _load_ai_admin_router():
+    """按文件路径加载 **ai-service** 的 admin_router。
+
+    不能写 `import admin_router`：content-service 也有同名 admin_router.py，
+    两边都是顶层 import，谁先加载谁占住 sys.modules。同时跑 tests/ai +
+    tests/gateway 时 gateway 的 conftest 会先加载 content-service，于是裸
+    import 拿到 content-service 那个（没有 ab-report 路由）。仓库里
+    test_admin_tts_test_classifier.py 早就记了这个问题，这里沿用同一做法。
+    """
+    name = "_b4_ai_admin_router"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, AI_DIR / "admin_router.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.fixture
 async def b4_client():
     module = _load_ai_app_b4()
@@ -378,7 +397,7 @@ async def test_ab_report_endpoint_empty_db(b4_client):
 
 async def test_ab_report_endpoint_requires_admin():
     """路由签名必须挂 require_admin_or_operator（对齐 B2 鉴权口径）。"""
-    import admin_router as ar_mod
+    ar_mod = _load_ai_admin_router()
 
     from stashbox.backend.common.auth_admin import require_admin_or_operator
 

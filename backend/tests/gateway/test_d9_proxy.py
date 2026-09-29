@@ -4,14 +4,21 @@ CP1.7.1 D9 代理单测：POST /api/v1/callback/d9-add-article（走 gateway 810
 覆盖：匿名 device_id / Authorization 透传 / 4001 / 3001 / 上游 5xx 透传不重试 /
       X-Request-ID 链路（客户端带的 + gateway 生成的）。
 
-注意：content-service 的 D9 端点是 `device_id: Header()`，FastAPI 把下划线转成连字符，
-所以真实头名是 `device-id`（不是任务包 §5 里写的 X-Device-Id）—— 按实现来，不改 content-service。
+头名口径：真实头名是 **`X-Device-Id`**。
+content-service 的端点签名是
+`device_id: Annotated[str | None, Header(alias="X-Device-Id")]`
+（commit a11aa87 从无 alias 的 `device_id: Header()` 改过来，对齐接口文档 §5
+和真机客户端）。HTTP 头名不区分大小写，但 `X-` 前缀是另一回事 —— 发 `device-id`
+content-service 读不到，会直接 4001。
+真机侧发送方：app/.../share/D9Receiver.kt 的 `addHeader("X-Device-Id", ...)`。
 """
+
 import uuid
 
 from helpers import new_user
 
 D9_URL = "/api/v1/callback/d9-add-article"
+DEVICE_ID_HEADER = "X-Device-Id"
 
 
 def _body(url_suffix: str) -> dict:
@@ -19,12 +26,12 @@ def _body(url_suffix: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 1. 无 Authorization + device-id → 转发到 content-service 并建文章
+# 1. 无 Authorization + X-Device-Id → 转发到 content-service 并建文章
 # ---------------------------------------------------------------------------
 async def test_d9_anonymous_device_id_reaches_content_service(gw, upstream_requests):
     device_id = "device_" + uuid.uuid4().hex[:8]
 
-    r = await gw.post(D9_URL, json=_body("d9_gw_anon"), headers={"device-id": device_id})
+    r = await gw.post(D9_URL, json=_body("d9_gw_anon"), headers={DEVICE_ID_HEADER: device_id})
 
     assert r.status_code == 200, r.text
     body = r.json()
@@ -35,8 +42,24 @@ async def test_d9_anonymous_device_id_reaches_content_service(gw, upstream_reque
     upstream = upstream_requests[-1]
     assert upstream.method == "POST"
     assert upstream.url.path == D9_URL
-    assert upstream.headers["device-id"] == device_id
+    assert upstream.headers[DEVICE_ID_HEADER.lower()] == device_id
     assert "authorization" not in upstream.headers  # 没带就不注入
+
+
+async def test_d9_rejects_wrong_device_header_name(gw):
+    """发 `device-id`（少 X- 前缀）→ 4001：锁住"头名必须带 X-"这个契约。
+
+    没有这条的话，谁把头名改回 `device-id` 都不会有测试报警，
+    而真机 D9Receiver 发的是 `X-Device-Id`，结果就是分享进来全部 400。
+    """
+    r = await gw.post(
+        D9_URL,
+        json=_body("d9_gw_wrong_header"),
+        headers={"device-id": "device_" + uuid.uuid4().hex[:8]},
+    )
+
+    assert r.status_code == 400
+    assert r.json()["code"] == 4001
 
 
 # ---------------------------------------------------------------------------

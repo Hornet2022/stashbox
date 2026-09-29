@@ -78,9 +78,12 @@ def fake_ai(monkeypatch):
     fake = _Fake()
     # P2-1 拆分后 force_retry 端点在 admin_router.py，其模块命名空间里
     # `get_ai_client` 已绑定，须 patch admin_router 模块属性（main 侧同步 patch 兜底）。
-    # 注意 main.py 用 `from admin_router import router as admin_router`，
-    # content_module.admin_router 是 APIRouter 实例，真正模块在 sys.modules。
-    monkeypatch.setattr(sys.modules["admin_router"], "get_ai_client", lambda: fake)
+    #
+    # 从 content_module 上取模块，而不是 sys.modules["admin_router"]：
+    # content-service 和 ai-service 各有一个同名 admin_router.py，main.py 现在
+    # 用唯一模块名按路径加载（见 content-service/main.py 的注释），裸名
+    # sys.modules 查不到，硬编码字符串会直接 KeyError。
+    monkeypatch.setattr(content_module.admin_router_module, "get_ai_client", lambda: fake)
     monkeypatch.setattr(content_module, "get_ai_client", lambda: fake)
     return fake
 

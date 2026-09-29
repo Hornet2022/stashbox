@@ -61,6 +61,26 @@ def _load_ai_app_b3():
     return module
 
 
+def _load_ai_admin_router():
+    """按文件路径加载 **ai-service** 的 admin_router。
+
+    不能写 `import admin_router`：ai-service 和 content-service 各有一个同名
+    `admin_router.py`，两边都用顶层 import（content-service/main.py 里就有
+    `from admin_router import router`）。谁先被 import 谁占住 sys.modules，
+    于是同时跑 tests/ai + tests/gateway 时，gateway 的 conftest 经 helpers
+    加载了 content-service，b3 这里的裸 import 就拿到了 content-service 的
+    那个 —— 路由表完全不同，断言 found == B3_PATHS 直接空集失败。
+    """
+    name = "_b3_ai_admin_router"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, AI_DIR / "admin_router.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.fixture
 async def b3_client():
     module = _load_ai_app_b3()
@@ -456,7 +476,7 @@ B3_PATHS = {
 
 
 def test_b3_routes_protected_by_auth():
-    import admin_router as ar_mod
+    ar_mod = _load_ai_admin_router()
 
     found = set()
     for route in ar_mod.router.routes:

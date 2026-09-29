@@ -129,7 +129,28 @@ app.add_middleware(
 # 用 APIRouter() 注入。include_router 不带 prefix —— admin_router 路径已是完整路径
 # （/api/v1/admin/*），保留前缀由 router 内的端点负责。后续 CP 推进 favorites /
 # articles / d9 三个 router 拆分时，遵循同样的 include_router 模式。
-from admin_router import router as admin_router  # noqa: E402
+#
+# 为什么按文件路径加载而不是 `from admin_router import router`
+# -------------------------------------------------------
+# ai-service 和 content-service 各有一个同名 `admin_router.py`，且两边 main
+# 都是顶层 import。顶层模块名共享 sys.modules，谁先加载谁占住名字 —— 于是
+# 同时跑 tests/ai + tests/gateway 时，gateway 的 conftest 先加载了
+# content-service，ai-service/main.py 就会把 **content-service 的 admin 路由**
+# 挂进自己的 app（表现为 /api/v1/admin/ab-report 404，鉴权断言也数错）。
+# 显式指定唯一模块名把这个共享状态彻底消除。
+import importlib.util as _ilu  # noqa: E402
+
+_spec = _ilu.spec_from_file_location(
+    "content_service_admin_router", Path(__file__).resolve().parent / "admin_router.py"
+)
+_mod = _ilu.module_from_spec(_spec)
+sys.modules["content_service_admin_router"] = _mod
+_spec.loader.exec_module(_mod)
+admin_router = _mod.router
+
+# 暴露模块本身：单测要 patch 它命名空间里的 get_ai_client 等依赖，
+# 比在测试里 `sys.modules["<名字>"]` 硬编码取更稳（名字变了测试不会 KeyError）。
+admin_router_module = _mod
 
 app.include_router(admin_router)
 
