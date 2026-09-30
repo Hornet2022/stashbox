@@ -33,6 +33,12 @@ MAIN_ACTIVITY = f"{PKG}/com.tingxia.audio.MainActivity"
 EVIDENCE_DIR = Path(os.getenv("STASHBOX_E2E_EVIDENCE", "/tmp/stashbox-e2e"))
 
 
+# logcat 里混着非 UTF-8 字节（设备端 C 层日志、崩溃转储等），
+# subprocess 默认按 locale 解码会抛 UnicodeDecodeError，把「读日志」变成
+# 「用例失败」。实测 logcat 48 万字节处就有个 0xc0。
+DECODE_KW = {"errors": "replace"}
+
+
 class E2EFailure(AssertionError):
     """E2E 断言失败。消息里带上现场文件路径。"""
 
@@ -79,7 +85,7 @@ class Device:
 
     def _adb(self, *args: str, timeout: int = 30) -> str:
         cmd = ["adb", "-s", self.serial, *args]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **DECODE_KW)
         if proc.returncode != 0:
             raise E2EFailure(f"adb {' '.join(args)} 失败: {proc.stderr.strip()[:300]}")
         return proc.stdout
@@ -92,7 +98,7 @@ class Device:
         「没查到」不是错误。所以这类调用走这里，失败信息仍保留。
         """
         cmd = ["adb", "-s", self.serial, *args]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **DECODE_KW)
         if proc.returncode != 0 and not proc.stdout.strip():
             raise E2EFailure(f"adb {' '.join(args)} 无输出: {proc.stderr.strip()[:300]}")
         return proc.stdout
@@ -145,9 +151,26 @@ class Device:
 
     # ---------- UI 树 ----------
 
-    def dump(self, timeout: int = 20) -> list[Node]:
-        """取当前 UI 树。每次都重新 dump —— 坐标不可缓存。"""
-        self._adb("shell", "uiautomator dump /sdcard/e2e_ui.xml", timeout=timeout)
+    def dump(self, timeout: int = 20, retries: int = 3) -> list[Node]:
+        """取当前 UI 树。每次都重新 dump —— 坐标不可缓存。
+
+        `uiautomator dump` 本身不稳：App 正在播放/转场时，AccessibilityService
+        可能拿不到窗口快照，命令非零退出且 **stderr 为空**（实测：
+        `adb shell uiautomator dump` 失败但 stderr 什么都没有）。
+        这种情况重试一次通常就好了，直接抛会把用例判成产品 bug。
+        """
+        last_exc: Exception | None = None
+        for attempt in range(retries):
+            try:
+                self._adb("shell", "uiautomator dump /sdcard/e2e_ui.xml", timeout=timeout)
+                break
+            except E2EFailure as exc:
+                last_exc = exc
+                if attempt < retries - 1:
+                    time.sleep(1.0 + attempt)
+        else:
+            raise last_exc  # type: ignore[misc]
+
         xml = self.shell("cat /sdcard/e2e_ui.xml", timeout=timeout)
         start = xml.find("<?xml")
         if start < 0:

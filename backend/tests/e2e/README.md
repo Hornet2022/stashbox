@@ -129,6 +129,23 @@ content-service 打的 Redis 标，ai-service 从来没读过 ——
 10. **`am start` deep link 不要带 `-n`**：带了 `-n` 就是显式指定 component，
    绕过 intent-filter 匹配，deep link 静默失效（App 停在首页，判据永远不满足）。
     正确写法 `am start -a android.intent.action.VIEW -d 'stashbox://detail/<id>'`。
+11. **`uiautomator dump` 本身不稳**：App 播放中 / 转场时拿不到窗口快照，
+    命令非零退出且 **stderr 为空**。`driver.dump()` 已加 3 次重试 ——
+    遇到就重试，别当成产品 bug。
+12. **`healthz` 200 不等于「跑的是最新代码」**：本轮排查「谁把真机那篇文章改成
+    failed」时，先怀疑后台进程、查了 arq 队列、翻了两个服务日志，全是空。
+    实际是我自己重启 ai-service 时 PYTHONPATH 没带对，服务直接启动失败
+    （`ModuleNotFoundError: No module named 'stashbox'`），监听 8103 的一直是
+    **旧进程** —— 于是本轮的修复根本没生效，我却以为已经生效。
+    教训：改完服务要确认启动日志无 import 错误；验证修复前先手动复现一遍
+    旧行为，确认「修之前确实是坏的」，否则你不知道自己在验什么。
+13. **调试别停在「猜测」**：那次的正确顺序是
+    `查 updated_at 时间点 → 对齐自己刚跑过什么 → 查监听进程的实际启动时间`。
+    第三步就定位到了：监听进程的启动时间比我改代码还早。
+14. **logcat 不是 UTF-8**：`logcat -d` 输出里混着非 UTF-8 字节（设备端 C 层日志、
+    崩溃转储），subprocess 默认按 locale 解码会抛 `UnicodeDecodeError`，
+    于是「读日志」变成「用例失败」。driver 统一 `errors="replace"`。
+    实测一次 logcat 48 万字节处就有个 `0xc0`。
 
 ## 与既有测试的分工
 

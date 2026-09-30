@@ -71,9 +71,18 @@ def _open_article(app, article_id: str, retries: int = 3):
     manifest 里也配了对应 intent-filter，所以
     `am start -a android.intent.action.VIEW -d stashbox://detail/<id>` 可以直达。
 
-    刻意**不传 `-n`**：加了 `-n` 就是显式指定 component，绕过 intent-filter
-    匹配，deep link 不再生效（实测卡在首页，判据「返回」按钮一直不出现）。
+    两个必须遵守的前提，都是实测踩出来的：
+
+    1. **不传 `-n`**：加了 `-n` 就是显式指定 component，绕过 intent-filter
+       匹配，deep link 静默失效（App 停在首页，判据「返回」一直不出现）。
+
+    2. **必须先 force-stop**：MainActivity 是 `launchMode="singleTask"`，
+       App 已经在跑时新 intent 走 `onNewIntent`，而 Compose Navigation 的
+       deep link 只在 `onCreate` 处理**初始** intent，不处理后续的 onNewIntent。
+       所以 App 已在前台时发 deep link，页面纹丝不动 —— 实测卡在首页。
     """
+    app.force_stop()
+    time.sleep(1.0)
     app.shell(f"am start -a android.intent.action.VIEW -d 'stashbox://detail/{article_id}'")
     # 判据：详情页有「返回」按钮（列表/首页没有这个控件）
     for _ in range(retries * 5):
