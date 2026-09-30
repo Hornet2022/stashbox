@@ -22,6 +22,40 @@ import os
 
 import pytest
 
+_DSN = os.getenv("STASHBOX_TEST_DSN", "postgresql://stashbox:stashbox_dev@localhost:5432/stashbox")
+
+
+def _exec_sql(sql: str, *args):
+    """asyncpg 直连跑一条写 SQL。
+
+    刻意不用 SQLAlchemy：AsyncSession 的连接池绑定在创建它的 event loop 上，
+    跨 loop 复用会抛 `got Future ... attached to a different loop`。
+    """
+    import asyncio
+
+    import asyncpg
+
+    async def _run():
+        conn = await asyncpg.connect(_DSN)
+        try:
+            await conn.execute(sql, *args)
+        finally:
+            await conn.close()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def _set_distill_status(article_id: str, status: str):
+    _exec_sql("update distilled_articles set status = $2 where article_id = $1", article_id, status)
+
+
+def _set_article_status(article_id: str, status: str):
+    _exec_sql("update articles set status = $2 where id = $1", article_id, status)
+
 
 async def _consume(uid: int):
     """跑一次 quota_service.consume，异常向上抛给调用方。"""
@@ -92,9 +126,7 @@ def test_quota_exceeded_contract_is_403_and_3001(db):
 
     from stashbox.backend.common.exceptions import BizException
 
-    dsn = os.getenv(
-        "STASHBOX_TEST_DSN", "postgresql://stashbox:stashbox_dev@localhost:5432/stashbox"
-    )
+    dsn = _DSN
     TARGET_UID = 9277
 
     async def _set_quota(uid, monthly, used):
@@ -158,36 +190,79 @@ def test_retrigger_distill_preserves_existing_artifact(owner_http, db):
     """重跑蒸馏**不会**打掉已有产物。
 
     CP-DISTILL-NONDESTRUCTIVE 的回归。原实现复用已有行时把
-    script_text / audio_url / duration_sec / quality_score / tags 一律置空。
+    script_text / audio_url / duration_sec / quality_score / tags 一律置空，
     本轮验收就因为这个把真机在用的一篇 done 文章打成了 queued，元数据全丢。
 
     断言口径：调完之后 status 变 queued 是对的（确实在重跑），
     但 **audio_url / script_text 必须还在** —— 旧产物要保留到新产物就位。
+
+    数据自建，**不碰真机在用的文章**。原先直接拿 `art_wxSOP_verify_0001`
+    （user 1 唯一一篇、真机正在用）开跑，问题有两个：
+      1) `/distill/start` 会 enqueue 一个 arq job，worker 异步跑完把状态写成
+         failed —— 测试的 finally 恢复发生在 worker 之前，恢复被覆盖，
+         真机上那篇就变成「蒸馏失败」。
+      2) 跑一次就留下一篇 failed 的真机数据，污染被测环境。
+    改成自己造一篇带产物的文章，测完连同蒸馏行一起删掉。
     """
-    rows = db(
-        "select id, status, audio_url, length(script_text) script_len "
-        "from distilled_articles where article_id='art_wxSOP_verify_0001'"
+    import time
+
+    url = f"https://mp.weixin.qq.com/s/e2e_retrigger_{int(time.time())}"
+    r = owner_http.post("/api/v1/callback/d9-add-article", json={"url": url, "source": "d9"})
+    if r.status_code == 403:
+        pytest.skip("配额不足，无法造测试文章")
+    assert r.status_code == 200, f"造文章失败: {r.status_code} {r.text[:200]}"
+    aid = r.json().get("article_id") or r.json().get("id")
+
+    # 伪造一条"已完成的产物"：直接写 distilled_articles，不等真 TTS。
+    # 这条测的是**重跑时旧产物保不保得住**，不需要产物是真的音频。
+    _exec_sql(
+        "delete from distilled_articles where article_id = $1", aid
+    )  # 清掉 D9 刚触发的排队任务
+    _exec_sql(
+        "insert into distilled_articles (id, article_id, status, audio_url, script_text) "
+        "values ($1, $2, 'done', $3, $4) "
+        "on conflict (article_id) do update set status='done', audio_url=excluded.audio_url, "
+        "script_text=excluded.script_text",
+        f"dst_e2e_{aid[-12:]}",
+        aid,
+        f"http://127.0.0.1:8333/stashbox-audio/audio/{aid}.wav",
+        "这是旧产物的正文，应该在重跑后依然存在。",
     )
-    assert rows, "缺少 art_wxSOP_verify_0001 的蒸馏行"
-    before = rows[0]
-    if before["audio_url"] is None:
-        pytest.skip("该文章当前没有音频产物，跳过")
 
-    # url 字段虽必填但后端 distill_start 实际用库里的 art.url，
-    # 请求体里的 url 仅满足 Pydantic 校验，传一个占位值即可。
-    r = owner_http.post(
-        "/api/v1/distill/start",
-        json={"article_id": "art_wxSOP_verify_0001", "url": "https://example.com/placeholder"},
-    )
-    assert r.status_code == 200, f"属主重跑应 200，实际 {r.status_code}: {r.text[:200]}"
+    try:
+        before = db(
+            "select id, status, audio_url, length(script_text) script_len "
+            "from distilled_articles where article_id = $1",
+            aid,
+        )[0]
+        assert before["audio_url"] is not None, "前置数据没造上"
 
-    after = db(
-        "select status, audio_url, length(script_text) script_len "
-        "from distilled_articles where article_id='art_wxSOP_verify_0001'"
-    )[0]
+        r = owner_http.post(
+            "/api/v1/distill/start",
+            json={"article_id": aid, "url": "https://example.com/placeholder"},
+        )
+        assert r.status_code == 200, f"属主重跑应 200，实际 {r.status_code}: {r.text[:200]}"
 
-    assert after["status"] == "queued", f"重跑后 status 应为 queued，实际 {after['status']}"
-    assert after["audio_url"] is not None, "重跑把 audio_url 清空了 —— 正在收听的用户会立刻失去音频"
-    assert (
-        after["script_len"] == before["script_len"]
-    ), f"重跑把 script_text 清空了：{before['script_len']} → {after['script_len']}"
+        after = db(
+            "select status, audio_url, length(script_text) script_len "
+            "from distilled_articles where article_id = $1",
+            aid,
+        )[0]
+
+        assert after["status"] == "queued", f"重跑后 status 应为 queued，实际 {after['status']}"
+        assert (
+            after["audio_url"] is not None
+        ), "重跑把 audio_url 清空了 —— 正在收听的用户会立刻失去音频"
+        assert (
+            after["script_len"] == before["script_len"]
+        ), f"重跑把 script_text 清空了：{before['script_len']} → {after['script_len']}"
+    finally:
+        # 自己的数据自己清干净，不留 failed 残渣
+        for sql in (
+            "delete from distilled_articles where article_id = $1",
+            "delete from feedback where article_id = $1",
+            "delete from listening_statuses where article_id = $1",
+            "delete from later_listens where article_id = $1",
+            "delete from articles where id = $1",
+        ):
+            _exec_sql(sql, aid)

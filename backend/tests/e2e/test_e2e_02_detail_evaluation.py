@@ -18,16 +18,24 @@ import pytest
 pytestmark = [pytest.mark.device]
 
 
-def _ready_article(db):
-    """取一篇可用的文章；没有就 skip。
+def _ready_article(db, user_id: int = 1):
+    """取一篇**属于该用户**的可用文章；没有就 None。
 
     不自己造数据：造出来的数据跑通了也说明不了真实链路。
+
+    `user_id = 1` 是必须的：真机登录的就是 user 1，而 App 的详情端点按属主
+    校验。库里躺着别的用户（dev 造的数据、其他 e2e 留下的）的 done 文章时，
+    不加这个过滤会选中一篇 App 根本打不开的文章 —— 表现为「详情页没出现」
+    或者 403，看起来像 App 坏了，其实是用例选错了对象。
+    本轮就踩了：库里最新的一篇 done 文章属于 user 13137。
     """
     rows = db(
         "select a.id, a.title, d.status, d.duration_sec "
         "from articles a join distilled_articles d on d.article_id = a.id "
-        "where a.deleted_at is null and d.status='done' and d.audio_url is not null "
-        "order by d.updated_at desc limit 1"
+        "where a.user_id = $1 "
+        "and a.deleted_at is null and d.status='done' and d.audio_url is not null "
+        "order by d.updated_at desc limit 1",
+        user_id,
     )
     return rows[0] if rows else None
 
@@ -60,13 +68,13 @@ def _open_article(app, article_id: str, retries: int = 3):
     才是稳定做法。
 
     MainActivity 注册了 `navDeepLink { uriPattern = "stashbox://detail/{id}" }`，
-    所以 `am start -a android.intent.action.VIEW -d stashbox://detail/<id>`
-    可以直达。
+    manifest 里也配了对应 intent-filter，所以
+    `am start -a android.intent.action.VIEW -d stashbox://detail/<id>` 可以直达。
+
+    刻意**不传 `-n`**：加了 `-n` 就是显式指定 component，绕过 intent-filter
+    匹配，deep link 不再生效（实测卡在首页，判据「返回」按钮一直不出现）。
     """
-    app.shell(
-        f"am start -a android.intent.action.VIEW "
-        f"-d 'stashbox://detail/{article_id}' -n {app.MAIN_ACTIVITY}"
-    )
+    app.shell(f"am start -a android.intent.action.VIEW -d 'stashbox://detail/{article_id}'")
     # 判据：详情页有「返回」按钮（列表/首页没有这个控件）
     for _ in range(retries * 5):
         if app.find(desc="返回") is not None or app.find(text="返回") is not None:

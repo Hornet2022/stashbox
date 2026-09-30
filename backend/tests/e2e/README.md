@@ -117,6 +117,18 @@ content-service 打的 Redis 标，ai-service 从来没读过 ——
 7. **表名和列名别猜**：`feedback`（有 `type` 列）≠ `feedback_v2`（有 `category` 列），
    收藏写的是前者；`tags` 接口返回的 `id` 是 **slug**（`"news"`）不是数据库主键（`1`），
    而 `tag_subscriptions.tag_id` 是 integer —— 查库得 `join tags on t.slug = $1`。
+8. **测试数据必须自带清理**：04 组挂在 user 1（真机在用账号）名下造文章，
+   不清理就会直接出现在真机 App 列表里。本轮跑完留了 32 篇 `e2e_capture_*`，
+   排在列表最前，把 02 组「详情页显示已就绪」顶掉了 —— 那个失败看着像产品 bug，
+   实际是自己污染被测环境。现在 04 每条用例的 `finally` 都调 `_purge_by_url`。
+   （删除顺序有讲究：先子表后父表，直接 `delete from articles` 会撞
+   `distilled_articles_article_id_fkey`。）
+9. **选测试数据要按属主过滤**：`App` 详情端点按属主校验，库里若躺着别的用户的
+   done 文章（dev 造的、其他 e2e 留下的），不加 `a.user_id = 1` 就会选中一篇
+   App 打不开的文章，表现为「详情页没出现」或 403。本轮就选中过 user 13137 的文章。
+10. **`am start` deep link 不要带 `-n`**：带了 `-n` 就是显式指定 component，
+   绕过 intent-filter 匹配，deep link 静默失效（App 停在首页，判据永远不满足）。
+    正确写法 `am start -a android.intent.action.VIEW -d 'stashbox://detail/<id>'`。
 
 ## 与既有测试的分工
 
