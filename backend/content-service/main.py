@@ -342,6 +342,7 @@ async def _create_article(
     event: EventName | None = None,  # 建库后要打的埋点（必须落在 commit 之前）
     *,
     fetch_on_create: bool = True,  # True=建库前调 fetcher 抓 title/source/raw_content
+    dedup: bool = True,  # True=同用户同 URL 已有未删文章则复用（CP-DUPLICATE-CLIP）
 ) -> Article:
     # CP11.0.7 P1.1：建库前同步抓一下页面，拿到 title/source/raw_content。
     # 失败软降级（fetcher 抛任何错都不阻塞 add,只是没 title/source/raw_content），
@@ -372,6 +373,35 @@ async def _create_article(
             log.warning(
                 f"fetch_unexpected on add (soft): url={url} err={type(exc).__name__}: {exc}"
             )
+
+    # CP-DUPLICATE-CLIP：同一用户重复剪藏同一 URL → 复用已有文章，不再建新行。
+    #
+    # articles 表对 (user_id, url) 没有任何唯一约束，所以 D9 / submit_article
+    # 重复提交同一链接会一路建到底：同一篇文章出现两条、配额扣两次。
+    # 实测两次 POST 同一 URL 拿到两个不同 article_id，quota_used 0 → 2。
+    #
+    # 口径：只查同一用户 + 未删除。不同用户剪藏同一链接各自拥有一份（属主隔离 +
+    # 配额按用户计），这是产品语义不是 bug；已软删的允许重新剪藏。
+    #
+    # dedup=False 的调用点（wechat_mp handler 那类由上游保证唯一性的）行为不变。
+    art = None
+    if dedup:
+        art = await db.scalar(
+            select(Article)
+            .where(
+                Article.user_id == user_id,
+                Article.url == url,
+                Article.deleted_at.is_(None),
+            )
+            .order_by(Article.created_at.desc())
+            .limit(1)
+        )
+    if art is not None:
+        log.info(
+            "duplicate_clip_reuse",
+            extra={"url": url, "user_id": user_id, "article_id": art.id},
+        )
+        return art
 
     art = Article(
         id=_new_article_id(),
@@ -436,6 +466,21 @@ async def submit_article(
     新端点漏调，现补上。
     """
     uid = _uid(user)
+    # CP-DUPLICATE-CLIP：先查重再扣费，重复提交同一链接不重复计费。
+    dup = await _find_existing_clip(req.url, uid, db)
+    if dup is not None:
+        log.info(
+            "submit_duplicate_reuse",
+            extra={"url": req.url, "user_id": uid, "article_id": dup.id},
+        )
+        try:
+            await get_ai_client().trigger_distill(
+                article_id=dup.id, auth_token=create_access_token(str(uid))
+            )
+        except Exception as exc:
+            log.warning(f"auto_distill_trigger_failed (dup): article={dup.id} error={exc}")
+        return _to_response(dup)
+
     quota = await quota_service.consume(db, uid)  # 用尽抛 QuotaExceededError(3001)
     art = await _create_article(req.url, uid, req.source, None, db, event=EventName.ARTICLE_SUBMIT)
     await cache_service.mark_article_quota(art.id)  # 打标：该文章已扣过配额
@@ -1361,6 +1406,25 @@ async def list_my_feedback_v2(
     }
 
 
+async def _find_existing_clip(url: str, user_id: int, db: AsyncSession) -> Article | None:
+    """同用户 + 同 URL + 未删除 的已有文章（CP-DUPLICATE-CLIP）。
+
+    单独抽出来是因为**扣费必须发生在判断之后**：
+    d9_add_article / submit_article 原实现是「先 consume 扣费 → 再建文章」，
+    重复剪藏同一链接时虽然不再建新行，配额却已经白扣了一次。
+    """
+    return await db.scalar(
+        select(Article)
+        .where(
+            Article.user_id == user_id,
+            Article.url == url,
+            Article.deleted_at.is_(None),
+        )
+        .order_by(Article.created_at.desc())
+        .limit(1)
+    )
+
+
 @app.post("/api/v1/callback/d9-add-article", response_model=D9AddResponse)
 async def d9_add_article(
     req: D9AddRequest,
@@ -1381,6 +1445,23 @@ async def d9_add_article(
 
     if user is not None:
         uid = _uid(user)
+        # CP-DUPLICATE-CLIP：先查重再扣费。重复剪藏同一链接复用已有文章，
+        # 配额不动 —— 否则用户重复分享一次就被多扣一次。
+        dup = await _find_existing_clip(req.url, uid, db)
+        if dup is not None:
+            log.info(
+                "d9_duplicate_reuse",
+                extra={"url": req.url, "user_id": uid, "article_id": dup.id},
+            )
+            task = await get_ai_client().trigger_distill(
+                dup.id, auth_token=create_access_token(str(uid))
+            )
+            return D9AddResponse(
+                article_id=dup.id,
+                task_id=(task or {}).get("task_id"),
+                status="distilling" if task else dup.status,
+                device_id=device_id,
+            )
         await quota_service.consume(db, uid)  # 用尽抛 QuotaExceededError(3001)
     else:
         uid = ANONYMOUS_USER_ID

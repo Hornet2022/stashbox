@@ -304,11 +304,12 @@ async def distill_start(
     url = art.url
     title = art.title
 
-    # 配额：与 /articles/{id}/distill 同口径——该文章已有蒸馏行则视为已扣过。
+    # 配额：与 /articles/{id}/distill 同口径 —— 已有蒸馏行 **或** content-service
+    # 打过「已扣配额」标，都视为已扣过。缺第二个判据会重复扣费（CP-AI-CHARGE-DUP）。
     existed_da = await db.scalar(
         select(DistilledArticle).where(DistilledArticle.article_id == req.article_id)
     )
-    if existed_da is None:
+    if existed_da is None and not await cache_service.has_article_quota(req.article_id):
         await quota_service.consume(db, uid)  # 用尽抛 3001
         await cache_service.mark_article_quota(req.article_id)
 
@@ -360,11 +361,27 @@ async def distill_article(
     url = art.url
     title = art.title
 
-    # 幂等：该文章已有蒸馏任务 → 不再扣配额
+    # 已有蒸馏产物行（复用旧行，CP-DISTILL-DUP）
     existed_da = await db.scalar(
         select(DistilledArticle).where(DistilledArticle.article_id == article_id)
     )
-    already_charged = existed_da is not None
+
+    # 幂等：已扣过配额就不再扣。判据有两个，缺一不可：
+    #   1) 该文章已有蒸馏产物行（existed_da）—— 说明之前扣过
+    #   2) content-service 提交时打的 Redis 标（mark_article_quota）—— 说明
+    #      抓取/剪藏阶段已经扣过，蒸馏阶段不该再扣
+    #
+    # CP-AI-CHARGE-DUP 修复：此前只查 existed_da，而 content-service 的
+    # d9_add_article / submit_article 都是「先 consume 扣一次 → 打 Redis 标 →
+    # 调本端点触发蒸馏」，此刻 distilled_articles 还没有行 → existed_da is None
+    # → **又扣一次**。实测剪藏 1 篇文章 quota_used 0 → 2，免费档 5 篇实际只能
+    # 剪藏 2.5 篇。has_article_quota() 写了却全项目零调用，就是漏在这一步。
+    #
+    # 注：CP1.7.4 的注释写的是「复用判定从『已扣过配额』改为『已有完整蒸馏产物』，
+    # 不再把 content-service 抓取阶段扣过的配额误算入蒸馏阶段」—— 注释描述的方向
+    # 与代码实际行为相反，代码正是把抓取阶段扣的那次又算了一遍。
+    marked = await cache_service.has_article_quota(article_id)
+    already_charged = existed_da is not None or marked
     quota_used = None
     if not already_charged:
         quota = await quota_service.consume(db, uid)  # 用尽抛 3001
