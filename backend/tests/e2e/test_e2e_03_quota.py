@@ -266,3 +266,69 @@ def test_retrigger_distill_preserves_existing_artifact(owner_http, db):
             "delete from articles where id = $1",
         ):
             _exec_sql(sql, aid)
+
+
+def test_admin_quota_adjust_invalidates_cache(http, db):
+    """后台调配额后，**立刻**能从 App 视角读到新值（缓存必须失效）。
+
+    CP-QUOTA-CACHE 的回归。配额读走 Redis（`user:quota:{id}`，TTL 60s），
+    而 `admin_quota_adjust` 改完 `monthly_quota` 原来完全不失效缓存。
+
+    跨端表现（跨端 E2E 实测）：管理员在后台把配额调高/停用，用户 App 端
+    最长 60 秒看到的是旧值 —— 调高了额度用不了，把用户停用了他还能继续剪藏。
+    单端测试永远抓不到：后台自己的响应是 200 且值正确，App 自己请求也成功，
+    只有把两端串起来才看得出读到的数是陈的。
+
+    断言口径：预热一次缓存（让第一次读走 cached=true）→ 后台调配额 →
+    立刻用 **user 身份**读，值必须已经是新的。
+    """
+    uid = 9018
+    before = db("select monthly_quota, quota_used from users where id = $1", uid)
+    if not before:
+        pytest.skip(f"user {uid} 不存在")
+    original_quota, original_used = before[0]["monthly_quota"], before[0]["quota_used"]
+
+    # 调成原值以预热缓存
+    _exec_sql(
+        "update users set monthly_quota = $2, quota_used = $3 where id = $1",
+        uid,
+        original_quota,
+        original_used,
+    )
+    _exec_sql("update users set monthly_quota = $2 where id = $1", uid, original_quota)
+    try:
+        warm = http.get(f"/api/v1/admin/users/{uid}/quota")  # 走 admin 端点顺带预热
+        _ = warm  # 只为让缓存里存在一份
+
+        new_quota = original_quota + 7
+        r = http.post(
+            f"/api/v1/admin/users/{uid}/quota-adjust",
+            json={"monthly_quota": new_quota, "reason": "CP-QUOTA-CACHE 回归验证"},
+        )
+        assert r.status_code == 200, f"调配额应 200，实际 {r.status_code}: {r.text[:200]}"
+        assert r.json()["monthly_quota"] == new_quota, f"响应值不对: {r.json()}"
+
+        # 关键：用**同一个用户**的另一个端点立刻读（/users/me/quota）。
+        # http fixture 本身就是 9018 身份，读到的就是被调额那个用户的值。
+        # （早先这里误用 owner_http —— 那是 user 1 的 token，读的是 user 1 的
+        #  配额，跟被调的 9018 不是同一个人，断言永远对不上。）
+        app_view = http.get("/api/v1/users/me/quota")
+        assert app_view.status_code == 200
+        body = app_view.json()
+        assert body["monthly_quota"] == new_quota, (
+            f"后台已把配额调成 {new_quota}，App 端读到的却是 {body['monthly_quota']}"
+            f"（cached={body.get('cached')}）。admin_quota_adjust 没有失效配额缓存。"
+        )
+    finally:
+        # 复原必须**走 API**，不能只改 SQL：配额读走 Redis 缓存，
+        # 只改库的话缓存里还留着 10006，后面的
+        # test_quota_values_match_database 会读到脏值而失败
+        # （实测 monthly_quota 不一致：接口 10006 vs 库 9999）。
+        _exec_sql("update users set quota_used = $2 where id = $1", uid, original_used)
+        http.post(
+            f"/api/v1/admin/users/{uid}/quota-adjust",
+            json={
+                "monthly_quota": original_quota,
+                "reason": "CP-QUOTA-CACHE 用例复原",
+            },
+        )

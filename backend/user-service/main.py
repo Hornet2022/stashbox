@@ -25,6 +25,7 @@ from stashbox.backend.common.auth import (
     require_user,
 )
 from stashbox.backend.common.config import settings
+from stashbox.backend.common import cache_service
 from stashbox.backend.common.database import get_db
 from stashbox.backend.common.exceptions import (
     BizException,
@@ -903,7 +904,18 @@ async def admin_quota_adjust(
     if target is None:
         raise HTTPException(status_code=404, detail=f"user {user_id} 不存在")
 
+    # CP-QUOTA-CACHE：配额读走 Redis 缓存（`user:quota:{id}`，TTL 60s），
+    # 而本端点改完 monthly_quota **没有失效缓存**。后果是跨端不一致：
+    # 管理员在后台把配额调高，用户 App 端最长 60 秒看不到新额度；
+    # 把用户停用（=0），用户最长 60 秒内仍能继续剪藏、不会看到任何提示。
+    # 跨端 E2E 实测：后台调成 0 之后立刻读 App 的配额接口，拿到的是
+    # {"monthly_quota":50,...,"cached":true} —— 还是调整前的值。
+    #
+    # 与 quota_service.consume 同一套版本号栅栏：quota_version+1 后
+    # invalidate_quota(new_version)，让在途的旧值回填被 Lua 栅栏挡住。
     target.monthly_quota = req.monthly_quota
+    new_version = (target.quota_version or 0) + 1
+    target.quota_version = new_version
 
     # 审计日志：与目标更新同事务提交，失败一起回滚
     log_row = AdminOperationLog(
@@ -928,6 +940,14 @@ async def admin_quota_adjust(
     except Exception:
         await db.rollback()
         raise
+
+    # 提交成功后再失效缓存：commit 之前失效的话，回滚会让缓存变成"已删但库没改"，
+    # 下一次读又把旧值回填回去。缓存失效失败不该让 200 变成 5xx ——
+    # 数据已经落库了，最多让用户等 TTL 到期。
+    try:
+        await cache_service.invalidate_quota(user_id, new_version)
+    except Exception as exc:  # pragma: no cover - 缓存是加速层，不是正确性来源
+        log.warning("QUOTA_CACHE_INVALIDATE_FAILED user=%s ver=%s err=%s", user_id, new_version, exc)
 
     return UserQuotaResponse(
         id=target.id,
