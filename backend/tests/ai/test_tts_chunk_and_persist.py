@@ -24,6 +24,7 @@ import uuid
 import wave
 from pathlib import Path
 
+import httpx
 import pytest
 import pytest_asyncio
 
@@ -33,6 +34,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 from app.services.tts.indextts import (  # noqa: E402
     IndexTTSClient,
+    IndexTTSError,
     _concat_wav,
     _patch_riff_sizes,
     _sibling_omlx_urls,
@@ -281,8 +283,16 @@ def test_sibling_urls_do_not_invent_ports_for_remote_host():
     assert _sibling_omlx_urls("http://gpu-box:9000/v1") == ["http://gpu-box:9000/v1"]
 
 
-def test_client_builds_failover_chain_and_short_timeout():
-    """单请求超时必须远小于整体墙钟预算（300s），否则等于在空转实例上白等。"""
+def test_client_builds_failover_chain_and_short_timeout(monkeypatch):
+    """单请求超时必须远小于整体墙钟预算（300s），否则等于在空转实例上白等。
+
+    ⚠️ 必须显式清掉这两个环境变量：候选链是由 .env 决定的，而 .env 是**每台机器
+    各不相同**的（这台可能配了 INDEXTTS_FAILOVER_URLS 或 INDEXTTS_SINGLE_INSTANCE）。
+    不清的话，改一次 .env 就会让本用例在别人机器上莫名其妙挂掉 —— 它要验的是
+    「默认走兄弟端口链」这条逻辑，不是「本机 .env 现在配了什么」。
+    """
+    monkeypatch.delenv("INDEXTTS_FAILOVER_URLS", raising=False)
+    monkeypatch.delenv("INDEXTTS_SINGLE_INSTANCE", raising=False)
     c = IndexTTSClient(
         base_url="http://127.0.0.1:8000/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
     )
@@ -298,6 +308,118 @@ def test_chunk_concurrency_is_bounded():
         base_url="http://127.0.0.1:8000/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
     )
     assert 1 <= c.chunk_concurrency <= 8
+
+
+# ==========================================================================
+# 2.6 单实例开关 + 熔断（CP-INDEXTTS-SINGLE / CP-INDEXTTS-CIRCUIT）
+# ==========================================================================
+
+
+def test_single_instance_flag_suppresses_sibling_discovery(monkeypatch):
+    """INDEXTTS_SINGLE_INSTANCE=1 时，候选链必须只剩 base_url 本身。
+
+    这条是 16GB 机器能不能活的关键：两个 oMLX 实例各 mmap 一份 1.7GB 权重，
+    swap 会被打爆（文件头有「只保留一个实例后 swap 降到 7.9GB」的实测）。
+    """
+    monkeypatch.setenv("INDEXTTS_SINGLE_INSTANCE", "1")
+    monkeypatch.delenv("INDEXTTS_FAILOVER_URLS", raising=False)
+    c = IndexTTSClient(
+        base_url="http://127.0.0.1:8008/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
+    )
+    assert c.endpoints == ["http://127.0.0.1:8008/v1"]
+
+
+def test_single_instance_flag_beats_explicit_failover(monkeypatch):
+    """单实例开关优先级最高：显式配了 FAILOVER 也不能把兄弟端口拉回来。"""
+    monkeypatch.setenv("INDEXTTS_SINGLE_INSTANCE", "1")
+    monkeypatch.setenv("INDEXTTS_FAILOVER_URLS", "http://127.0.0.1:8008/v1")
+    c = IndexTTSClient(
+        base_url="http://127.0.0.1:8000/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
+    )
+    assert c.endpoints == ["http://127.0.0.1:8000/v1"]
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_opens_after_threshold_then_fast_fails(monkeypatch):
+    """连续失败到阈值后开闸，后续调用必须**立刻**失败而不是再烧一轮超时。
+
+    没有熔断时 oMLX 引擎段错误崩掉后，一段 200 字要走
+    端点数 × 尝试数 × chunk_timeout = 2×2×240s = 16 分钟才报错，一篇 8 段就
+    两个多小时。熔断把这个变成秒级失败。
+    """
+    import time as _time
+
+    monkeypatch.delenv("INDEXTTS_FAILOVER_URLS", raising=False)
+    monkeypatch.delenv("INDEXTTS_SINGLE_INSTANCE", raising=False)
+    monkeypatch.setenv("INDEXTTS_BREAKER_THRESHOLD", "3")
+    monkeypatch.setenv("INDEXTTS_BREAKER_COOLDOWN", "300")
+    monkeypatch.setenv("INDEXTTS_CHUNK_TIMEOUT", "240")
+    c = IndexTTSClient(
+        base_url="http://127.0.0.1:8000/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
+    )
+    # 参考音频文件不存在时 _load_ref_audio_b64 会先抛 IndexTTSError，根本走不到
+    # 重试循环 —— 桩掉它，否则本用例验的是「文件存不存在」而不是熔断。
+    c._load_ref_audio_b64 = lambda *a, **kw: _async_value("x")  # type: ignore[assignment]
+
+    calls = 0
+
+    async def _boom(*a, **kw):
+        nonlocal calls
+        calls += 1
+        # 必须抛 httpx 自己的异常类型：重试循环只捕 TimeoutException / HTTPError，
+        # 抛别的会直接穿透循环，用例就变成在验「异常类型对不对」而不是验熔断。
+        raise httpx.ReadTimeout("simulated oMLX engine hang")
+
+    # 连着 3 次全部失败（模拟引擎已死）
+    c._client.post = _boom  # type: ignore[method-assign]
+    for _i in range(3):
+        with pytest.raises(IndexTTSError):
+            await c._synthesize_once("测试")
+
+    assert c._consecutive_failures == 3
+    assert c._circuit_open_until > _time.monotonic()
+
+    # 第 4 次：熔断应已打开 —— 不发请求，直接抛
+    calls_before = calls
+    with pytest.raises(IndexTTSError, match="熔断中"):
+        await c._synthesize_once("测试")
+    assert calls == calls_before, "熔断期间不应再打后端"
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_resets_on_success(monkeypatch):
+    """一次成功就要复位熔断计数 —— 后端自愈后不该继续被挡住。"""
+    import time as _time
+
+    monkeypatch.setenv("INDEXTTS_BREAKER_THRESHOLD", "3")
+    c = IndexTTSClient(
+        base_url="http://127.0.0.1:8000/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
+    )
+    c._consecutive_failures = 2
+    c._circuit_open_until = _time.monotonic() + 300
+
+    # 冷却期已过 → 允许进入
+    c._circuit_open_until = 0.0
+
+    class _Resp:
+        status_code = 200
+        content = b"RIFF" + b"\x00" * 4096
+        headers = {"content-type": "audio/wav"}
+        text = ""
+
+    async def _ok(*a, **kw):
+        return _Resp()
+
+    c._client.post = _ok  # type: ignore[method-assign]
+    c._load_ref_audio_b64 = lambda *a, **kw: _async_value("x")  # type: ignore[assignment]
+    out = await c._synthesize_once("测试")
+    assert out
+    assert c._consecutive_failures == 0
+    assert c._circuit_open_until == 0.0
+
+
+async def _async_value(v):
+    return v
 
 
 # ==========================================================================

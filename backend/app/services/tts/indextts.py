@@ -59,6 +59,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 import wave
 from pathlib import Path
 from urllib.parse import urlparse
@@ -312,7 +313,20 @@ class IndexTTSClient(TTSClient):
         self.chunk_timeout = float(os.getenv("INDEXTTS_CHUNK_TIMEOUT", "90"))
         failover = os.getenv("INDEXTTS_FAILOVER_URLS", "").strip()
         candidates = [u.strip().rstrip("/") for u in failover.split(",") if u.strip()]
-        if not candidates:
+        # CP-INDEXTTS-SINGLE：显式关掉「自动把本机另一个 oMLX 端口补进候选链」。
+        #
+        # 为什么要留这个开关：`_sibling_omlx_urls` 是**无条件**补 8000/8008 的，
+        # 所以光把 INDEXTTS_FAILOVER_URLS 删掉并不会变单实例 —— 候选链还是两条。
+        # 16GB 机器上两个实例各 mmap 一份 1.7GB 权重就是 swap 被打爆的直接原因
+        # （见本文件头「只保留一个实例后 swap 降到 7.9GB」那条实测）。
+        single = os.getenv("INDEXTTS_SINGLE_INSTANCE", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if single:
+            candidates = [self.base_url]
+        elif not candidates:
             # 没显式配 failover 时，自动把本机另一个 oMLX 端口补进候选链 ——
             # 两个实例交替空转（见文件头），单靠死等主地址必然失败。
             candidates = _sibling_omlx_urls(self.base_url)
@@ -321,6 +335,21 @@ class IndexTTSClient(TTSClient):
         # 去重保序
         self.endpoints: list[str] = list(dict.fromkeys(candidates))
         self.max_attempts = max(1, int(os.getenv("INDEXTTS_MAX_ATTEMPTS", "2")))
+
+        # CP-INDEXTTS-CIRCUIT：连续失败熔断。
+        #
+        # 为什么必须有：oMLX 的 TTS 引擎一旦段错误崩掉（crash.log 里见过
+        # `Fatal Python error: Segmentation fault ... tts.py:278 _synthesize_sync`），
+        # **HTTP 层仍然应答**（/v1/models 秒回 200、错 payload 返 422），只有真实
+        # 合成请求会永久挂起。没有熔断的话，一段 200 字要走
+        # 端点数 × max_attempts 次 × chunk_timeout 才报错 —— 实测 2 实例 × 2 次
+        # × 240s = **单段最多烧 16 分钟**，一篇 8 段就是两个多小时，然后失败。
+        # 熔断让「后端已经死了」变成几秒内的明确失败。
+        self.breaker_threshold = max(1, int(os.getenv("INDEXTTS_BREAKER_THRESHOLD", "3")))
+        self.breaker_cooldown = float(os.getenv("INDEXTTS_BREAKER_COOLDOWN", "300"))
+        self._consecutive_failures = 0
+        self._circuit_open_until = 0.0
+
         # 分段并发度。
         #
         # ⚠️ **默认 1（串行）**，这不是保守，是实测逼出来的：
@@ -483,7 +512,21 @@ class IndexTTSClient(TTSClient):
         而不是拿 300s 死等一个正在空转的实例。
 
         CP-TTS-VOICE：ref_audio / ref_text 为按调用覆盖的音色（见 synthesize）。
+
+        CP-INDEXTTS-CIRCUIT：连续 [breaker_threshold] 段彻底失败后开闸
+        [breaker_cooldown] 秒，期间直接快速失败，不再重试。
         """
+        # 熔断检查放在最前面 —— 包括 ref 音频加载之前，这样连冷读 1.7GB 权重
+        # 的开销都省掉。后端已死时重试到底只会把机器拖得更慢。
+        now = time.monotonic()
+        if self._circuit_open_until > now:
+            raise IndexTTSError(
+                f"IndexTTS 熔断中：已连续失败 {self._consecutive_failures} 段，"
+                f"{self._circuit_open_until - now:.0f}s 后重试"
+                f"（端点 {self.endpoints}）。多半是 oMLX 引擎崩了，"
+                f"先看 ~/.omlx/logs/crash.log。"
+            )
+
         ref_b64 = await self._load_ref_audio_b64(ref_audio)
         ref_text_value = self._ensure_ref_text(ref_text)
 
@@ -558,11 +601,29 @@ class IndexTTSClient(TTSClient):
                 log.warning("IndexTTS 空音频，切换实例: base=%s ct=%s", base, ct)
                 continue
             log.info("IndexTTS synthesized: %d bytes (%s) via %s", len(audio), ct, base)
+            # 成功即复位熔断计数：一次成功说明后端活了。
+            if self._consecutive_failures:
+                log.info("IndexTTS 熔断计数复位（此前连续失败 %d 段）", self._consecutive_failures)
+            self._consecutive_failures = 0
+            self._circuit_open_until = 0.0
             return audio
+
+        # 全部尝试用尽 —— 计入熔断。
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self.breaker_threshold:
+            self._circuit_open_until = time.monotonic() + self.breaker_cooldown
+            log.error(
+                "IndexTTS 熔断打开：连续 %d 段失败（阈值 %d），" "暂停 %ss 再试。端点=%s",
+                self._consecutive_failures,
+                self.breaker_threshold,
+                self.breaker_cooldown,
+                self.endpoints,
+            )
 
         raise IndexTTSError(
             f"IndexTTS 合成失败（已尝试 {len(attempts)} 次 / "
-            f"{len(self.endpoints)} 个实例，请求超时 {self.chunk_timeout}s）：{last_err}"
+            f"{len(self.endpoints)} 个实例，请求超时 {self.chunk_timeout}s，"
+            f"连续失败第 {self._consecutive_failures} 段）：{last_err}"
         ) from last_err
 
     async def close(self) -> None:
