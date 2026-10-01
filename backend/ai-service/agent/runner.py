@@ -283,6 +283,10 @@ async def tts_node(state: AgentState) -> dict[str, Any]:
             "tts_audio_url": result.get("audio_url"),
             "tts_audio_path": result.get("audio_path"),
             "tts_duration_sec": result.get("duration_sec"),
+            # CP-TTS-VOICE：把本次用的音色带进 state，distill_task 据此回写
+            # distilled_articles.tts_voice_id（None = 全局配置，来源不可溯源）
+            "tts_voice_id": result.get("tts_voice_id"),
+            "tts_voice_name": result.get("tts_voice_name"),
             # CP-AGENT-PASSTHROUGH：累加 tool_calls 历史
             "tool_calls": (state.get("tool_calls") or [])
             + [

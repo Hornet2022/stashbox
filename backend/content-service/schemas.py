@@ -13,6 +13,18 @@ class AddArticleRequest(BaseModel):
     source: str = "web"  # wechat | douyin | web | pdf | d9 | clawbot
 
 
+class TTSVoiceBrief(BaseModel):
+    """这段音频的合成音色（CP-TTS-VOICE 溯源）。
+
+    `available=False` = 该音色已下架/已删除，但**名字照给** —— 历史音频确实是
+    它合成的，藏掉名字会让来源凭空消失，用户反而以为自己记错了。
+    """
+
+    id: str
+    name: str
+    available: bool = True
+
+
 class ArticleResponse(BaseModel):
     id: str
     url: str
@@ -37,6 +49,14 @@ class ArticleResponse(BaseModel):
     # CP-DISTILL-TEXT：LLM 听感改写稿全文（hook/body/outro 以空行分段）。
     # 详情页展示"整理后的正文"。蒸馏未完成时为 None。
     script_text: str | None = None
+    # CP-TTS-VOICE 溯源：这段音频当时用哪个音色合成的。
+    # None 有两种含义，客户端无法也不必区分：迁移前跑的历史文章（无从得知）、
+    # 以及用全局配置合成的（source 不可溯源，刻意不塞假音色）。
+    #
+    # ⚠️ **只在详情页填**，列表接口恒为 null：列表每行都挂个音色名是噪音，
+    # 而且要为此在列表查询里多 join 一次音色表。详情页和 /status 才需要它 ——
+    # 后者是「换音色重生成」时 App 轮询的那个端点，不带缓存，重生成后能立刻看到音色变了。
+    tts_voice: TTSVoiceBrief | None = None
 
 
 class D9AddRequest(BaseModel):
@@ -69,6 +89,9 @@ class ArticleStatusResponse(BaseModel):
     quality_score: float | None = None
     created_at: str
     updated_at: str
+    # CP-TTS-VOICE 溯源：同 ArticleResponse.tts_voice。放在这里是因为 App 在
+    # 重生成期间轮的就是这个端点（且不走缓存），能在蒸馏完成的那一刻看到音色变化。
+    tts_voice: TTSVoiceBrief | None = None
 
 
 class AudioUrlResponse(BaseModel):

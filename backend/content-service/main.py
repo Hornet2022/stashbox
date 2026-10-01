@@ -63,11 +63,13 @@ from schemas import (  # noqa: E402
     ClawBotMessageRequest,
     D9AddRequest,
     D9AddResponse,
+    TTSVoiceBrief,
     WechatMpMessageRequest,
 )
 
 from stashbox.backend.common import cache_service, quota_service
 from stashbox.backend.common.config import settings
+from stashbox.backend.common.tts_voice_service import get_voice_briefs
 from stashbox.backend.common.auth import create_access_token, require_user, require_user_optional
 from stashbox.backend.common.auth_admin import require_admin_or_operator
 from stashbox.backend.common.database import AsyncSessionLocal, get_db
@@ -155,6 +157,18 @@ admin_router_module = _mod
 app.include_router(admin_router)
 
 
+# CP-TTS-VOICE：音色库 + 用户音色/语速偏好端点。
+# 同样按文件路径加载（不复用 import），理由见上面 admin_router 那段注释 ——
+# 多个服务都有同名模块，直接 import 会撞名。
+_spec_tts_voice = _ilu.spec_from_file_location(
+    "content_service_tts_voice_router", Path(__file__).resolve().parent / "tts_voice_router.py"
+)
+_mod_tts_voice = _ilu.module_from_spec(_spec_tts_voice)
+sys.modules["content_service_tts_voice_router"] = _mod_tts_voice
+_spec_tts_voice.loader.exec_module(_mod_tts_voice)
+app.include_router(_mod_tts_voice.router)
+
+
 class InvalidRequest(BizException):
     """参数 / 身份类错误（HTTP 400，业务码按场景传）。"""
 
@@ -171,8 +185,29 @@ def _new_article_id() -> str:
     return f"art_{uuid.uuid4().hex[:24]}"
 
 
+async def _tts_voice_brief(task: DistilledArticle | None) -> TTSVoiceBrief | None:
+    """把蒸馏产物的 `tts_voice_id` 翻成「谁念的」（CP-TTS-VOICE 溯源）。
+
+    走 `get_voice_briefs`（不过滤软删）：管理员下架/删除音色后，**历史音频的
+    署名仍要留着**。用 `get_voice`（过滤软删）的话，删完音色所有老文章的来源
+    会一起变 null，用户看着自己明明听过的音色凭空消失。
+
+    查不到（id 悬空）也回 None —— 与「迁移前历史文章无从得知」同义，不编造。
+    """
+    if task is None or not task.tts_voice_id:
+        return None
+    brief = (await get_voice_briefs([task.tts_voice_id])).get(task.tts_voice_id)
+    if brief is None:
+        return None
+    return TTSVoiceBrief(id=brief.id, name=brief.name, available=brief.available)
+
+
 def _to_response(
-    a: Article, task: DistilledArticle | None = None, *, full_script: bool = False
+    a: Article,
+    task: DistilledArticle | None = None,
+    *,
+    full_script: bool = False,
+    tts_voice: TTSVoiceBrief | None = None,
 ) -> ArticleResponse:
     """CP9.x dev 兜底：本地模式（STORAGE_PROVIDER=local）下 audio_url 用
     PUBLIC_GATEWAY_URL 拼，避免真机客户端连到 localhost（设备本机）。
@@ -210,6 +245,8 @@ def _to_response(
         tags=list(task.tags) if task and task.tags else None,
         # CP-DISTILL-TEXT：详情页透出听感改写稿全文；列表页用摘要前缀避免响应膨胀
         script_text=_script_text_for(task, list_mode=not full_script),
+        # CP-TTS-VOICE 溯源：只有详情页调用方才解析（列表恒 None，见 schema 注释）
+        tts_voice=tts_voice,
     )
 
 
@@ -635,7 +672,9 @@ async def get_article(
 
     art, task = await _get_owned_with_task(article_id, _uid(user), db)
     # CP-DISTILL-TEXT：详情页返回蒸馏稿全文（列表页只要 120 字摘要）
-    payload = _to_response(art, task, full_script=True).model_dump()
+    payload = _to_response(
+        art, task, full_script=True, tts_voice=await _tts_voice_brief(task)
+    ).model_dump()
     await cache_service.set_article(article_id, payload)  # ttl 300s
     return payload
 
@@ -1498,6 +1537,7 @@ async def article_status(
         quality_score=task.quality_score if task else None,
         created_at=art.created_at.isoformat() if art.created_at else "",
         updated_at=art.updated_at.isoformat() if art.updated_at else "",
+        tts_voice=await _tts_voice_brief(task),
     )
 
 

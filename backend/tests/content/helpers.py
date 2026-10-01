@@ -2,6 +2,7 @@
 
 前置：本机 PG 5432 + Redis 6379 已起，且已 `alembic upgrade head`。
 """
+
 import importlib.util
 import sys
 import uuid
@@ -98,6 +99,7 @@ async def new_task(
     duration_sec: int | None = None,
     tags: list | None = None,
     quality_score: float | None = None,
+    tts_voice_id: str | None = None,
 ) -> str:
     async with AsyncSessionLocal() as session:
         task = DistilledArticle(
@@ -108,6 +110,7 @@ async def new_task(
             duration_sec=duration_sec,
             tags=tags,
             quality_score=quality_score,
+            tts_voice_id=tts_voice_id,
         )
         session.add(task)
         await session.commit()

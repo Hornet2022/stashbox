@@ -95,6 +95,46 @@ ROUTES: list[Route] = [
         "DELETE", "/api/v1/articles/{article_id}/snooze", "content-service", _url("content-service")
     ),
     Route("GET", "/api/v1/tags", "content-service", _url("content-service")),
+    # CP-TTS-VOICE：音色列表 + 用户音色/语速偏好 → content-service 的
+    # tts_voice_router。显式注册而不是靠 fallback 猜 —— fallback 的
+    # _resolve_target 只认 articles/tags/callback/distill/user/subscription，
+    # 新前缀 `tts` 和 `users` 都猜不到，会 404（历史坑 CP7.3.5 同款）。
+    Route("GET", "/api/v1/tts/voices", "content-service", _url("content-service")),
+    Route(
+        "GET",
+        "/api/v1/users/me/tts-preference",
+        "content-service",
+        _url("content-service"),
+    ),
+    Route(
+        "PUT",
+        "/api/v1/users/me/tts-preference",
+        "content-service",
+        _url("content-service"),
+    ),
+    # admin 段同样不走 fallback（见上面 B2 注释：必须显式注册）。
+    # 音色库 CRUD 在 content-service 的 tts_voice_router 里。
+    Route("GET", "/api/v1/admin/tts/voices", "content-service", _url("content-service")),
+    Route("POST", "/api/v1/admin/tts/voices", "content-service", _url("content-service")),
+    Route(
+        "POST",
+        "/api/v1/admin/tts/voices/import-from-config",
+        "content-service",
+        _url("content-service"),
+    ),
+    Route("PUT", "/api/v1/admin/tts/voices/{voice_id}", "content-service", _url("content-service")),
+    Route(
+        "DELETE",
+        "/api/v1/admin/tts/voices/{voice_id}",
+        "content-service",
+        _url("content-service"),
+    ),
+    Route(
+        "POST",
+        "/api/v1/admin/tts/voices/{voice_id}/preview",
+        "content-service",
+        _url("content-service"),
+    ),
     Route("POST", "/api/v1/distill/start", "ai-service", _url("ai-service")),
     Route("GET", "/api/v1/distill/{task_id}", "ai-service", _url("ai-service")),
     # B1/G5：distill 系端点显式注册（消除对 fallback 猜表的路径依赖，

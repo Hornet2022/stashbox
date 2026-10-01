@@ -310,6 +310,105 @@ api-gateway 按 `config.ROUTES` 精确表转发，表外走 fallback **按第一
 
 ---
 
+## 5.5 音色与播放语速（CP-TTS-VOICE，2026-09-30 新增）
+
+App 端「音色可选 + 语速可调」的完整契约。此前这两件事在 App 里都是断的：
+语速只有五档 UI 但值是 `remember` 出来的本地变量（播放器速度从未被改过），
+音色则完全没有这个概念。
+
+### 5.5.1 音色列表
+
+```
+GET /api/v1/tts/voices
+```
+
+```json
+{
+  "voices": [
+    { "id": "ttsv_ebad119efb93498188626ec7", "slug": "default",
+      "display_name": "默认音色", "description": null, "is_default": true }
+  ],
+  "available_speeds": [0.75, 1.0, 1.25, 1.5, 2.0],
+  "default_speed": 1.0
+}
+```
+
+- `voices` 只含**已上架**（`is_active`）的
+- `available_speeds` 是**语速档位的单一事实源**，App 不要硬编码
+- 响应**刻意不含** `ref_audio_url`：那是内部存储地址，用户没理由知道
+
+### 5.5.2 我的音色 / 语速偏好
+
+```
+GET  /api/v1/users/me/tts-preference
+PUT  /api/v1/users/me/tts-preference
+```
+
+```json
+{
+  "voice_id": "ttsv_790850e72fa5403d8e5559d2",
+  "voice_name": "婷婷（克隆测试）",
+  "speed": 1.25,
+  "available_speeds": [0.75, 1.0, 1.25, 1.5, 2.0],
+  "effective_voice_name": "婷婷（克隆测试）",
+  "effective_source": "user"
+}
+```
+
+⚠️ **`voice_id` 是三态的**，PUT 时必须区分：
+
+| 请求体 | 后端行为 |
+|---|---|
+| `{"speed": 1.5}` | 只改语速，**音色不动** |
+| `{"voice_id": "ttsv_xxx"}` | 切到该音色 |
+| `{"voice_id": null}` | 清空 = **跟随默认音色** |
+| `{}` | 400「至少要传 voice_id 或 speed 之一」 |
+
+> 📌 **Kotlin 侧踩过的坑**：`kotlinx.serialization` 默认 `encodeDefaults = false`，
+> 所以「一个可空字段 + 始终编码」是错的 —— 那样只改语速也会带上 `voice_id: null`
+> 把音色清掉；而不加 `@EncodeDefault(ALWAYS)` 的话 null 又会被静默省略，
+> 「清空音色」退化成「没改音色」。正确做法是**两个 body 形状打同一个端点**：
+> `PlaybackSpeedBody(speed)`（根本不含该键）+ `VoiceSelectionBody(voiceId)`
+> （`@EncodeDefault(ALWAYS)`）。参考 `data/model/TtsPreferences.kt`。
+
+⚠️ **`effective_*` 才是界面上该显示的东西**。用户可能从没设过偏好，这时生效的是
+全局默认音色或全局 TTS 配置。`effective_source` 三态：
+`user`（用户选的）/ `default`（全局默认音色）/ `global_config`（全局 TTS 配置兜底）。
+只显示 `voice_id` 那栏会出现「未选择音色，但听着明显是某个人念的」—— 假闭环。
+
+### 5.5.3 语速是播放端行为
+
+变速由客户端 ExoPlayer 完成，**不重跑蒸馏**。实测单篇蒸馏约 23 分钟（16 段 TTS），
+让用户为调速等一刻钟不可接受。代价是变速后音调会跟着变（变调不变速需额外 pitch
+correction，本项目没有），UI 上已如实说明。
+
+### 5.5.4 用当前音色重新生成
+
+```
+POST /api/v1/distill/start
+{ "article_id": "art_xxx" }
+```
+
+```json
+{
+  "task_id": "dst_1dcfbe3b341e49d68da1195c",
+  "article_id": "art_xxx", "status": "queued", "job_id": "a3c8...",
+  "voice_id": "ttsv_790850e72fa5403d8e5559d2",
+  "voice_name": "婷婷（克隆测试）"
+}
+```
+
+- **不另开 `/re-distill` 端点**：本项目在 CP-DISTILL-START-HARDEN 第 2 条上吃过亏
+  （`/articles/{id}/distill` 扣配额而 `/distill/start` 不扣，同一件事两种计费口径）。
+  再开入口只会重演。
+- `url` **不用传**（后端一律取库里的值）。曾被设成必填但根本不用，App 调
+  「重新生成」被迫编 url 容易传错，本轮已改为可选。
+- `voice_name` 是「这次会用哪个音色」，拿它在确认弹窗里告诉用户，别让用户点了
+  不知道音频会变成谁念的。
+- 该端点**保留旧产物**：重跑期间旧音频仍能听，worker 跑成功才覆盖。
+
+---
+
 ## 6. 端到端联调冒烟（curl，模拟器视角）
 
 ```bash
@@ -356,6 +455,7 @@ curl -s -X POST "$GW/api/v1/distill/$TID/evaluation" -H "$AUTH" \
 
 | 版本 | 日期 | 内容 |
 |---|---|---|
+| v1.3 | 2026-09-30 | **CP-TTS-VOICE 落地**：§5.5 音色库 + 语速偏好（`GET /api/v1/tts/voices`、`GET/PUT /api/v1/users/me/tts-preference`）+ `POST /api/v1/distill/start` 作为「用当前音色重新生成」入口。⚠️ 前置：迁移须到 **0033**（新增 `tts_voices` / `user_tts_preferences` 两表 + `distilled_articles.tts_voice_id` 列）。三态 `voice_id` 语义与 Kotlin 序列化坑见 §5.5.2 |
 | v1.2 | 2026-09-24 | **G1 落地**：§2.6 四维评分端点完整契约（请求/响应/校验/联动语义/触发时机）；§0.3/§3 路由升级为显式注册（G5 关闭）；§4 个性化状态更新（分桶已落库、评分→画像闭环已通）；§5 缺口清单刷新（G1/G5 done，G2/G3/G4 开放）；§6 冒烟补 4 维评分 + 迁移 0029 硬前提 |
 | v1.1 | 2026-09-24 | 新增 §3 多码率变体（CP7.3.0）、§4 个性化现状、§5 缺口清单 G1-G5 |
 | v1.0 | 2026-09-16 | 初版（CP1.x 主链路） |

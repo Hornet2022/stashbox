@@ -26,8 +26,61 @@
   "paths": {
     "/api/v1/admin/ab-report": {
       "get": {
-        "summary": "Proxy Get /Api/V1/Admin/Ab-Report",
-        "operationId": "proxy_get__api_v1_admin_ab_report_api_v1_admin_ab_report_get",
+        "summary": "Admin Ab Report",
+        "description": "A/B 分组四指标（复听率/完听率/评分均值/跳过率），方案 §2.7-D。\n\ndate_from / date_to 按蒸馏任务 created_at 过滤（ISO 8601）。\nab_group=NULL 的历史行归入 pre_experiment 组（不可用于实验结论）。",
+        "operationId": "admin_ab_report_api_v1_admin_ab_report_get",
+        "parameters": [
+          {
+            "name": "date_from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Date From"
+            }
+          },
+          {
+            "name": "date_to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Date To"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -36,9 +89,20 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         },
         "tags": [
+          "ai-service",
           "api-gateway"
         ]
       }
@@ -139,7 +203,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -198,7 +261,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -265,7 +327,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -334,7 +395,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -342,8 +402,27 @@
     },
     "/api/v1/admin/audio-variants/stats": {
       "get": {
-        "summary": "Proxy Get /Api/V1/Admin/Audio-Variants/Stats",
-        "operationId": "proxy_get__api_v1_admin_audio_variants_stats_api_v1_admin_audio_variants_stats_get",
+        "summary": "Admin Audio Variants Stats",
+        "description": "变体覆盖统计：按码率分布 + 覆盖文章数 / done 文章数。\n\n给 CP7.4 预加载策略调优做输入（哪档被生成、平均体积）。",
+        "operationId": "admin_audio_variants_stats_api_v1_admin_audio_variants_stats_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -352,9 +431,20 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         },
         "tags": [
+          "ai-service",
           "api-gateway"
         ]
       }
@@ -422,7 +512,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -556,7 +645,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -607,8 +695,63 @@
     },
     "/api/v1/admin/consents": {
       "get": {
-        "summary": "Proxy Get /Api/V1/Admin/Consents",
-        "operationId": "proxy_get__api_v1_admin_consents_api_v1_admin_consents_get",
+        "summary": "Admin Consents List",
+        "description": "GDPR 同意记录抽查（合规审计）。\n\n隐私：仅结构化开关 + 版本 + 时间，无自由文本字段可回显。",
+        "operationId": "admin_consents_list_api_v1_admin_consents_get",
+        "parameters": [
+          {
+            "name": "personalization_enabled",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Personalization Enabled"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -617,9 +760,20 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         },
         "tags": [
+          "ai-service",
           "api-gateway"
         ]
       }
@@ -668,7 +822,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -676,8 +829,127 @@
     },
     "/api/v1/admin/evaluations": {
       "get": {
-        "summary": "Proxy Get /Api/V1/Admin/Evaluations",
-        "operationId": "proxy_get__api_v1_admin_evaluations_api_v1_admin_evaluations_get",
+        "summary": "Admin Evaluations List",
+        "description": "distillation_evaluations 分页（评测员/用户/LLM 自评混排，按时间倒序）。",
+        "operationId": "admin_evaluations_list_api_v1_admin_evaluations_get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "auto_flag",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Auto Flag"
+            }
+          },
+          {
+            "name": "min_score",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Score"
+            }
+          },
+          {
+            "name": "max_score",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Max Score"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -686,17 +958,63 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         },
         "tags": [
+          "ai-service",
           "api-gateway"
         ]
       }
     },
     "/api/v1/admin/evaluations/agreement": {
       "get": {
-        "summary": "Proxy Get /Api/V1/Admin/Evaluations/Agreement",
-        "operationId": "proxy_get__api_v1_admin_evaluations_agreement_api_v1_admin_evaluations_agreement_get",
+        "summary": "Admin Evaluations Agreement",
+        "description": "评测员间一致性（0-1）。按 (evaluator_id, task) 组织 overall_score 序列。\n\n纯聚合：只统计有 evaluator_id 的标注行（校准标注），排除用户评分。",
+        "operationId": "admin_evaluations_agreement_api_v1_admin_evaluations_agreement_get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -705,17 +1023,66 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         },
         "tags": [
+          "ai-service",
           "api-gateway"
         ]
       }
     },
     "/api/v1/admin/evaluations/{evaluation_id}/annotate": {
       "post": {
-        "summary": "Proxy Post /Api/V1/Admin/Evaluations/{Evaluation Id}/Annotate",
-        "operationId": "proxy_post__api_v1_admin_evaluations__evaluation_id__annotate_api_v1_admin_evaluations__evaluation_id__annotate_post",
+        "summary": "Admin Evaluation Annotate",
+        "description": "评测员对已有用户评分做校准标注（写新行，evaluator_id=admin sub）。\n\n口径（决策 §5.2 方案 B）：user_id 沿用被标注行的用户（保持「该任务评分人」语义），\nevaluator_id 记录评测员归属；不修改原行。入池/画像联动不触发（标注不是用户评分）。",
+        "operationId": "admin_evaluation_annotate_api_v1_admin_evaluations__evaluation_id__annotate_post",
+        "parameters": [
+          {
+            "name": "evaluation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Evaluation Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnnotateRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -724,22 +1091,23 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         },
         "tags": [
+          "ai-service",
           "api-gateway"
         ]
-      },
-      "parameters": [
-        {
-          "name": "evaluation_id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        }
-      ]
+      }
     },
     "/api/v1/admin/export/articles.csv": {
       "get": {
@@ -785,7 +1153,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -835,7 +1202,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -885,7 +1251,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -935,7 +1300,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -985,7 +1349,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -993,8 +1356,95 @@
     },
     "/api/v1/admin/few-shot-pool": {
       "get": {
-        "summary": "Proxy Get /Api/V1/Admin/Few-Shot-Pool",
-        "operationId": "proxy_get__api_v1_admin_few_shot_pool_api_v1_admin_few_shot_pool_get",
+        "summary": "Admin Few Shot List",
+        "description": "池条目分页（kind=hook/section/outro；min_score 过滤；active 过滤）。",
+        "operationId": "admin_few_shot_list_api_v1_admin_few_shot_pool_get",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "name": "min_score",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Score"
+            }
+          },
+          {
+            "name": "active",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Active"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -1003,17 +1453,57 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         },
         "tags": [
+          "ai-service",
           "api-gateway"
         ]
       }
     },
     "/api/v1/admin/few-shot-pool/audit-result": {
       "post": {
-        "summary": "Proxy Post /Api/V1/Admin/Few-Shot-Pool/Audit-Result",
-        "operationId": "proxy_post__api_v1_admin_few_shot_pool_audit_result_api_v1_admin_few_shot_pool_audit_result_post",
+        "summary": "Admin Few Shot Audit Result",
+        "description": "人工抽查结果回写 score_avg（加权平均）。auditor = admin sub。",
+        "operationId": "admin_few_shot_audit_result_api_v1_admin_few_shot_pool_audit_result_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuditResultRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -1022,17 +1512,57 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         },
         "tags": [
+          "ai-service",
           "api-gateway"
         ]
       }
     },
     "/api/v1/admin/few-shot-pool/audit-sample": {
       "get": {
-        "summary": "Proxy Get /Api/V1/Admin/Few-Shot-Pool/Audit-Sample",
-        "operationId": "proxy_get__api_v1_admin_few_shot_pool_audit_sample_api_v1_admin_few_shot_pool_audit_sample_get",
+        "summary": "Admin Few Shot Audit Sample",
+        "description": "按 50/30/20 高/中/低分策略抽池子样本供人工评审。",
+        "operationId": "admin_few_shot_audit_sample_api_v1_admin_few_shot_pool_audit_sample_get",
+        "parameters": [
+          {
+            "name": "size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 10,
+              "title": "Size"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -1041,17 +1571,47 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         },
         "tags": [
+          "ai-service",
           "api-gateway"
         ]
       }
     },
     "/api/v1/admin/few-shot-pool/cleanup": {
       "post": {
-        "summary": "Proxy Post /Api/V1/Admin/Few-Shot-Pool/Cleanup",
-        "operationId": "proxy_post__api_v1_admin_few_shot_pool_cleanup_api_v1_admin_few_shot_pool_cleanup_post",
+        "summary": "Admin Few Shot Cleanup",
+        "description": "手动跑完整清理（stale + low_quality + duplicates）。\n\n各子清理内部 try/except 自兜底；决策 §5.4：先手动端点，观察一周再定 cron。",
+        "operationId": "admin_few_shot_cleanup_api_v1_admin_few_shot_pool_cleanup_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -1060,17 +1620,47 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         },
         "tags": [
+          "ai-service",
           "api-gateway"
         ]
       }
     },
     "/api/v1/admin/few-shot-pool/health": {
       "get": {
-        "summary": "Proxy Get /Api/V1/Admin/Few-Shot-Pool/Health",
-        "operationId": "proxy_get__api_v1_admin_few_shot_pool_health_api_v1_admin_few_shot_pool_health_get",
+        "summary": "Admin Few Shot Health",
+        "description": "池健康度（高/中/低分布 + 过期率 + health_score 0-100 + warning）。\n\n直调 PoolHealthMonitor.compute_health —— 内部已兜底（异常返空报告），\n故本端点恒 200。",
+        "operationId": "admin_few_shot_health_api_v1_admin_few_shot_pool_health_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -1079,9 +1669,20 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         },
         "tags": [
+          "ai-service",
           "api-gateway"
         ]
       }
@@ -1130,7 +1731,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -1188,7 +1788,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -1238,7 +1837,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -1465,7 +2063,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -1515,7 +2112,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -1584,7 +2180,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -1592,8 +2187,27 @@
     },
     "/api/v1/admin/tier-config": {
       "get": {
-        "summary": "Proxy Get /Api/V1/Admin/Tier-Config",
-        "operationId": "proxy_get__api_v1_admin_tier_config_api_v1_admin_tier_config_get",
+        "summary": "Admin Tier Config Get",
+        "description": "生效 tier 映射 + 来源（db/default）+ 代码默认 + provider 覆盖 warning。\n\n⚠️ 不含任何 key 字段（方案 §4-3 密钥红线）。",
+        "operationId": "admin_tier_config_get_api_v1_admin_tier_config_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -1602,15 +2216,55 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         },
         "tags": [
+          "ai-service",
           "api-gateway"
         ]
       },
       "put": {
-        "summary": "Proxy Put /Api/V1/Admin/Tier-Config",
-        "operationId": "proxy_put__api_v1_admin_tier_config_api_v1_admin_tier_config_put",
+        "summary": "Admin Tier Config Put",
+        "description": "写 system_config KEY_TIER（结构校验同 resolve_tier_map）。\n\n生效方式：蒸馏任务启动前已有 reload 链路，tier map 在 resolve 时读\nsystem_config（Redis 5s 缓存 + 写后立即 invalidate）→ 无需重启。",
+        "operationId": "admin_tier_config_put_api_v1_admin_tier_config_put",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TierConfigPutRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -1619,17 +2273,57 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         },
         "tags": [
+          "ai-service",
           "api-gateway"
         ]
       }
     },
     "/api/v1/admin/tts/blind-test": {
       "post": {
-        "summary": "Proxy Post /Api/V1/Admin/Tts/Blind-Test",
-        "operationId": "proxy_post__api_v1_admin_tts_blind_test_api_v1_admin_tts_blind_test_post",
+        "summary": "Admin Tts Blind Test Setup",
+        "description": "发起盲测：同文本 × N provider 合成 + 随机隐藏映射。\n\n⚠️ CP3.8.0 现状：setup 为 mock 合成（fake url）——真 TTS 配额接入属后续；\n本端点先打通运营链路。盲测会话存进程内存（单 worker 前提，重启即失）。",
+        "operationId": "admin_tts_blind_test_setup_api_v1_admin_tts_blind_test_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BlindTestSetupRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -1638,17 +2332,56 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         },
         "tags": [
+          "ai-service",
           "api-gateway"
         ]
       }
     },
     "/api/v1/admin/tts/blind-test/{blind_id}/results": {
       "get": {
-        "summary": "Proxy Get /Api/V1/Admin/Tts/Blind-Test/{Blind Id}/Results",
-        "operationId": "proxy_get__api_v1_admin_tts_blind_test__blind_id__results_api_v1_admin_tts_blind_test__blind_id__results_get",
+        "summary": "Admin Tts Blind Test Results",
+        "description": "盲测聚合：每个 provider 的中位分（compute_blind_score）。",
+        "operationId": "admin_tts_blind_test_results_api_v1_admin_tts_blind_test__blind_id__results_get",
+        "parameters": [
+          {
+            "name": "blind_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Blind Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -1657,27 +2390,66 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         },
         "tags": [
+          "ai-service",
           "api-gateway"
         ]
-      },
-      "parameters": [
-        {
-          "name": "blind_id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        }
-      ]
+      }
     },
     "/api/v1/admin/tts/blind-test/{blind_id}/submit": {
       "post": {
-        "summary": "Proxy Post /Api/V1/Admin/Tts/Blind-Test/{Blind Id}/Submit",
-        "operationId": "proxy_post__api_v1_admin_tts_blind_test__blind_id__submit_api_v1_admin_tts_blind_test__blind_id__submit_post",
+        "summary": "Admin Tts Blind Test Submit",
+        "description": "评测员提交一份盲测打分（按 evaluator_id 覆盖式更新）。",
+        "operationId": "admin_tts_blind_test_submit_api_v1_admin_tts_blind_test__blind_id__submit_post",
+        "parameters": [
+          {
+            "name": "blind_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Blind Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BlindTestSubmitRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -1686,22 +2458,23 @@
                 "schema": {}
               }
             }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
           }
         },
         "tags": [
+          "ai-service",
           "api-gateway"
         ]
-      },
-      "parameters": [
-        {
-          "name": "blind_id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        }
-      ]
+      }
     },
     "/api/v1/admin/tts/config": {
       "get": {
@@ -1747,7 +2520,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -1805,7 +2577,6 @@
           }
         },
         "tags": [
-          "ai-service",
           "content-service",
           "api-gateway"
         ]
@@ -1855,7 +2626,353 @@
           }
         },
         "tags": [
-          "ai-service",
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/tts/voices": {
+      "get": {
+        "summary": "Admin List Voices",
+        "operationId": "admin_list_voices_api_v1_admin_tts_voices_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      },
+      "post": {
+        "summary": "Admin Create Voice",
+        "operationId": "admin_create_voice_api_v1_admin_tts_voices_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoiceCreateIn"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/tts/voices/import-from-config": {
+      "post": {
+        "summary": "Admin Import Voice From Config",
+        "description": "把当前全局 TTS 配置里的 indextts_ref_audio 收编成音色库第一条。\n\n存在的理由：迁移 0033 **刻意没有 seed 默认音色** —— 迁移里读 env 会把本机\n绝对路径固化进库，换台机器就是死路径。管理员点一次这个按钮，就能在不敲\n任何路径的前提下完成冷启动。",
+        "operationId": "admin_import_voice_from_config_api_v1_admin_tts_voices_import_from_config_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportFromConfigOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/tts/voices/{voice_id}": {
+      "put": {
+        "summary": "Admin Update Voice",
+        "operationId": "admin_update_voice_api_v1_admin_tts_voices__voice_id__put",
+        "parameters": [
+          {
+            "name": "voice_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Voice Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoiceUpdateIn"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      },
+      "delete": {
+        "summary": "Admin Delete Voice",
+        "operationId": "admin_delete_voice_api_v1_admin_tts_voices__voice_id__delete",
+        "parameters": [
+          {
+            "name": "voice_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Voice Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/tts/voices/{voice_id}/preview": {
+      "post": {
+        "summary": "Admin Preview Voice",
+        "description": "试听：拿这个音色的 ref_audio 真合成一段。\n\n真调 oMLX 而不是假装成功 —— 音色库里最容易翻车的是「参考音频和参考文本\n对不上」「音频根本不是有效 wav」，这两个只有真合成一次才会暴露。",
+        "operationId": "admin_preview_voice_api_v1_admin_tts_voices__voice_id__preview_post",
+        "parameters": [
+          {
+            "name": "voice_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Voice Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoicePreviewIn"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VoicePreviewOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
           "content-service",
           "api-gateway"
         ]
@@ -1864,7 +2981,7 @@
     "/api/v1/admin/users": {
       "get": {
         "summary": "Admin List Users",
-        "description": "v1 §3.6 用户管理：分页 + 关键词 + 角色过滤。\n\n- 关键词：nickname ILIKE '%keyword%'（v1 §3.6 原指 email/display_name，\n  users 表无 email 列，映射为 nickname）\n- 排序：created_at DESC\n- status 查询参数保留接口兼容；users 表无状态列，不做落库过滤",
+        "description": "v1 §3.6 用户管理：分页 + 关键词 + 角色过滤。\n\n- 关键词：nickname OR email ILIKE '%keyword%'（CP-USERS-REALITY：email 列已存在，\n  原实现只搜 nickname，导致有邮箱的用户搜邮箱搜不到）\n- 排序：created_at DESC\n- status：CP-USERS-REALITY 由 deleted_at 派生，**本次真正落库过滤**。\n  原实现收了 status 参数却不加任何 where，选 suspended/deleted 返回的还是全量，\n  管理后台那个下拉是纯装饰。\n- tier：原样过滤 users.tier\n\n注意 users 表只有一列 tier，同时承载「等级」和「管理员角色」两种语义\n（admin 用户的 tier 值就是 'admin'）。这是历史建模遗留，红线是不在本次补\nmigration，故响应里 role 与 tier 都从这一列派生，靠 role 字段做区分。",
         "operationId": "admin_list_users_api_v1_admin_users_get",
         "parameters": [
           {
@@ -1965,7 +3082,7 @@
     "/api/v1/admin/users/{user_id}/quota-adjust": {
       "post": {
         "summary": "Admin Quota Adjust",
-        "description": "v1 §3.6 调整用户月度配额。\n\n行为：\n  1. 校验 monthly_quota > 0、reason 必填 ≥5 字符、目标 user 存在\n  2. 更新 users.monthly_quota\n  3. 同事务写入 admin_operation_logs 一条（A1 已建表）\n  4. 失败整体回滚（ValidationError 在 commit 前抛出，不落库）",
+        "description": "v1 §3.6 调整用户月度配额。\n\n行为：\n  1. 校验 monthly_quota >= 0、reason 必填 ≥5 字符、目标 user 存在\n  2. 更新 users.monthly_quota\n  3. 同事务写入 admin_operation_logs 一条（A1 已建表）\n  4. 失败整体回滚（ValidationError 在 commit 前抛出，不落库）\n\nCP-USERS-REALITY：原校验是 `monthly_quota <= 0` 拒绝，但 **0 是系统里的真实值**\n—— users.id=1 的 monthly_quota 就是 0（额度耗尽/停用状态），管理员把它设回 0\n是合法操作。同时前端 Users.tsx 校验的是 `value < 0`，两边口径不一致：\n管理员在前端填 0，前端放行、后端 400。这里统一为 >= 0。",
         "operationId": "admin_quota_adjust_api_v1_admin_users__user_id__quota_adjust_post",
         "parameters": [
           {
@@ -3689,6 +4806,7 @@
     "/api/v1/distill/start": {
       "post": {
         "summary": "Distill Start",
+        "description": "按 article_id 触发蒸馏。\n\nCP-DISTILL-START-HARDEN（本轮修复的三个问题，都是实测出来的）：\n\n1) **越权**。原实现只信请求体里的 article_id/url，从不查 Article，\n   任何人拿到别人的 article_id 就能对其重跑蒸馏。实测：以 user 9277 的\n   token 对 user 1 名下的 art_wxSOP_verify_0001 调本端点返回 200。\n   现在查库校验归属，非本人 → 403（与 /articles/{id}/distill 同口径）。\n\n2) **不扣配额**。本端点从头到尾没碰过 quota_service，而\n   /articles/{id}/distill 扣。同一件事两条路径、两种计费口径。\n\n3) **破坏性复用**。文章已有蒸馏行时复用原行，并把 script_text / audio_url /\n   duration_sec / quality_score / tags 一律置空。实测把一篇 status=done、\n   有音频的真机在用文章打成了 status=queued，产物元数据全部丢失，且无法找回。\n   改为**保留旧产物**：重跑期间用户仍能听旧音频，worker 跑成功才覆盖。\n\nurl / title 一律取库里的值，不用请求体传的——传什么蒸馏什么，等于允许\n调用方把 A 文章的产物写到 B 上。\n\nCP-TTS-VOICE：**本端点同时是「用当前音色重新生成」的入口**，不另开新端点。\n理由是本项目已经吃过亏 —— 见上面第 2) 条：「同一件事两条路径、两种计费口径」。\n再加一个 `/re-distill` 只会重演：它要么不扣费（和这里不一致），要么重复扣费\n（用户点两次就少两次配额）。音色是合成期参数，worker 里\n`resolve_voice_for_user()` 会重新解析用户当前选的音色，所以重跑自然生效。",
         "operationId": "distill_start_api_v1_distill_start_post",
         "parameters": [
           {
@@ -4911,6 +6029,57 @@
         ]
       }
     },
+    "/api/v1/tts/voices": {
+      "get": {
+        "summary": "List Available Voices",
+        "description": "可选购音色列表（只含已上架的）。\n\n连同 `available_speeds` 一起给：语速档位是服务端单一事实源，\nApp 不该硬编码 —— 后台改了这里就改了全端行为。",
+        "operationId": "list_available_voices_api_v1_tts_voices_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VoiceListOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
     "/api/v1/user": {
       "get": {
         "summary": "Get User",
@@ -5259,6 +6428,116 @@
         },
         "tags": [
           "user-service"
+        ]
+      }
+    },
+    "/api/v1/users/me/tts-preference": {
+      "get": {
+        "summary": "Get My Tts Preference",
+        "description": "我选的音色 + 我的语速。\n\n同时回 `effective_voice_name` / `effective_source`：用户可能从没设过偏好，\n这时实际生效的是全局默认音色或全局配置 —— App 应该显示**实际生效的那个**，\n否则用户会看到「未选择」但听到的是某个音色，典型的假闭环。\n\n⚠️ **已下架 / 已软删的音色要当没选**（2026-09-30 自测发现的假闭环）：\n管理员把用户选中的音色下架后，`resolve_voice_for_user` 会跳过它回落到\n默认/全局配置，但本端点原先照样回它的 `display_name` ——\nApp 于是显示「待下架音色」，可实际生效的根本不是它，而且它也不在\n`GET /api/v1/tts/voices` 的可选列表里，Sheet 中没有对应行可点。\n用户看到的是一个自己选不了、也没在生效的音色，音频还和显示的不一样。\n现在 `voice_id` / `voice_name` 一起置空，如实回落到 `effective_*`。",
+        "operationId": "get_my_tts_preference_api_v1_users_me_tts_preference_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TTSPreferenceOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      },
+      "put": {
+        "summary": "Update My Tts Preference",
+        "description": "改音色 / 语速。\n\n**不会触发重跑蒸馏**：语速是播放端行为；音色只对之后新剪藏的文章生效，\n存量文章要换音色得走重生成入口（见 re-distill 端点）。",
+        "operationId": "update_my_tts_preference_api_v1_users_me_tts_preference_put",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TTSPreferenceUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TTSPreferenceOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
         ]
       }
     },
@@ -6100,7 +7379,7 @@
           "used_quota"
         ],
         "title": "AdminUserItem",
-        "description": "GET /admin/users 单条用户。\n\nv1 §3.6 字段：email / display_name / role / status / last_active_at。\n这些列在 users 表尚未建模（无 email/状态/活跃时间列），按现有模型映射：\n  - email         -> None（users 表无 email 列，保留字段兼容前端）\n  - display_name  -> nickname\n  - role          -> tier（v1 §3.6 角色语义即 tier）\n  - status        -> \"active\"（无 soft-delete 状态列，默认 active）\n  - last_active_at-> None（users 表无该列）\n不在此追加 migration（CP3.6-A2 红线），仅暴露管理端点。"
+        "description": "GET /admin/users 单条用户。\n\nv1 §3.6 字段：email / display_name / role / status / last_active_at。\n\n口径修正（CP-USERS-REALITY）：原注释写「users 表无 email/状态列，故 email=None、\nstatus 恒 active」，**该前提已不成立** —— 后续 migration 给 users 补了\n`email` 与 `deleted_at` 两列。管理后台却还在按老前提硬编码，于是：\n  - 邮箱列全空白（库里明明有值）\n  - 状态筛选是个假下拉（选了 suspended/deleted，返回的仍是全部用户）\n\n现在一律取真实列：\n  - email         -> u.email（可能为 None，前端渲染 \"—\"）\n  - display_name  -> nickname\n  - role          -> 管理员角色：admin/operator 原样，其余归 user\n  - tier          -> users.tier 原值（系统里这一列同时承载\"等级\"和\"管理员角色\"，\n                     见下方 docstring 的说明，不臆造第二列）\n  - status        -> 由 deleted_at 派生：deleted_at 非空 = deleted，否则 active\n  - last_active_at-> None（users 表确无该列，不用 listening 之类数据假装）"
       },
       "AdminUserListResponse": {
         "properties": {
@@ -6317,6 +7596,77 @@
         "title": "AdminActionRequest",
         "description": "admin 写操作统一 body：reason 必填（审计留痕）。"
       },
+      "AdminVoiceOut": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "slug": {
+            "type": "string",
+            "title": "Slug"
+          },
+          "display_name": {
+            "type": "string",
+            "title": "Display Name"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "is_default": {
+            "type": "boolean",
+            "title": "Is Default",
+            "default": false
+          },
+          "ref_audio_url": {
+            "type": "string",
+            "title": "Ref Audio Url"
+          },
+          "ref_text": {
+            "type": "string",
+            "title": "Ref Text"
+          },
+          "is_active": {
+            "type": "boolean",
+            "title": "Is Active",
+            "default": true
+          },
+          "sort_order": {
+            "type": "integer",
+            "title": "Sort Order",
+            "default": 0
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "slug",
+          "display_name",
+          "ref_audio_url",
+          "ref_text"
+        ],
+        "title": "AdminVoiceOut",
+        "description": "管理端多吐几项：参考音频地址、参考文本、上下架、排序。"
+      },
       "ArticleResponse": {
         "properties": {
           "id": {
@@ -6441,6 +7791,16 @@
               }
             ],
             "title": "Script Text"
+          },
+          "tts_voice": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TTSVoiceBrief"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -6553,6 +7913,16 @@
           "updated_at": {
             "type": "string",
             "title": "Updated At"
+          },
+          "tts_voice": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TTSVoiceBrief"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -6760,6 +8130,23 @@
           "content"
         ],
         "title": "FeedbackV2CreateRequest"
+      },
+      "ImportFromConfigOut": {
+        "properties": {
+          "voice": {
+            "$ref": "#/components/schemas/AdminVoiceOut"
+          },
+          "created": {
+            "type": "boolean",
+            "title": "Created",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "voice"
+        ],
+        "title": "ImportFromConfigOut"
       },
       "LLMConfigUpdate": {
         "properties": {
@@ -7086,6 +8473,115 @@
         "title": "TTSConfigUpdate",
         "description": "PUT 请求体。空/不传的字段视作「不动」，null/\"\" 显式清空回落到 env。"
       },
+      "TTSPreferenceOut": {
+        "properties": {
+          "voice_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice Id"
+          },
+          "voice_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice Name"
+          },
+          "speed": {
+            "type": "number",
+            "title": "Speed",
+            "default": 1.0
+          },
+          "available_speeds": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "title": "Available Speeds"
+          },
+          "effective_voice_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Effective Voice Name"
+          },
+          "effective_source": {
+            "type": "string",
+            "title": "Effective Source",
+            "default": "global_config"
+          }
+        },
+        "type": "object",
+        "title": "TTSPreferenceOut"
+      },
+      "TTSPreferenceUpdate": {
+        "properties": {
+          "voice_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice Id"
+          },
+          "speed": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speed"
+          }
+        },
+        "type": "object",
+        "title": "TTSPreferenceUpdate",
+        "description": "部分更新：不传的字段保持不变。\n\nvoice_id 显式传 null = 「跟随默认音色」；不传该字段 = 不动。\n靠 pydantic 的 model_fields_set 区分这两种情况 —— 这是本项目\nTTSConfigUpdate 已经用过的约定（见 admin_router.py:786）。"
+      },
+      "TTSVoiceBrief": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "available": {
+            "type": "boolean",
+            "title": "Available",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "TTSVoiceBrief",
+        "description": "这段音频的合成音色（CP-TTS-VOICE 溯源）。\n\n`available=False` = 该音色已下架/已删除，但**名字照给** —— 历史音频确实是\n它合成的，藏掉名字会让来源凭空消失，用户反而以为自己记错了。"
+      },
       "TagCreateRequest": {
         "properties": {
           "slug": {
@@ -7113,6 +8609,279 @@
           "name"
         ],
         "title": "TagCreateRequest"
+      },
+      "VoiceCreateIn": {
+        "properties": {
+          "slug": {
+            "type": "string",
+            "title": "Slug"
+          },
+          "display_name": {
+            "type": "string",
+            "title": "Display Name"
+          },
+          "ref_audio_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref Audio Url"
+          },
+          "ref_audio_b64": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref Audio B64"
+          },
+          "ref_text": {
+            "type": "string",
+            "title": "Ref Text"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "is_default": {
+            "type": "boolean",
+            "title": "Is Default",
+            "default": false
+          },
+          "is_active": {
+            "type": "boolean",
+            "title": "Is Active",
+            "default": true
+          },
+          "sort_order": {
+            "type": "integer",
+            "title": "Sort Order",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "slug",
+          "display_name",
+          "ref_text"
+        ],
+        "title": "VoiceCreateIn"
+      },
+      "VoiceListOut": {
+        "properties": {
+          "voices": {
+            "items": {
+              "$ref": "#/components/schemas/VoiceOut"
+            },
+            "type": "array",
+            "title": "Voices"
+          },
+          "available_speeds": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array",
+            "title": "Available Speeds"
+          },
+          "default_speed": {
+            "type": "number",
+            "title": "Default Speed",
+            "default": 1.0
+          }
+        },
+        "type": "object",
+        "required": [
+          "voices",
+          "available_speeds"
+        ],
+        "title": "VoiceListOut"
+      },
+      "VoiceOut": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "slug": {
+            "type": "string",
+            "title": "Slug"
+          },
+          "display_name": {
+            "type": "string",
+            "title": "Display Name"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "is_default": {
+            "type": "boolean",
+            "title": "Is Default",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "slug",
+          "display_name"
+        ],
+        "title": "VoiceOut",
+        "description": "音色对外形态。\n\n刻意**不吐 ref_audio_url**：那是内部存储地址，普通用户没有理由知道，\n也不该能拿去直接下载别人的参考音频文件。"
+      },
+      "VoicePreviewIn": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "title": "Text",
+            "default": "这是一段试听文本，用来确认这个音色的效果。"
+          }
+        },
+        "type": "object",
+        "title": "VoicePreviewIn"
+      },
+      "VoicePreviewOut": {
+        "properties": {
+          "audio_url": {
+            "type": "string",
+            "title": "Audio Url"
+          },
+          "bytes_len": {
+            "type": "integer",
+            "title": "Bytes Len"
+          },
+          "duration_sec": {
+            "type": "integer",
+            "title": "Duration Sec"
+          },
+          "voice_id": {
+            "type": "string",
+            "title": "Voice Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "audio_url",
+          "bytes_len",
+          "duration_sec",
+          "voice_id"
+        ],
+        "title": "VoicePreviewOut"
+      },
+      "VoiceUpdateIn": {
+        "properties": {
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "ref_audio_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref Audio Url"
+          },
+          "ref_audio_b64": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref Audio B64"
+          },
+          "ref_text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref Text"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "is_active": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Active"
+          },
+          "is_default": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Default"
+          },
+          "sort_order": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sort Order"
+          }
+        },
+        "type": "object",
+        "title": "VoiceUpdateIn"
       },
       "WechatMpMessageRequest": {
         "properties": {
@@ -7149,6 +8918,165 @@
         "title": "WechatMpMessageRequest",
         "description": "微信公众号服务号回调消息（v1 §11.2 CP2.5）。"
       },
+      "AnnotateRequest": {
+        "properties": {
+          "hook_score": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hook Score"
+          },
+          "section_score": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Section Score"
+          },
+          "outro_score": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outro Score"
+          },
+          "rhythm_score": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rhythm Score"
+          },
+          "overall_score": {
+            "type": "integer",
+            "title": "Overall Score"
+          },
+          "comment": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Comment"
+          }
+        },
+        "type": "object",
+        "required": [
+          "overall_score"
+        ],
+        "title": "AnnotateRequest"
+      },
+      "AuditResultRequest": {
+        "properties": {
+          "example_id": {
+            "type": "string",
+            "title": "Example Id"
+          },
+          "audit_score": {
+            "type": "number",
+            "maximum": 10.0,
+            "minimum": 0.0,
+            "title": "Audit Score"
+          }
+        },
+        "type": "object",
+        "required": [
+          "example_id",
+          "audit_score"
+        ],
+        "title": "AuditResultRequest"
+      },
+      "BlindTestScoreItem": {
+        "properties": {
+          "sample_key": {
+            "type": "string",
+            "title": "Sample Key"
+          },
+          "score": {
+            "type": "number",
+            "maximum": 5.0,
+            "minimum": 1.0,
+            "title": "Score"
+          }
+        },
+        "type": "object",
+        "required": [
+          "sample_key",
+          "score"
+        ],
+        "title": "BlindTestScoreItem"
+      },
+      "BlindTestSetupRequest": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Text"
+          },
+          "providers": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 6,
+            "minItems": 2,
+            "title": "Providers"
+          }
+        },
+        "type": "object",
+        "required": [
+          "text",
+          "providers"
+        ],
+        "title": "BlindTestSetupRequest"
+      },
+      "BlindTestSubmitRequest": {
+        "properties": {
+          "evaluator_id": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Evaluator Id"
+          },
+          "scores": {
+            "items": {
+              "$ref": "#/components/schemas/BlindTestScoreItem"
+            },
+            "type": "array",
+            "maxItems": 20,
+            "minItems": 1,
+            "title": "Scores"
+          }
+        },
+        "type": "object",
+        "required": [
+          "evaluator_id",
+          "scores"
+        ],
+        "title": "BlindTestSubmitRequest"
+      },
       "DistillStartRequest": {
         "properties": {
           "article_id": {
@@ -7156,7 +9084,14 @@
             "title": "Article Id"
           },
           "url": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Url"
           },
           "title": {
@@ -7173,8 +9108,7 @@
         },
         "type": "object",
         "required": [
-          "article_id",
-          "url"
+          "article_id"
         ],
         "title": "DistillStartRequest"
       },
@@ -7196,6 +9130,28 @@
             "type": "string",
             "title": "Job Id",
             "default": ""
+          },
+          "voice_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice Id"
+          },
+          "voice_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice Name"
           }
         },
         "type": "object",
@@ -7289,6 +9245,26 @@
         "type": "object",
         "title": "EvaluationCreateRequest",
         "description": "4 维评分（1-5，各维可 null=用户跳过该项）+ 总评必填。\n\n校验口径对齐 /rate：手动校验 → 业务 400（code 4001），不走 422。"
+      },
+      "TierConfigPutRequest": {
+        "properties": {
+          "tier_model_map": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "type": "object",
+            "minProperties": 1,
+            "title": "Tier Model Map"
+          }
+        },
+        "type": "object",
+        "required": [
+          "tier_model_map"
+        ],
+        "title": "TierConfigPutRequest"
       }
     },
     "securitySchemes": {}

@@ -21,6 +21,7 @@ from llm import get_llm_client, maybe_close_llm_client
 from llm import reload as llm_reload
 from stashbox.backend.app.services.tts import reload as tts_reload
 from stashbox.backend.common.database import AsyncSessionLocal
+from stashbox.backend.common import cache_service
 from stashbox.backend.common.models import Article
 from stashbox.backend.common.models.tag import Tag, TagSubscription
 from stashbox.backend.common.models.push_notification import PushNotification
@@ -606,6 +607,11 @@ async def _persist_agent_final(
                 da.audio_url = final["tts_audio_url"]
             if final.get("tts_duration_sec") is not None:
                 da.duration_sec = int(final["tts_duration_sec"])
+            # CP-TTS-VOICE：溯源「这段音频是谁念的」。
+            # None = 回落全局 indextts_ref_audio，来源不可溯源 —— 保持 NULL，
+            # 不要回填一个「看起来对」的音色 ID，那会让统计口径失真。
+            if final.get("tts_voice_id"):
+                da.tts_voice_id = final["tts_voice_id"]
 
             # 先 flush 让 IntegrityError 在这里暴露（而不是拖到 commit 把事务搞废）
             await db.flush()
@@ -619,6 +625,31 @@ async def _persist_agent_final(
             )
             await db.rollback()
             return  # 数据没落上就没必要再写埋点了
+
+    # ---- 第二步：失效 content-service 的文章详情缓存（BUG#7，2026-09-30 自测）----
+    # 蒸馏是 ai-worker 直写 DB，**不会**经过 content-service，所以
+    # `GET /api/v1/articles/{id}` 那份 300s 缓存没人清。结果是：
+    #   App 轮询 /status（不走缓存）看到 ready，音频能播；
+    #   但用户退出详情页再进来，loadArticle 走的是详情接口，拿到的是
+    #   缓存里的 `status=distilling / audio_url=null` ——
+    # 一篇 20 分钟前就听完的文章又被显示成「蒸馏中」，还要再轮询 90 秒。
+    # 实测：改库让蒸馏完成后，详情仍返回 distilling，/status 同时返回 ready。
+    #
+    # 放这里而不是 content-service 侧，是因为唯一知道「这篇蒸馏结束了」的地方
+    # 就是这个函数；放晚了（埋点之后）会被前面的 early return 跳过。
+    #
+    # 失败路径同样要清：状态从 distilling 变 failed 一样是陈旧缓存问题。
+    # 缓存失效失败不能影响业务（日志里能看到就行）。
+    try:
+        await cache_service.invalidate_article(article_id)
+        await cache_service.invalidate_pending(user_id)
+    except Exception as exc:
+        log.warning(
+            "agent_cache_invalidate_failed",
+            task_id=task_id,
+            article_id=article_id,
+            error=str(exc),
+        )
 
     # ---- 第二步：埋点（独立 session，失败只丢埋点，不影响上面的数据）----
     # 失败 → 带 reason，让 admin dashboard 看到"为什么失败"。

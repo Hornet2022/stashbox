@@ -3,17 +3,43 @@
 """
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# CP-ENV-CWD：把 backend/.env 按**绝对路径**灌进 os.environ，且只做一次。
+#
+# 为什么必须显式 load_dotenv：SettingsConfigDict(env_file=".env") 是**相对 CWD**
+# 解析的，而各进程的 CWD 并不统一 ——
+#   - api-gateway / content-service / user-service 的 LaunchAgent CWD 是 backend/
+#   - **ai-service 和 ai-worker 的 CWD 是 backend/ai-service/**
+# 后者去找 backend/ai-service/.env（不存在）→ 蒸馏链路**整条都读不到 .env**：
+# INDEXTTS_REF_AUDIO 读不到就直接抛「IndexTTS 需要参考音频」，
+# INDEXTTS_BASE_URL 落回 DEFAULT，LLM/TTS 全部走代码默认值。
+#
+# 为什么不能只改 env_file 路径：pydantic-settings 只把 .env 灌进 Settings 对象，
+# **不会写进 os.environ**。而 app/services/llm/__init__.py 等模块是直接
+# `os.getenv("OPENAI_LLM_API_KEY")` 读的 —— 那些调用点只有 os.environ 里有值。
+# 所以这里显式 load_dotenv，两种读法都覆盖到。
+#
+# override=False：真实环境变量（launchd plist 里注入的）优先级高于 .env，不要被文件盖掉。
+_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+if _ENV_FILE.is_file():
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(_ENV_FILE, override=False)
+    except ImportError:  # 没装 python-dotenv 时退回 pydantic-settings 的 env_file
+        pass
 
 
 class Settings(BaseSettings):
     """全局配置（4 服务共享）"""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_FILE),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",

@@ -147,6 +147,97 @@ content-service 打的 Redis 标，ai-service 从来没读过 ——
     于是「读日志」变成「用例失败」。driver 统一 `errors="replace"`。
     实测一次 logcat 48 万字节处就有个 `0xc0`。
 
+## 2026-09-30 事故：蒸馏全线失败（6 层原因叠加）
+
+现象：真机剪藏的文章永远停在 `distilling` → `failed`，日志里 6 次失败全是
+`agent distill failed at tts ... IndexTTS 合成失败（已尝试 4 次 / 2 个实例）`。
+**10:47 就已经在失败了，比那次剪藏更早** —— 顺着「第一次失败是什么时候」查下去，
+挖出四层独立的原因，任何一层单独存在都足以让蒸馏必挂。
+
+15. **`.env` 是相对 CWD 解析的，而各服务 CWD 不统一**。`common/config.py` 用
+    `SettingsConfigDict(env_file=".env")`，相对进程 CWD 找文件。四个服务的
+    LaunchAgent 里，api-gateway / content-service / user-service 的 CWD 是
+    `backend/`，**ai-service 和 ai-worker 的 CWD 是 `backend/ai-service/`** ——
+    于是真正干蒸馏的两个组件**从来没读到过 `.env`**。表现极具迷惑性：LLM 改写
+    正常（配置存在 `system_config` 表里，DB > env），TTS 却报「需要参考音频」
+    （那只在 `.env` 里）。修法见 `common/config.py` 的 CP-ENV-CWD 注释。
+    ⚠️ 只改 `env_file` 路径**不够**：pydantic-settings 只把 `.env` 灌进 Settings
+    对象，不写 `os.environ`，而 `app/services/llm/__init__.py` 是直接
+    `os.getenv()` 读的 —— 必须显式 `load_dotenv` 绝对路径。
+16. **launchd `KeepAlive` + 服务端 daemonize = 实例增生**。oMLX 的 LaunchAgent
+    配了 `KeepAlive=true`，但 `omlx-cli serve` 会把真正的 `omlx-server`
+    daemonize 掉，launchd 手里追踪的 PID 随即退出 → launchd 认为「服务挂了」
+    → 再拉一个。实测同时跑过 **4 个** oMLX 实例，每个都预加载 1.4~2.3GB 的 TTS
+    模型 → 内存打爆 → 空转（CPU 高、RSS 不涨、合成端点零响应）。
+    这就是文件头 `indextts.py:41` 记的那个现象的一半成因。已把 plist 改成
+    `KeepAlive=false` + `RunAtLoad=true`。
+17. **oMLX 内存守卫会反复卸载模型**。`~/.omlx/settings.json` 里
+    `memory_guard_tier=balanced` / `soft_threshold=0.85`；16GB 机器上软阈值
+    ≈13.6GB，而本机 swap 常年占 7GB+（陈旧页），守卫误判成内存吃紧 →
+    把已加载的 TTS 模型卸掉 → 下个请求冷加载 2.26GB → 撞 90s 超时。
+    已给 serve 加 `--memory-guard off`。
+18. **分段参数与实测速度不匹配**。实测 Qwen3-TTS 约 **0.7s/字**
+    （18 字 → 11.6s；378 字 → **267.9s**），而 `.env` 是
+    `CHUNK_CHARS=400` + `CHUNK_TIMEOUT=90` —— 每段都要跑 ~280s 却被 90s 掐断。
+    现改为 `CHUNK_CHARS=200` + `CHUNK_TIMEOUT=240`。**这是 TTS 慢的根因，
+    不是连接问题** —— 之前一直误判成「服务连不上」而反复加 failover。
+    完整修复后单篇 2193 字实测 16 段、`1419.87s` 跑完并产出 570s 音频。
+19. **Postgres 数据目录被删且不可恢复**：09-28 11:38 数据目录消失，launchd
+    重试 17284 次全失败（`could not access directory ... Run initdb`）。
+    全盘搜 `PG_VERSION`（深度 8，含外置卷）**什么都没有**，无 Time Machine、
+    无本地快照、无容器卷 —— 开发数据全丢，只能 `initdb` + `alembic upgrade head`
+    重建。**教训：数据目录消失时先 `initdb` 是错的**，先确认全盘搜过再说。
+20. **`alembic 0032` 不幂等 → 空库一张表都建不出来**。它假设
+    `push_notifications_tag_slug_fkey` 不存在才补建，但**空库上 0008 的
+    `create_table` 会正常发出这条 FK**，于是报 DuplicateObjectError。alembic
+    用事务型 DDL，一个迁移失败会**回滚整条链** —— 表现为「initdb 之后
+    `upgrade head` 建表失败」，但表数是 0 而不是 19。
+    已改成先查存在性再动手（见该迁移的 `_fk_exists` / `_index_exists`）。
+21. **`tools.py` 的 `log` 是 stdlib logging，不是 structlog**。同一份代码里
+    `distill_task.py` 用 structlog（`log.info("event", key=value)` 合法）、
+    `agent/tools.py` 用 `logging.getLogger`（同样写法会抛
+    `Logger._log() got an unexpected keyword argument 'article_id'`）。
+    症状极怪：任务在 **tts 阶段**失败，但报错跟 TTS 毫无关系 —— 是我加的一行
+    日志打错了格式。**跨文件加日志前先确认那个文件的 log 是什么类型**。
+
+
+## 2026-09-30 自由拓展自测：端到端没覆盖到的 6 个 BUG
+
+上一节的事故修完后，功能是通的，但「通」不等于「对」。这一轮不看覆盖率的洞，
+专挑**端到端用例结构上照不到**的地方：并发、权限、降级、缓存、界面诚实性。
+6 个 BUG 全部已修，每个都配了回归测试（见下表）。
+
+| # | BUG | 为什么 e2e 照不到 | 回归测试 |
+|---|---|---|---|
+| 5 | 并发首次写偏好 → 500 | e2e 一次只点一下，撞不上竞态 | `tests/content/test_tts_voice_preference.py` |
+| 6 | 蒸馏溯源 `tts_voice_id` 只写不读 | 「少了个字段」不会让任何请求失败 | `tests/content/test_tts_voice_trace.py` |
+| 7 | 蒸馏完成后文章详情缓存不失效 | 断言都打在 `/status`（不走缓存）上 | `tests/ai/test_distill_cache_invalidation.py` |
+| 8 | provider 不支持覆盖时溯源说谎 | 本机只有 indextts 这一个 provider | `tests/ai/test_tts_voice_trace_honesty.py` |
+| 9 | 设置页加载失败仍显示笃定值 | 断网/401 不在用例路径里 | 真机手动验（停网关） |
+| 10 | 「最近剪藏」卡片不可点 | 用例从列表页进详情，绕开了剪藏页 | 真机手动验（uiautomator clickable 节点） |
+
+### 三个值得单独记的教训
+
+**1. 竞态测试要盯「实现方式」，不要盯「跑 N 次会不会炸」。**
+   BUG#5 最初写的是「并发 6 次写偏好，断言没有 5xx」。这测试在 pytest 的
+   in-process ASGI 下**一次都复现不出来**（请求被天然串行化），旧实现照样全绿 ——
+   是个只会给人安全感的空转测试。真正测住的是把断言换成
+   「发往 `user_tts_preferences` 的语句必须只有 1 条且含 ON CONFLICT」：
+   只要有人改回读-改-写，它必红，与调度顺序无关。
+   临时回退验证过：干净回退后**恰好**是结构那条和空操作那条红，时序那条依旧绿。
+
+**2. 写缓存的测试不能放在 Redis 被 mock 掉的目录。**
+   `tests/ai/conftest.py` 有个 autouse fixture 把 `redis.asyncio.Redis` 整个换成
+   no-op 桩（为测退款锁）。在那里写「先塞缓存再断言缓存没了」，
+   `get_article` 恒返回 None，断言会因为桩而**假绿**。改成 spy 住
+   `cache_service.invalidate_article` 记录调用，不依赖 Redis。
+
+**3. 「少了个字段」是 e2e 照不到的经典盲区。**
+   BUG#6：蒸馏链路老实把「这段音频是谁念的」写进库，但从头到尾**没有任何一处读它**。
+   三端都不显示，`GET /articles/{id}` 照样 200、字段一个不少地少一个。
+   而它唯一的展示位是「换音色→重生成」的验收凭据 —— 闭环看着接上了，其实断在最后一米。
+
+
 ## 与既有测试的分工
 
 `tests/ai` `tests/gateway` `tests/admin` 是**接口/单元**测试，直接连共享库。

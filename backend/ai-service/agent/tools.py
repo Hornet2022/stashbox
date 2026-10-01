@@ -127,9 +127,57 @@ async def tts_synthesize_tool(state: dict[str, Any], args: dict[str, Any]) -> di
         raise ToolError("badreq", "script 不能为空（rewritten_script 字段未填）")
 
     from stashbox.backend.app.services.tts import reload as tts_reload
+    from stashbox.backend.common.tts_voice_service import resolve_voice_for_user
+
+    # CP-TTS-VOICE：解析这个用户该用哪个音色（用户偏好 → 全局默认 → 全局配置）。
+    # 只有 IndexTTS 支持按调用覆盖 ref_audio/ref_text；其他 provider 的音色
+    # 由各自的配置项决定（edge_voice / openai_voice / …），不接受覆盖。
+    resolved = await resolve_voice_for_user(state.get("user_id"))
+    overrides: dict[str, Any] = {}
+    if resolved.source in ("user", "default"):
+        overrides = {"ref_audio": resolved.ref_audio, "ref_text": resolved.ref_text}
+    # 注意：本模块的 log 是 **stdlib logging**（见文件头 `log = logging.getLogger`），
+    # 不支持 structlog 那种 `log.info(event, key=value)` —— 传额外 kwargs 会抛
+    # `Logger._log() got an unexpected keyword argument`。所以用 %-格式化。
+    log.info(
+        "tts_voice_resolved article=%s user=%s voice_id=%s voice=%s source=%s applied=%s",
+        state.get("article_id"),
+        state.get("user_id"),
+        resolved.voice_id,
+        resolved.display_name,
+        resolved.source,
+        bool(overrides),
+    )
 
     client = await tts_reload()
+    # `applied` = 用户选的音色**真的**用上了没有。它决定 tts_voice_id 能不能记，
+    # 必须由「实际走了哪条调用路径」推导，不能由「解析出了什么」推导 ——
+    # 这正是 BUG#8（2026-09-30 自测发现）：
+    # provider 不是 indextts 时覆盖参数会 TypeError，然后回退到 provider 自己的
+    # 默认音色（实测 edge 走 `zh-CN-XiaoxiaoNeural`），但返回里照样把
+    # `resolved.voice_id` 写进 state，于是 distilled_articles.tts_voice_id 记下
+    # 一个**根本没被使用**的音色，详情页就会显示「本期由 婷婷 朗读」——
+    # 溯源在说谎，而且恰好是给「换音色重生成」这条闭环做的展示在说谎。
+    # 覆盖没生效时必须记 None（与 global_config 同义：来源不可溯源）。
+    applied = False
     try:
+        # 非 IndexTTS 的 synthesize() 没有 ref_audio/ref_text 形参，直接传会 TypeError
+        audio = await client.synthesize(
+            script,
+            voice=getattr(client, "voice", None),
+            **overrides,
+        )
+        applied = bool(overrides)
+    except TypeError as exc:
+        # 兜底：provider 不支持覆盖时退回原调用，不要整个任务挂掉。
+        # ⚠️ 这里 TypeError 既可能是「形参不匹配」，也可能是 provider 内部真炸了
+        # （比如对 None 求长度）。两者都回退，行为是安全的：回退调用不带覆盖参数，
+        # 写错的代码照样会在回退里再炸一次并被下面的 except 捕获。
+        log.warning(
+            "tts_voice_override_unsupported provider=%s err=%s",
+            client.provider_name,
+            exc,
+        )
         audio = await client.synthesize(script, voice=getattr(client, "voice", None))
     except Exception as exc:
         raise ToolError("internal", f"tts_synthesize 失败: {exc}") from exc
@@ -151,6 +199,15 @@ async def tts_synthesize_tool(state: dict[str, Any], args: dict[str, Any]) -> di
         "voice": voice or getattr(client, "voice", None),
         "duration_sec": _wav_duration_sec(audio) or len(audio) // 32000,
         "bytes_len": len(audio),
+        # CP-TTS-VOICE：把本次用的音色带回 state，节点据此回写
+        # distilled_articles.tts_voice_id。两种情况记 None，都表示「来源不可溯源」：
+        #   1. source='global_config' —— 用的是全局参考音频，本来就没有音色行
+        #   2. 覆盖没生效（provider 非 indextts）—— 见上面 applied 的说明
+        # 留空比编一个「看起来对」的音色 ID 诚实：那会让详情页显示一个
+        # 根本没参与这次合成的人名。
+        "tts_voice_id": resolved.voice_id if applied else None,
+        "tts_voice_name": resolved.display_name if applied else None,
+        "tts_voice_source": resolved.source if applied else "not_applied",
     }
 
 

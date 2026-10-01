@@ -18,8 +18,17 @@
      - 数据完整性已 check：push_notifications 中无孤儿 tag_slug（外键引用都指向真实 tags）。
 
 降级：恢复 FK + 重建索引。
+
+⚠️ 幂等化（2026-09-30）：本迁移原先假设「FK 一定不存在」，只在**已有库**上验证过。
+空库重建时反而炸了 —— `alembic upgrade head` 从 base 跑会报
+`DuplicateObjectError: constraint "push_notifications_tag_slug_fkey" ... already exists`，
+因为 0008 的 `create_table` 在空库上**会**正常发出这条 FK DDL。
+alembic 用事务型 DDL，一个迁移失败会回滚整条链，于是 `alembic upgrade head`
+在全新环境里一张表都建不出来（表现为「initdb 之后建表失败」）。
+现在两处操作都先查存在性再动手：已有库行为不变，空库也能跑通。
 """
 
+import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
@@ -29,19 +38,51 @@ branch_labels = None
 depends_on = None
 
 
+def _fk_exists(name: str, table: str) -> bool:
+    bind = op.get_bind()
+    return (
+        bind.execute(
+            sa.text(
+                "select 1 from pg_constraint "
+                "where conname = :name and conrelid = to_regclass(:table)"
+            ),
+            {"name": name, "table": table},
+        ).scalar()
+        is not None
+    )
+
+
+def _index_exists(name: str, table: str) -> bool:
+    bind = op.get_bind()
+    return (
+        bind.execute(
+            sa.text(
+                "select 1 from pg_indexes "
+                "where schemaname = current_schema() "
+                "and indexname = :name and tablename = :table"
+            ),
+            {"name": name, "table": table},
+        ).scalar()
+        is not None
+    )
+
+
 def upgrade() -> None:
-    # ① 删孤儿索引
-    op.drop_index("idx_distilled_ab_group", table_name="distilled_articles")
+    # ① 删孤儿索引（模型已移除 ab_group，列被后续迁移删掉时索引会跟着消失）
+    if _index_exists("idx_distilled_ab_group", "distilled_articles"):
+        op.drop_index("idx_distilled_ab_group", table_name="distilled_articles")
 
     # ② 补 push_notifications.tag_slug → tags.slug 外键
-    op.create_foreign_key(
-        "push_notifications_tag_slug_fkey",
-        "push_notifications",
-        "tags",
-        ["tag_slug"],
-        ["slug"],
-        ondelete="SET NULL",
-    )
+    #    空库上 0008 已经建过这条 FK，补建会撞 DuplicateObjectError
+    if not _fk_exists("push_notifications_tag_slug_fkey", "push_notifications"):
+        op.create_foreign_key(
+            "push_notifications_tag_slug_fkey",
+            "push_notifications",
+            "tags",
+            ["tag_slug"],
+            ["slug"],
+            ondelete="SET NULL",
+        )
 
 
 def downgrade() -> None:

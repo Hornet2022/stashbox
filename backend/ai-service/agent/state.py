@@ -39,6 +39,11 @@ class AgentState(TypedDict, total=False):
     tts_audio_url: Optional[str]  # step3 TTS 合成音频 OSS URL
     tts_audio_path: Optional[str]  # 音频本地落盘路径（OSS 未就绪时的真实产物）
     tts_duration_sec: Optional[int]
+    # CP-TTS-VOICE：本次蒸馏实际用的音色（tts_voices.id）。
+    # None = 回落全局 indextts_ref_audio 配置，来源不可溯源。
+    # 回写 distilled_articles.tts_voice_id，让「这篇音频是谁念的」可追溯。
+    tts_voice_id: Optional[str]
+    tts_voice_name: Optional[str]
     final_audio_url: Optional[str]  # step4 拼接后最终音频 OSS URL
     final_duration_sec: Optional[int]
 

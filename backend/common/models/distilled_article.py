@@ -42,5 +42,15 @@ class DistilledArticle(Base, TimestampMixin):
     # ab-report 按 NULL 单独一组过滤。方案 §2.7-D：user_id % 100 < 30 → personalized。
     ab_group: Mapped[str | None] = mapped_column(String(16), nullable=True)
     is_personalized: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # CP-TTS-VOICE：这段音频当时用哪个音色合成的（溯源）。
+    # **刻意可空**：0033 之前跑出来的历史行无从得知音色，留 NULL 表示
+    # 「未知 / 当时用的是全局默认参考音频」，比回填一个假音色诚实。
+    # 音色被删时 SET NULL —— 音频本身还在，只是失去了溯源信息。
+    tts_voice_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("tts_voices.id", ondelete="SET NULL"), nullable=True
+    )
 
-    __table_args__ = (Index("idx_distilled_article_id", "article_id"),)
+    __table_args__ = (
+        Index("idx_distilled_article_id", "article_id"),
+        Index("idx_distilled_tts_voice", "tts_voice_id"),
+    )

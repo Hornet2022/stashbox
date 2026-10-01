@@ -238,7 +238,11 @@ async def _run_pipeline(task_id: str, simulate_failure: bool = False) -> None:
 # ---------------------------------------------------------------------------
 class DistillStartRequest(BaseModel):
     article_id: str
-    url: str
+    # url / title 可选且**被忽略** —— 端点一律取库里的值（见 distill_start
+    # docstring：传什么蒸馏什么等于允许把 A 的产物写到 B 上）。
+    # 这两个字段保留只为兼容老调用方；曾经是必填，App 的「用新音色重新生成」
+    # 按钮只该传 article_id，被迫编个 url 出来反而容易传错。
+    url: str | None = None
     title: str | None = None
 
 
@@ -247,6 +251,10 @@ class DistillStartResponse(BaseModel):
     article_id: str
     status: str
     job_id: str = ""  # CP3.5-pre-3：Arq job_id（BackgroundTasks 时代没有）
+    # CP-TTS-VOICE：本次会用哪个音色合成。让 App 能在「重新生成」确认弹窗里
+    # 告诉用户「将用『男声』重新生成」，而不是让用户点了之后不知道会变成谁。
+    voice_id: str | None = None
+    voice_name: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -293,8 +301,19 @@ async def distill_start(
 
     url / title 一律取库里的值，不用请求体传的——传什么蒸馏什么，等于允许
     调用方把 A 文章的产物写到 B 上。
+
+    CP-TTS-VOICE：**本端点同时是「用当前音色重新生成」的入口**，不另开新端点。
+    理由是本项目已经吃过亏 —— 见上面第 2) 条：「同一件事两条路径、两种计费口径」。
+    再加一个 `/re-distill` 只会重演：它要么不扣费（和这里不一致），要么重复扣费
+    （用户点两次就少两次配额）。音色是合成期参数，worker 里
+    `resolve_voice_for_user()` 会重新解析用户当前选的音色，所以重跑自然生效。
     """
     uid = int(user["sub"])
+
+    # 提前解析一次音色回给 App（worker 里会再解析一次；这里纯粹为了回显，
+    # 两次之间用户改了偏好的话以 worker 那次为准，不追求强一致）。
+    # import 提到函数开头：下面的幂等分支要直接 return 用到它。
+    from stashbox.backend.common.tts_voice_service import resolve_voice_for_user
 
     art = await db.scalar(select(Article).where(Article.id == req.article_id))
     if art is None:
@@ -324,8 +343,16 @@ async def distill_start(
         url=url,
         title=title,
     )
+    # 提前解析一次音色回给 App（worker 里会再解析一次；这里纯粹为了回显，
+    # 两次之间用户改了偏好的话以 worker 那次为准，不追求强一致）
+    voice = await resolve_voice_for_user(uid)
     return DistillStartResponse(
-        task_id=task_id, article_id=req.article_id, status="queued", job_id=job_id
+        task_id=task_id,
+        article_id=req.article_id,
+        status="queued",
+        job_id=job_id,
+        voice_id=voice.voice_id,
+        voice_name=voice.display_name,
     )
 
 

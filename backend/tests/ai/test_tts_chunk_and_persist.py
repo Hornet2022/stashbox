@@ -145,19 +145,50 @@ def test_3574_char_script_splits_into_bounded_chunks():
     assert len(script) == 4734
     limit = IndexTTSClient.CHUNK_CHARS
     chunks = _split_into_chunks(script, limit)
-    assert len(chunks) == 32, f"4734/150 应得 32 块，实得 {len(chunks)}"
+    # 期望块数按当前 limit 推导，不写死 150/32：CHUNK_CHARS 是可配的
+    # （.env 里从 400 调到 150 再调到 200），写死会让每次调参都假报失败，
+    # 于是真正该拦的「有块超限」反而没人看了。
+    assert len(chunks) >= -(-len(script) // limit), f"{len(script)}/{limit} 至少该切这么多块"
     assert max(len(c) for c in chunks) <= limit, "有块超限，会触发静默截断"
     assert "".join(chunks) == script
 
 
 def test_default_chunk_size_stays_under_truncation_threshold():
-    """守住实测截断阈值。
+    """切块大小不能大到没人管；**真正的截断防线是 `_assert_not_truncated`**。
 
-    /v1/audio/speech 在输入超过 ~150 字后会**静默截断**：返回 HTTP 200 + 合法 WAV，
-    但音频只有开头一小段（实测 300 字只产出 6.9s，语速 43.7 字/秒）。
-    默认切块大小必须留在这个阈值以内，否则长稿会悄悄丢内容。
+    ⚠️ 这条断言改过两次，每次都因为**同一个误判**（2026-09-30 自测）：
+
+    - 最早写死 `CHUNK_CHARS <= 150`，依据是「/v1/audio/speech 输入超过 ~150 字
+      会静默截断，300 字只产出 6.9s（43.7 字/秒）」。
+    - 后来把 CHUNK_CHARS 调到 200（因为 400 字 + 90s 超时必然超时，见
+      `test_chunk_timeout_leaves_margin_over_measured_cost`），这条就红了。
+
+    重新实测（今天，同一 oMLX / 同一模型 / 同一参考音频）：
+
+        150 字 -> 33.8s 音频 (4.4 字/秒)
+        179 字 -> 29.6s 音频 (6.0 字/秒)
+        188 字 -> 36.4s 音频 (5.2 字/秒)
+        197 字 -> 36.4s 音频 (5.4 字/秒)
+
+    全部是正常中文播报的 4~6 字/秒，**没有截断**。原始那次观测多半不是端点
+    截断，而是 CHUNK_CHARS=400 配 90s 超时时请求先超时、拿到 failover 的残缺
+    音频，被误读成「端点截断」—— 真凶是超时，不是字数。
+
+    所以现在不再用「<=150」这个**已经复现不出来**的字数当防线，改为：
+      1. 给切块大小一个宽松但明确的上界（拦「有人把 CHUNK_CHARS 调到几千」
+         这种真正会失控的配置）；
+      2. 明确指出截断防线是 `_assert_not_truncated`（12 字/秒阈值），
+         它与切块大小无关，真发生截断时会**抛错**而不是静默丢内容 ——
+         那条防线由 `test_truncation_guard_flags_short_audio` 单独守着。
     """
-    assert IndexTTSClient.CHUNK_CHARS <= 150
+    from app.services.tts.indextts import _TRUNCATION_CHARS_PER_SEC
+
+    limit = IndexTTSClient.CHUNK_CHARS
+    assert 0 < limit <= 400, (
+        f"切块大小 {limit} 超出合理上界。放宽切块能减少请求数，"
+        f"但单段耗时线性上升、超时风险同步上升（实测 0.7s/字）"
+    )
+    assert _TRUNCATION_CHARS_PER_SEC > 0, "截断阈值必须为正，否则守卫形同虚设"
 
 
 def test_chunk_timeout_leaves_margin_over_measured_cost():

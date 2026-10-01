@@ -346,33 +346,67 @@ class IndexTTSClient(TTSClient):
         return "indextts"
 
     # -- 参考音频 ---------------------------------------------------------
-    def _load_ref_audio_b64(self) -> str:
-        """读参考 wav → base64（缓存，路径变更才重读）。"""
-        path = self.ref_audio_path
-        if not path:
+    async def _load_ref_audio_b64(self, source: str | None = None) -> str:
+        """读参考 wav → base64（缓存，来源变更才重读）。
+
+        CP-TTS-VOICE：`source` 支持两种来源 ——
+          - **本地绝对路径**（历史行为，配 INDEXTTS_REF_AUDIO）
+          - **http(s) URL**（音色库存上传后的地址，指向 S3/OSS）
+
+        音色库（`common/tts_voice_service.py`）里每条音色存的就是这两种之一，
+        所以这里必须两种都认 —— 之前只认 `Path.is_file()`，音色库存 URL 会直接
+        报「参考音频文件不存在」。
+
+        缓存键是**来源字符串本身**，所以同一个 client 连着合成不同音色的稿件时
+        会自动换缓存（正常流程下 distill 一次只用一个音色，属防御性设计）。
+        """
+        src = (source or self.ref_audio_path or "").strip()
+        if not src:
             raise IndexTTSError(
-                "IndexTTS 需要参考音频：配置 INDEXTTS_REF_AUDIO（管理后台 TTS 设置页 indextts_ref_audio）。"
+                "IndexTTS 需要参考音频：配置 INDEXTTS_REF_AUDIO（管理后台 TTS 设置页 "
+                "indextts_ref_audio）或选择音色（tts_voices.ref_audio_url）。"
             )
-        p = Path(path).expanduser()
-        if not p.is_file():
-            raise IndexTTSError(f"参考音频文件不存在: {p}")
-        if self._ref_b64 is not None and self._ref_b64_for == str(p):
+        if self._ref_b64 is not None and self._ref_b64_for == src:
             return self._ref_b64
-        data = p.read_bytes()
+
+        if src.startswith(("http://", "https://")):
+            data = await self._fetch_ref_audio(src)
+        else:
+            p = Path(src).expanduser()
+            if not p.is_file():
+                raise IndexTTSError(f"参考音频文件不存在: {p}")
+            data = p.read_bytes()
+
         if len(data) < 1000:
-            raise IndexTTSError(f"参考音频太小({len(data)}B)，可能不是有效 wav: {p}")
+            raise IndexTTSError(f"参考音频太小({len(data)}B)，可能不是有效 wav: {src}")
         self._ref_b64 = base64.b64encode(data).decode("ascii")
-        self._ref_b64_for = str(p)
-        log.info("IndexTTS ref audio loaded: %s (%dB)", p, len(data))
+        self._ref_b64_for = src
+        log.info("IndexTTS ref audio loaded: %s (%dB)", src, len(data))
         return self._ref_b64
 
-    def _ensure_ref_text(self) -> str:
-        if not self.ref_text.strip():
+    async def _fetch_ref_audio(self, url: str) -> bytes:
+        """从 URL 拉参考音频。
+
+        复用同一个 httpx client（已带 `trust_env=False`）。超时给 30s：
+        音色库里的音频在 S3 上正常 <1s，但外网 OSS 可能慢。
+        """
+        try:
+            resp = await self._client.get(url, timeout=30.0)
+        except httpx.HTTPError as exc:
+            raise IndexTTSError(f"参考音频下载失败: {url} ({exc})") from exc
+        if resp.status_code != 200:
+            raise IndexTTSError(f"参考音频下载失败 HTTP {resp.status_code}: {url}")
+        return resp.content
+
+    def _ensure_ref_text(self, override: str | None = None) -> str:
+        """取参考文本。`override` 非 None 时用它（音色库自带 ref_text）。"""
+        text = override if override is not None else self.ref_text
+        if not (text or "").strip():
             raise IndexTTSError(
                 "IndexTTS 需要参考音频转录文本：配置 INDEXTTS_REF_TEXT"
                 "（管理后台 TTS 设置页 indextts_ref_text，须与 ref_audio 内容一致）。"
             )
-        return self.ref_text
+        return text
 
     # -- 合成 -------------------------------------------------------------
     async def synthesize(
@@ -380,6 +414,8 @@ class IndexTTSClient(TTSClient):
         text: str,
         voice: str | None = None,  # 契约兼容；IndexTTS 音色由 ref_audio 决定
         output_format: str = "wav",
+        ref_audio: str | None = None,
+        ref_text: str | None = None,
     ) -> bytes:
         """合成文本为音频字节。
 
@@ -388,13 +424,18 @@ class IndexTTSClient(TTSClient):
         字，单请求必然撞 `INDEXTTS_TIMEOUT`（实测「合成超时(300.0s)」）。
         这里在句读边界切块 → 逐块合成 → 拼接为单个 WAV 返回，
         使**单次请求**始终远小于超时阈值（单块 ≤ CHUNK_CHARS 字）。
+
+        CP-TTS-VOICE：`ref_audio` / `ref_text` 允许**按调用覆盖**音色。
+        传 None 时用 client 自身的全局配置（历史行为不变）。
+        蒸馏时由 `resolve_voice_for_user()` 解析出用户选的那个音色传进来 ——
+        音色是 IndexTTS 的「参考音频 + 参考文本」对，不是能填名字的参数。
         """
         if not text or not text.strip():
             raise ValueError("text 不能为空")
 
         body = text.strip()
         if len(body) <= self.CHUNK_CHARS:
-            return await self._synthesize_once(body)
+            return await self._synthesize_once(body, ref_audio, ref_text)
 
         chunks = _split_into_chunks(body, self.CHUNK_CHARS)
         log.info(
@@ -411,7 +452,7 @@ class IndexTTSClient(TTSClient):
             nonlocal done
             i, chunk = i_chunk
             async with sem:
-                piece = await self._synthesize_once(chunk)
+                piece = await self._synthesize_once(chunk, ref_audio, ref_text)
                 done += 1
                 log.info(
                     "IndexTTS 分段进度: %d/%d chars=%d bytes=%d",
@@ -429,27 +470,34 @@ class IndexTTSClient(TTSClient):
         log.info("IndexTTS 分段合成完成: %d 段 -> %d bytes", len(pieces), len(merged))
         return merged
 
-    async def _synthesize_once(self, text: str) -> bytes:
+    async def _synthesize_once(
+        self,
+        text: str,
+        ref_audio: str | None = None,
+        ref_text: str | None = None,
+    ) -> bytes:
         """单次合成（不分段），带短超时 + 故障切换 + 重试。
 
         CP-INDEXTTS-FAILOVER：对每个 endpoint 轮转尝试，单请求超时用
         `chunk_timeout`（默认 90s），超时/连接错误立刻换下一个实例，
         而不是拿 300s 死等一个正在空转的实例。
+
+        CP-TTS-VOICE：ref_audio / ref_text 为按调用覆盖的音色（见 synthesize）。
         """
-        ref_b64 = self._load_ref_audio_b64()
-        ref_text = self._ensure_ref_text()
+        ref_b64 = await self._load_ref_audio_b64(ref_audio)
+        ref_text_value = self._ensure_ref_text(ref_text)
 
         payload = {
             "model": self.model,
             "input": text.strip(),
             "ref_audio": ref_b64,
-            "ref_text": ref_text,
+            "ref_text": ref_text_value,
         }
         log.info(
             "IndexTTS synthesize: model=%s text_chars=%d ref=%s endpoints=%s",
             self.model,
             len(text),
-            self.ref_audio_path,
+            ref_audio or self.ref_audio_path,
             self.endpoints,
         )
 
