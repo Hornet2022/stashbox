@@ -1,7 +1,18 @@
 #!/usr/bin/env sh
+# 注意：没有 `set -e` 的话，只有**最后一条命令**的退出码算数 —— `ruff check`
+# 报错会被 `ruff format --check` 的成功掩盖掉，lint 就形同虚设。
+# 2026-10-02 之前就是这样：ruff check 一直报 18 个 E402，提交却一路放行。
+set -e
+
 HUSKY_DIR="$(cd "$(dirname -- "$0")" && pwd)"
 . "$HUSKY_DIR/_/husky.sh"
 
 cd "$HUSKY_DIR/.."
-.venv/bin/ruff check $(git diff --cached --name-only --diff-filter=ACM | grep -E '\.py$' | tr '\n' ' ')
-.venv/bin/ruff format --check $(git diff --cached --name-only --diff-filter=ACM | grep -E '\.py$' | tr '\n' ' ')
+
+STAGED_PY="$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.py$' | tr '\n' ' ')"
+if [ -z "$STAGED_PY" ]; then
+  exit 0
+fi
+
+backend/.venv/bin/ruff check $STAGED_PY
+backend/.venv/bin/ruff format --check $STAGED_PY

@@ -46,6 +46,13 @@ testpaths = ["tests"]
 line-length = 100
 target-version = "py311"
 
+[tool.ruff.lint.per-file-ignores]
+# 这两个文件在 import stashbox.* 之前必须先改 sys.path（CP-ENV-CWD：
+# 服务以 `python -m uvicorn <svc>.main:app` 从各自目录启动，仓库根不在
+# 默认 import 路径上）。E402 在这里是有意为之，不是笔误。
+"api-gateway/main.py" = ["E402"]
+"ai-service/distill/steps.py" = ["E402"]
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
