@@ -5,12 +5,16 @@ Redis，任务由独立 worker 进程消费，uvicorn 不再被长任务阻塞�
 
 抽这一层的目的：将来换 Celery / Dramatiq 只改本文件，业务代码（main.py）不动。
 """
+
 from arq import create_pool
 from arq.connections import ArqRedis, RedisSettings
 
 from arq_settings import load_arq_config
 
 DISTILL_TASK_NAME = "distill_task"
+# 音频变体转码（CP7.3.0）。单独一个任务名，和蒸馏任务互不阻塞：
+# 一篇 30 分钟音频的 ffmpeg 转码要几十秒到几分钟，绝不能占着蒸馏 worker。
+VARIANT_TRANSCODE_TASK_NAME = "variant_transcode_task"
 
 
 class DistillDispatcher:
@@ -59,6 +63,27 @@ class DistillDispatcher:
             simulate_failure=simulate_failure,
         )
         return job.job_id if job else ""
+
+    async def enqueue_variant_transcode(
+        self,
+        article_id: str,
+        bitrate: int,
+    ) -> str:
+        """入队一次低码率转码，返回 job_id（入队失败返回空串，不抛）。
+
+        刻意不抛：调用方是「读接口顺手补一个档」，转码入队失败不该让
+        「打开文章详情页」整个失败 —— 主档能播就已经满足用户了。
+        """
+        try:
+            await self.connect()
+            job = await self._pool.enqueue_job(
+                VARIANT_TRANSCODE_TASK_NAME,
+                article_id=article_id,
+                bitrate=bitrate,
+            )
+            return job.job_id if job else ""
+        except Exception:
+            return ""
 
 
 # 全局单例（lazy init）

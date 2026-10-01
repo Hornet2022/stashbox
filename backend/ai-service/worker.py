@@ -17,6 +17,7 @@ from prometheus_client import start_http_server
 
 from arq_settings import load_arq_config
 from tasks.distill_task import distill_task
+from variant_transcode_task import variant_transcode_task
 
 _cfg = load_arq_config()
 
@@ -24,7 +25,7 @@ _cfg = load_arq_config()
 class WorkerSettings:
     """Arq WorkerSettings（Arq 通过名字反射调用，别在这上面写逻辑）。"""
 
-    functions = [distill_task]
+    functions = [distill_task, variant_transcode_task]
     redis_settings = RedisSettings.from_dsn(_cfg.redis_url)
     queue_name = _cfg.queue_name
     max_jobs = _cfg.max_jobs

@@ -270,6 +270,9 @@ ROUTES += [
     Route("GET", "/api/v1/admin/export/users.csv", "content-service", _url("content-service")),
     Route("GET", "/api/v1/admin/export/articles.csv", "content-service", _url("content-service")),
     Route("GET", "/api/v1/admin/export/feedback.csv", "content-service", _url("content-service")),
+    # 2026-10-02: 标签导出。admin-web 标签页一直在调这个，后端却没实现，
+    # 而 admin 段不走前缀 fallback → 必然 404。
+    Route("GET", "/api/v1/admin/export/tags.csv", "content-service", _url("content-service")),
     Route("GET", "/api/v1/admin/export/audit-log.csv", "content-service", _url("content-service")),
     Route(
         "GET", "/api/v1/admin/export/subscriptions.csv", "content-service", _url("content-service")
@@ -287,6 +290,16 @@ ROUTES += [
     # admin-web 用的 POST /api/v1/tags + GET /api/v1/notifications（CP3.6-A2 + CP5.4a）
     Route("POST", "/api/v1/tags", "content-service", _url("content-service")),
     Route("GET", "/api/v1/notifications", "user-service", _url("user-service")),
+    # 2026-10-02: 标记已读。user-service 早就实现了（main.py 的
+    # POST /api/v1/notifications/{id}/mark-read），但**网关注册表里没有**这条，
+    # 前缀 fallback 也不认 notifications 段 → App 里点「标记已读」必 404，
+    # 而 ViewModel 用 catch(_: Exception) 静默吞掉，角标永远不减少。
+    Route(
+        "POST",
+        "/api/v1/notifications/{notification_id}/mark-read",
+        "user-service",
+        _url("user-service"),
+    ),
     # CP5.4a-ADMIN：admin 全量推送队列端点（v1 §端点需求_admin推送队列_v1）。
     # admin 段不在 fallback 第一段前缀匹配里，必须显式注册，漏注册 = 8100 返 404。
     Route("GET", "/api/v1/admin/push-notifications", "user-service", _url("user-service")),

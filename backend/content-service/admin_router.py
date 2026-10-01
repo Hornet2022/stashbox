@@ -1216,6 +1216,48 @@ async def admin_export_users_csv(
     return _stream_csv(filename, header, fetch)
 
 
+@router.get("/api/v1/admin/export/tags.csv")
+async def admin_export_tags_csv(
+    user: dict = Depends(require_admin_or_operator), db: AsyncSession = Depends(get_db)
+):
+    """导出 tags 全量（2026-10-02 补）。
+
+    为什么补：admin-web 的标签管理页一直在调这个导出（``src/api/admin/csv.ts``
+    的 ExportKind 含 'tags'），但**后端从来没实现过**，而 admin 段又不走网关的
+    前缀 fallback —— 点了「导出标签」必然 404。更糟的是前端用
+    ``window.location.href`` 直链下载、绕过了 axios 拦截器，用户看到的是一个
+    下载下来的 404 JSON 页面，且**没有任何报错提示**。
+    """
+    path = "/api/v1/admin/export/tags.csv"
+    filename = _csv_filename("tags")
+    header = [
+        "id",
+        "slug",
+        "name",
+        "category",
+        "is_system",
+        "creator_id",
+        "created_at",
+    ]
+    total = await db.scalar(select(func.count()).select_from(Tag)) or 0
+    await _write_export_log(db, user, path, filename, total)
+
+    async def fetch(session: AsyncSession):
+        result = await session.stream(select(Tag).order_by(Tag.id))
+        async for t in result.scalars():
+            yield [
+                t.id,
+                t.slug,
+                t.name,
+                t.category,
+                t.is_system,
+                t.creator_id,
+                t.created_at,
+            ]
+
+    return _stream_csv(filename, header, fetch)
+
+
 @router.get("/api/v1/admin/export/articles.csv")
 async def admin_export_articles_csv(
     user: dict = Depends(require_admin_or_operator), db: AsyncSession = Depends(get_db)

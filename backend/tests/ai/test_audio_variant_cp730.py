@@ -55,6 +55,24 @@ class MemoryStorage:
 
 
 # 兼容基类（Storage.key_from_url 默认实现被复用）
+@pytest.fixture(autouse=True)
+def _no_real_transcode_enqueue(monkeypatch):
+    """把转码入队 stub 掉。
+
+    2026-10-02 起 list_variants 会调 ``_enqueue_transcode`` → ``get_dispatcher()``
+    建**全局** Redis 连接池。如果让单测真建，那个池会绑在本测试的 event loop 上；
+    循环结束后全局单例仍持有已关闭的连接，后续用例会报
+    ``RuntimeError: Event loop is closed``（实测污染到 test_distill_dispatcher）。
+
+    单测本来就不该连 Redis，这里 stub 掉顺带让本文件变成纯离线单测。
+    """
+
+    async def _fake(article_id, bitrate):
+        return None
+
+    monkeypatch.setattr("distill.audio_variant_service._enqueue_transcode", _fake, raising=True)
+
+
 from stashbox.backend.app.services.storage.base import Storage  # noqa: E402
 
 MemoryStorage.key_from_url = Storage.key_from_url
@@ -305,8 +323,17 @@ async def test_ensure_variant_missing_main_file():
 # ---------------------------------------------------------------------------
 
 
-async def test_list_variants_generates_missing(tmp_path):
-    """3 档全出：主档 URL + 96/64 按需生成后 available。"""
+async def test_list_variants_does_not_transcode_synchronously(tmp_path):
+    """2026-10-02 起：读接口**不再**同步转码。
+
+    原来这里是 `assert all(v["available"])` —— 即「调一次列表就把缺的档转出来」。
+    问题是这个读接口是用户点开文章详情页时调的，而转 30 分钟音频要几十秒到
+    几分钟，安卓端超时 65s：地铁隧道里打开一篇只有主档的文章必然超时失败，
+    弱网反而比强网更糟。
+
+    新契约：缺档时 available=false（主档立刻可用），转码交给 arq 后台任务。
+    这正是产品化方案 §5 决策 2 的选项 B「按需转码」该有的样子。
+    """
     from distill.audio_variant_service import AudioVariantService
 
     src = _sine_m4a(tmp_path, seconds=1)
@@ -319,9 +346,11 @@ async def test_list_variants_generates_missing(tmp_path):
         svc = AudioVariantService(storage=st, session_factory=sf)
         vs = await svc.list_variants(db, da)
         assert [v["bitrate"] for v in vs] == [128, 96, 64]
+        # 主档照常可用 —— 用户当下能播
         assert vs[0]["is_main"] and vs[0]["available"]
         assert vs[0]["url"] == da.audio_url
-        assert all(v["available"] for v in vs)
+        # 低码率不在读请求里转，报告为未就绪
+        assert [v["available"] for v in vs] == [True, False, False]
     await engine.dispose()
 
 

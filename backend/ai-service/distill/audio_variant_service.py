@@ -64,6 +64,29 @@ def _find_bin(name: str) -> str | None:
     return None
 
 
+async def _enqueue_transcode(article_id: str, bitrate: int) -> None:
+    """把一次转码丢进 arq 队列（2026-10-02）。
+
+    读接口只负责「有没有」，没有就排个后台任务补上，绝不在请求里同步转码。
+    入队失败只 log —— 主档能播就已经满足用户，不能因为补个低码率失败
+    就让「打开文章」整个失败。
+    """
+    try:
+        from dispatcher import get_dispatcher
+
+        job_id = await get_dispatcher().enqueue_variant_transcode(article_id, bitrate)
+        log.info(
+            "variant_transcode_enqueued", article_id=article_id, bitrate=bitrate, job_id=job_id
+        )
+    except Exception as exc:
+        log.warning(
+            "variant_transcode_enqueue_failed",
+            article_id=article_id,
+            bitrate=bitrate,
+            error=str(exc),
+        )
+
+
 def _variant_key(article_id: str, bitrate: int, fmt: str = "m4a") -> str:
     """storage key 规范：audio/{article_id}.{bitrate}k.{fmt}（主音频是 audio/{id}.m4a）。"""
     return f"audio/{article_id}.{bitrate}k.{fmt}"
@@ -206,7 +229,20 @@ class AudioVariantService:
 
             row = existing.get(bitrate)
             if row is None and generate_missing:
-                row = await self.ensure_variant(db, distilled_article, bitrate)
+                # 2026-10-02：转码从**同步**改成**后台触发 + 立即返回未就绪**。
+                #
+                # 原来这里 await ensure_variant(...) —— 也就是「用户点开文章详情页」
+                # 这个读请求里同步跑 ffmpeg 转 30 分钟音频。而客户端超时上限是 65s
+                # （android NetworkModule），于是地铁隧道里打开一篇只有主档的文章，
+                # 转码跑不完 → 客户端直接抛异常 → 选档整条失败。弱网场景反而比
+                # 强网更糟，这不合理。
+                #
+                # 现在的口径：读接口只报「有没有」，没有就返回 available=false，
+                # 转码丢到后台任务去。用户当下拿到主档能播就行，低码率等转好了
+                # 下次就有了 —— 这才是「按需转码」该有的样子。
+                await _enqueue_transcode(distilled_article.article_id, bitrate)
+                row = None
+
             results.append(
                 {
                     "bitrate": bitrate,
