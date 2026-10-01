@@ -29,6 +29,36 @@ from tests.e2e.driver import E2EFailure, evidence_on_failure  # noqa: E402
 
 GATEWAY = os.getenv("STASHBOX_GATEWAY", "http://127.0.0.1:8100")
 
+# 生产网关端口。这套 e2e 用例是**真的**会建用户、建文章、派蒸馏任务的，
+# 打到生产就等于往生产库灌数据并占住 TTS 队列。
+#
+# 2026-10-02 实测踩过：全量 pytest 跑一次，往生产库写了 5 篇文章、7 个用户、
+# 5 条蒸馏记录、50 条反馈，还留下 5 个排队等 TTS 的任务（每个 4-17 分钟）。
+# 根因就是这里默认 8100 —— 而 tests/conftest.py 里设的 POSTGRES_DB=stashbox_test
+# 对走 HTTP 的用例**完全无效**：处理请求的是生产服务，它们连的是生产库。
+#
+# 与 admin-web 的 e2e/gateway.ts 同一个教训：静默的默认值比没有默认值危险。
+# ⚠️ 必须用 int：`urlparse(...).port` 返回的是 int，写成字符串集合会让
+#    `8100 in {"8100"}` 恒为 False —— 守卫看着在、实际从不触发，
+#    比没有守卫更危险。
+_PRODUCTION_PORTS = {8100, 8101, 8102, 8103, 8104}
+
+
+def _assert_not_production(gateway: str) -> None:
+    from urllib.parse import urlparse
+
+    port = urlparse(gateway).port
+    if port in _PRODUCTION_PORTS:
+        raise RuntimeError(
+            f"拒绝执行：STASHBOX_GATEWAY={gateway} 指向生产端口 {port}。\n"
+            "  这套 e2e 会真的建用户/文章/派蒸馏任务，打生产等于污染生产库 + 占 TTS 队列。\n"
+            "  · 先起隔离后端再指过去（例如 admin-web 的 e2e-backend.sh，:18100）\n"
+            "  · 或显式确认后设 STASHBOX_ALLOW_PROD_E2E=1（不建议）"
+        )
+
+
+_assert_not_production(GATEWAY)
+
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "device: 需要真机在线")

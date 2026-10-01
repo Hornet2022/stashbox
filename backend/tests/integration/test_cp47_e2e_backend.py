@@ -14,6 +14,7 @@ CP4.7-E2E-BACKEND 端到端集成测试（content-service → ai-service → aud
 import asyncio
 import os
 import uuid
+from urllib.parse import urlparse
 
 import httpx
 import pytest
@@ -25,8 +26,17 @@ skip_in_ci = pytest.mark.skipif(
     reason="integration test requires running services (skipped in CI, run locally with services up)",
 )
 
-# dev 服务地址（已在跑，不要重启）
-GATEWAY_URL = "http://localhost:8100"
+# 网关地址。默认指向隔离实例（18100），**不再默认打生产 8100** ——
+# 这个文件里的用例会真的建用户、建文章、派蒸馏任务，2026-10-02 实测因为
+# 默认值是 8100，一次全量 pytest 就往生产库灌了数据并占了 TTS 队列。
+# 隔离后端的起法见 admin-web/e2e-backend.sh。
+GATEWAY_URL = os.getenv("STASHBOX_GATEWAY", "http://127.0.0.1:18100")
+
+if urlparse(GATEWAY_URL).port in {8100, 8101, 8102, 8103, 8104}:
+    raise RuntimeError(
+        f"拒绝执行：STASHBOX_GATEWAY={GATEWAY_URL} 指向生产端口，"
+        "这套 integration 用例会污染生产库并占住 TTS 队列。"
+    )
 
 
 # ---------------------------------------------------------------------------
