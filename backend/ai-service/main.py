@@ -152,6 +152,12 @@ def _new_task_id() -> str:
     return f"dst_{uuid.uuid4().hex[:24]}"
 
 
+#: CP-TTS-VOICE BUG#12：这些状态说明**已经有活儿在跑了**，此时重复入队只会打架。
+#: 放在模块级而不是端点内，是为了和 `tests/ai/test_distill_start_idempotent.py`
+#: 里的 `IN_FLIGHT` 对齐 —— 判据散落两处迟早会漂。
+IN_FLIGHT_DISTILL_STATUSES = ("queued", "running")
+
+
 def _requeue_or_create(
     db: AsyncSession, existed_da: DistilledArticle | None, article_id: str
 ) -> str:
@@ -302,6 +308,10 @@ async def distill_start(
     url / title 一律取库里的值，不用请求体传的——传什么蒸馏什么，等于允许
     调用方把 A 文章的产物写到 B 上。
 
+    CP-TTS-VOICE BUG#12：入队侧补幂等 —— 已有蒸馏行且处于 `queued` / `running`
+    时不再入队，原样返回既有 task_id（见下方注释与
+    `tests/ai/test_distill_start_idempotent.py`）。
+
     CP-TTS-VOICE：**本端点同时是「用当前音色重新生成」的入口**，不另开新端点。
     理由是本项目已经吃过亏 —— 见上面第 2) 条：「同一件事两条路径、两种计费口径」。
     再加一个 `/re-distill` 只会重演：它要么不扣费（和这里不一致），要么重复扣费
@@ -328,6 +338,39 @@ async def distill_start(
     existed_da = await db.scalar(
         select(DistilledArticle).where(DistilledArticle.article_id == req.article_id)
     )
+
+    # CP-TTS-VOICE BUG#12：**已在跑就不再入队**，原样返回既有任务。
+    #
+    # 端点此前只对**配额**做了幂等（已有蒸馏行就不重复扣），对**入队**没有 ——
+    # `enqueue_distill` 直接 `enqueue_job(...)` 不带任何幂等键，于是对同一篇文章
+    # 连调两次 = 两个独立 Arq job，两者都写**同一行** distilled_articles。后果：
+    # 白烧一轮 GPU（单篇实测约 23 分钟）、两个 worker 并发写同一行导致产物是混的、
+    # 耗时叠加到 46 分钟。
+    #
+    # 真的会发生的路径不是"理论上能重复调"：客户端响应丢失后重试（幂等性问题里
+    # 排第一的成因）、以及和 BUG#7 的因果链 —— 蒸馏完成后详情缓存没失效，用户重进
+    # 详情页看到的仍是 READY，「换音色重新生成」入口还在，再点一次就重复入队。
+    #
+    # 只挡 `queued` / `running`；`done` / `failed` 仍放行 —— 那正是「换音色重新生成」
+    # 和「失败重试」依赖的行为，一起挡掉会让重生成功能整个死掉
+    # （见 tests/ai/test_distill_start_idempotent.py 的两个回归用例）。
+    #
+    # ⚠️ 已知取舍：worker 崩溃会让行永远停在 `queued`，此时用户既不能重试也不能重生成，
+    # 只能靠运维捞。这是**刻意不**加超时兜底的原因 —— 超时窗口要按「最慢一轮蒸馏
+    # 耗时」定（本项目约 23 分钟），定短了会误杀正常长任务，真要做需要单独评估。
+    if existed_da is not None and existed_da.status in IN_FLIGHT_DISTILL_STATUSES:
+        voice = await resolve_voice_for_user(uid)
+        return DistillStartResponse(
+            task_id=existed_da.id,
+            article_id=req.article_id,
+            # 回报**真实**状态而不是写死 running：调用方要能区分「刚排上」和「已在跑」。
+            status=existed_da.status,
+            # 幂等分支不产生新 job，也就没有 job_id 可回；留空而不是编一个。
+            job_id="",
+            voice_id=voice.voice_id,
+            voice_name=voice.display_name,
+        )
+
     if existed_da is None and not await cache_service.has_article_quota(req.article_id):
         await quota_service.consume(db, uid)  # 用尽抛 3001
         await cache_service.mark_article_quota(req.article_id)
