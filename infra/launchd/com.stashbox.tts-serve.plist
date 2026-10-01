@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.stashbox.tts-serve</string>
+
+    <!--
+      听匣独立 TTS 服务（2026-10-01 取代 oMLX 承担 TTS）。
+
+      为什么要自建：oMLX 的 TTS 引擎内部就是 mlx-audio，但那段代码在一个
+      1.6GB 的签名 app 里，出问题只能等上游发版。本机 pip 装 mlx-audio
+      （venv 562MB）后自行接管，那层 `#2312 sampler 冻结 RNG` 的修复就成了
+      我们自己的代码 —— 这正是「可复用现有模型 + 轻量化 + 可 patch」三者
+      在这台机器上唯一能同时满足的形态。
+
+      权重仍然读 /Volumes/AIWorker，**不搬任何模型文件**。
+      MLX_AUDIO_MODEL_ALIASES 把后端发的短名映射成本地绝对路径；
+      不设的话 mlx-audio 的 get_model_path 会认为本地没有，转而从
+      HuggingFace 下载几十 GB。
+
+      后端侧只改一个变量：INDEXTTS_BASE_URL=http://127.0.0.1:8010/v1
+      （且 INDEXTTS_SINGLE_INSTANCE=1，防止 indextts.py 的 _sibling_omlx_urls
+      把 8000/8008 又补进故障切换链）。
+      回滚 = 把 INDEXTTS_BASE_URL 改回 8000，oMLX 仍在 8000 托管
+      embedding / OCR / rerank。
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/hornet/work/.venvs/mlx-audio/bin/python</string>
+        <string>-m</string>
+        <string>tts_serve</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>8010</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MLX_AUDIO_MODEL_ALIASES</key>
+        <string>Qwen3-TTS-12Hz-0.6B-Base-bf16=/Volumes/AIWorker/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16</string>
+        <!-- 服务代码（tts_serve.py / omlx_sampling.py / webrtcvad.py）随仓库走，
+             venv 里只装依赖。重建 venv 用 infra/mlx-audio-tts-service/setup.sh。 -->
+        <key>PYTHONPATH</key>
+        <string>/Users/hornet/work/stashbox/infra/mlx-audio-tts-service</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/hornet/work/stashbox/infra/mlx-audio-tts-service</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      SuccessfulExit=false：只在**非零退出**时重启。
+      uvicorn 正常停止退出码是 0（`launchctl bootout` / 手动 kill 也算正常停止），
+      这样不会在计划内停机时被 launchd 立刻拉起来。
+
+      ThrottleInterval=30：万一 oMLX 那种段错误反复发生，30s 一次的重启
+      频率足够低，不会把 16GB 机器拖进疯狂重启的风暴
+      （oMLX 自己的 plist 就因为 KeepAlive=true + daemonize 拉出过 4 个实例）。
+    -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/stashbox-tts-serve.out</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/stashbox-tts-serve.err</string>
+</dict>
+</plist>
