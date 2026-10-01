@@ -31,7 +31,10 @@ import time
 
 import pytest
 
-GATEWAY = "http://127.0.0.1:8100"
+# 2026-10-02：这里原来有个自己的 `GATEWAY = "http://127.0.0.1:8100"`。
+# 它是死代码（本文件的请求都走 conftest 的 owner_http fixture），但危险 ——
+# 自己硬编码会**绕过** conftest 里的生产端口守卫：STASHBOX_GATEWAY 指向隔离
+# 实例也没用，这个文件看上去还是"在连生产"。已删除，不要再加回来。
 
 # 用例专用的 article_id 后缀，跑完可按此清理
 _E2E_SUFFIX = "e2e_capture_"

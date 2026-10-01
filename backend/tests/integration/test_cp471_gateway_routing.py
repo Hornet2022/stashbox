@@ -13,7 +13,7 @@ import os
 import pytest
 import httpx
 
-GATEWAY_URL = "http://localhost:8100"
+from tests.integration.conftest import GATEWAY_URL  # noqa: E402
 
 # 集成测试需要 gateway/user/content/ai 4 个服务真跑，CI workflow 只起 PG/Redis，
 # 服务不在。CI 上跳过（CP6.12），本地手跑保留测试。
@@ -85,6 +85,6 @@ async def test_audio_url_routes_to_content_service_via_gateway():
         # content-service 有 /audio-url 端点（可能 200 带 url 或 404 说没准备好）
         # 期望不是 404 表示路由到了正确的 content-service
         # （fallback 走 articles/ → content-service 本来就对此路径正确）
-        assert audio_resp.status_code != 404, (
-            f"audio-url routing failed: got 404. Response: {audio_resp.text}"
-        )
+        assert (
+            audio_resp.status_code != 404
+        ), f"audio-url routing failed: got 404. Response: {audio_resp.text}"

@@ -4,13 +4,25 @@ CP4.7-E2E-BACKEND 集成测 conftest：提供 auth fixture，跨服务测试用�
 - 通过 gateway (8100) 登录拿 token
 - fixture scope="session" 减少 db 重置（CP2 集成测踩过的坑）
 """
+
 import asyncio
+
+import os
+from urllib.parse import urlparse
 
 import httpx
 import pytest
 import pytest_asyncio
 
-GATEWAY_URL = "http://localhost:8100"
+# 默认指向隔离实例（18100），不再默认打生产 8100。理由同
+# tests/e2e/conftest.py：这套用例会真的建用户/文章/派蒸馏任务。
+GATEWAY_URL = os.getenv("STASHBOX_GATEWAY", "http://127.0.0.1:18100")
+
+if urlparse(GATEWAY_URL).port in {8100, 8101, 8102, 8103, 8104}:
+    raise RuntimeError(
+        f"拒绝执行：STASHBOX_GATEWAY={GATEWAY_URL} 指向生产端口，"
+        "integration 用例会污染生产库并占住 TTS 队列。"
+    )
 
 
 @pytest.fixture(scope="session")
