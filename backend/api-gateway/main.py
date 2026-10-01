@@ -29,7 +29,7 @@ if _THIS_DIR not in sys.path:
 
 import httpx
 import structlog
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -163,7 +163,31 @@ async def health():
 
 @app.post("/api/v1/auth/token", response_model=TokenResponse)
 async def issue_token(req: TokenRequest):
-    """签发 JWT（mock：直接用传入 user_id）+ 配套 refresh_token。"""
+    """开发调试专用：直接用传入 user_id 签发 JWT。
+
+    ⚠️ 这是一个**无鉴权的后门** —— 任何能访问网关的人传任意 user_id 就能拿到
+    该账号的有效 token。生产环境绝对不能开着。
+
+    2026-10-02 审计发现：此端点原本是裸装饰器，无任何门控，实测在生产网关
+    （:8100）上直接可用，等同于任意账号接管。已改为默认关闭。
+
+    真正的登录走 user-service 的 `POST /api/v1/auth/wechat-login`
+    （由 code 派生 open_id → 查/建 users 行 → 签发），安卓 App 已切到那条路径。
+
+    本地调试要开：显式设 `STASHBOX_ALLOW_DEV_TOKEN=1`，且仅限非 prod 环境。
+    两者缺一即 403 —— 单设 env 不足以在 prod 打开。
+    """
+    if not os.getenv("STASHBOX_ALLOW_DEV_TOKEN"):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "dev token 端点已关闭。真实登录请用 POST /api/v1/auth/wechat-login；"
+                "本地调试可设 STASHBOX_ALLOW_DEV_TOKEN=1。"
+            ),
+        )
+    if settings.environment == "prod":
+        raise HTTPException(status_code=403, detail="dev token 端点在 prod 环境禁用")
+
     token = create_access_token(req.user_id)
     refresh = create_refresh_token(req.user_id)
     return TokenResponse(
