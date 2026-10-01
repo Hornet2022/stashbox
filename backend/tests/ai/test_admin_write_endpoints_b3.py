@@ -382,7 +382,27 @@ async def test_audit_result_not_found(b3_client):
 # ---------------------------------------------------------------------------
 
 
-async def test_blind_test_roundtrip(b3_client):
+@pytest.fixture
+def stub_blind_synthesis(monkeypatch, tmp_path):
+    """盲测 setup 改成真合成后，端到端测试不能真调 TTS（本机一句 38 字 24s）。
+
+    这里只 stub 合成那一步，端点的其余流程（建会话、匿名化、submit 校验、
+    聚合）仍然走真实代码 —— 那些才是这个测试要守的东西。
+    """
+    from distill import tts_blind_test as mod
+    from distill.tts_blind_test import TtsBlindTest
+
+    monkeypatch.setattr(mod, "BLIND_TEST_DIR", tmp_path)
+
+    async def _fake(self, text, provider, token, index):
+        f = tmp_path / f"{token}_{index}.wav"
+        f.write_bytes(b"RIFFfake")
+        return f
+
+    monkeypatch.setattr(TtsBlindTest, "_synthesize_to_file", _fake)
+
+
+async def test_blind_test_roundtrip(b3_client, stub_blind_synthesis):
     r = await b3_client.post(
         "/api/v1/admin/tts/blind-test",
         json={"text": "开场三十秒抓住通勤的你。", "providers": ["doubao", "index_tts"]},
@@ -428,7 +448,7 @@ async def test_blind_test_roundtrip(b3_client):
     assert set(res["revealed_mapping"]) == {"sample_1", "sample_2"}
 
 
-async def test_blind_test_submit_bad_key(b3_client):
+async def test_blind_test_submit_bad_key(b3_client, stub_blind_synthesis):
     r = await b3_client.post(
         "/api/v1/admin/tts/blind-test",
         json={"text": "t", "providers": ["a", "b"]},

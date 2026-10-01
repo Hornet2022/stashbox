@@ -132,11 +132,32 @@ class MemoryStore:
         if not row:
             return UserProfile(user_id=user_id, tier="free")
 
+        # 2026-10-02：收听行为指标（跳过率/完听率/平均单次收听时长）改成
+        # **即时算**，不读 user_listening_patterns 里那三列。
+        #
+        # 那三列从建表至今没有任何写入方、恒为 NULL，而它们描述的是收听行为
+        # （来源 listening_statuses），不是评分驱动的画像更新能覆盖的。
+        # 读死列等于永远读不到；即时算既不会过期，也不用等某个写入方。
+        behavior: dict[str, float] = {}
+        try:
+            async with self._session_factory() as db:
+                from distill.behavior_metrics import compute_behavior_metrics
+
+                m = await compute_behavior_metrics(db, user_id)
+            if m.skip_rate is not None:
+                behavior["跳过率"] = round(m.skip_rate * 100, 1)
+            if m.completion_rate is not None:
+                behavior["完听率"] = round(m.completion_rate * 100, 1)
+            if m.avg_session_sec is not None and m.sample_count > 0:
+                behavior["平均单次收听秒数"] = m.avg_session_sec
+        except Exception as exc:
+            log.warning("memory_load_behavior_metrics_failed user_id=%s error=%s", user_id, exc)
+
         return UserProfile(
             user_id=int(row.id),
             tier=str(row.tier or "free"),
-            ab_group=None,  # 见 docstring：用户级 ab_group 不在此表
-            preferences=_build_preferences(row),
+            ab_group=None,  # 见 docstring：用户级 ab_group 不此表
+            preferences={**_build_preferences(row), **behavior},
         )
 
     async def load_few_shots(

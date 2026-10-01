@@ -624,10 +624,15 @@ async def admin_tts_blind_test_setup(
     req: BlindTestSetupRequest,
     user: dict = Depends(require_admin_or_operator),
 ):
-    """发起盲测：同文本 × N provider 合成 + 随机隐藏映射。
+    """发起盲测：同文本 × N provider **真合成** + 随机隐藏映射。
 
-    ⚠️ CP3.8.0 现状：setup 为 mock 合成（fake url）——真 TTS 配额接入属后续；
-    本端点先打通运营链路。盲测会话存进程内存（单 worker 前提，重启即失）。
+    2026-10-02：setup 从 mock 假 URL 改成真调 TTS。原先它返回
+    `https://tts-blind-test.example/...`，评测员听不到任何声音，逐条打的
+    1-5 分在揭晓后全部作废 —— 功能上是废的。音频现在落到
+    `/tmp/audio/blind-test/`，由 api-gateway 的 `/audio/*` 挂载出去可播。
+
+    盲测会话存进程内存（单 worker 前提，重启即失）——这是为了不把 provider
+    映射写进库里：写库就等于给评测员开了后门。
     """
     from distill.tts_blind_test import TtsBlindTest
 
@@ -646,16 +651,15 @@ async def admin_tts_blind_test_setup(
         "order": result["order"],
         "created_at": datetime.now(),
     }
-    # 只回样本清单；⚠️ mock url 路径含 provider 名（tts_blind_test.py 现状），
-    # 端点层统一替换为匿名占位 URL，避免盲测泄漏 provider；真 TTS 合成接入后移除
-    anon_samples = [
-        {"key": k, "audio_url": f"https://tts-blind-test.anon/{blind_id}/{k}.m4a"}
-        for k in sorted(samples)
-    ]
+    # 样本 URL 直接用真实路径 —— TtsBlindTest 生成的文件名里**不含 provider**
+    # （是 text 哈希 + 序号），所以仍然是双盲；端点层不再替换。
+    failed = result.get("failed") or []
     return {
         "blind_test_id": blind_id,
-        "samples": anon_samples,
+        "samples": [{"key": k, "audio_url": v} for k, v in sorted(samples.items())],
         "note": "provider 顺序已随机隐藏，评测员对每个样本打 1-5 听感分后 submit",
+        # 合成失败的 provider 要告诉前端，否则运营会以为是系统 bug
+        "failed_providers": failed,
     }
 
 

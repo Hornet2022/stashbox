@@ -203,18 +203,83 @@ async def test_run_regression_old_articles():
 # ---------------------------------------------------------------------------
 # 4. tts_blind_test
 # ---------------------------------------------------------------------------
-async def test_setup_blind_test_3_providers():
-    """CP3.8.0 §2.7：3 provider 盲测 setup。"""
+async def test_setup_blind_test_3_providers(monkeypatch, tmp_path):
+    """CP3.8.0 §2.7：3 provider 盲测 setup。
+
+    2026-10-02：setup 改成**真合成**后，单测不能再真调 TTS（本机 mlx-audio
+    一句 38 字就要 24s），也不能再靠假 URL —— 原来这个测试用的
+    openai/qwen_vl/claude 里后两个压根不是 TTS provider，只是旧 mock 让它们
+    「成功」而已。现在 stub 掉合成层，断言真实的样本/映射契约。
+    """
+    from distill import tts_blind_test as mod
     from distill.tts_blind_test import TtsBlindTest
 
-    bt = TtsBlindTest()
-    result = await bt.setup_blind_test("test text", ["openai", "qwen_vl", "claude"])
+    monkeypatch.setattr(mod, "BLIND_TEST_DIR", tmp_path)
+
+    calls: list[str] = []
+
+    async def _fake(self, text, provider, token, index):
+        calls.append(provider)
+        p = tmp_path / f"{token}_{index}.wav"
+        p.write_bytes(b"RIFFfake")
+        return p
+
+    monkeypatch.setattr(TtsBlindTest, "_synthesize_to_file", _fake)
+
+    # 用不会与十六进制哈希混淆的名字，才能真正验证「URL 里没有 provider」
+    providers = ["alpha", "beta", "gamma"]
+    result = await TtsBlindTest().setup_blind_test("test text", providers)
     assert "samples" in result
     assert "order" in result
     assert len(result["samples"]) == 3
     assert len(result["order"]) == 3
-    # order 是 providers 的随机打乱
-    assert set(result["order"]) == {"openai", "qwen_vl", "claude"}
+    assert set(result["order"]) == set(providers)
+    assert set(calls) == set(providers)
+    # 双盲的前提：样本 URL 里不能出现 provider 名
+    for url in result["samples"].values():
+        assert not any(name in url for name in providers), url
+
+
+async def test_setup_blind_test_reports_failed_providers(monkeypatch, tmp_path):
+    """2026-10-02：某个 provider 合成失败时降级，且**如实上报**。
+
+    旧行为是给一个打不开的假 URL，评测员听完发现没声音，评分全作废。
+    现在失败要能被调用方看见。
+    """
+    from distill import tts_blind_test as mod
+    from distill.tts_blind_test import TtsBlindTest
+
+    monkeypatch.setattr(mod, "BLIND_TEST_DIR", tmp_path)
+
+    async def _partly_fake(self, text, provider, token, index):
+        if provider == "bad":
+            raise RuntimeError("provider 不可用")
+        p = tmp_path / f"{token}_{index}.wav"
+        p.write_bytes(b"RIFFfake")
+        return p
+
+    monkeypatch.setattr(TtsBlindTest, "_synthesize_to_file", _partly_fake)
+
+    result = await TtsBlindTest().setup_blind_test("t", ["good", "bad"])
+    assert len(result["samples"]) == 1
+    assert result["failed"] == ["bad"]
+
+
+async def test_setup_blind_test_all_failed_returns_empty(monkeypatch, tmp_path):
+    """全部失败 → samples 空，由端点层报错（不要返回一个打不开的会话）。"""
+    from distill import tts_blind_test as mod
+    from distill.tts_blind_test import TtsBlindTest
+
+    monkeypatch.setattr(mod, "BLIND_TEST_DIR", tmp_path)
+
+    async def _always_fail(self, text, provider, token, index):
+        raise RuntimeError("全挂")
+
+    monkeypatch.setattr(TtsBlindTest, "_synthesize_to_file", _always_fail)
+
+    result = await TtsBlindTest().setup_blind_test("t", ["a", "b"])
+    assert result["samples"] == {}
+    assert sorted(result["failed"]) == ["a", "b"]
 
 
 def test_compute_blind_score_median_per_provider():
