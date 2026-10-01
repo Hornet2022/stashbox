@@ -33,8 +33,14 @@ if REPO_PARENT not in sys.path:
 
 
 def _is_test_run() -> bool:
-    """只在本模块被 pytest 收集时切换，避免被当作普通库 import 时误伤。"""
-    return "pytest" in sys.modules and os.environ.get("PYTEST_CURRENT_TEST") is not None
+    """恒为 True —— conftest.py 只会被 pytest 收集时加载，没有别的入口。
+
+    ⚠️ 之前这里判断的是 `"PYTEST_CURRENT_TEST" in os.environ`，**是错的**：
+    那个变量只在测试**运行**阶段设置，collection 阶段（也就是 conftest 顶层
+    执行的时候）还没设。于是判断为 False，隔离整段没生效 ——
+    2026-10-01 复核时又往生产库写了 18 篇文章、7 条蒸馏记录才发现。
+    """
+    return True
 
 
 # ⚠️ 必须在下面这些 import 之前设置，业务模块 import 期就会读走。
