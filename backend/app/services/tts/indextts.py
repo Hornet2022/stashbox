@@ -1,16 +1,21 @@
-"""IndexTTS provider（oMLX OpenAI 兼容 /v1/audio/speech + 零样本音色克隆）。
+"""IndexTTS provider（OpenAI 兼容 /v1/audio/speech + 零样本音色克隆）。
 
-服务：macmini 上 oMLX CLI serve 同时托管 embedding / OCR / IndexTTS-1.5。
-端点契约（已实测 2026-09-22）：
+服务：macmini 上自建的独立 mlx-audio 服务（:8010，launchd `com.stashbox.tts-serve`）。
+**不再走 oMLX** —— oMLX 的 TTS 引擎内部本来就是 mlx-audio（它 `omlx/engine/tts.py`
+里直接 `from mlx_audio.tts.utils import load_model`），但那 455 行封在 1.6GB 的
+签名 app 里，它自己踩过的坑改不了只能等发版。拆出来自己接管之后，下面记录的
+这类修复就成了本仓库里的普通代码。
+
+端点契约（2026-09-22 建立，2026-10-01 在 :8010 上复验）：
 
     POST {base_url}/audio/speech
     {
-      "model": "IndexTTS-1.5",
+      "model": "Qwen3-TTS-12Hz-0.6B-Base-bf16",
       "input": "待合成文本",
       "ref_audio": "<参考音频 wav 的 base64>",
       "ref_text": "参考音频的文字转录"
     }
-    → 200 + audio/wav bytes（16-30s 文本约 10-20s 合成）
+    → 200 + audio/wav bytes
 
 缺 ref_audio/ref_text 服务返回 400（"ref_text is required when ref_audio is provided"），
 所以两者必须成对配置，缺一不可。
@@ -19,34 +24,43 @@
 - voice 参数无意义 —— 音色由参考音频决定（克隆），保留形参只为契约兼容
 - 返回是 WAV（RIFF），交给 step4/pipeline 落 .wav/.m4a 均能被 ExoPlayer 播
 
-⚠️ **这个端点会静默截断长输入 —— 这是最关键的坑**（实测 2026-09-28）：
+⚠️ **这个端点会静默截断长输入 —— 这是最关键的坑**（2026-10-01 在 :8010 复测）：
 
-    150 字 → 音频 17.9s  语速  8.4 字/秒  ✅ 正常
-    300 字 → 音频  6.9s  语速 43.7 字/秒  ❌ 截断
-    600 字 → 音频 19.8s  语速 30.4 字/秒  ❌ 截断
+    122 字 → 语速 4.41 字/秒  ✅
+    400 字 → 语速 4.63 字/秒  ✅ 安全上限
+    800 字 → 语速 8.35 字/秒  ❌ 截断，音频比外推值短约 45%
 
 请求会返回 **HTTP 200 + 合法 WAV**，但音频只有开头一小段，后面的内容凭空消失。
-判定方法：语速超过 ~10 字/秒就是被截断了（正常中文播报 4~6 字/秒）。
+判定方法：语速超过 7 字/秒就是被截断了（正常中文播报 4~6 字/秒）。
 
 所以 `synthesize()` 必须在 ~150 字处切块（`INDEXTTS_CHUNK_CHARS`），否则长稿会**静默丢内容**。
 
-⚠️ **合成实时率约 0.6x**（不是"慢 30 倍"，别算错基准）：
+⚠️ **合成实时率约 2.8x**（别算错基准 —— 早期这里写的 0.6x 已无法复现）：
 
-    50/100/150/300/600 字 → RTF 全部稳定在 0.60~0.62x
+    38 字 → 23.5~24.2s 墙钟，产出 8.4~8.5s 音频，RTF 2.80~2.85x
 
-即"生成 1 秒音频需要 1.6 秒计算"。GPU 本身完全正常（Metal 可用，M4，
-matmul 实测 41 TFLOPS），瓶颈在模型结构（IndexTTS 的扩散/流匹配声码器要跑
-多轮去噪），不是硬件或内存。
+即"生成 1 秒音频需要 2.8 秒计算"。用 oMLX 还是自建服务**完全一样**
+（同一份权重、同样 GPU 访存、同样 16GB 内存墙），实测两者在噪声范围内。
+并行也救不了：受控重测下并发 2 / 3 路各要 49.3s / 66.0s（≈ N × 单发），
+推理被**完全串行化**，并发零吞吐增益，单流已打满 GPU 访存。
+（早期「并发 2 会崩溃」是误判 —— 当时 8008 还挂着第二个 oMLX 实例，
+ 元凶是那个多出来的实例，不是并发本身。）
 
-⚠️ **8000 与 8008 两个 oMLX 实例都会间歇性空转，而且会自愈**：
-空转时 50% CPU、合成端点零响应（13 字短文本也挂起）。
-根因是**两个实例同时驻留模型把内存打爆**（实测 swap 一度 14.9GB/15.4GB、
-可用内存 17%，oMLX 各 8~11GB writable regions、50%+ 被换出）→ 推理退化成
-磁盘换页，表现为"随机 20~40s"和"卡死"。
-**只保留一个实例**后 swap 降到 7.9GB、可用 54%，RTF 就稳定在 0.6x 了。
+⚠️ **「合成端点零响应 + 50% CPU 空转」的真正根因是 mx.compile 冻结 RNG**
+（不要再归因成「多实例打爆内存」，那条判断是错的）：
+
+`mlx_lm/sample_utils` 把 `categorical_sampling` / `apply_top_k` /
+`apply_top_p` / `apply_min_p` 都装饰了
+`@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)`。
+这个装饰器在第一次调用后**不再推进全局 RNG 状态**，于是 TTS sampler 重放同一个
+冻结的随机数；当冻结值偏向 codec EOS 列时，talker 在 step 0 就发 EOS，此后每次
+请求都返回**零音频**。RNG 状态和 compile 缓存是进程级的、跨模型重载存活的，
+所以**只有重启进程才能恢复** —— 症状正是「13 字短文本也无限期挂起」。
+
+自建服务里已经打了这个补丁，见 `infra/mlx-audio-tts-service/tts_serve.py`。
 
 ⚠️ 绝不要拿 `INDEXTTS_TIMEOUT`(300s) 去死等单请求；单请求用
-`INDEXTTS_CHUNK_TIMEOUT`（默认 90s），超时立刻切 `INDEXTTS_FAILOVER_URLS` 的下一个实例。
+`INDEXTTS_CHUNK_TIMEOUT`（默认 90s），超时立刻切 `INDEXTTS_FAILOVER_URLS` 的下一个端点。
 
 ⚠️ **别用"测试调用按钮"能否通过来判断长稿能否合成**：该端点只发
 「TTS 烟雾测试。」7 个字，几秒就返回，跟 3000+ 字成稿完全是两回事。
@@ -62,7 +76,6 @@ import tempfile
 import time
 import wave
 from pathlib import Path
-from urllib.parse import urlparse
 
 import httpx
 
@@ -77,34 +90,31 @@ class IndexTTSError(RuntimeError):
 
 # 长稿切块阈值（字）。
 #
-# 实测（:8000 / IndexTTS-1.5，真实 LLM 成稿，非重复句）——**关键发现是这个端点会截断**：
+# ⚠️ **这个端点会静默截断长输入** —— 请求返回 HTTP 200 + 合法 WAV，但音频只有
+# 开头一小段，后面内容凭空消失。判定只能靠语速：正常中文播报 4~6 字/秒，
+# 明显偏高就是被截断了。
 #
-#     150 字 → 音频 17.9s  语速 8.4 字/秒   ✅ 正常
-#     300 字 → 音频  6.9s  语速 43.7 字/秒  ❌ 截断
-#     600 字 → 音频 19.8s  语速 30.4 字/秒  ❌ 截断
+# 2026-10-01 在自建服务（:8010 / Qwen3-TTS-12Hz-0.6B-Base-bf16）上重新实测，
+# 真实 LLM 成稿、同一份参考音频：
 #
-# 语速超过 ~10 字/秒就说明音频被提前截断了（正常中文播报 4~6 字/秒）。
-# 所以单块必须控制在 ~150 字以内，否则会**静默丢内容**——请求成功、音频却只有开头一小段。
-# 150 字实测耗时约 30s，相对 90s 的单请求超时还有约 3 倍余量。
-_CHUNK_CHARS = int(os.getenv("INDEXTTS_CHUNK_CHARS", "150"))
+#      38 字 → 墙钟  23.8s，音频  8.4s，RTF 2.83x， 4.52 字/秒  ✅
+#     122 字 → 墙钟  80.4s，音频 27.7s，RTF 2.90x， 4.41 字/秒  ✅
+#     400 字 → 墙钟 230.9s，音频 86.3s，RTF 2.68x， 4.63 字/秒  ✅ 安全上限
+#     800 字 → 墙钟 248.2s，音频 95.8s，RTF 2.59x， 8.35 字/秒  ❌ 截断
+#
+# 800 字那行是**真截断**：按 400 字的 4.63 字/秒外推应产出约 173s 音频，
+# 实际只有 95.8s —— 丢了约 45% 的内容，而 HTTP 状态是 200。
+#
+# 所以单块必须 ≤ 400 字。早年「150 字正常 / 300 字截断」那组数据是在 oMLX 上
+# 测的，结论对当前服务已不适用（多半是当时 CHUNK_CHARS=400 配 90s 超时先超时、
+# 拿到了 failover 的残缺响应，不是端点行为）。
+#
+# 默认仍取 200：实测 400 字是 0.577 s/字，比 130 字/段时的 0.7 s/字快约 18%，
+# 但 400 字的墙钟 230.9s 已经贴着 INDEXTTS_CHUNK_TIMEOUT=240s 的上限，
+# 放大的收益远小于超时风险。
+_CHUNK_CHARS = int(os.getenv("INDEXTTS_CHUNK_CHARS", "200"))
 # 句读边界（中英文标点 + 换行），优先在这些位置切，避免把一句话劈两半。
 _SENTENCE_END = "。！？；\n.!?;"
-
-
-def _sibling_omlx_urls(base_url: str, ports: tuple[int, ...] = (8000, 8008)) -> list[str]:
-    """列出本机所有 oMLX 候选地址（base_url 排最前，其余按端口序）。
-
-    本机常同时跑着 launchd 托管的 `:8000` 和 oMLX GUI 拉起的 `:8008`，
-    两者都会间歇空转且交替发生 —— 所以把它们串成候选链做故障切换。
-    非本机 base_url（如远程 oMLX）不猜端口，只返回它自己。
-    """
-    host = urlparse(base_url).hostname
-    if host not in ("127.0.0.1", "localhost", "::1"):
-        return [base_url]
-    ordered = [base_url] + [
-        f"http://127.0.0.1:{p}/v1" for p in ports if f"http://127.0.0.1:{p}/v1" != base_url
-    ]
-    return list(dict.fromkeys(ordered))
 
 
 def _wav_duration_sec(data: bytes) -> float | None:
@@ -119,9 +129,15 @@ def _wav_duration_sec(data: bytes) -> float | None:
         return None
 
 
-# 正常中文播报约 4~6 字/秒。留足余量后仍高于此值 → 音频被截断。
-# 实测截断样本：300 字只产出 6.9s（43.7 字/秒）、600 字产出 19.8s（30.4 字/秒）。
-_TRUNCATION_CHARS_PER_SEC = 12.0
+# 截断判定的语速上限。
+#
+# ⚠️ 2026-10-01 收紧：原值 12.0 太宽松，**实测漏判过一次**。
+# 正常样本语速 4.41~4.63 字/秒，800 字那个真截断样本是 8.35 字/秒 ——
+# 12.0 的阈值对它判「正常」，于是约 45% 的内容静默丢失还能写进库。
+#
+# 取 7.0：离正常上界 4.63 还有 51% 余量，又稳稳低于真截断的 8.35。
+# 宁可误报（合成失败重试）也不要漏报（内容缺失但状态成功）。
+_TRUNCATION_CHARS_PER_SEC = 7.0
 
 
 def _assert_not_truncated(text: str, audio: bytes) -> None:
@@ -272,15 +288,15 @@ def _patch_riff_sizes(wav_header: bytes, total_len: int) -> bytes:
 
 
 class IndexTTSClient(TTSClient):
-    """oMLX 托管 IndexTTS-1.5（OpenAI 兼容 + ref_audio 零样本克隆）。"""
+    """本地自建 mlx-audio TTS 服务（OpenAI 兼容 + ref_audio 零样本克隆）。"""
 
-    DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
-    """launchd 托管（KeepAlive）的 omlx-cli serve 端口 —— 选它是因为进程挂了会被
-    自动拉起，不是为了绕开什么 8008 故障（两个实例都会间歇空转，见文件头说明）。"""
+    DEFAULT_BASE_URL = "http://127.0.0.1:8010/v1"
+    """自建服务的端口，launchd `com.stashbox.tts-serve` 托管（KeepAlive 只在非零
+    退出时重启 + ThrottleInterval 30s），进程挂了会被自动拉起。"""
 
     CHUNK_CHARS = _CHUNK_CHARS
-    """超过这个字数就分段合成（见文件头「合成耗时随字数暴涨」）。"""
-    DEFAULT_MODEL = "IndexTTS-1.5"
+    """超过这个字数就分段合成（见 _CHUNK_CHARS 处的实测）。"""
+    DEFAULT_MODEL = "Qwen3-TTS-12Hz-0.6B-Base-bf16"
 
     def __init__(
         self,
@@ -296,53 +312,35 @@ class IndexTTSClient(TTSClient):
         self.model = model or os.getenv("INDEXTTS_MODEL", self.DEFAULT_MODEL)
         self.ref_audio_path = ref_audio_path or os.getenv("INDEXTTS_REF_AUDIO", "")
         self.ref_text = ref_text or os.getenv("INDEXTTS_REF_TEXT", "")
-        # 超时可配：oMLX 首次加载 IndexTTS 模型 / 机器负载高时，单段合成可能远超
-        # 120s，硬编码会让蒸馏在 TTS 阶段必然超时失败（实测「合成超时(120.0s)」）。
+        # 超时可配：首次加载 1.7GB 权重 / 机器负载高时，单段合成可能远超 120s，
+        # 硬编码会让蒸馏在 TTS 阶段必然超时失败（实测「合成超时(120.0s)」）。
         # 默认放宽到 300s，可用 INDEXTTS_TIMEOUT 覆盖。
         self.timeout = (
             timeout if timeout is not None else float(os.getenv("INDEXTTS_TIMEOUT", "300"))
         )
         # CP-INDEXTTS-FAILOVER：单请求超时 vs 整体超时分开。
         #
-        # 实测 oMLX 实例会**间歇性空转**（50% CPU、RSS 不涨、合成端点零响应），
-        # 13 字短文本也会无限期挂起；空转窗口过去后自己恢复（同一分钟内
-        # 8000 挂 / 8008 正常，下一分钟又反过来）。所以：
-        #   - 拿 300s 去等一个卡死的实例 = 白等 5 分钟，还必然失败；
-        #   - 单请求用较短超时（默认 90s）快速失败，再切到另一个实例重试。
-        # 两个实例交替空转 → 故障切换后成功率显著高于死等单一实例。
+        # 拿 300s 去等一个已经卡死/挂起的端点 = 白等 5 分钟，还必然失败；
+        # 单请求用较短超时（默认 90s）快速失败，再切到候选链的下一个端点重试。
         self.chunk_timeout = float(os.getenv("INDEXTTS_CHUNK_TIMEOUT", "90"))
-        failover = os.getenv("INDEXTTS_FAILOVER_URLS", "").strip()
-        candidates = [u.strip().rstrip("/") for u in failover.split(",") if u.strip()]
-        # CP-INDEXTTS-SINGLE：显式关掉「自动把本机另一个 oMLX 端口补进候选链」。
+        # 候选链 = base_url + INDEXTTS_FAILOVER_URLS（逗号分隔，可为空）。
         #
-        # 为什么要留这个开关：`_sibling_omlx_urls` 是**无条件**补 8000/8008 的，
-        # 所以光把 INDEXTTS_FAILOVER_URLS 删掉并不会变单实例 —— 候选链还是两条。
-        # 16GB 机器上两个实例各 mmap 一份 1.7GB 权重就是 swap 被打爆的直接原因
-        # （见本文件头「只保留一个实例后 swap 降到 7.9GB」那条实测）。
-        single = os.getenv("INDEXTTS_SINGLE_INSTANCE", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-        if single:
-            candidates = [self.base_url]
-        elif not candidates:
-            # 没显式配 failover 时，自动把本机另一个 oMLX 端口补进候选链 ——
-            # 两个实例交替空转（见文件头），单靠死等主地址必然失败。
-            candidates = _sibling_omlx_urls(self.base_url)
-        else:
-            candidates = [self.base_url] + candidates
+        # 曾经这里会**无条件**把本机 8000/8008 两个 oMLX 端口猜进链里
+        # （`_sibling_omlx_urls`），所以光删环境变量并不会变单端点，必须另设
+        # `INDEXTTS_SINGLE_INSTANCE=1` 才能压住。oMLX 弃用后那套猜测已经没有
+        # 对象，连同开关一起删掉：端点链现在完全由配置显式决定，行为可预测。
+        failover = os.getenv("INDEXTTS_FAILOVER_URLS", "").strip()
+        extra = [u.strip().rstrip("/") for u in failover.split(",") if u.strip()]
         # 去重保序
-        self.endpoints: list[str] = list(dict.fromkeys(candidates))
+        self.endpoints: list[str] = list(dict.fromkeys([self.base_url, *extra]))
         self.max_attempts = max(1, int(os.getenv("INDEXTTS_MAX_ATTEMPTS", "2")))
 
         # CP-INDEXTTS-CIRCUIT：连续失败熔断。
         #
-        # 为什么必须有：oMLX 的 TTS 引擎一旦段错误崩掉（crash.log 里见过
-        # `Fatal Python error: Segmentation fault ... tts.py:278 _synthesize_sync`），
-        # **HTTP 层仍然应答**（/v1/models 秒回 200、错 payload 返 422），只有真实
-        # 合成请求会永久挂起。没有熔断的话，一段 200 字要走
-        # 端点数 × max_attempts 次 × chunk_timeout 才报错 —— 实测 2 实例 × 2 次
+        # 为什么必须有：TTS 服务挂掉之后 HTTP 层仍然应答
+        # （/v1/models 秒回 200、错 payload 返 422），只有真实合成请求会永久挂起。
+        # 没有熔断的话，一段 200 字要走
+        # 端点数 × max_attempts 次 × chunk_timeout 才报错 —— 实测 2 端点 × 2 次
         # × 240s = **单段最多烧 16 分钟**，一篇 8 段就是两个多小时，然后失败。
         # 熔断让「后端已经死了」变成几秒内的明确失败。
         self.breaker_threshold = max(1, int(os.getenv("INDEXTTS_BREAKER_THRESHOLD", "3")))
@@ -352,17 +350,19 @@ class IndexTTSClient(TTSClient):
 
         # 分段并发度。
         #
-        # ⚠️ **默认 1（串行）**，这不是保守，是实测逼出来的：
-        #   - 600 字 6 块**串行** → ✅ 成功
-        #   - 4734 字 37 块**并发 3** → ❌ 2 实例 × 2 次尝试全部 90s 超时
+        # ⚠️ **默认 1（串行）**，这不是保守，是实测逼出来的 —— 而且原因
+        # 换过一次，早期那个「并发会吃爆内存」的归因是错的。
         #
-        # 并发会直接吃内存：实测并发 3 时 oMLX writable regions 从 4.9GB 涨到
-        # 11.9GB、swapped_out 50%、整机 swap 从 7.9GB 回到 11.9GB —— 把刚治好的
-        # 内存耗尽又请回来，推理退化成磁盘换页，请求就再也回不来了。
-        #
-        # oMLX 默认 max_concurrent_requests=8 是给内存充裕的大机器的；16GB 机器
-        # 不要照抄。机器内存充裕时可调高（INDEXTTS_CONCURRENCY），但请先盯
-        # `sysctl vm.swapusage` 和 oMLX 的 swapped_out 比例。
+        # 受控重测（机器空闲、无其它负载，同一段 38 字文本）：
+        #     单发    24.2s → 8.5s 音频
+        #     并发 2  各 49.3s → 合计 16.8s
+        #     并发 3  各 66.0s → 合计 25.4s
+        # 2/3 路**全部成功、进程存活、crash.log 无新记录**，所以并发本身不会
+        # 搞崩服务（早期「并发 2 会崩」是误判：当时 8008 还挂着第二个 oMLX
+        # 实例，元凶是那个多出来的实例）。
+        # 但 49.3 ≈ 2×24.2、66.0 ≈ 3×22 → 推理被**完全串行化**，并发零吞吐
+        # 增益，只是把每段的等待时间按倍数拉长。单流已打满 GPU 访存。
+        # 所以 TTS 侧和 ARQ_MAX_JOBS 都应保持 1。
         self.chunk_concurrency = max(1, int(os.getenv("INDEXTTS_CONCURRENCY", "1")))
         # trust_env=False：忽略沙箱/系统 HTTP(S)_PROXY（代理漂移会打挂本地 127.0.0.1 请求）
         self._client = httpx.AsyncClient(timeout=self.timeout, trust_env=False)
@@ -523,8 +523,8 @@ class IndexTTSClient(TTSClient):
             raise IndexTTSError(
                 f"IndexTTS 熔断中：已连续失败 {self._consecutive_failures} 段，"
                 f"{self._circuit_open_until - now:.0f}s 后重试"
-                f"（端点 {self.endpoints}）。多半是 oMLX 引擎崩了，"
-                f"先看 ~/.omlx/logs/crash.log。"
+                f"（端点 {self.endpoints}）。先看 "
+                f"launchctl list | grep tts-serve 和 /tmp/stashbox-tts-serve.err。"
             )
 
         ref_b64 = await self._load_ref_audio_b64(ref_audio)
@@ -583,7 +583,7 @@ class IndexTTSClient(TTSClient):
 
             audio = resp.content
             ct = resp.headers.get("content-type", "")
-            # oMLX 正常返回 audio/wav；若哪天返回 JSON base64 兜底解一下
+            # 本服务正常返回 audio/wav；若哪天返回 JSON base64 兜底解一下
             if ct.startswith("application/json"):
                 import json as _json
 

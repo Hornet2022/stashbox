@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openclaw.omlx</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/oMLX.app/Contents/MacOS/omlx-cli</string>
+        <string>serve</string>
+        <string>--port</string>
+        <string>8000</string>
+        <string>--model-dir</string>
+        <string>/Volumes/AIWorker</string>
+        <!--
+          --memory-guard off（2026-09-30 加）
+
+          ~/.omlx/settings.json 里 memory_guard_tier = balanced、soft_threshold = 0.85。
+          16GB 机器上软阈值 ≈ 13.6GB，而本机 swap 常年占 7GB+（陈旧页），
+          守卫误判成内存吃紧 → 反复把已加载的 TTS 模型卸载掉。
+          表现就是 backend/app/services/tts/indextts.py 文件头记的那个「空转」：
+          CPU 高、RSS 不涨、合成端点零响应，连 13 字短文本都挂起，
+          蒸馏每篇都卡在 tts 阶段失败。
+
+          蒸馏只需要 1~4GB 模型常驻，16GB 机器扛得住，故关掉守卫。
+        -->
+        <string>--memory-guard</string>
+        <string>off</string>
+    </array>
+    <!-- RunAtLoad = false（2026-10-01 取消开机自启，由 Hornet 指令） -->
+    <key>RunAtLoad</key>
+    <false/>
+    <!--
+      KeepAlive = false（2026-09-30 从 true 改掉）
+
+      omlx-cli serve 会把真正的 omlx-server 进程 daemonize 掉，launchd 手里
+      追踪的那个 PID 随即退出。KeepAlive=true 时 launchd 认为「服务挂了」就再拉一个，
+      于是 oMLX 实例越积越多（实测同时跑过 4 个），每个都预加载一遍 TTS 模型
+      （单个 1.4~2.3GB），直接把内存打爆 —— 这正是上面「空转」的另一半成因。
+
+      现在只保留 RunAtLoad：开机起一次，服务自己管生命周期。
+      真挂了手动 `launchctl kickstart -k gui/$UID/com.openclaw.omlx` 即可。
+    -->
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/tmp/omlx-8000.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/omlx-8000.err</string>
+</dict>
+</plist>

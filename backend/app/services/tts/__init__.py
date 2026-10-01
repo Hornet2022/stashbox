@@ -53,15 +53,14 @@ def _env_config() -> dict[str, Any]:
         # local provider（macOS say + ffmpeg）
         "local_voice": os.getenv("TTS_LOCAL_VOICE", "Tingting"),
         "ffmpeg_bin": os.getenv("FFMPEG_BIN", "/opt/homebrew/bin/ffmpeg"),
-        # indextts provider（oMLX /v1/audio/speech + ref_audio 零样本克隆）
-        # 选 8000 是因为它由 launchd KeepAlive 托管（进程挂了会自动拉起）。
-        # ⚠️ 真正的坑不是端口，是**内存**：两个 oMLX 实例同时驻留模型会把内存打爆
-        # （实测 swap 14.9GB/15.4GB），推理退化成磁盘换页，表现为随机 20~40s
-        # 和"卡死"。只留一个实例后 RTF 稳定在 0.6x。
-        # ⚠️ 另一个坑：该端点输入超 ~150 字会**静默截断**（HTTP 200 + 合法 WAV，
-        # 但音频只剩开头），所以 indextts.py 里按 INDEXTTS_CHUNK_CHARS=150 切块。
-        "indextts_base_url": os.getenv("INDEXTTS_BASE_URL", "http://127.0.0.1:8000/v1"),
-        "indextts_model": os.getenv("INDEXTTS_MODEL", "IndexTTS-1.5"),
+        # indextts provider（自建 mlx-audio /v1/audio/speech + ref_audio 零样本克隆）
+        # 8010 由 launchd `com.stashbox.tts-serve` 托管，进程挂了会自动拉起。
+        # oMLX 已从听匣弃用（它的 TTS 引擎内部本来就是 mlx-audio，但封在签名 app 里）。
+        # ⚠️ 真正的坑是「静默截断」：输入过长时返回 HTTP 200 + 合法 WAV，但音频
+        # 只剩开头一小段，所以 indextts.py 里按 INDEXTTS_CHUNK_CHARS 切块，
+        # 并用 _assert_not_truncated 按语速（>7 字/秒）兜底校验。
+        "indextts_base_url": os.getenv("INDEXTTS_BASE_URL", "http://127.0.0.1:8010/v1"),
+        "indextts_model": os.getenv("INDEXTTS_MODEL", "Qwen3-TTS-12Hz-0.6B-Base-bf16"),
         "indextts_ref_audio": os.getenv("INDEXTTS_REF_AUDIO", ""),
         "indextts_ref_text": os.getenv("INDEXTTS_REF_TEXT", ""),
     }
@@ -102,8 +101,8 @@ def build_client(config: dict[str, Any]) -> TTSClient:
         )
     if provider == "indextts":
         return IndexTTSClient(
-            base_url=config.get("indextts_base_url") or "http://127.0.0.1:8000/v1",
-            model=config.get("indextts_model") or "IndexTTS-1.5",
+            base_url=config.get("indextts_base_url") or "http://127.0.0.1:8010/v1",
+            model=config.get("indextts_model") or "Qwen3-TTS-12Hz-0.6B-Base-bf16",
             ref_audio_path=config.get("indextts_ref_audio") or "",
             ref_text=config.get("indextts_ref_text") or "",
         )

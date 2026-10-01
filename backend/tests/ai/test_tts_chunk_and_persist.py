@@ -37,7 +37,6 @@ from app.services.tts.indextts import (  # noqa: E402
     IndexTTSError,
     _concat_wav,
     _patch_riff_sizes,
-    _sibling_omlx_urls,
     _split_into_chunks,
 )
 
@@ -158,30 +157,26 @@ def test_3574_char_script_splits_into_bounded_chunks():
 def test_default_chunk_size_stays_under_truncation_threshold():
     """切块大小不能大到没人管；**真正的截断防线是 `_assert_not_truncated`**。
 
-    ⚠️ 这条断言改过两次，每次都因为**同一个误判**（2026-09-30 自测）：
+    ⚠️ 这条断言改过三次，每次都因为**同一个误判**：
 
     - 最早写死 `CHUNK_CHARS <= 150`，依据是「/v1/audio/speech 输入超过 ~150 字
       会静默截断，300 字只产出 6.9s（43.7 字/秒）」。
-    - 后来把 CHUNK_CHARS 调到 200（因为 400 字 + 90s 超时必然超时，见
-      `test_chunk_timeout_leaves_margin_over_measured_cost`），这条就红了。
+    - 后来把 CHUNK_CHARS 调到 200（400 字 + 90s 超时必然超时），这条就红了。
+    - 2026-09-30 复测 150~197 字全是 4.4~6.0 字/秒，判断是「那组观测其实是
+      超时导致拿到残缺响应，不是端点截断」。
+    - 2026-10-01 在自建服务 :8010 上补测，真正找到边界：
 
-    重新实测（今天，同一 oMLX / 同一模型 / 同一参考音频）：
+          400 字 -> 86.3s 音频 = 4.63 字/秒   ✅ 安全上限
+          800 字 -> 95.8s 音频 = 8.35 字/秒   ❌ 真截断（比外推短约 45%）
 
-        150 字 -> 33.8s 音频 (4.4 字/秒)
-        179 字 -> 29.6s 音频 (6.0 字/秒)
-        188 字 -> 36.4s 音频 (5.2 字/秒)
-        197 字 -> 36.4s 音频 (5.4 字/秒)
+      即端点确实会截断，只是阈值在 400~800 字之间，而不是 150~300 字。
 
-    全部是正常中文播报的 4~6 字/秒，**没有截断**。原始那次观测多半不是端点
-    截断，而是 CHUNK_CHARS=400 配 90s 超时时请求先超时、拿到 failover 的残缺
-    音频，被误读成「端点截断」—— 真凶是超时，不是字数。
-
-    所以现在不再用「<=150」这个**已经复现不出来**的字数当防线，改为：
-      1. 给切块大小一个宽松但明确的上界（拦「有人把 CHUNK_CHARS 调到几千」
-         这种真正会失控的配置）；
-      2. 明确指出截断防线是 `_assert_not_truncated`（12 字/秒阈值），
+    所以现在不再用某个具体字数当防线，改为：
+      1. 给切块大小一个宽松但明确的上界 400（拦「有人把 CHUNK_CHARS 调到几千」
+         这种真正会丢内容的配置）；
+      2. 明确指出截断防线是 `_assert_not_truncated`（7 字/秒阈值），
          它与切块大小无关，真发生截断时会**抛错**而不是静默丢内容 ——
-         那条防线由 `test_truncation_guard_flags_short_audio` 单独守着。
+         那条防线由 `test_truncation_guard_*` 单独守着。
     """
     from app.services.tts.indextts import _TRUNCATION_CHARS_PER_SEC
 
@@ -200,7 +195,7 @@ def test_chunk_timeout_leaves_margin_over_measured_cost():
     当时切 400 字、按 0.6x RTF 需约 100s，而超时只给了 90s）。
     """
     c = IndexTTSClient(
-        base_url="http://127.0.0.1:8000/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
+        base_url="http://127.0.0.1:8010/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
     )
     assert c.chunk_timeout >= 60, "对 150 字/块（约 30s）来说余量不足"
 
@@ -218,22 +213,47 @@ def test_concat_single_piece_returns_as_is():
 def test_truncation_guard_flags_short_audio():
     """守住"HTTP 200 但内容被静默截断"这个坑。
 
-    实测：300 字只产出 6.9s（43.7 字/秒）、600 字产出 19.8s（30.4 字/秒），
-    而正常中文播报是 4~6 字/秒。不校验的话缺内容的音频会被当成功写库。
+    实测（2026-10-01，自建服务 :8010，真实 LLM 成稿 + 同一份参考音频）：
+
+        122 字 -> 27.7s 音频  = 4.41 字/秒  ✅
+        400 字 -> 86.3s 音频  = 4.63 字/秒  ✅ 安全上限
+        800 字 -> 95.8s 音频  = 8.35 字/秒  ❌ 截断（比外推值短约 45%）
+
+    不校验的话缺内容的音频会被当成功写库。
     """
     from app.services.tts.indextts import IndexTTSError, _assert_not_truncated
 
-    silent_7s = _make_wav(16000 * 7, 440)  # 7 秒静音 WAV
+    # 800 字真样本的形状：时长够长，但按 400 字的 4.63 字/秒外推只该有 ~173s，
+    # 实际只有 95.8s —— 这就是「静默丢一半内容却返回 200」的样子。
+    silent_96s = _make_wav(16000 * 96, 440)
     with pytest.raises(IndexTTSError, match="截断"):
-        _assert_not_truncated("中" * 300, silent_7s)
+        _assert_not_truncated("中" * 800, silent_96s)
+
+
+def test_truncation_guard_catches_moderate_samples_the_old_threshold_missed():
+    """8.35 字/秒这个真截断样本，旧阈值 12.0 会漏判。
+
+    这是本用例存在的理由：阈值从 12.0 收紧到 7.0 就是因为它漏过一次，
+    差点让 ~45% 的内容缺失以「成功」状态写进库。
+    """
+    from app.services.tts.indextts import _TRUNCATION_CHARS_PER_SEC, _assert_not_truncated
+
+    assert _TRUNCATION_CHARS_PER_SEC < 8.35, "阈值必须能拦住实测到的真截断样本"
+    with pytest.raises(IndexTTSError, match="截断"):
+        _assert_not_truncated("中" * 800, _make_wav(16000 * 96, 440))
 
 
 def test_truncation_guard_does_not_false_positive_on_normal_audio():
-    """150 字 / 17.9s = 8.4 字/秒属正常，不应误报。"""
+    """400 字 / 86.3s = 4.63 字/秒是实测安全样本，不应误报。
+
+    旧用例用的是 150 字 / 18s = 8.33 字/秒 —— 那个样本在收紧后的阈值下会被
+    判成截断。它来自 oMLX 时代的一组「疑似截断」观测，而那组观测后来被证明
+    是超时导致的残缺响应，不是端点行为（见同文件 CHUNK_CHARS 上界用例的说明）。
+    """
     from app.services.tts.indextts import _assert_not_truncated
 
-    normal = _make_wav(16000 * 18, 440)
-    _assert_not_truncated("中" * 150, normal)  # 不抛即通过
+    normal = _make_wav(16000 * 86, 440)
+    _assert_not_truncated("中" * 400, normal)  # 不抛即通过
 
 
 def test_concat_wav_produces_valid_header_and_correct_length():
@@ -261,101 +281,79 @@ def test_patch_riff_sizes_updates_length_fields():
 # ==========================================================================
 # 2.5 故障切换（CP-INDEXTTS-FAILOVER）
 #
-# 实测两个 oMLX 实例会**交替空转且会自愈**：同一分钟内 8000 挂 / 8008 正常，
-# 下一分钟反过来。对着单个实例死等 300s 必然失败。
+# 候选链 = base_url + INDEXTTS_FAILOVER_URLS（逗号分隔，可为空）。
+# 曾经这里还会**无条件**把本机 8000/8008 两个 oMLX 端口猜进链里，导致光删环境
+# 变量并不会变单端点（得另设 INDEXTTS_SINGLE_INSTANCE）。oMLX 弃用后那套猜测
+# 连同开关一起删掉了 —— 端点链现在完全由配置显式决定，行为可预测。
 # ==========================================================================
 
 
-def test_sibling_urls_include_both_local_omlx_ports():
-    """本机 base_url 必须自动把另一个 oMLX 端口串进候选链。"""
-    assert _sibling_omlx_urls("http://127.0.0.1:8000/v1") == [
-        "http://127.0.0.1:8000/v1",
-        "http://127.0.0.1:8008/v1",
-    ]
-    assert _sibling_omlx_urls("http://127.0.0.1:8008/v1") == [
-        "http://127.0.0.1:8008/v1",
-        "http://127.0.0.1:8000/v1",
-    ]
+def test_endpoints_default_to_base_url_only(monkeypatch):
+    """没配 FAILOVER 时候选链必须只有 base_url —— 不许再凭空猜出别的端口。"""
+    monkeypatch.delenv("INDEXTTS_FAILOVER_URLS", raising=False)
+    c = IndexTTSClient(
+        base_url="http://127.0.0.1:8010/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
+    )
+    assert c.endpoints == ["http://127.0.0.1:8010/v1"]
 
 
-def test_sibling_urls_do_not_invent_ports_for_remote_host():
-    """远程 oMLX 不该被塞本机端口。"""
-    assert _sibling_omlx_urls("http://gpu-box:9000/v1") == ["http://gpu-box:9000/v1"]
+def test_explicit_failover_appends_after_base_url(monkeypatch):
+    """显式配的 failover 端点接在 base_url 之后，且去重保序。"""
+    monkeypatch.setenv(
+        "INDEXTTS_FAILOVER_URLS", "http://127.0.0.1:8011/v1, http://127.0.0.1:8010/v1"
+    )
+    c = IndexTTSClient(
+        base_url="http://127.0.0.1:8010/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
+    )
+    # 重复的 8010 只保留一次，且留在 base_url 的位置
+    assert c.endpoints == ["http://127.0.0.1:8010/v1", "http://127.0.0.1:8011/v1"]
 
 
 def test_client_builds_failover_chain_and_short_timeout(monkeypatch):
-    """单请求超时必须远小于整体墙钟预算（300s），否则等于在空转实例上白等。
+    """单请求超时必须远小于整体墙钟预算（300s），否则等于在挂起的服务上白等。
 
-    ⚠️ 必须显式清掉这两个环境变量：候选链是由 .env 决定的，而 .env 是**每台机器
-    各不相同**的（这台可能配了 INDEXTTS_FAILOVER_URLS 或 INDEXTTS_SINGLE_INSTANCE）。
-    不清的话，改一次 .env 就会让本用例在别人机器上莫名其妙挂掉 —— 它要验的是
-    「默认走兄弟端口链」这条逻辑，不是「本机 .env 现在配了什么」。
+    ⚠️ 必须显式清掉 INDEXTTS_FAILOVER_URLS：候选链由 .env 决定，而 .env 是
+    **每台机器各不相同**的。不清的话，改一次 .env 就会让本用例在别人机器上
+    莫名其妙挂掉 —— 它要验的是「单请求超时 < 整体超时」这条逻辑。
     """
     monkeypatch.delenv("INDEXTTS_FAILOVER_URLS", raising=False)
-    monkeypatch.delenv("INDEXTTS_SINGLE_INSTANCE", raising=False)
     c = IndexTTSClient(
-        base_url="http://127.0.0.1:8000/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
+        base_url="http://127.0.0.1:8010/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
     )
-    assert c.endpoints[0] == "http://127.0.0.1:8000/v1"
-    assert "http://127.0.0.1:8008/v1" in c.endpoints
+    assert c.endpoints[0] == "http://127.0.0.1:8010/v1"
     # 90s << 300s 墙钟预算：快速失败才有意义
     assert c.chunk_timeout < c.timeout
 
 
 def test_chunk_concurrency_is_bounded():
-    """分段并发必须有上限——oMLX 每并发都要额外工作集，内存曾经被打爆过。"""
+    """分段并发必须有上限 —— 实测 2/3 路虽不崩，但推理完全串行、零吞吐增益。"""
     c = IndexTTSClient(
-        base_url="http://127.0.0.1:8000/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
+        base_url="http://127.0.0.1:8010/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
     )
     assert 1 <= c.chunk_concurrency <= 8
 
 
 # ==========================================================================
-# 2.6 单实例开关 + 熔断（CP-INDEXTTS-SINGLE / CP-INDEXTTS-CIRCUIT）
+# 2.6 熔断（CP-INDEXTTS-CIRCUIT）
 # ==========================================================================
-
-
-def test_single_instance_flag_suppresses_sibling_discovery(monkeypatch):
-    """INDEXTTS_SINGLE_INSTANCE=1 时，候选链必须只剩 base_url 本身。
-
-    这条是 16GB 机器能不能活的关键：两个 oMLX 实例各 mmap 一份 1.7GB 权重，
-    swap 会被打爆（文件头有「只保留一个实例后 swap 降到 7.9GB」的实测）。
-    """
-    monkeypatch.setenv("INDEXTTS_SINGLE_INSTANCE", "1")
-    monkeypatch.delenv("INDEXTTS_FAILOVER_URLS", raising=False)
-    c = IndexTTSClient(
-        base_url="http://127.0.0.1:8008/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
-    )
-    assert c.endpoints == ["http://127.0.0.1:8008/v1"]
-
-
-def test_single_instance_flag_beats_explicit_failover(monkeypatch):
-    """单实例开关优先级最高：显式配了 FAILOVER 也不能把兄弟端口拉回来。"""
-    monkeypatch.setenv("INDEXTTS_SINGLE_INSTANCE", "1")
-    monkeypatch.setenv("INDEXTTS_FAILOVER_URLS", "http://127.0.0.1:8008/v1")
-    c = IndexTTSClient(
-        base_url="http://127.0.0.1:8000/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
-    )
-    assert c.endpoints == ["http://127.0.0.1:8000/v1"]
 
 
 @pytest.mark.asyncio
 async def test_circuit_breaker_opens_after_threshold_then_fast_fails(monkeypatch):
     """连续失败到阈值后开闸，后续调用必须**立刻**失败而不是再烧一轮超时。
 
-    没有熔断时 oMLX 引擎段错误崩掉后，一段 200 字要走
+    没有熔断时 TTS 服务挂掉后，一段 200 字要走
     端点数 × 尝试数 × chunk_timeout = 2×2×240s = 16 分钟才报错，一篇 8 段就
     两个多小时。熔断把这个变成秒级失败。
     """
     import time as _time
 
     monkeypatch.delenv("INDEXTTS_FAILOVER_URLS", raising=False)
-    monkeypatch.delenv("INDEXTTS_SINGLE_INSTANCE", raising=False)
     monkeypatch.setenv("INDEXTTS_BREAKER_THRESHOLD", "3")
     monkeypatch.setenv("INDEXTTS_BREAKER_COOLDOWN", "300")
     monkeypatch.setenv("INDEXTTS_CHUNK_TIMEOUT", "240")
     c = IndexTTSClient(
-        base_url="http://127.0.0.1:8000/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
+        base_url="http://127.0.0.1:8010/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
     )
     # 参考音频文件不存在时 _load_ref_audio_b64 会先抛 IndexTTSError，根本走不到
     # 重试循环 —— 桩掉它，否则本用例验的是「文件存不存在」而不是熔断。
@@ -368,7 +366,7 @@ async def test_circuit_breaker_opens_after_threshold_then_fast_fails(monkeypatch
         calls += 1
         # 必须抛 httpx 自己的异常类型：重试循环只捕 TimeoutException / HTTPError，
         # 抛别的会直接穿透循环，用例就变成在验「异常类型对不对」而不是验熔断。
-        raise httpx.ReadTimeout("simulated oMLX engine hang")
+        raise httpx.ReadTimeout("simulated engine hang")
 
     # 连着 3 次全部失败（模拟引擎已死）
     c._client.post = _boom  # type: ignore[method-assign]
@@ -393,7 +391,7 @@ async def test_circuit_breaker_resets_on_success(monkeypatch):
 
     monkeypatch.setenv("INDEXTTS_BREAKER_THRESHOLD", "3")
     c = IndexTTSClient(
-        base_url="http://127.0.0.1:8000/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
+        base_url="http://127.0.0.1:8010/v1", ref_audio_path="/tmp/none.wav", ref_text="t"
     )
     c._consecutive_failures = 2
     c._circuit_open_until = _time.monotonic() + 300

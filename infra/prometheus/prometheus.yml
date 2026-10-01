@@ -1,7 +1,35 @@
+# Prometheus scrape 配置（宿主机直跑场景）。
+#
+# 端口按 launchd 本机部署的真实值（backend/.env + bin/restart_*.sh）：
+#     api-gateway 8100 / user-service 8101 / content-service 8102
+#     ai-service 8103 / ai-worker 8104
+#
+# ⚠️ 2026-10-01 修正：这里原先写的是 content-service→8000、api-gateway→8001，
+# 两个都是错的（那是早期 docker 默认端口映射，compose 里并没有起这些服务）。
+# 8000 恰好又是 oMLX 的端口，所以 oMLX 停用后这个 target 变成必然失败的死配置。
+#
+# ⚠️ 自建 TTS 服务（:8010，com.stashbox.tts-serve）**不纳入这里**：
+# mlx-audio 的 server 没有暴露 /metrics（只有 OpenAI 兼容的 /v1/* 端点）。
+# 它的可用性靠后端熔断 + launchctl list 兜底，不靠 prometheus 告警。
+#
+# 容器内跑 prometheus 时请用 infra/docker/prometheus/prometheus.yml ——
+# 那份走 host.docker.internal:<port>，且已经覆盖全部 5 个服务。
 global:
   scrape_interval: 15s
+  evaluation_interval: 15s
+
 scrape_configs:
-- job_name: 'content-service'
-  static_configs: [{ targets: ['localhost:8000'] }]
-- job_name: 'api-gateway'
-  static_configs: [{ targets: ['localhost:8001'] }]
+  - job_name: api-gateway
+    static_configs: [{ targets: ['localhost:8100'] }]
+
+  - job_name: user-service
+    static_configs: [{ targets: ['localhost:8101'] }]
+
+  - job_name: content-service
+    static_configs: [{ targets: ['localhost:8102'] }]
+
+  - job_name: ai-service
+    static_configs: [{ targets: ['localhost:8103'] }]
+
+  - job_name: ai-worker
+    static_configs: [{ targets: ['localhost:8104'] }]

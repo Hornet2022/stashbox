@@ -81,8 +81,9 @@ cat <<EOF
 后端切换（backend/.env）：
 
   INDEXTTS_BASE_URL=http://127.0.0.1:8010/v1
-  INDEXTTS_SINGLE_INSTANCE=1      # 不设的话 _sibling_omlx_urls 会把 8000 补回故障切换链
 
-回滚：把 INDEXTTS_BASE_URL 改回 http://127.0.0.1:8000/v1 并重启 ai-worker。
-oMLX 仍在 8000 托管 embedding / OCR / rerank，全程没动。
+服务本身由 launchd 托管，开机会自起（plist 在 infra/launchd/）。
+
+回滚：oMLX 已停用，plist 归档在 infra/launchd/_disabled/。要回滚见
+README.md 的「回滚」一节。
 EOF

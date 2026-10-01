@@ -1,7 +1,7 @@
 # 听匣独立 TTS 服务
 
-用 `mlx-audio` 直接提供 OpenAI 兼容的 TTS，取代 oMLX 承担 TTS 合成。
-**不是换栈提速，是把修复权拿回自己手里。**
+用 `mlx-audio` 直接提供 OpenAI 兼容的 TTS。**oMLX 已从听匣彻底弃用**
+（2026-10-01），本服务是 TTS 的唯一端点。
 
 ## 为什么不用 oMLX
 
@@ -17,6 +17,22 @@ oMLX 的 TTS 引擎内部**就是** `mlx-audio`：
 13 字短文本也零响应」的排查就卡在这里。
 
 把它单独 pip 装出来自己接管之后，同一个修复就成了本目录里的普通代码。
+
+## 本机其它模型现在归谁
+
+oMLX 停用后，它的 9 个模型重新分工如下（都不是本服务的活）：
+
+| 能力 | 现在的归属 | 备注 |
+|---|---|---|
+| TTS | 本服务 `:8010` | launchd `com.stashbox.tts-serve` |
+| embedding | KnowledgeBase `:8008` | `embedding_server.py`，`mlx_lm.utils.load` + last-token + L2 normalize，**不经过 oMLX** |
+| OCR / rerank | 无调用方 | 听匣和 KnowledgeBase 都没用；要启用得自己拉起 oMLX（plist 归档在 `../launchd/_disabled/`） |
+
+顺带一提：mlx-lm 0.32.0 **不提供** `/v1/embeddings`（它的 server 只有
+`/v1/completions` 和 `/v1/chat/completions`），所以 embedding 那个自写服务是
+对的思路而不是绕路。OCR 则是 mlx-lm 的硬阻断 —— `DeepSeek-OCR` / `GLM-OCR`
+是视觉语言模型，需要 `mlx-vlm`。
+
 
 ## 三个文件
 
@@ -65,7 +81,7 @@ venv 里只装依赖；重建用 `bash setup.sh`。
 
 ASGI 中间件在 FastAPI 解析 pydantic 之前把 body 里的 base64 落盘
 （按内容 sha256 命名，同一个参考音频进程生命周期内只写一次），替换成路径。
-后端一行不用改，**回滚只需把 `INDEXTTS_BASE_URL` 改回 8000**。
+后端一行不用改。
 
 同一个中间件还负责把缺省的 `response_format` 补成 `wav` ——
 `SpeechRequest` 默认是 `mp3`，而后端用 `wave.open` 解析返回字节。
@@ -126,12 +142,26 @@ plist 在 `../launchd/com.stashbox.tts-serve.plist`，
 
 ## 回滚
 
-后端 `backend/.env`：
+oMLX 已停用（plist 归档在 `../launchd/_disabled/com.openclaw.omlx.plist`）。
+要回滚到 oMLX 承担 TTS，三步：
+
+```bash
+# 1. 恢复 launchd agent
+cp ../launchd/_disabled/com.openclaw.omlx.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.openclaw.omlx.plist
+
+# 2. 确认 oMLX 起来了（注意它会预加载 IndexTTS-1.5，+1.7GB）
+curl -s http://127.0.0.1:8000/v1/models
+```
+
+3. 后端 `backend/.env`：
 
 ```diff
 - INDEXTTS_BASE_URL=http://127.0.0.1:8010/v1
 + INDEXTTS_BASE_URL=http://127.0.0.1:8000/v1
 ```
 
-然后重启 `com.stashbox.ai-worker`。oMLX 全程没动过，仍在 8000 托管
-embedding / OCR / rerank，权重也一直在原地。
+然后重启 `com.stashbox.ai-worker`。权重一直在 `/Volumes/AIWorker` 原地没动过。
+
+不过要清楚回滚意味着什么：oMLX 的 sampler 补丁只在 app 内部，**「冻结 RNG →
+返回零音频 → 只有重启进程才恢复」那个坑会一起回来**，而且改不了。
