@@ -496,7 +496,10 @@ async def _run_distill_via_agent(
 
     store = MemoryStore(session_factory=AsyncSessionLocal)
     user_profile = await store.load_user_profile(user_id)
-    few_shot_examples = await store.load_few_shots(topic=source, limit=3)
+    # 方案 §1 闭环 1 要求注入 top-5 高分样本。之前这里传的是 `topic=source`
+    # （wechat/web/…），而 kind 列只允许 hook/section/outro → 恒返回空集，
+    # few-shot 池于是只增不读。改为不按 kind 过滤，取全局最高分的 5 条。
+    few_shot_examples = await store.load_few_shots(limit=5)
 
     initial_state: AgentState = {
         "article_id": article_id,
@@ -535,6 +538,14 @@ async def _run_distill_via_agent(
         memory_count=len(few_shot_examples),
     )
     final = await _agent_app.ainvoke(initial_state)
+
+    # A/B 分组要在落库时写进 distilled_agents（方案 §2.7-D：user_id % 100 < 30
+    # → personalized 组，其余 general，intention-to-treat 口径）。
+    # 之前只有死代码 pipeline.py 会写这两个字段，生产 8 条记录实测全是 NULL，
+    # ab-report 报表因此拿不到任何分组结论。
+    ab_group = "personalized" if user_id % 100 < 30 else "general"
+    is_personalized = bool(final.get("is_personalized"))
+    final = {**final, "ab_group": ab_group, "is_personalized": is_personalized}
     log.info(
         "agent_run_completed",
         task_id=task_id,
@@ -545,7 +556,46 @@ async def _run_distill_via_agent(
 
     # 把 final state 写回 DB
     await _persist_agent_final(task_id, article_id, user_id, final)
+
+    # CP3.7.2 hook 接回活路径（2026-10-02）：生产走 agent 而不是 DistillPipeline，
+    # 导致 7 个 hook 全部悬空 —— 评分预测 / 自动重蒸 / 画像更新 / few-shot 入池
+    # 一次都没跑过。这里显式补上，产物已落库，hook 挂了只告警。
+    await _run_agent_post_hooks(task_id, article_id, user_id, url, raw_content, final)
     return final
+
+
+async def _run_agent_post_hooks(
+    task_id: str,
+    article_id: str,
+    user_id: int,
+    url: str,
+    raw_content: str,
+    final: dict,
+) -> None:
+    """蒸馏成功后触发 CP3.7.2 post-hooks。
+
+    整体包 try/except：hook 失败绝不能把已成功的蒸馏标记成失败。
+    """
+    try:
+        from distill.agent_hook_bridge import build_ctx_from_agent_final, run_post_hooks
+
+        ctx = build_ctx_from_agent_final(
+            task_id=task_id,
+            article_id=article_id,
+            user_id=user_id,
+            url=url,
+            raw_content=raw_content,
+            final=final,
+        )
+        async with AsyncSessionLocal() as db:
+            await run_post_hooks(ctx, db)
+    except Exception as exc:
+        log.warning(
+            "agent_post_hooks_failed_continue",
+            task_id=task_id,
+            article_id=article_id,
+            error=str(exc),
+        )
 
 
 async def _persist_agent_final(
@@ -612,6 +662,12 @@ async def _persist_agent_final(
             # 不要回填一个「看起来对」的音色 ID，那会让统计口径失真。
             if final.get("tts_voice_id"):
                 da.tts_voice_id = final["tts_voice_id"]
+            # A/B 归因（方案 §2.7-D）。NULL 会被 ab-report 归进 pre_experiment
+            # 组，报表看起来像「实验没跑」，实际是压根没写过。
+            if final.get("ab_group"):
+                da.ab_group = final["ab_group"]
+            if final.get("is_personalized") is not None:
+                da.is_personalized = bool(final["is_personalized"])
 
             # 先 flush 让 IntegrityError 在这里暴露（而不是拖到 commit 把事务搞废）
             await db.flush()

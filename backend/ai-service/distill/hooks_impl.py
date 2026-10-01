@@ -18,7 +18,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import pipeline_hooks
-from .auto_retry import should_auto_retry
+from .auto_retry import (
+    bump_user_daily_retry_count,
+    enqueue_auto_retry,
+    get_user_daily_retry_count,
+    should_auto_retry,
+)
 from .listening_pattern_updater import update_user_listening_pattern
 from .pipeline_hooks import PostDistillHook, PostStepHook, PreDistillHook
 from .schemas import (
@@ -26,7 +31,7 @@ from .schemas import (
     RewriteExample,
     UserListeningPattern,
 )
-from .score_predictor import MOCK_SCORE, predict_and_save_quality_score
+from .score_predictor import predict_and_save_quality_score
 from .stage_cache import write_stage
 from .tier_router import route_tier
 
@@ -42,7 +47,7 @@ def _is_real_session(db: object) -> bool:
     return hasattr(db, "in_transaction")
 
 
-async def _latest_user_evaluation(db: AsyncSession, task_id: str) -> Any:
+async def _latest_user_evaluation(db: AsyncSession, ctx: DistillContext) -> Any:
     """取这篇**真实**的用户最新一条听感评分；没有则 None。
 
     为什么必须查真值，不能造一条 overall_score=4 的
@@ -59,20 +64,39 @@ async def _latest_user_evaluation(db: AsyncSession, task_id: str) -> Any:
 
     所以这里改成：只认用户真的提交过的评分（`auto_flag=false`），
     没有就不更新 —— 没有真实信号时保持空，而不是用假信号假装有。
+
+    ## 2026-10-02：改成经 DistilledArticle 桥接查
+
+    ``distillation_evaluations`` 只有 task_id 列，而写入时用的是
+    ``task_id = DistilledArticle.id``（``evaluation_service.py``）——那是这篇
+    文章**首次**蒸馏的 task_id。直接拿 ``ctx.task_id`` 查，文章一旦重蒸就对不上，
+    评分永远查不到（表现为「用户明明打过 1 星，系统毫无反应」）。
+    改为 article_id → DistilledArticle.id → evaluations.task_id 三段跳。
     """
     from sqlalchemy import select as _select
 
-    from stashbox.backend.common.models import DistillationEvaluation
+    from stashbox.backend.common.models import DistillationEvaluation, DistilledArticle
 
-    return await db.scalar(
-        _select(DistillationEvaluation)
-        .where(
-            DistillationEvaluation.task_id == task_id,
-            DistillationEvaluation.auto_flag.is_(False),
+    try:
+        da_id = await db.scalar(
+            _select(DistilledArticle.id).where(DistilledArticle.article_id == ctx.article_id)
         )
-        .order_by(DistillationEvaluation.created_at.desc())
-        .limit(1)
-    )
+        if da_id is None:
+            return None
+        return await db.scalar(
+            _select(DistillationEvaluation)
+            .where(
+                DistillationEvaluation.task_id == da_id,
+                DistillationEvaluation.auto_flag.is_(False),
+            )
+            .order_by(DistillationEvaluation.created_at.desc())
+            .limit(1)
+        )
+    except Exception as exc:
+        log.warning(
+            "latest_user_evaluation_query_failed", article_id=ctx.article_id, error=str(exc)
+        )
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +158,48 @@ class UserProfileHook:
             log.warning("user_profile_hook_failed_continue", task_id=ctx.task_id, error=str(e))
 
 
+async def _lookup_user_tier(db: AsyncSession, user_id: int) -> str:
+    """查用户付费档位（users.tier）。查不到按 free 处理。"""
+    from sqlalchemy import text
+
+    try:
+        row = (
+            await db.execute(
+                text("SELECT tier FROM users WHERE id = :uid AND deleted_at IS NULL"),
+                {"uid": user_id},
+            )
+        ).first()
+        return str(row[0] or "free") if row else "free"
+    except Exception as exc:
+        log.warning("lookup_user_tier_failed", user_id=user_id, error=str(exc))
+        return "free"
+
+
+async def _lookup_personalization_consent(db: AsyncSession, user_id: int) -> bool:
+    """查用户是否授权了个性化（user_consents.personalization_enabled）。
+
+    没有 consent 记录时返回 False —— 授权是**需要用户明示同意**才能做的事，
+    「查不到」不等于「同意」。早前这里写死 True，等于绕过整个同意流程。
+    """
+    from sqlalchemy import text
+
+    try:
+        row = (
+            await db.execute(
+                text(
+                    "SELECT personalization_enabled FROM user_consents "
+                    "WHERE user_id = :uid AND deleted_at IS NULL"
+                ),
+                {"uid": user_id},
+            )
+        ).first()
+        return bool(row[0]) if row else False
+    except Exception as exc:
+        # 表可能还不存在（迁移未跑）→ 按未授权处理，宁可少个性化不要越权
+        log.warning("lookup_consent_failed_default_denied", user_id=user_id, error=str(exc))
+        return False
+
+
 class FewShotSelectorHook:
     """CP5.6.0 §2.3：PreDistillHook —— 选 few-shot（CP3.7.2 骨架 + CP3.7.3 完整 + CP5.6.0 个性化）。
 
@@ -159,15 +225,24 @@ class FewShotSelectorHook:
             from .personalization_selector import PersonalizationSelector
 
             selector = PersonalizationSelector()
-            user_tier = getattr(article, "user_tier", None) or "free"
+            # ⚠️ 原来这两行都是假的（2026-10-02 修）：
+            # 1) `getattr(article, "user_tier", None)` —— Article 模型里根本没有
+            #    user_tier 这个属性，getattr 恒返回 None → 恒为 "free" →
+            #    所有用户都被判成免费档，个性化付费墙形同虚设。
+            # 2) `consent_enabled=True` 写死 —— 用户在 App 里关掉个性化授权，
+            #    系统照样用他的数据算画像（GDPR 风险）。
+            # 现在都真查 users / user_consents 表。
+            user_tier = await _lookup_user_tier(db, ctx.user_id)
+            consent_enabled = await _lookup_personalization_consent(db, ctx.user_id)
+
             examples, is_personalized = await selector.select_personalized_few_shot(
                 db,
                 user_id=ctx.user_id,
                 user_tier=user_tier,
                 user_profile=ctx.user_profile,
                 article_topic_tags=None,
-                consent_enabled=True,  # CP5.6.0 默认 True（Android UI 推动）
-                is_minor=False,  # CP5.6.0 默认 False（学生用户走未成年路径）
+                consent_enabled=consent_enabled,
+                is_minor=False,
                 limit=5,
             )
             ctx.few_shot_examples = [
@@ -228,7 +303,7 @@ class ListeningPatternUpdaterHook:
         if not _is_real_session(db):
             return
         try:
-            evaluation = await _latest_user_evaluation(db, ctx.task_id)
+            evaluation = await _latest_user_evaluation(db, ctx)
             if evaluation is None:
                 # 用户还没评过这篇 → 没有真实信号可更新，保持原样
                 log.info(
@@ -262,7 +337,7 @@ class FewShotPoolHook:
         try:
             from .few_shot_pool import add_high_score_to_pool
 
-            evaluation = await _latest_user_evaluation(db, ctx.task_id)
+            evaluation = await _latest_user_evaluation(db, ctx)
             if evaluation is None:
                 log.info(
                     "few_shot_pool_hook_skipped_no_real_eval",
@@ -289,15 +364,25 @@ class FewShotPoolHook:
 
 
 class ScorePredictorHook:
-    """CP3.7.3 §2.2.E：PostDistillHook —— 听感评分预测（mock 8.5，CP3.8.0 接真实评分）。"""
+    """CP3.7.3 §2.2.E：PostDistillHook —— 听感质量分落库。
+
+    2026-10-02：改为只用真实用户评分算分，没有就留 NULL —— 之前是写死 8.5。
+    写 8.5 比留 NULL 更有害：NULL 读作「未评估」，8.5 读作「评估过、质量好」，
+    管理后台的评分列和 A/B 报表都会拿它当依据。
+    """
 
     async def __call__(self, ctx: DistillContext, db: AsyncSession) -> None:
         if not _is_real_session(db):
             return
         try:
-            await predict_and_save_quality_score(db, ctx.task_id)
+            # 按 article_id（业务键）查，不是 ctx.task_id —— agent 路径一篇文章
+            # 可能对应多个 task_id，按 id 查会漏掉。
+            score = await predict_and_save_quality_score(db, ctx.article_id)
             await db.commit()
-            log.info("score_predictor_hook_completed", task_id=ctx.task_id, score=MOCK_SCORE)
+            if score is None:
+                log.info("score_predictor_no_real_eval", article_id=ctx.article_id)
+            else:
+                log.info("score_predictor_hook_completed", article_id=ctx.article_id, score=score)
         except Exception as e:
             log.warning(
                 "score_predictor_hook_failed_continue",
@@ -307,33 +392,50 @@ class ScorePredictorHook:
 
 
 class AutoRetryHook:
-    """CP3.7.3 §2.2.E：PostDistillHook —— 评分 < 3 → 自动重蒸（本期骨架）。
+    """CP3.7.3 §2.2.E：PostDistillHook —— 评分 < 3 → **真正重新入队**。
 
-    早期版本写死 mock_score=4.0，等于"永远判定不用重试"，真实低分（用户打 1-2 星）
-    永远不会触发重蒸。改成读真实评分；用户没评过就没有重蒸依据，跳过。
-    真正入队（arq.enqueue_job）仍留 CP3.7.x。
+    2026-10-02 从「只判断 + 打日志」改成真入队。理由：低分自动重蒸馏是方案
+    §1 闭环 1 承诺的核心动作之一，此前命中后只写一行 log，用户打 1-2 星
+    什么都不会发生 —— 评分闭环在体验上完全断裂。
+
+    限流用 Redis 日计数（之前 `user_daily_retry_count = 0` 是写死的，
+    限流形同虚设；真接上入队后不限流，一次低分就能把队列打爆）。
     """
 
     async def __call__(self, ctx: DistillContext, db: AsyncSession) -> None:
         try:
             if not _is_real_session(db):
                 return
-            evaluation = await _latest_user_evaluation(db, ctx.task_id)
+            evaluation = await _latest_user_evaluation(db, ctx)
             if evaluation is None or evaluation.overall_score is None:
                 log.info("auto_retry_skipped_no_real_eval", task_id=ctx.task_id)
                 return
 
             score = float(evaluation.overall_score)
-            user_daily_retry_count = 0  # 本期固定 0（CP3.7.x 接 Redis 计数）
+            daily_count = await get_user_daily_retry_count(ctx.user_id)
 
-            if should_auto_retry(score, user_daily_retry_count):
+            if not should_auto_retry(score, daily_count):
                 log.info(
-                    "auto_retry_triggered",
-                    task_id=ctx.task_id,
-                    score=score,
+                    "auto_retry_skipped", task_id=ctx.task_id, score=score, daily_count=daily_count
                 )
-            else:
-                log.info("auto_retry_skipped", task_id=ctx.task_id, score=score)
+                return
+
+            # 先占额度再入队：反过来会让入队失败的尝试白占名额
+            await bump_user_daily_retry_count(ctx.user_id)
+
+            job_id = await enqueue_auto_retry(
+                user_id=ctx.user_id,
+                article_id=ctx.article_id,
+                url=ctx.url,
+            )
+            log.info(
+                "auto_retry_triggered",
+                task_id=ctx.task_id,
+                article_id=ctx.article_id,
+                score=score,
+                daily_count=daily_count + 1,
+                new_job_id=job_id,
+            )
         except Exception as e:
             log.warning(
                 "auto_retry_hook_failed_continue",

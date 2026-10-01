@@ -60,7 +60,7 @@ def patch_agent_runner_deps(monkeypatch):
             self.score = 9.0
             self.tags = ("科技",)
 
-    async def fake_load_few_shots(topic=None, limit=3):
+    async def fake_load_few_shots(kind=None, limit=5):
         return [_FakeFewShot()]
 
     class _FakeMemoryStore:
@@ -70,8 +70,8 @@ def patch_agent_runner_deps(monkeypatch):
         async def load_user_profile(self, user_id):
             return await fake_load_profile(user_id)
 
-        async def load_few_shots(self, topic=None, limit=3):
-            return await fake_load_few_shots(topic, limit)
+        async def load_few_shots(self, kind=None, limit=5):
+            return await fake_load_few_shots(kind, limit)
 
     monkeypatch.setattr(memory_module, "MemoryStore", _FakeMemoryStore)
 

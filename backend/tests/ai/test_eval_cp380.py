@@ -251,20 +251,21 @@ def test_compute_blind_score_empty():
 # ---------------------------------------------------------------------------
 # 5. score_predictor 集成
 # ---------------------------------------------------------------------------
-def test_score_predictor_uses_evaluator_singleton():
-    """CP3.8.0：get_evaluator 单例。"""
-    from distill.score_predictor import get_evaluator
+def test_score_predictor_no_longer_depends_on_evaluator():
+    """2026-10-02：score_predictor 不再走 Evaluator（那是个恒返回 8.5 的假实现）。
 
-    e1 = get_evaluator()
-    e2 = get_evaluator()
-    assert e1 is e2  # singleton
+    质量分改为直接来自真实用户评分（distillation_evaluations）。
+    """
+    import distill.score_predictor as sp
+
+    assert not hasattr(sp, "get_evaluator"), "不该再依赖恒返回 8.5 的 Evaluator"
 
 
-def test_score_predictor_mock_score_constant():
-    """CP3.8.0：MOCK_SCORE = 8.5（fallback）。"""
-    from distill.score_predictor import MOCK_SCORE
+def test_score_predictor_no_mock_score_constant():
+    """2026-10-02：MOCK_SCORE 已移除，系统不再编造质量分。"""
+    import distill.score_predictor as sp
 
-    assert MOCK_SCORE == 8.5
+    assert not hasattr(sp, "MOCK_SCORE"), "MOCK_SCORE 不该再存在"
 
 
 # ---------------------------------------------------------------------------

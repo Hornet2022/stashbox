@@ -13,7 +13,12 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from sqlalchemy import Column, MetaData, String as SA_String, Table
+from sqlalchemy import (
+    Column,
+    MetaData,
+    String as SA_String,
+    Table,
+)
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 REPO_PARENT = str(Path(__file__).resolve().parents[3])
@@ -25,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ai-service"))
 from stashbox.backend.common.models import (  # noqa: E402
     ArticleAudioVariant,
     DistillationEvaluation,
+    DistilledArticle,
     FewShotExample,
     UserListeningPattern,
 )
@@ -36,10 +42,39 @@ _users_stub = Table(
     _FK_METADATA,
     Column("id", SA_String(32), primary_key=True),
 )
+
+
+# 2026-10-02：不再手写影子表。hook 改成经
+# article_id → DistilledArticle.id → evaluations.task_id 三段跳之后，
+# 测试要真的往 distilled_articles 插一行，影子表必须跟着 ORM 一起长 ——
+# 手写版本就是因为漏了 script_text 等列反复报 no such column。
+# 这里直接复用真实模型的列定义，但剥掉外键（fixture 里没有 articles /
+# tts_voices 两张表，SQLite 建表时外键会因找不到目标表而失败）。
+def _sqlite_safe_columns(table) -> list:
+    """把 ORM 表的列定义搬进 SQLite fixture。
+
+    两处不得不改：
+    - JSONB 在 SQLite 上没有编译器（visit_JSONB 不存在），降级成 JSON；
+    - 外键指向的 articles / tts_voices 表不在 fixture 里，会导致建表失败，
+      所以逐列 copy 时不复制 ForeignKey 约束。
+    """
+    from sqlalchemy import JSON
+    from sqlalchemy.dialects.postgresql import JSONB
+
+    cols = []
+    for c in table.columns:
+        new_c = c.copy()
+        if isinstance(new_c.type, JSONB):
+            new_c.type = JSON()
+        new_c.foreign_keys = set()
+        cols.append(new_c)
+    return cols
+
+
 _distilled_articles_stub = Table(
     "distilled_articles",
     _FK_METADATA,
-    Column("id", SA_String(32), primary_key=True),
+    *_sqlite_safe_columns(DistilledArticle.__table__),
 )
 
 
@@ -384,23 +419,122 @@ def test_auto_retry_disabled_no_op(monkeypatch):
 # ---------------------------------------------------------------------------
 # 13-14. ScorePredictorHook
 # ---------------------------------------------------------------------------
-def test_score_predictor_mock_returns_85():
-    """CP3.7.3：MOCK_SCORE = 8.5。"""
-    from distill.score_predictor import MOCK_SCORE
+async def test_score_predictor_no_fake_score_constant():
+    """2026-10-02：MOCK_SCORE 常量已移除 —— 系统不再编造质量分。
 
-    assert MOCK_SCORE == 8.5
+    写死 8.5 比留 NULL 更有害：NULL 读作「未评估」，8.5 读作「评估过、质量好」，
+    管理后台评分列 / A/B 报表都会拿它当依据。
+    """
+    import distill.score_predictor as sp
+
+    assert not hasattr(sp, "MOCK_SCORE"), "MOCK_SCORE 不该再存在"
 
 
-async def test_score_predictor_failure_returns_mock():
-    """CP3.7.3：DB 失败时返回 MOCK_SCORE（不破主流程）。"""
-    from distill.score_predictor import MOCK_SCORE, predict_and_save_quality_score
+async def test_score_predictor_no_real_eval_returns_none():
+    """2026-10-02：查库失败 / 无真实评分 → 返回 None，绝不写假分。"""
+    from distill.score_predictor import predict_and_save_quality_score
 
     class _BrokenSession:
         async def execute(self, *args, **kwargs):
             raise RuntimeError("simulated db error")
 
-    result = await predict_and_save_quality_score(_BrokenSession(), "dst_x")
-    assert result == MOCK_SCORE
+    result = await predict_and_save_quality_score(_BrokenSession(), "art_x")
+    assert result is None
+
+
+async def test_score_predictor_empty_evaluations_returns_none():
+    """2026-10-02：真实评分表为空 → None（不是 8.5）。"""
+    from distill.score_predictor import _real_score_from_evaluations
+
+    class _EmptySession:
+        async def execute(self, *args, **kwargs):
+            class _R:
+                def scalars(self_inner):
+                    return self_inner
+
+                def all(self_inner):
+                    return []
+
+            return _R()
+
+    assert await _real_score_from_evaluations(_EmptySession(), "art_x") is None
+
+
+async def test_score_predictor_real_eval_averages_to_0_10_scale():
+    """2026-10-02：有真实评分 → 均值 ×2 落到 0-10 量纲。"""
+    from distill.score_predictor import _real_score_from_evaluations
+
+    class _Session:
+        # 第一次 execute 查 DistilledArticle.id（桥接），第二次查评分
+        def __init__(self):
+            self.calls = 0
+
+        async def scalar(self, *args, **kwargs):
+            return "dst_first_task_id"
+
+        async def execute(self, *args, **kwargs):
+            class _R:
+                def scalars(self_inner):
+                    return self_inner
+
+                def all(self_inner):
+                    return [4, 5, 3]
+
+            return _R()
+
+    # (4+5+3)/3 = 4.0 → ×2 = 8.0（0-10 制）
+    assert await _real_score_from_evaluations(_Session(), "art_x") == 8.0
+
+
+async def test_score_predictor_bridges_via_distilled_article_id():
+    """2026-10-02：评分只认 task_id，必须经 DistilledArticle 桥接。
+
+    distillation_evaluations 没有 article_id 列；直接按当前 ctx.task_id 查，
+    文章重蒸后就对不上了（表现为「用户打过 1 星，系统毫无反应」）。
+    """
+    from distill.score_predictor import _real_score_from_evaluations
+
+    seen: list[str] = []
+
+    class _Session:
+        async def scalar(self, stmt, *args, **kwargs):
+            seen.append("scalar:DistilledArticle.id")
+            return "dst_first_task_id"
+
+        async def execute(self, stmt, *args, **kwargs):
+            seen.append("execute:evaluations")
+            sql = str(stmt)
+            # SQLAlchemy 2.0 风格：值编译进 statement 的绑定参数里，不是 kwargs
+            bound = stmt.compile().params
+
+            class _R:
+                def scalars(self_inner):
+                    return self_inner
+
+                def all(self_inner):
+                    return [2]
+
+            assert "distillation_evaluations" in sql
+            assert "dst_first_task_id" in bound.values(), f"绑定参数里没有桥接 id: {bound}"
+            return _R()
+
+    # 2 星 → ×2 = 4.0
+    assert await _real_score_from_evaluations(_Session(), "art_x") == 4.0
+    assert seen == ["scalar:DistilledArticle.id", "execute:evaluations"]
+
+
+async def test_score_predictor_no_distilled_row_returns_none():
+    """2026-10-02：没有蒸馏结果行 → None，不是 8.5。"""
+    from distill.score_predictor import _real_score_from_evaluations
+
+    class _Session:
+        async def scalar(self, *args, **kwargs):
+            return None
+
+        async def execute(self, *args, **kwargs):
+            raise AssertionError("没有 DistilledArticle 行时不该再查评分")
+
+    assert await _real_score_from_evaluations(_Session(), "art_x") is None
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +606,9 @@ async def test_hooks_use_real_evaluation_when_exists(session):
     from distill.hooks_impl import FewShotPoolHook, ListeningPatternUpdaterHook
 
     now = datetime.now()
+    # 2026-10-02：hook 改成 article_id → DistilledArticle.id → evaluations.task_id
+    # 三段跳，所以必须先有蒸馏结果行，否则查不到评分（这正是修复要覆盖的场景）。
+    session.add(DistilledArticle(id="dst_hook", article_id="art_dst_hook", status="done"))
     session.add(
         DistillationEvaluation(
             id="eval_real_1",
