@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.stashbox.rerank-serve</string>
+
+    <!--
+      听匣本地 rerank 服务（2026-10-01）。
+
+      用 mlx-lm + Qwen3-Reranker-0.6B-4bit 提供 /v1/rerank，和 TTS 服务
+      （com.stashbox.tts-serve）共用同一个 venv，权重仍读 /Volumes/AIWorker。
+
+      为什么不复用本机那个 jina-reranker-v3.5-mlx：它 model_type 也是 qwen3，
+      mlx_lm.load() 会**成功**、forward 也会**成功**，但权重里的 projector.* 被
+      静默丢弃，且它是 cross-encoder 架构不能用 yes/no logprob 打分 —— 实测
+      排序完全颠倒、区分度接近零。细节见 infra/rerank-service/README.md。
+
+      端口 8011：8008 是 KnowledgeBase 的 embedding，8010 是 TTS。
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/hornet/work/.venvs/mlx-audio/bin/python</string>
+        <string>-m</string>
+        <string>rerank_serve</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RERANK_MODEL</key>
+        <string>/Volumes/AIWorker/Qwen3-Reranker-0.6B-4bit</string>
+        <key>RERANK_HOST</key>
+        <string>127.0.0.1</string>
+        <key>RERANK_PORT</key>
+        <string>8011</string>
+        <!-- 同批最大条数。MLX eval 同一时刻只允许一个线程，调大不会更快。 -->
+        <key>RERANK_BATCH_SIZE</key>
+        <string>16</string>
+        <key>RERANK_MAX_DOC_LEN</key>
+        <string>2048</string>
+        <!-- 服务代码随仓库走，venv 里只装依赖。 -->
+        <key>PYTHONPATH</key>
+        <string>/Users/hornet/work/stashbox/infra/rerank-service</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/hornet/work/stashbox/infra/rerank-service</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      SuccessfulExit=false：只在**非零退出**时重启，正常停止（launchctl bootout /
+      手动 kill）不会被立刻拉起来。
+      ThrottleInterval=30：万一反复崩溃，30s 一次的重启频率足够低。
+    -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/stashbox-rerank-serve.out</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/stashbox-rerank-serve.err</string>
+</dict>
+</plist>
