@@ -453,6 +453,37 @@ async def distill_article(
     marked = await cache_service.has_article_quota(article_id)
     already_charged = existed_da is not None or marked
     quota_used = None
+
+    # 入队幂等：**已在跑就不再入队**（CP-TTS-VOICE BUG#12 的守卫原本只加在
+    # /api/v1/distill/start 上，本端点漏了）。
+    #
+    # 实测（2026-10-02，华为真机剪藏一篇 838 字文章）：安卓在 POST /api/v1/articles
+    # 之后又自己调了一次本端点（相隔 163ms），于是**同一篇文章入队两个独立 Arq job**。
+    # 两个 job 的 payload 完全相同（含同一个 task_id），但 Arq 拿 job_id 去重、
+    # 这里每次都新生成 job_id，所以拦不住。后果：
+    #   10:53:57 job A 开始 TTS（7 段，1182 字）
+    #   11:04:58 A 完成 → arq_distill_completed
+    #   11:04:59 job B 被取走（入队于 10:53:42，队列里 delayed=676.97s）
+    #   11:05:13 B 重新 LLM 改写 + 全量 TTS（8 段，1271 字，文字还不一样）
+    # → 单篇耗时翻倍（~23 分钟 vs ~12），本机算力 + LLM 费用双倍，第一遍音频整个丢弃。
+    #
+    # 之前那句「端点对已存在 task 的文章是 idempotent 的（不重复扣配额），安全」
+    # 只对了一半：配额有守卫（`already_charged`），**入队没有**。两个都要有才算幂等。
+    #
+    # 只挡 queued / running；done / failed 放行 —— 那是「换音色重新生成」和
+    # 「失败重试」依赖的行为，一起挡掉会让重生成功能死掉（同 distill_start 的取舍）。
+    if existed_da is not None and existed_da.status in IN_FLIGHT_DISTILL_STATUSES:
+        return {
+            "article_id": article_id,
+            "task_id": existed_da.id,
+            # 幂等分支不产生新 job，也就没有 job_id 可回；留空而不是编一个。
+            "job_id": "",
+            # 回报**真实**状态而不是写死 "started"：调用方要能区分「刚排上」和「已在跑」。
+            "status": existed_da.status,
+            "quota_consumed": False,
+            "quota_used": (await quota_service.get_quota(db, uid))["quota_used"],
+        }
+
     # 系统/公共内容不计入用户配额。
     #
     # user_id=0 是 content-service 的 ANONYMOUS_USER_ID，承载两类不该计费的内容：

@@ -117,12 +117,24 @@ def dispatcher_spy(monkeypatch):
         # 配额路径会一路走到 cache_service 的 Lua 脚本（register_script），
         # 而本目录的 Redis 是 no-op 桩，会抛 'coroutine' object is not callable。
         # 本用例验的是入队幂等，配额另有专门用例，不在这里掺和。
-        return None
+        #
+        # 必须返回**真实形状的 dict**而不是 None：/api/v1/distill/start 不读返回值，
+        # 但 /api/v1/articles/{id}/distill 会 `quota["quota_used"]`，
+        # 返回 None 会 TypeError 把入队断言一起带偏（看起来像守卫失效，其实是桩的问题）。
+        return {"quota_used": amount, "monthly_quota": 99, "remaining": 99 - amount}
 
     monkeypatch.setattr(module, "get_dispatcher", lambda: _FakeDispatcher())
     monkeypatch.setattr(module.cache_service, "has_article_quota", _no_quota)
     monkeypatch.setattr(module.cache_service, "mark_article_quota", _mark_quota)
     monkeypatch.setattr(module.quota_service, "consume", _consume)
+
+    async def _get_quota(db, user_id):
+        # 同上：get_quota 会走 cache_service.set_quota → register_script，
+        # 本目录的 Redis 是 no-op 桩会抛 'coroutine' object is not callable。
+        # /api/v1/articles/{id}/distill 的响应里要回 quota_used，必须有桩。
+        return {"quota_used": 1, "monthly_quota": 99, "remaining": 98}
+
+    monkeypatch.setattr(module.quota_service, "get_quota", _get_quota)
     return calls
 
 
@@ -219,3 +231,62 @@ async def test_失败的文章可以重试(owner_and_article, client, dispatcher
     r = await _start(client, uid, aid)
     assert r.status_code == 200, r.text
     assert len(dispatcher_spy) == 2
+
+
+# ---------------------------------------------------------------------------
+# 同一条守卫，但打在**另一个端点**上
+#
+# 上面四个用例验的是 /api/v1/distill/start。生产剪藏链路走的却是
+# /api/v1/articles/{id}/distill（content-service 的 trigger_distill 拼的就是它），
+# 而「已在跑就不再入队」的守卫当初**只加在前一个端点上**，后者无条件 enqueue。
+#
+# 实测（2026-10-02，华为 JEF-AN20 剪藏一篇 838 字文章）：安卓在
+# POST /api/v1/articles 之后又自己调了一次这个端点（相隔 163ms）→ 同一篇文章
+# 入队两个独立 Arq job（payload 完全相同、含同一个 task_id，但 job_id 是新生成的，
+# Arq 的去重拦不住）。后果是单篇耗时翻倍并双倍烧 LLM/TTS，第一遍音频整个丢弃：
+#   10:53:57 job A 开始 TTS(7段) → 11:04:59 A 完成
+#   11:04:59 job B 被取走（入队于 10:53:42，delayed=676.97s）→ 11:05:13 B 重做(8段)
+#
+# 教训写在这里免得再犯：**幂等要么两个端点都有，要么两个都没有**。
+# 「不重复扣配额」不等于「幂等」—— 计费和入队是两条独立的路径。
+# ---------------------------------------------------------------------------
+
+
+async def _start_by_article(client, uid: int, aid: str):
+    return await client.post(f"/api/v1/articles/{aid}/distill", headers=_auth(uid))
+
+
+@pytest.mark.asyncio
+async def test_文章级端点连续两次调用只应排一个任务(owner_and_article, client, dispatcher_spy):
+    """安卓剪藏会连打两次这个端点，必须只入队一个。"""
+    uid, aid = owner_and_article
+
+    r1 = await _start_by_article(client, uid, aid)
+    assert r1.status_code == 200, r1.text
+    r2 = await _start_by_article(client, uid, aid)
+    assert r2.status_code == 200, r2.text
+
+    assert len(dispatcher_spy) == 1, (
+        f"文章级端点入队了 {len(dispatcher_spy)} 次：{dispatcher_spy} —— "
+        f"重复入队会让单篇蒸馏跑两遍（实测 ~23 分钟 vs ~12），算力与 LLM 费用双倍"
+    )
+
+
+@pytest.mark.asyncio
+async def test_文章级端点幂等时返回真实在跑状态(owner_and_article, client, dispatcher_spy):
+    """幂等分支要回报**真实**状态，而不是复用非幂等分支的 "started"。
+
+    否则调用方无法区分「刚排上」和「已经在跑了」。
+    """
+    uid, aid = owner_and_article
+
+    r1 = await _start_by_article(client, uid, aid)
+    r2 = await _start_by_article(client, uid, aid)
+
+    assert r1.json()["task_id"] == r2.json()["task_id"]
+    assert r2.json()["job_id"] == "", "幂等分支不该凭空编一个 job_id"
+    assert r2.json()["status"] in (
+        "queued",
+        "running",
+    ), f"幂等分支应回报真实在跑状态，实际 {r2.json()['status']!r}"
+    assert r2.json()["quota_consumed"] is False, "幂等分支不该再报扣了配额"
