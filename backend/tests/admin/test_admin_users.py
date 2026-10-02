@@ -9,6 +9,7 @@
 不在本任务范围），admin_operation_logs（0009）到不了。测试用 ORM metadata
 幂等建本测试依赖的两张表（users / admin_operation_logs），不依赖 broken 迁移链。
 """
+
 import importlib.util
 import sys
 import uuid
@@ -83,7 +84,13 @@ async def test_list_users_default():
     # 字段映射：display_name=nickname, role=tier, status=active
     item = next(it for it in data["items"] if it["id"] == uid)
     assert item["display_name"] == "alice_default"
-    assert item["role"] == item["tier"] == "free"
+    # role 不是独立字段：后端 user-service/main.py:873 是
+    #   role = tier if tier in {"admin","operator"} else "user"
+    # 所以 free 用户拿到的 role 是 "user" 而不是 "free"。
+    # 原来这里断言 role == tier，等于把「某个函数的输出 == 它的输入」
+    # 这个假想当成了契约 —— 既不成立，也不表达任何产品含义。
+    assert item["tier"] == "free"
+    assert item["role"] == "user"
     assert item["status"] == "active"
 
 
@@ -221,8 +228,8 @@ async def test_quota_adjust_reason_too_short():
 
 
 @pytest.mark.asyncio
-async def test_quota_adjust_non_positive():
-    """monthly_quota <= 0 -> 400。"""
+async def test_quota_adjust_negative_rejected():
+    """monthly_quota < 0 -> 400。"""
     target = await _make_user()
     admin = await _make_user(tier="admin")
     async with httpx.AsyncClient(
@@ -231,9 +238,31 @@ async def test_quota_adjust_non_positive():
         resp = await client.post(
             f"/api/v1/admin/users/{target}/quota-adjust",
             headers={"Authorization": f"Bearer {_token(admin)}"},
-            json={"monthly_quota": 0, "reason": "vip 客户补偿"},
+            json={"monthly_quota": -1, "reason": "vip 客户补偿"},
         )
     assert resp.status_code == 400
+
+
+async def test_quota_adjust_zero_is_allowed_on_purpose():
+    """monthly_quota == 0 是**合法值**，不是非法输入。
+
+    0 的语义是「额度耗尽、停用该用户」—— 后端 user-service/main.py 的校验
+    是 `if req.monthly_quota < 0`，并且跨端 E2E 实测就是靠调成 0 来停用用户的
+    （调高/停用都走这一个端点）。原来这里断言 0 返 400，那是这条规则改成
+    「< 0 才拒」之前的旧契约。
+    """
+    target = await _make_user()
+    admin = await _make_user(tier="admin")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=user_app), base_url="http://test"
+    ) as client:
+        resp = await client.post(
+            f"/api/v1/admin/users/{target}/quota-adjust",
+            headers={"Authorization": f"Bearer {_token(admin)}"},
+            json={"monthly_quota": 0, "reason": "违规停用该用户"},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["monthly_quota"] == 0
 
 
 @pytest.mark.asyncio

@@ -2089,13 +2089,56 @@ async def admin_delete_tag(
     return {"tag_id": tag_id, "name": tag_name, "deleted": True}
 
 
-@router.get("/api/v1/admin/distill-p95")
+class DistillStepStats(BaseModel):
+    """单个阶段的分位数。
+
+    p50/p95/p99 为 null 表示**超出监控量程**（样本全落在直方图 +Inf 桶），
+    与 count == 0（没跑过）含义完全不同：前者要调桶上界或改监控配置，
+    后者是没数据。UI 必须区分这两种「没有值」。
+
+    count / mean / upper_bound 是刻意补的：
+      count      —— 分位数基于几个样本算出来的，决定它可不可信（3 个样本
+                    算出的 P95 基本只是噪声）；
+      mean       —— _sum/_count 的精确均值，分位数不可解时它是唯一还
+                    准确的量（实测本机 step3_tts 均值 744.85s，而桶上界
+                    当时只到 600s，P50/P95/P99 全不可解）；
+      upper_bound—— 直方图最大有限桶上界，用来解释「为什么算不出来」。
+    """
+
+    p50: Optional[float] = None
+    p95: Optional[float] = None
+    p99: Optional[float] = None
+    count: int = 0
+    mean: Optional[float] = None
+    upper_bound: Optional[float] = None
+
+
+class DistillP95Response(BaseModel):
+    """GET /api/v1/admin/distill-p95 的响应。
+
+    之前这个端点**没有 response_model**，于是 OpenAPI 里 responses 是空的
+    （端点在 schema 里，但响应结构未描述）。后果是改契约时没有任何东西能
+    校验：这一版加了 count/mean/upper_bound，落盘的 schema 毫无反应，
+    只能靠人肉发现。这里补上模型，让契约显式且可核对。
+    """
+
+    cached: bool = False
+    by_step: dict[str, DistillStepStats] = {}
+    overall: DistillStepStats = DistillStepStats()
+    error: Optional[str] = None
+
+
+@router.get("/api/v1/admin/distill-p95", response_model=DistillP95Response)
 async def admin_distill_p95(
     user: dict = Depends(require_admin_or_operator),
 ):
     """蒸馏 P50/P95/P99 耗时（秒），从 ai-service Prometheus metrics 解析。
 
     用于 admin-web Dashboard 显示蒸馏性能。
+
+    overall 是 4 个阶段**同名分位数相加**的端到端近似（mean 则是各阶段均值
+    之和，由期望的线性性可知是精确的 E[端到端]）。任一阶段不可解时整体同样
+    返回 null —— 不能拿 3 步的数和冒充整体。
     """
     global _DISTILL_P95_CACHE, _DISTILL_P95_CACHE_TS
     import time as _t

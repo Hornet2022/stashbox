@@ -206,6 +206,63 @@
           "content-service",
           "api-gateway"
         ]
+      },
+      "post": {
+        "summary": "Admin Create Article",
+        "description": "运营手动录入文章（admin 全局视图用）。\n\n为什么必须有这个端点，而不是让后台复用 ``POST /api/v1/articles``：\n那个是**用户侧剪藏**入口，用 admin token 打过去会连带三件运营不想要的事：\n\n  1. ``quota_service.consume(db, uid)`` —— 扣的是**运营账号自己的**配额，\n     运营只是录一篇文章，配额却按用户剪藏的价扣；\n  2. ``_create_article(url, _uid(user), ...)`` —— 文章 owner 变成运营账号，\n     于是这条本该是「全站公共内容」的文章变成运营名下的私有文章，\n     在用户侧列表里只有运营自己看得到；\n  3. 语义上把「运营造内容」和「用户剪藏」混成同一类数据，后续按 owner 统计全失真。\n\n本端点：归属记 ``ANONYMOUS_USER_ID(0)``（与匿名剪藏同一约定）、\n**不扣配额**、写 admin 审计日志、照常派蒸馏。",
+        "operationId": "admin_create_article_api_v1_admin_articles_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddArticleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
       }
     },
     "/api/v1/admin/articles/{article_id}": {
@@ -520,7 +577,7 @@
     "/api/v1/admin/audit-log": {
       "get": {
         "summary": "Admin Audit Log",
-        "description": "v1 §3.6 审计日志查询（读 admin_operation_logs，CP3.6-A1）。\n\n查询参数：page / size / actor_id / action_type / from / to\n排序：created_at DESC；过滤：actor_id exact + action_type exact + 时间范围。",
+        "description": "v1 §3.6 审计日志查询（读 admin_operation_logs，CP3.6-A1）。\n\n查询参数：page / size / actor_id / action_type / from / to\n排序：created_at DESC；过滤：actor_id exact + action_type exact + 时间范围。\n\n⚠️ ``from_`` 必须带 ``alias=\"from\"``：``from`` 是 Python 关键字，FastAPI 默认\n直接拿形参名当 query 名，于是形参叫 from_ 时前端发 ``from`` 会被当**未知参数静默丢弃**。\n后果是「结束时间 to 生效、开始时间 from 不生效」—— 筛出来的结果里混着范围外的记录，\n却看起来像筛过了。审计场景下这比完全不筛更危险。",
         "operationId": "admin_audit_log_api_v1_admin_audit_log_get",
         "parameters": [
           {
@@ -576,7 +633,7 @@
             }
           },
           {
-            "name": "from_",
+            "name": "from",
             "in": "query",
             "required": false,
             "schema": {
@@ -588,7 +645,7 @@
                   "type": "null"
                 }
               ],
-              "title": "From "
+              "title": "From"
             }
           },
           {
@@ -781,7 +838,7 @@
     "/api/v1/admin/distill-p95": {
       "get": {
         "summary": "Admin Distill P95",
-        "description": "蒸馏 P50/P95/P99 耗时（秒），从 ai-service Prometheus metrics 解析。\n\n用于 admin-web Dashboard 显示蒸馏性能。",
+        "description": "蒸馏 P50/P95/P99 耗时（秒），从 ai-service Prometheus metrics 解析。\n\n用于 admin-web Dashboard 显示蒸馏性能。\n\noverall 是 4 个阶段**同名分位数相加**的端到端近似（mean 则是各阶段均值\n之和，由期望的线性性可知是精确的 E[端到端]）。任一阶段不可解时整体同样\n返回 null —— 不能拿 3 步的数和冒充整体。",
         "operationId": "admin_distill_p95_api_v1_admin_distill_p95_get",
         "parameters": [
           {
@@ -806,7 +863,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/DistillP95Response"
+                }
               }
             }
           },
@@ -1261,6 +1320,55 @@
         "summary": "Admin Export Subscriptions Csv",
         "description": "导出 subscriptions 全量（v1 §4.6.1）。\n\n[known issue] 本仓库 subscriptions 表尚未实现（无 ORM 模型 / 无 migration，\n本地 alembic 停在 0004），故表缺失时降级为「只回 header」的合法 CSV 而非 500\n—— 与 admin stats 对同样未实现的 orders 表的处理口径一致（见 _safe_revenue）。\n表落地后本端点无需改代码即自动生效。",
         "operationId": "admin_export_subscriptions_csv_api_v1_admin_export_subscriptions_csv_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/export/tags.csv": {
+      "get": {
+        "summary": "Admin Export Tags Csv",
+        "description": "导出 tags 全量（2026-10-02 补）。\n\n为什么补：admin-web 的标签管理页一直在调这个导出（``src/api/admin/csv.ts``\n的 ExportKind 含 'tags'），但**后端从来没实现过**，而 admin 段又不走网关的\n前缀 fallback —— 点了「导出标签」必然 404。更糟的是前端用\n``window.location.href`` 直链下载、绕过了 axios 拦截器，用户看到的是一个\n下载下来的 404 JSON 页面，且**没有任何报错提示**。",
+        "operationId": "admin_export_tags_csv_api_v1_admin_export_tags_csv_get",
         "parameters": [
           {
             "name": "authorization",
@@ -2294,7 +2402,7 @@
     "/api/v1/admin/tts/blind-test": {
       "post": {
         "summary": "Admin Tts Blind Test Setup",
-        "description": "发起盲测：同文本 × N provider 合成 + 随机隐藏映射。\n\n⚠️ CP3.8.0 现状：setup 为 mock 合成（fake url）——真 TTS 配额接入属后续；\n本端点先打通运营链路。盲测会话存进程内存（单 worker 前提，重启即失）。",
+        "description": "发起盲测：同文本 × N provider **真合成** + 随机隐藏映射。\n\n2026-10-02：setup 从 mock 假 URL 改成真调 TTS。原先它返回\n`https://tts-blind-test.example/...`，评测员听不到任何声音，逐条打的\n1-5 分在揭晓后全部作废 —— 功能上是废的。音频现在落到\n`/tmp/audio/blind-test/`，由 api-gateway 的 `/audio/*` 挂载出去可播。\n\n盲测会话存进程内存（单 worker 前提，重启即失）——这是为了不把 provider\n映射写进库里：写库就等于给评测员开了后门。",
         "operationId": "admin_tts_blind_test_setup_api_v1_admin_tts_blind_test_post",
         "parameters": [
           {
@@ -4546,7 +4654,7 @@
     "/api/v1/auth/token": {
       "post": {
         "summary": "Issue Token",
-        "description": "签发 JWT（mock：直接用传入 user_id）+ 配套 refresh_token。",
+        "description": "开发调试专用：直接用传入 user_id 签发 JWT。\n\n⚠️ 这是一个**无鉴权的后门** —— 任何能访问网关的人传任意 user_id 就能拿到\n该账号的有效 token。生产环境绝对不能开着。\n\n2026-10-02 审计发现：此端点原本是裸装饰器，无任何门控，实测在生产网关\n（:8100）上直接可用，等同于任意账号接管。已改为默认关闭。\n\n真正的登录走 user-service 的 `POST /api/v1/auth/wechat-login`\n（由 code 派生 open_id → 查/建 users 行 → 签发），安卓 App 已切到那条路径。\n\n本地调试要开：显式设 `STASHBOX_ALLOW_DEV_TOKEN=1`，且仅限非 prod 环境。\n两者缺一即 403 —— 单设 env 不足以在 prod 打开。",
         "operationId": "issue_token_api_v1_auth_token_post",
         "requestBody": {
           "content": {
@@ -4766,17 +4874,51 @@
     "/api/v1/callback/wechat-mp-message": {
       "post": {
         "summary": "Wechat Mp Message",
-        "description": "微信公众号服务号回调（v1 §11.2 CP2.5）。\n\n接收用户发给服务号的 URL → 路由 fetcher 抓正文 → 建文章 → 触发蒸馏。\n\n- 不需要 JWT（公众号回调，公众号已认证用户身份）\n- 不扣配额（匿名入口，等客户端登录后再扣）\n- 失败抛 BizException(2001=URL 不支持 / 2002=抓取失败)",
+        "description": "微信公众号服务号回调（v1 §11.2 CP2.5）。\n\n接收用户发给服务号的 URL → 路由 fetcher 抓正文 → 建文章 → 触发蒸馏。\n\n- **鉴权走共享密钥**（`X-Callback-Secret`，见 common/callback_auth.py）：\n  服务号回调没有用户 JWT，而这条路径**不扣配额**，所以它必须是全站最严的入口之一。\n  原实现只挂 `Depends(get_db)`，即无任何鉴权 —— 任意匿名请求 `text` 塞个 URL 就能\n  建文章 + 触发蒸馏，直接烧 LLM/TTS。注释里「公众号已认证用户身份」从未在代码中落地。\n- 不扣配额（匿名入口，等客户端登录后再扣）\n- 失败抛 BizException(2001=URL 不支持 / 2002=抓取失败)",
         "operationId": "wechat_mp_message_api_v1_callback_wechat_mp_message_post",
+        "parameters": [
+          {
+            "name": "X-Callback-Secret",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Callback-Secret"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
         "requestBody": {
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/WechatMpMessageRequest"
               }
             }
-          },
-          "required": true
+          }
         },
         "responses": {
           "200": {
@@ -4806,7 +4948,7 @@
     "/api/v1/distill/start": {
       "post": {
         "summary": "Distill Start",
-        "description": "按 article_id 触发蒸馏。\n\nCP-DISTILL-START-HARDEN（本轮修复的三个问题，都是实测出来的）：\n\n1) **越权**。原实现只信请求体里的 article_id/url，从不查 Article，\n   任何人拿到别人的 article_id 就能对其重跑蒸馏。实测：以 user 9277 的\n   token 对 user 1 名下的 art_wxSOP_verify_0001 调本端点返回 200。\n   现在查库校验归属，非本人 → 403（与 /articles/{id}/distill 同口径）。\n\n2) **不扣配额**。本端点从头到尾没碰过 quota_service，而\n   /articles/{id}/distill 扣。同一件事两条路径、两种计费口径。\n\n3) **破坏性复用**。文章已有蒸馏行时复用原行，并把 script_text / audio_url /\n   duration_sec / quality_score / tags 一律置空。实测把一篇 status=done、\n   有音频的真机在用文章打成了 status=queued，产物元数据全部丢失，且无法找回。\n   改为**保留旧产物**：重跑期间用户仍能听旧音频，worker 跑成功才覆盖。\n\nurl / title 一律取库里的值，不用请求体传的——传什么蒸馏什么，等于允许\n调用方把 A 文章的产物写到 B 上。\n\nCP-TTS-VOICE：**本端点同时是「用当前音色重新生成」的入口**，不另开新端点。\n理由是本项目已经吃过亏 —— 见上面第 2) 条：「同一件事两条路径、两种计费口径」。\n再加一个 `/re-distill` 只会重演：它要么不扣费（和这里不一致），要么重复扣费\n（用户点两次就少两次配额）。音色是合成期参数，worker 里\n`resolve_voice_for_user()` 会重新解析用户当前选的音色，所以重跑自然生效。",
+        "description": "按 article_id 触发蒸馏。\n\nCP-DISTILL-START-HARDEN（本轮修复的三个问题，都是实测出来的）：\n\n1) **越权**。原实现只信请求体里的 article_id/url，从不查 Article，\n   任何人拿到别人的 article_id 就能对其重跑蒸馏。实测：以 user 9277 的\n   token 对 user 1 名下的 art_wxSOP_verify_0001 调本端点返回 200。\n   现在查库校验归属，非本人 → 403（与 /articles/{id}/distill 同口径）。\n\n2) **不扣配额**。本端点从头到尾没碰过 quota_service，而\n   /articles/{id}/distill 扣。同一件事两条路径、两种计费口径。\n\n3) **破坏性复用**。文章已有蒸馏行时复用原行，并把 script_text / audio_url /\n   duration_sec / quality_score / tags 一律置空。实测把一篇 status=done、\n   有音频的真机在用文章打成了 status=queued，产物元数据全部丢失，且无法找回。\n   改为**保留旧产物**：重跑期间用户仍能听旧音频，worker 跑成功才覆盖。\n\nurl / title 一律取库里的值，不用请求体传的——传什么蒸馏什么，等于允许\n调用方把 A 文章的产物写到 B 上。\n\nCP-TTS-VOICE BUG#12：入队侧补幂等 —— 已有蒸馏行且处于 `queued` / `running`\n时不再入队，原样返回既有 task_id（见下方注释与\n`tests/ai/test_distill_start_idempotent.py`）。\n\nCP-TTS-VOICE：**本端点同时是「用当前音色重新生成」的入口**，不另开新端点。\n理由是本项目已经吃过亏 —— 见上面第 2) 条：「同一件事两条路径、两种计费口径」。\n再加一个 `/re-distill` 只会重演：它要么不扣费（和这里不一致），要么重复扣费\n（用户点两次就少两次配额）。音色是合成期参数，worker 里\n`resolve_voice_for_user()` 会重新解析用户当前选的音色，所以重跑自然生效。",
         "operationId": "distill_start_api_v1_distill_start_post",
         "parameters": [
           {
@@ -5758,7 +5900,8 @@
           }
         },
         "tags": [
-          "user-service"
+          "user-service",
+          "api-gateway"
         ]
       }
     },
@@ -6386,7 +6529,7 @@
     "/api/v1/users/me/quota/reset-monthly": {
       "post": {
         "summary": "Reset Quota Monthly",
-        "description": "手动触发月度重置（定时器见 quota_service.quota_reset_loop）。",
+        "description": "**全平台**月度重置：把**所有**用户的 quota_used 清零、quota_version+1。\n\n⚠️ 命名与语义不符是历史遗留：路径里的 ``me`` 有误导性，实际是全库操作。\n路径保留是为了不打断已存在的调用方，但鉴权必须是 admin —— 这是本函数的\n原实现只有 ``Depends(require_user)`` 时的真实后果：\n\n    quota_service.reset_monthly() 的 UPDATE 没有 User.id 过滤，\n    即任意登录用户 POST 一次即可把全平台配额清零 → 直接击穿 LLM/TTS 成本。\n\n定时器（quota_service.quota_reset_loop，每小时）才是常规路径，本端点只给\n运营在跨月后需要立刻生效时手动触发。",
         "operationId": "reset_quota_monthly_api_v1_users_me_quota_reset_monthly_post",
         "parameters": [
           {
@@ -7574,6 +7717,17 @@
             "type": "string",
             "title": "Source",
             "default": "web"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
           }
         },
         "type": "object",
@@ -8067,6 +8221,110 @@
           "status"
         ],
         "title": "D9AddResponse"
+      },
+      "DistillP95Response": {
+        "properties": {
+          "cached": {
+            "type": "boolean",
+            "title": "Cached",
+            "default": false
+          },
+          "by_step": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/DistillStepStats"
+            },
+            "type": "object",
+            "title": "By Step",
+            "default": {}
+          },
+          "overall": {
+            "$ref": "#/components/schemas/DistillStepStats",
+            "default": {
+              "count": 0
+            }
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          }
+        },
+        "type": "object",
+        "title": "DistillP95Response",
+        "description": "GET /api/v1/admin/distill-p95 的响应。\n\n之前这个端点**没有 response_model**，于是 OpenAPI 里 responses 是空的\n（端点在 schema 里，但响应结构未描述）。后果是改契约时没有任何东西能\n校验：这一版加了 count/mean/upper_bound，落盘的 schema 毫无反应，\n只能靠人肉发现。这里补上模型，让契约显式且可核对。"
+      },
+      "DistillStepStats": {
+        "properties": {
+          "p50": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "P50"
+          },
+          "p95": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "P95"
+          },
+          "p99": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "P99"
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count",
+            "default": 0
+          },
+          "mean": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean"
+          },
+          "upper_bound": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upper Bound"
+          }
+        },
+        "type": "object",
+        "title": "DistillStepStats",
+        "description": "单个阶段的分位数。\n\np50/p95/p99 为 null 表示**超出监控量程**（样本全落在直方图 +Inf 桶），\n与 count == 0（没跑过）含义完全不同：前者要调桶上界或改监控配置，\n后者是没数据。UI 必须区分这两种「没有值」。\n\ncount / mean / upper_bound 是刻意补的：\n  count      —— 分位数基于几个样本算出来的，决定它可不可信（3 个样本\n                算出的 P95 基本只是噪声）；\n  mean       —— _sum/_count 的精确均值，分位数不可解时它是唯一还\n                准确的量（实测本机 step3_tts 均值 744.85s，而桶上界\n                当时只到 600s，P50/P95/P99 全不可解）；\n  upper_bound—— 直方图最大有限桶上界，用来解释「为什么算不出来」。"
       },
       "FeedbackV2CreateRequest": {
         "properties": {

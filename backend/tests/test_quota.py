@@ -7,6 +7,7 @@ CP1.6 配额扣减事务 + Redis 缓存层 - pytest（6 个 case）。
 
 覆盖：happy path / 配额用尽 / 并发冲突 / 退还 / 缓存失效 / 缓存 miss。
 """
+
 import asyncio
 import importlib.util
 import sys
@@ -14,6 +15,7 @@ import uuid
 from pathlib import Path
 
 import httpx
+import pytest
 import redis
 import redis.asyncio
 from sqlalchemy import select
@@ -25,6 +27,14 @@ from stashbox.backend.common.models import User
 from stashbox.backend.common.redis_client import get_redis_pool
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
+
+# ai-service 的模块之间是平铺 import（main.py 里 `import dispatcher`），
+# 按文件路径加载 main.py 时不会把 ai-service 目录放进 sys.path，
+# 于是 `import dispatcher` 失败：ModuleNotFoundError: No module named 'dispatcher'。
+# content-service 恰好能加载是因为 main.py 自己会先处理 sys.path。
+_AI_DIR = BACKEND_DIR / "ai-service"
+if str(_AI_DIR) not in sys.path:
+    sys.path.insert(0, str(_AI_DIR))
 
 
 def _load_app(name: str, rel: str):
@@ -122,7 +132,10 @@ async def test_concurrent_consume_no_over_sell():
     uid, token = await new_user(monthly_quota=100)
     async with client(content_app, token) as c:
         responses = await asyncio.gather(
-            *[c.post("/api/v1/articles", json={"url": f"https://example.com/{i}"}) for i in range(100)]
+            *[
+                c.post("/api/v1/articles", json={"url": f"https://example.com/{i}"})
+                for i in range(100)
+            ]
         )
     success = sum(1 for r in responses if r.status_code == 200)
     assert success > 0
@@ -132,7 +145,18 @@ async def test_concurrent_consume_no_over_sell():
 # ---------------------------------------------------------------------------
 # 4. 退还：蒸馏失败 → quota_used-1
 # ---------------------------------------------------------------------------
-async def test_refund_on_distill_failure():
+async def test_redistill_does_not_double_charge():
+    """重蒸馏同一篇文章**不再重复扣配额**（幂等）。
+
+    背景：这条用例原来叫 test_refund_on_distill_failure，断言
+    `quota_consumed is True` 且 `quota_used == 2` —— 也就是要求重蒸时再扣一次。
+    那是 CP-DISTILL-DUP 修复之前的行为：那版实跑发现一篇蒸馏被完整跑了两遍
+    （相隔 163ms 入队两个 job），本机算力和 LLM 费用双倍、第一遍音频整个丢弃。
+    修法是 `already_charged = existed_da is not None or marked`，重蒸直接复用
+    原任务行、不再扣费。旧断言等于把那个 bug 钉死成了契约。
+
+    实测：submit 后 quota_used=1，重蒸返回 quota_consumed=False、quota_used 仍为 1。
+    """
     uid, token = await new_user(monthly_quota=5)
     r = await submit(token, "https://example.com/refund")
     assert r.status_code == 200, r.text
@@ -145,19 +169,33 @@ async def test_refund_on_distill_failure():
         )
         assert r.status_code == 200, r.text
         body = r.json()
-        assert body["status"] == "started" and body["quota_consumed"] is True
-        assert body["quota_used"] == 2  # 蒸馏本身再扣 1 次
+        assert body["status"] == "started"
+        # 关键断言：已扣过就不��再扣
+        assert body["quota_consumed"] is False
+        assert body["quota_used"] == 1
+    assert await db_quota_used(uid) == 1
 
-        # 等后台 mock 流水线跑完（4 步 × 2s）后失败 → 退还
-        for _ in range(40):
-            s = await c.get(f"/api/v1/distill/{body['task_id']}")
-            if s.json()["status"] == "failed":
-                break
-            await asyncio.sleep(0.5)
-        assert s.json()["status"] == "failed"
 
-    assert await db_quota_used(uid) == 1  # 退还 1 次
-    assert (await get_quota(uid, token))["quota_used"] == 1  # 缓存也失效了
+@pytest.mark.slow
+@pytest.mark.asyncio
+async def test_refund_on_distill_failure_NOT_COVERED():
+    """⚠️ **当前无法在单测里覆盖** —— 保留在此只为记录这个缺口。
+
+    蒸馏失败退款由 ai-service/tasks/distill_task.py::_refund_quota_once 承担
+    （带 Redis 锁 refund:{task_id}，每个 task 只退一次）。要测它必须让蒸馏
+    真的跑到 failed 态，但生产蒸馏早已改成 LangGraph agent + 真实 TTS 队列：
+    实测 20 秒后任务仍是 `pending`（真实 TTS 单篇约 12 分钟），原用例注释里
+    说的「mock 流水线 4 步 × 2s」早已不存在。
+
+    也就是说：**退款逻辑目前没有任何有效测试覆盖**。要补需要给
+    distill_task 注入一个可替换的流水线 seam（类似 admin_router 的
+    _fetch_ai_metrics 那样能 monkeypatch 的边界），否则只能靠真实跑一篇
+    失败文章来验证，那是分钟级且依赖 TTS 可用性的集成测试。
+
+    这里**故意不用 assert 去假装覆盖** —— 写一个断言 pending 的用例并叫它
+    「退款测试」，比没有测试更糟。修复方式：加 seam，然后把它改回真断言。
+    """
+    pytest.skip("需要 distill_task 的可注入 seam；见 docstring")
 
 
 # ---------------------------------------------------------------------------
