@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select, text
@@ -386,7 +386,7 @@ async def admin_audit_log(
     size: int = 20,
     actor_id: str | None = None,
     action_type: str | None = None,
-    from_: str | None = None,
+    from_: str | None = Query(default=None, alias="from"),
     to: str | None = None,
     user: dict = Depends(require_admin_or_operator),
     db: AsyncSession = Depends(get_db),
@@ -395,6 +395,11 @@ async def admin_audit_log(
 
     查询参数：page / size / actor_id / action_type / from / to
     排序：created_at DESC；过滤：actor_id exact + action_type exact + 时间范围。
+
+    ⚠️ ``from_`` 必须带 ``alias="from"``：``from`` 是 Python 关键字，FastAPI 默认
+    直接拿形参名当 query 名，于是形参叫 from_ 时前端发 ``from`` 会被当**未知参数静默丢弃**。
+    后果是「结束时间 to 生效、开始时间 from 不生效」—— 筛出来的结果里混着范围外的记录，
+    却看起来像筛过了。审计场景下这比完全不筛更危险。
     """
     page = max(page, 1)
     size = max(min(size, 100), 1)
@@ -470,13 +475,37 @@ class LLMConfigUpdate(BaseModel):
     base_url: str | None = None
 
 
+# 通用字段缺失时，按 provider 回落到它专属的 env 字段。
+# 与 app/services/llm/__init__.py 的 build_client 读法保持一致。
+_PROVIDER_MODEL_KEY = {"openai": "openai_llm_model", "qwen_vl": "qwen_vl_model"}
+_PROVIDER_BASE_KEY = {"openai": "openai_llm_base_url", "qwen_vl": "qwen_vl_base_url"}
+_PROVIDER_KEY = {"openai": "openai_llm_api_key", "qwen_vl": "qwen_vl_api_key"}
+
+
 def _masked_llm_config(config: dict, source: str, updated_at: str | None) -> dict:
-    """把完整配置（含明文 api_key）转成可出网的响应体。"""
-    api_key = config.get("api_key") or ""
+    """把完整配置（含明文 api_key）转成可出网的响应体。
+
+    2026-10-02 修 KeyError: 'model'。
+
+    原来这里是 ``config["model"]`` 硬索引，但 ``_env_config()`` 只产出
+    ``openai_llm_model`` / ``qwen_vl_model`` 这类 **provider 专属** 字段，
+    通用 ``model`` 键只有当 system_config 表里配过才会有。而该表在新部署下
+    是空的 → 回落 env → 没有 ``model`` → KeyError → 整个 GET 500。
+
+    后果不是"少显示一个字段"：**运营在后台打不开 LLM 配置页**，
+    既看不到当前用的哪个模型，也没法改。改法是按 provider 回落到专属字段，
+    与 build_client 的读法一致。
+    """
+    provider = str(config.get("provider") or "mock").lower()
+    api_key = config.get("api_key") or config.get(_PROVIDER_KEY.get(provider, ""), "")
     return {
-        "provider": config["provider"],
-        "model": config["model"],
-        "base_url": config.get("base_url") or None,
+        "provider": provider,
+        "model": config.get("model")
+        or config.get(_PROVIDER_MODEL_KEY.get(provider, ""), "")
+        or None,
+        "base_url": config.get("base_url")
+        or config.get(_PROVIDER_BASE_KEY.get(provider, ""), "")
+        or None,
         "api_key_set": bool(api_key),
         "api_key_last4": api_key[-4:] if api_key else None,
         "source": source,  # db = 表里配了；env = 回落环境变量/默认值

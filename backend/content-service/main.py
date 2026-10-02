@@ -72,6 +72,7 @@ from stashbox.backend.common.config import settings
 from stashbox.backend.common.tts_voice_service import get_voice_briefs
 from stashbox.backend.common.auth import create_access_token, require_user, require_user_optional
 from stashbox.backend.common.auth_admin import require_admin_or_operator
+from stashbox.backend.common.callback_auth import require_callback_secret
 from stashbox.backend.common.database import AsyncSessionLocal, get_db
 from stashbox.backend.common.exceptions import (
     BizException,
@@ -82,6 +83,7 @@ from stashbox.backend.common.exceptions import (
 from stashbox.backend.common.logging import get_logger, setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
 from stashbox.backend.common.models import (
+    AdminOperationLog,
     Article,
     DistilledArticle,
     Favorite,
@@ -547,6 +549,72 @@ async def submit_article(
         "quota_used": quota["quota_used"],
         "monthly_quota": quota["monthly_quota"],
         "remaining": quota["monthly_quota"] - quota["quota_used"],
+    }
+
+
+@app.post("/api/v1/admin/articles")
+async def admin_create_article(
+    req: AddArticleRequest,
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """运营手动录入文章（admin 全局视图用）。
+
+    为什么必须有这个端点，而不是让后台复用 ``POST /api/v1/articles``：
+    那个是**用户侧剪藏**入口，用 admin token 打过去会连带三件运营不想要的事：
+
+      1. ``quota_service.consume(db, uid)`` —— 扣的是**运营账号自己的**配额，
+         运营只是录一篇文章，配额却按用户剪藏的价扣；
+      2. ``_create_article(url, _uid(user), ...)`` —— 文章 owner 变成运营账号，
+         于是这条本该是「全站公共内容」的文章变成运营名下的私有文章，
+         在用户侧列表里只有运营自己看得到；
+      3. 语义上把「运营造内容」和「用户剪藏」混成同一类数据，后续按 owner 统计全失真。
+
+    本端点：归属记 ``ANONYMOUS_USER_ID(0)``（与匿名剪藏同一约定）、
+    **不扣配额**、写 admin 审计日志、照常派蒸馏。
+    """
+    _validate_url(req.url)
+    art = await _create_article(
+        req.url,
+        ANONYMOUS_USER_ID,
+        req.source,
+        req.title,
+        db,
+        event=EventName.ARTICLE_SUBMIT,
+    )
+    # 记审计：这条是 admin 写操作，不能只靠 AuditMiddleware（它只挂在网关上，
+    # 直连 content-service:8102 绕过网关时不会有记录 —— 见 plist 绑定收紧的说明）。
+    db.add(
+        AdminOperationLog(
+            admin_tier=str(user.get("tier", "admin")),
+            action="ADMIN_CREATE_ARTICLE",
+            target_type="article",
+            target_id=str(art.id),
+            reason="admin 手动录入文章",
+            method="POST",
+            path="/api/v1/admin/articles",
+            request_body={"url": req.url, "source": req.source, "title": req.title},
+        )
+    )
+    await db.commit()
+
+    task_id = None
+    try:
+        trigger_result = await get_ai_client().trigger_distill(
+            article_id=art.id,
+            auth_token=create_access_token(str(art.user_id)),
+        )
+        task_id = (trigger_result or {}).get("task_id")
+    except Exception as exc:  # 蒸馏派发失败不该让录入回滚
+        log.warning(
+            "admin_create_article_distill_failed", extra={"article_id": art.id, "error": str(exc)}
+        )
+
+    return {
+        "article_id": art.id,
+        "url": art.url,
+        "status": art.status,
+        "task_id": task_id,
     }
 
 
@@ -1743,12 +1811,19 @@ async def clawbot_message(
 
 
 @app.post("/api/v1/callback/wechat-mp-message")
-async def wechat_mp_message(req: WechatMpMessageRequest, db: AsyncSession = Depends(get_db)):
+async def wechat_mp_message(
+    req: WechatMpMessageRequest,
+    callback_secret: str = Depends(require_callback_secret),
+    db: AsyncSession = Depends(get_db),
+):
     """微信公众号服务号回调（v1 §11.2 CP2.5）。
 
     接收用户发给服务号的 URL → 路由 fetcher 抓正文 → 建文章 → 触发蒸馏。
 
-    - 不需要 JWT（公众号回调，公众号已认证用户身份）
+    - **鉴权走共享密钥**（`X-Callback-Secret`，见 common/callback_auth.py）：
+      服务号回调没有用户 JWT，而这条路径**不扣配额**，所以它必须是全站最严的入口之一。
+      原实现只挂 `Depends(get_db)`，即无任何鉴权 —— 任意匿名请求 `text` 塞个 URL 就能
+      建文章 + 触发蒸馏，直接烧 LLM/TTS。注释里「公众号已认证用户身份」从未在代码中落地。
     - 不扣配额（匿名入口，等客户端登录后再扣）
     - 失败抛 BizException(2001=URL 不支持 / 2002=抓取失败)
     """

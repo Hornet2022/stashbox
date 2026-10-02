@@ -453,7 +453,18 @@ async def distill_article(
     marked = await cache_service.has_article_quota(article_id)
     already_charged = existed_da is not None or marked
     quota_used = None
-    if not already_charged:
+    # 系统/公共内容不计入用户配额。
+    #
+    # user_id=0 是 content-service 的 ANONYMOUS_USER_ID，承载两类不该计费的内容：
+    #   1. 匿名 D9 剪藏（d9_add_article，注释明写「匿名不计费」）
+    #   2. 运营在后台手动录入的文章（POST /api/v1/admin/articles）
+    # 而 users 表里 id=0 那行的 monthly_quota=0，于是 quota_service._apply 的
+    # `used + delta > monthly`（0+1 > 0）必然成立 → QuotaExceededError(3001)。
+    # 结果：这两类文章**永远派不出蒸馏任务**，卡在 pending 没人推。
+    # 这里显式跳过计量，而不是去改 users 表 —— 把"不收费"编码在计费点上，
+    # 比依赖某个哨兵行的数值更不容易被下次改配置时踩坏。
+    is_system_content = uid == 0
+    if not already_charged and not is_system_content:
         quota = await quota_service.consume(db, uid)  # 用尽抛 3001
         quota_used = quota["quota_used"]
         await cache_service.mark_article_quota(article_id)

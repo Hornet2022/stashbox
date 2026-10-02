@@ -11,6 +11,7 @@
 
 依赖真实 PG（/tmp:5432）+ alembic upgrade head（0009）。
 """
+
 import pytest
 from sqlalchemy import select
 
@@ -76,7 +77,9 @@ async def test_retry_already_pending_returns_409(fake_ai_client):
         resp = await c.post(f"/api/v1/articles/{art_id}/retry")
 
     assert resp.status_code == 409
-    assert "pending" in resp.json()["detail"]
+    # 注意：裸 HTTPException(detail=...) 会被 common/exceptions.register_exception_handlers
+    # （F2 接口一致性改造）统一包成 {code, message, data}，所以断言 message 而不是 detail。
+    assert "pending" in resp.json()["message"]
 
 
 @pytest.mark.asyncio
@@ -89,7 +92,9 @@ async def test_retry_already_ready_returns_409(fake_ai_client):
         resp = await c.post(f"/api/v1/articles/{art_id}/retry")
 
     assert resp.status_code == 409
-    assert "ready" in resp.json()["detail"]
+    # 注意：裸 HTTPException(detail=...) 会被 common/exceptions.register_exception_handlers
+    # （F2 接口一致性改造）统一包成 {code, message, data}，所以断言 message 而不是 detail。
+    assert "ready" in resp.json()["message"]
 
 
 @pytest.mark.asyncio

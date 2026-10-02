@@ -88,6 +88,11 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 60 * 24 * 7
     jwt_refresh_expire_minutes: int = 60 * 24 * 30  # refresh token 有效期 30 天（rotate 用）
 
+    # 第三方回调（微信公众号服务号 / clawbot 等）的共享密钥。
+    # 空 = 未配置 → 回调端点一律 503 拒绝（fail-closed），见 common/callback_auth.py。
+    # 这类回调没有用户 JWT 可校验，历史上就是裸奔的匿名建文章入口。
+    callback_shared_secret: str = ""
+
     user_service_url: str = "http://user-service:8001"
     content_service_url: str = "http://content-service:8002"
     ai_service_url: str = "http://ai-service:8003"

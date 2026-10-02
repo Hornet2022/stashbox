@@ -199,6 +199,15 @@ ROUTES: list[Route] = [
         "content-service",
         _url("content-service"),
     ),
+    # 运营手动录入文章：挂在 admin 命名空间下，明确不扣配额、不记在运营名下。
+    # 不能让后台复用 POST /api/v1/articles —— 那是用户侧剪藏入口，会扣运营自己配额
+    # 并把文章 owner 设成运营账号。
+    Route(
+        "POST",
+        "/api/v1/admin/articles",
+        "content-service",
+        _url("content-service"),
+    ),
     Route(
         "GET",
         "/api/v1/admin/articles/{article_id}",

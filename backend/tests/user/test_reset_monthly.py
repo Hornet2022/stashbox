@@ -12,6 +12,7 @@ CP1.6 把 `datetime.now(timezone.utc)`（tz-aware）写进 `users.quota_reset_at
 
 前置：本机 PG 5432 + Redis 6379 已起，且已 `alembic upgrade head`。
 """
+
 import importlib.util
 import sys
 import uuid
@@ -42,20 +43,27 @@ def _load_app(name: str, rel: str):
 user_app = _load_app("_cp173_reset_user_main", "user-service/main.py")
 
 
-async def new_user_with_usage(used: int = 3, monthly_quota: int = 5) -> tuple[int, str]:
-    """建一个已消耗配额的测试用户，返回 (user_id, JWT)。"""
+async def new_user_with_usage(
+    used: int = 3, monthly_quota: int = 5, tier: str = "admin"
+) -> tuple[int, str]:
+    """建一个已消耗配额的测试用户，返回 (user_id, JWT)。
+
+    tier 默认 "admin"：本文件前三个用例测的是**重置机制**（清零/naive 时间/幂等），
+    与鉴权无关；而端点自 2026-10 起是 admin-only（见文件末尾的安全回归），
+    用 free 用户会全部 403。鉴权本身由 ``test_regular_user_is_rejected`` 单独覆盖。
+    """
     async with AsyncSessionLocal() as session:
         user = User(
             open_id="cp173_" + uuid.uuid4().hex[:24],
             nickname="pytest",
-            tier="free",
+            tier=tier,
             monthly_quota=monthly_quota,
             quota_used=used,
         )
         session.add(user)
         await session.commit()
         await session.refresh(user)
-        return int(user.id), create_access_token(str(user.id))
+        return int(user.id), create_access_token(str(user.id), extra={"tier": tier})
 
 
 def client(token: str) -> httpx.AsyncClient:
@@ -157,3 +165,44 @@ async def test_quota_endpoint_reflects_reset_after_cache_invalidation():
     after = await get_quota(token)
     assert after["quota_used"] == 0  # 不是缓存里的旧值 3
     assert after["remaining"] == after["monthly_quota"]
+
+
+# ---------------------------------------------------------------------------
+# 5. 安全回归：普通用户不能触发全平台重置（2026-10 修）
+#
+# 端点路径叫 /users/me/quota/reset-monthly，读起来像"重置我的配额"，
+# 但 quota_service.reset_monthly() 的 UPDATE 没有 User.id 过滤，是**全库**操作。
+# 原实现只挂 require_user → 任意登录用户 POST 一次即清零全平台配额，
+# 而这条路径明确不扣配额（重建文章 + 触发蒸馏），等于直接烧 LLM/TTS 成本。
+# user-service 绑 0.0.0.0，局域网可直连 8101 绕过网关触发（网关路由表不含此路径）。
+#
+# 本用例是**负向测试**：断言守卫真的会拦，而不是只验证它没坏。
+# ---------------------------------------------------------------------------
+async def test_regular_user_is_rejected():
+    victim_uid, _victim_token = await new_user_with_usage(used=77, tier="free")
+    _attacker_uid, attacker_token = await new_user_with_usage(used=5, tier="free")
+
+    async with client(attacker_token) as c:
+        r = await c.post(RESET_URL)
+
+    assert r.status_code == 403, f"普通用户竟然能触发重置：{r.status_code} {r.text}"
+    used, _version, _ = await db_user(victim_uid)
+    assert used == 77, f"受害者配额被清零了（{used}）—— 漏洞没修干净"
+
+
+async def test_operator_is_also_rejected():
+    """operator 也放行 —— 只有 admin 能做全平台级操作。"""
+    _uid, token = await new_user_with_usage(used=1, tier="operator")
+    async with client(token) as c:
+        r = await c.post(RESET_URL)
+    assert r.status_code == 403, f"operator 不该能触发全平台重置：{r.status_code} {r.text}"
+
+
+async def test_admin_reset_is_platform_wide_and_says_so():
+    """admin 放行，且响应显式声明作用域 —— 名字叫 me 实际是全平台，不能再含糊。"""
+    uid, token = await new_user_with_usage(used=9)  # tier=admin
+    async with client(token) as c:
+        r = await c.post(RESET_URL)
+    assert r.status_code == 200, r.text
+    assert r.json()["scope"] == "all_users"
+    assert (await db_user(uid))[0] == 0

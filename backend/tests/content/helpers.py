@@ -50,19 +50,24 @@ class FakeAIClient:
         }
 
 
-async def new_user(monthly_quota: int = 5) -> tuple[int, str]:
-    """建一个测试用户，返回 (user_id, JWT)。"""
+async def new_user(monthly_quota: int = 5, tier: str = "free") -> tuple[int, str]:
+    """建一个测试用户，返回 (user_id, JWT)。
+
+    tier 可选：admin/operator 场景要用真 token（payload 里要带 tier 声明），
+    且 users 行必须真实存在 —— tags.creator_id / tag_subscriptions.user_id 上有
+    外键指向 users.id，用不存在的假 id 会直接 ForeignKeyViolation。
+    """
     async with AsyncSessionLocal() as session:
         user = User(
             open_id="cp17_" + uuid.uuid4().hex[:24],
             nickname="pytest",
-            tier="free",
+            tier=tier,
             monthly_quota=monthly_quota,
         )
         session.add(user)
         await session.commit()
         await session.refresh(user)
-        return int(user.id), create_access_token(str(user.id))
+        return int(user.id), create_access_token(str(user.id), extra={"tier": tier})
 
 
 def client(token: str | None = None, **extra_headers) -> httpx.AsyncClient:

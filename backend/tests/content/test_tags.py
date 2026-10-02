@@ -9,7 +9,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, select, text
 
-from helpers import content_main
+from helpers import content_main, new_user
 from stashbox.backend.common.database import AsyncSessionLocal
 from stashbox.backend.common.models import Tag, TagSubscription
 
@@ -65,7 +65,10 @@ async def test_tag_subscriptions_table_exists():
 async def test_admin_create_tag():
     """admin create 端点：mock user 创 tag（幂等 slug → 409）"""
     slug = _unique_slug()
-    mock_user = {"id": 999, "sub": "999", "tier": "admin"}
+    # 原来这里写死 {"id": 999, ...}，但 tags.creator_id 有外键指向 users.id，
+    # users 表里并没有 999 → ForeignKeyViolation（test_admin_create_tag 长期红）。
+    admin_id, _ = await new_user(tier="admin")
+    mock_user = {"id": admin_id, "sub": str(admin_id), "tier": "admin"}
 
     with _override_auth("require_admin_or_operator", mock_user):
         transport = ASGITransport(app=content_main.app)
@@ -90,7 +93,10 @@ async def test_admin_create_tag():
 async def test_admin_create_tag_duplicate_409():
     """重复 slug → 409"""
     slug = _unique_slug()
-    mock_user = {"id": 999, "sub": "999", "tier": "admin"}
+    # 原来这里写死 {"id": 999, ...}，但 tags.creator_id 有外键指向 users.id，
+    # users 表里并没有 999 → ForeignKeyViolation（test_admin_create_tag 长期红）。
+    admin_id, _ = await new_user(tier="admin")
+    mock_user = {"id": admin_id, "sub": str(admin_id), "tier": "admin"}
 
     # 创建第一个
     with _override_auth("require_admin_or_operator", mock_user):
@@ -112,7 +118,7 @@ async def test_admin_create_tag_duplicate_409():
 async def test_user_subscribe_tag_idempotent():
     """subscribe 端点：幂等（重复订阅返 already_subscribed）+ 写 tag_subscriptions"""
     slug = _unique_slug()
-    user_id = 1001
+    user_id, _tok = await new_user()
 
     # 先建一个 tag
     async with AsyncSessionLocal() as s:
@@ -167,7 +173,7 @@ async def test_user_subscribe_tag_idempotent():
 async def test_user_unsubscribe_tag_idempotent():
     """unsubscribe 端点：幂等（本来没订阅也返 already_unsubscribed）+ 删 tag_subscriptions"""
     slug = _unique_slug()
-    user_id = 1002
+    user_id, _tok = await new_user()
 
     # 先建一个 tag
     async with AsyncSessionLocal() as s:

@@ -17,10 +17,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+
+from stashbox.backend.common.ssrf import SsrfBlocked, assert_public_url
 
 from .base import (
     FetchResult,
@@ -28,6 +31,7 @@ from .base import (
     FetcherError,
     FetcherErrorCode,
 )
+
 from .parser import (
     MAX_HTML_CHARS,
     MIN_TEXT_DENSITY,
@@ -37,6 +41,21 @@ from .parser import (
     TimeExtractor as _TimeExtractor,
     TitleExtractor as _TitleExtractor,
 )
+
+
+async def _ssrf_request_hook(request: httpx.Request) -> None:
+    """把 SsrfBlocked 翻成 httpx 能识别的异常类型，让 fetcher 的错误分支接住。
+
+    必须写成 async：httpx 的 AsyncClient 会 ``await hook(request)``，传同步函数
+    会直接 TypeError（同步 Client 不 await，所以这个区别很容易踩）。
+
+    DNS 解析（socket.getaddrinfo）是阻塞调用，放进 to_thread 免得把事件循环卡住。
+    """
+    try:
+        await asyncio.to_thread(assert_public_url, str(request.url))
+    except SsrfBlocked as exc:
+        raise httpx.RequestError(f"blocked target: {exc}", request=request) from exc
+
 
 _HTML_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})  # 本模块专属，不进 parser
 
@@ -74,10 +93,20 @@ class GenericURLFetcher(Fetcher):
                 source=self.name,
             )
 
+        # SSRF 防护全部交给下面 client_kwargs 里的 event_hooks。
+        # 刻意**不**在这里再做一次前置校验：实测 httpx 0.28.1 的 request hook 在
+        # 首个请求之前就会触发（不只是重定向跳），所以前置校验是纯冗余 ——
+        # 而冗余的防护如果没有任何测试覆盖，就等于给后来人一个「已经校验过了」的
+        # 错觉，正是本项目反复吃过亏的那类假守卫。单一拦截点 = 单一可测事实。
+
         # 1. HTTP 抓取
         client_kwargs: dict[str, Any] = {
             "timeout": timeout,
             "follow_redirects": True,
+            # SSRF 兜底：request hook 在每次请求**发出之前**触发，且重定向每一跳都会重新
+            # 触发（实测 httpx 0.28.1 行为，见 common/ssrf.py 顶部时序记录）。
+            # 只做前置校验的话，一个 302 就能把白名单绕过到 127.0.0.1。
+            "event_hooks": {"request": [_ssrf_request_hook]},
             # CP9.x fix：trust_env=False 防止 HTTP_PROXY 把本机/内网请求拐去系统代理而失败
             "trust_env": False,
             "headers": {

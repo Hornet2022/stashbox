@@ -55,8 +55,11 @@ class WorkerSettings:
 
         from prometheus_client import start_http_server
 
+        # addr 必须显式给 127.0.0.1：不传时 prometheus_client 绑 0.0.0.0，
+        # 8104 是**无鉴权**的指标口，局域网内任何设备都能读走队列深度/延迟/错误率。
+        # 本机采集（同机 curl / 未来的 exporter）走回环即可。
         try:
-            start_http_server(8104)
+            start_http_server(8104, addr="127.0.0.1")
         except Exception:
             pass
 
@@ -66,7 +69,7 @@ def main():
     # CP11.0.3: 启动独立的 metrics HTTP server，让 distill histogram counter 可被 ai-service 抓到
     # worker 进程有自己的 Prometheus registry（与 FastAPI 进程隔离），需独立端口
     try:
-        start_http_server(8104)
+        start_http_server(8104, addr="127.0.0.1")
     except Exception:
         pass
     asyncio.run(run_worker(WorkerSettings))

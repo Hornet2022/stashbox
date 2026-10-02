@@ -35,7 +35,7 @@ from stashbox.backend.common.exceptions import (
 )
 from stashbox.backend.common.logging import setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
-from stashbox.backend.common.auth_admin import require_admin_or_operator
+from stashbox.backend.common.auth_admin import require_admin, require_admin_or_operator
 from stashbox.backend.common.models import User
 from stashbox.backend.common.models.admin_operation_log import AdminOperationLog
 from stashbox.backend.common.models.push_notification import PushNotification
@@ -436,13 +436,24 @@ async def get_my_quota(user: dict = Depends(require_user), db: AsyncSession = De
 
 @app.post("/api/v1/users/me/quota/reset-monthly")
 async def reset_quota_monthly(
-    user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+    user: dict = Depends(require_admin), db: AsyncSession = Depends(get_db)
 ):
-    """手动触发月度重置（定时器见 quota_service.quota_reset_loop）。"""
+    """**全平台**月度重置：把**所有**用户的 quota_used 清零、quota_version+1。
+
+    ⚠️ 命名与语义不符是历史遗留：路径里的 ``me`` 有误导性，实际是全库操作。
+    路径保留是为了不打断已存在的调用方，但鉴权必须是 admin —— 这是本函数的
+    原实现只有 ``Depends(require_user)`` 时的真实后果：
+
+        quota_service.reset_monthly() 的 UPDATE 没有 User.id 过滤，
+        即任意登录用户 POST 一次即可把全平台配额清零 → 直接击穿 LLM/TTS 成本。
+
+    定时器（quota_service.quota_reset_loop，每小时）才是常规路径，本端点只给
+    运营在跨月后需要立刻生效时手动触发。
+    """
     n = await quota_service.reset_monthly(db)
-    # CP6.2.1 埋点：quota_reset
+    # CP6.2.1 埋点：quota_reset（记录实际操作人）
     await track_simple(db, EventName.QUOTA_RESET, int(user["sub"]), "n/a")
-    return {"reset_users": n}
+    return {"reset_users": n, "scope": "all_users"}
 
 
 @app.post("/api/v1/users/me/onboarding/start")
@@ -947,7 +958,9 @@ async def admin_quota_adjust(
     try:
         await cache_service.invalidate_quota(user_id, new_version)
     except Exception as exc:  # pragma: no cover - 缓存是加速层，不是正确性来源
-        log.warning("QUOTA_CACHE_INVALIDATE_FAILED user=%s ver=%s err=%s", user_id, new_version, exc)
+        log.warning(
+            "QUOTA_CACHE_INVALIDATE_FAILED user=%s ver=%s err=%s", user_id, new_version, exc
+        )
 
     return UserQuotaResponse(
         id=target.id,

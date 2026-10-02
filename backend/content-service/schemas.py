@@ -11,6 +11,11 @@ from pydantic import BaseModel
 class AddArticleRequest(BaseModel):
     url: str
     source: str = "web"  # wechat | douyin | web | pdf | d9 | clawbot
+    # 运营手动录入时会传标题。之前这里**没有**这个字段，而 admin-web 的
+    # createArticle 一直在 body 里带 title —— Pydantic 默认忽略未声明字段，
+    # 于是标题被静默丢弃，运营填完看到"创建成功"但库里没有标题。
+    # 保持 optional：老客户端不传时行为不变（走 fetcher 抓标题）。
+    title: Optional[str] = None
 
 
 class TTSVoiceBrief(BaseModel):
