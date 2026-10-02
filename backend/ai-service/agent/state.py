@@ -6,6 +6,8 @@ LangGraph 自动 merge 到 State 上（reducer 默认覆盖）。
 设计要点：
   - 必填字段：article_id / user_id / current_step / status
   - 上下文：fetched_content / rewritten_script / tts_audio_url / final_audio_url
+  - 改写结构：rewrite_hook / rewrite_sections / rewrite_outro
+    （CP-AGENT-REWRITE-STRUCTURED：LLM 回 JSON，代码拼整稿并保证段落边界）
   - 决策：next_action（让 Phase 3 的 LLM router 写，节点读取决定走哪条边）
   - 错误：error / error_step / error_kind（CP-LLM-TEST-ERR / CP-TTS-TEST-ERR 兼容）
   - 工具结果：tool_results（list[dict]）
@@ -33,7 +35,13 @@ class AgentState(TypedDict, total=False):
     # === 上下文：节点产出 ===
     fetched_content: Optional[str]  # step1 fetch_url 拿到的原文 markdown
     fetched_meta: Optional[dict[str, Any]]  # 标题/作者/发布时间/字数
-    rewritten_script: Optional[str]  # step2 LLM 改写后的听感稿
+    rewritten_script: Optional[str]  # step2 LLM 改写后的听感稿（整稿，段落边界 = \n\n）
+    # CP-AGENT-REWRITE-STRUCTURED：LLM 按 JSON 契约回 {hook, sections, outro}，
+    # 解析后原样存这三项。`rewritten_script` 是我们按这三项拼的，段落边界
+    # 由代码保证 —— 下游 few-shot 入池取 `split("\n\n",1)[0]` 拿到的才是 hook。
+    rewrite_hook: Optional[str]
+    rewrite_sections: Optional[list[str]]
+    rewrite_outro: Optional[str]
     rewrite_quality_score: Optional[float]
     rewrite_tags: Optional[list[str]]
     tts_audio_url: Optional[str]  # step3 TTS 合成音频 OSS URL

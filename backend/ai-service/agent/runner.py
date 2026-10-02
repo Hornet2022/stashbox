@@ -18,9 +18,12 @@ Phase 2（当前）已经把 fetch_url / tts_synthesize 抽成 ToolRegistry 调�
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
+import re
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -150,30 +153,43 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
         # 不能 await —— 之前多写 await 导致生产报 "can't be used in 'await' expression"。
         llm = _llm_module.get_llm_client()
 
-        base_prompt = (
-            f"请把以下原文改写成一篇适合通勤收听的「听感稿」，"
-            f"约 800-1200 字，保留关键事实与数据。\n\n"
-            f"# 原文\n{fetched_content}"
-        )
+        prompt = _rewrite_prompt(fetched_content)
 
         # Phase 2：memory 注入（如果有 store + profile）
         if user_profile or few_shot_examples:
             # Note: MemoryStore 实例化依赖 session_factory；这里用延迟注入模式
             # —— runner 调用方注入（避免 agent 模块依赖 DB 配置）。
-            prompt = _maybe_inject_memory(state, base_prompt)
-        else:
-            prompt = base_prompt
+            prompt = _maybe_inject_memory(state, prompt)
 
-        script = await _chat_text(
+        raw = await _chat_text(
             llm,
             prompt,
+            system_prompt=_REWRITE_SYSTEM,
             step="agent_rewrite",
             task_id=state.get("trace_id", ""),
         )
-        # 真实实现：从 script 提取 quality_score + tags
-        # Phase 1 简化：score=None，tags=[]
+        # 结构化解析（CP-AGENT-REWRITE-STRUCTURED）：LLM 必须回 JSON
+        # {hook, sections, outro}，这样 script_text 的段落边界才是可靠的。
+        parts = _parse_rewrite(raw)
+        log.info(
+            "agent_rewrite_parsed hook=%dB sections=%d outro=%dB fallback=%s",
+            len(parts.hook),
+            len(parts.sections),
+            len(parts.outro),
+            parts.degraded,
+        )
+        if not parts.script.strip():
+            return _error_update(
+                state,
+                "rewrite",
+                ToolError("llmerr", "LLM 改写返回空内容"),
+            )
         return {
-            "rewritten_script": script,
+            "rewritten_script": parts.script,
+            # 结构化字段单独存：入池取 hook、下游要 outro 都不用再切字符串
+            "rewrite_hook": parts.hook,
+            "rewrite_sections": parts.sections,
+            "rewrite_outro": parts.outro,
             "rewrite_quality_score": None,
             "rewrite_tags": [],
             # CP-AGENT-PASSTHROUGH：LangGraph 默认 reducer 不一定保留
@@ -565,6 +581,175 @@ def _error_update(state: AgentState, step: str, err: ToolError) -> dict[str, Any
         "retry_after": err.retry_after,
         "finished_at": _now(),
     }
+
+
+# ---------------------------------------------------------------------------
+# 改写：结构化输出契约（CP-AGENT-REWRITE-STRUCTURED）
+# ---------------------------------------------------------------------------
+#
+# 为什么必须结构化（2026-10-02 端到端自测挖出）：
+#
+#   下游 `evaluation_service.submit_user_evaluation` 用
+#   `script_text.split("\n\n", 1)[0]` 取 hook 入 few-shot 池，
+#   这条假设只在「script_text = hook \n\n sections \n\n outro」时成立。
+#
+#   但 agent 的 prompt 曾经是一句「改写成听感稿」，让 LLM 自由输出纯文本。
+#   LLM 于是照着原文风格带出了音效标注，script_text 变成：
+#
+#       （轻松开场音乐淡出）
+#
+#       哈喽各位正在通勤路上的朋友，今天咱们来聊聊…
+#
+#   `split("\n\n")[0]` 拿到的就是那行音效标注。于是**用户给优质开场白打了
+#   4 分，系统把音效标注当「高分改写范例」存进池子**喂给后续所有改写。
+#   实测池里唯一一条就是 `（轻松开场音乐淡出）`。
+#
+#   旧的 `distill/prompts.py:STEP2_SYSTEM` 本来就定义了 JSON 契约
+#   （hook/sections/outro/word_count），是 agent 换 prompt 时把这个契约丢了。
+#   这里把它捡回来，并保留容错：LLM 不听话时降级成「整段当正文」，
+#   宁可 hook 语义不完美，也不能让音效标注被当成范例。
+
+_REWRITE_SYSTEM = """你是一个中文播客主理人。任务：把原文改写成适合通勤收听的播客稿
+（目标听众：上下班通勤、希望快速吃透一篇文章要点的人）。
+
+【输出格式 — 严格 JSON，不要 Markdown 代码块】
+{
+  "hook": "开场钩子，≤ 80 字，15 秒左右能读完",
+  "sections": ["正文节拍，一节一个字符串，80-180 字，共 3-6 节"],
+  "outro": "收束，≤ 80 字，呼应 hook 的开头句式或意象"
+}
+
+【写作原则】
+1. **信息密度**：每句要么给新事实，要么给新视角。删掉"咱们一起来看看""接下来要说的是"这类水词
+2. **口语化但不失准**：用"咱们""有意思的是""其实啊"等口语连接词；数字/机构/人名必须与原文一致
+3. **钩子要狠**：hook 必须在前 15 秒让人想听完。可以是反问、矛盾、或出人意料的对比
+4. **节拍过渡**：sections 各节靠自然语义承接，不要写"接下来我们看看""说到这里"这种过渡套话
+5. **收束呼应**：outro 呼应 hook 的开头意象，让人感觉绕了一圈回来了
+6. **不要复读原文**，要重述 + 加你的解读
+7. **不要输出音效标注**：不要出现"（轻松开场音乐淡出）""【片头音乐】"这类
+   舞台提示或音效描述。它们会被当成正文混进稿子污染下游。
+8. **不要 markdown、不要 bullet、不要 emoji、不要"听众朋友们"这种播音腔**
+9. **长度自适应**：原文 < 500 字 → 600-800 字；500-2000 字 → 800-1100 字；> 2000 字 → 1000-1400 字
+
+输出纯 JSON。"""
+
+
+def _rewrite_prompt(fetched_content: str) -> str:
+    """构造改写 prompt（user 侧）。
+
+    system 契约放在 `_chat_text(system_prompt=...)`，这里只拼原文。
+    """
+    return f"# 原文\n{fetched_content}"
+
+
+@dataclass
+class _RewriteParts:
+    """解析后的改写结果。
+
+    `script` 是给 TTS / 落库用的整稿；`hook` / `sections` / `outro` 是结构化原样。
+    `degraded=True` 表示 LLM 没按 JSON 输出，已降级成纯文本。
+    """
+
+    hook: str = ""
+    sections: list[str] = field(default_factory=list)
+    outro: str = ""
+    degraded: bool = False
+
+    @property
+    def script(self) -> str:
+        """拼整稿，**段落边界由我们控制**，不交给 LLM。
+
+        每段内部先把连续空行压掉 —— 只要 hook 内部没有空行，
+        `split("\n\n", 1)[0]` 拿到的就一定是 hook 本身。
+        """
+        parts = [self.hook, *self.sections, self.outro]
+        return "\n\n".join(_flatten_para(p) for p in parts if p.strip())
+
+
+# 音效/舞台提示：整段就是括号或方括号包着的一小段，且不含句号
+_SFX_RE = re.compile(r"^[\(（\[【][^\n]{0,24}[\)）\]】]\s*$")
+
+
+def _flatten_para(text: str) -> str:
+    """把一段内部的连续换行压成单换行，保证它整体还是一个「段」。"""
+    return re.sub(r"\n{2,}", "\n", (text or "").strip())
+
+
+def _is_sfx_para(text: str) -> bool:
+    """整段是否是音效标注（而不是正文）。
+
+    只认「整段被括号包住且很短」这一种明确形态 —— 宁可漏判也不要误杀
+    正常正文，正文误杀进 hook 的代价（污染池子）比分段不完美大得多。
+    """
+    t = (text or "").strip()
+    return bool(t) and bool(_SFX_RE.match(t))
+
+
+def _extract_json_object(raw: str) -> dict | None:
+    """从 LLM 输出里抠出 JSON 对象。
+
+    容错三种常见不听话：```json 围栏、前后有解释文字、尾部多余逗号。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    # 1. 剥 markdown 围栏
+    fence = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.S)
+    if fence:
+        text = fence.group(1).strip()
+    # 2. 抠第一个 { 到最后一个 }
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    candidate = text[start : end + 1]
+    # 3. 容忍尾随逗号
+    candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+    try:
+        obj = json.loads(candidate)
+    except (ValueError, TypeError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _parse_rewrite(raw: str) -> _RewriteParts:
+    """解析 LLM 改写输出，降级但不崩。
+
+    降级路径（`degraded=True`）：整段当正文，并**主动跳过开头的音效段** ——
+    这正是 2026-10-02 那条污染样本的形态，宁可 hook 为空也不能让
+    「（轻松开场音乐淡出）」进池子。
+    """
+    obj = _extract_json_object(raw)
+    if obj is not None:
+        hook = _flatten_para(str(obj.get("hook") or ""))
+        raw_sections = obj.get("sections") or []
+        if isinstance(raw_sections, str):
+            raw_sections = [raw_sections]
+        sections = [_flatten_para(str(s)) for s in raw_sections if str(s).strip()]
+        outro = _flatten_para(str(obj.get("outro") or ""))
+        # hook 缺失但有正文 → 拿第一节顶上，别让整稿没有钩子
+        if not hook and sections:
+            hook, sections = sections[0], sections[1:]
+        if hook or sections or outro:
+            return _RewriteParts(hook=hook, sections=sections, outro=outro)
+
+    # 降级：按空行切段，跳掉开头的音效标注段
+    paras = [_flatten_para(p) for p in (raw or "").split("\n\n")]
+    paras = [p for p in paras if p]
+    while paras and _is_sfx_para(paras[0]):
+        paras.pop(0)
+    if not paras:
+        return _RewriteParts(hook="", sections=[], outro="", degraded=True)
+    return _RewriteParts(
+        hook=paras[0],
+        sections=paras[1:-1] if len(paras) > 2 else paras[1:],
+        outro=paras[-1] if len(paras) > 1 else "",
+        degraded=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 记忆注入
+# ---------------------------------------------------------------------------
 
 
 def _maybe_inject_memory(state: AgentState, base_prompt: str) -> str:
