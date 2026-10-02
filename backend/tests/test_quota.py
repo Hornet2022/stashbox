@@ -15,7 +15,6 @@ import uuid
 from pathlib import Path
 
 import httpx
-import pytest
 import redis
 import redis.asyncio
 from sqlalchemy import select
