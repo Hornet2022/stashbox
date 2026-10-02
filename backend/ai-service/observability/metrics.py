@@ -9,12 +9,32 @@
 
 from prometheus_client import Counter, Gauge, Histogram
 
-# 蒸馏 step 耗时（v1 §11.3 验收 P95 < 5min = 300s，bucket 上界 600s）
+# 蒸馏 step 耗时（v1 §11.3 验收 P95 < 5min = 300s）
+#
+# 桶上界不能拍脑袋定在 600s：实测本机 mlx-audio 单路 TTS 约 745s/篇
+# （step3_tts 6 次采样 sum=4469s），5/6 落进 +Inf，量程形同虚设。
+# 扩到 3600s 留足余量；若 TTS 再变慢，解析侧会对超量程的分位数返回 null
+# 而不是编造数字（见 content-service/admin_router.py::_parse_distill_p95）。
 DISTILL_STEP_DURATION = Histogram(
     "distill_step_duration_seconds",
     "Distill step latency (CP3.6, v1 §11.3)",
     ["step"],
-    buckets=(0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0),
+    buckets=(
+        0.5,
+        1.0,
+        2.5,
+        5.0,
+        10.0,
+        30.0,
+        60.0,
+        120.0,
+        300.0,
+        600.0,
+        900.0,
+        1200.0,
+        1800.0,
+        3600.0,
+    ),
 )
 
 # 蒸馏尝试次数（per step）

@@ -1829,7 +1829,7 @@ async def admin_stats(
 
 
 # CP11.0.3 蒸馏 P95 metrics（从 ai-service /metrics 解析）
-_DISTILL_P95_CACHE: dict[str, float] = {}
+_DISTILL_P95_CACHE: dict[str, Any] = {}
 _DISTILL_P95_CACHE_TS: float = 0.0
 _DISTILL_P95_CACHE_TTL = 30.0  # 30 秒缓存
 
@@ -1869,18 +1869,42 @@ def _parse_distill_p95(metrics_text: str) -> dict:
     输入：/metrics 文本（含 ai-service FastAPI 进程 + arq worker 进程的合并）
     输出：
       {
-        "by_step": {"step1_structure": {"p50": ..., "p95": ..., "p99": ...}, ...},
-        "overall": {"p50": ..., "p95": ..., "p99": ...}
+        "by_step": {
+          "step1_structure": {
+            "p50": ..., "p95": ..., "p99": ...,   # 落在 +Inf 里则为 None
+            "count": int,        # 样本数 —— 分位数基于几个样本，必须让人看得见
+            "mean": float,       # _sum/_count，精确均值
+            "upper_bound": float, # 直方图最大**有限**桶上界
+          }, ...
+        },
+        "overall": {同上}
       }
+
+    为什么分位数可能是 None
+    ----------------------
+    桶上界是有限的。任何落进 `+Inf` 桶的样本，其真实值直方图并不知道 ——
+    `+Inf` 只是一个「比最大的有限桶还大」的哨兵，没有数值。
+    早先这里把 +Inf 当成 1e18 参与线性插值，于是 P50 落在 +Inf 时算出
+    `600 + ratio * (1e18 - 600)`，页面直接显示 `400000000000000320.00 秒`。
+    宁可留 None 让运营看见「超量程」，也不编一个像样但假的数字。
     """
     from prometheus_client.parser import text_string_to_metric_families
 
     result: dict[str, Any] = {
         "by_step": {},
-        "overall": {"p50": None, "p95": None, "p99": None},
+        "overall": {
+            "p50": None,
+            "p95": None,
+            "p99": None,
+            "count": 0,
+            "mean": None,
+            "upper_bound": None,
+        },
     }
     # 按 step 分组 bucket：{step: [(le, cumulative_count), ...]}
     buckets_by_step: dict[str, list[tuple[float, float]]] = {}
+    # {step: (sum, count)} —— 均值是直方图算不出来的唯一精确量
+    sum_count_by_step: dict[str, tuple[float, float]] = {}
     try:
         families = list(text_string_to_metric_families(metrics_text))
     except Exception:
@@ -1892,51 +1916,93 @@ def _parse_distill_p95(metrics_text: str) -> dict:
         if family.name != "distill_step_duration_seconds":
             continue
         for sample in family.samples:
-            # 只关心 bucket（cumulative），count/sum 由 SDK 解析但本函数不用
-            if not sample.name.endswith("_bucket"):
-                continue
             step = sample.labels.get("step")
-            le_label = sample.labels.get("le")
-            if step is None or le_label is None:
+            if step is None:
                 continue
-            try:
-                le = 1e18 if le_label == "+Inf" else float(le_label)
-                cnt = float(sample.value)
-            except (TypeError, ValueError):
-                continue
-            buckets_by_step.setdefault(step, []).append((le, cnt))
+            if sample.name.endswith("_bucket"):
+                le_label = sample.labels.get("le")
+                if le_label is None:
+                    continue
+                try:
+                    # +Inf 不再折成 1e18 —— 折了就会在下面的插值里造出假数字。
+                    # 单独收进 inf_buckets 标记，让分位数知道自己不可解。
+                    le = float("inf") if le_label == "+Inf" else float(le_label)
+                    cnt = float(sample.value)
+                except (TypeError, ValueError):
+                    continue
+                buckets_by_step.setdefault(step, []).append((le, cnt))
+            elif sample.name.endswith("_sum"):
+                try:
+                    s = sum_count_by_step.setdefault(step, (0.0, 0.0))
+                    sum_count_by_step[step] = (s[0] + float(sample.value), s[1])
+                except (TypeError, ValueError):
+                    continue
+            elif sample.name.endswith("_count"):
+                try:
+                    s = sum_count_by_step.setdefault(step, (0.0, 0.0))
+                    sum_count_by_step[step] = (s[0], s[1] + float(sample.value))
+                except (TypeError, ValueError):
+                    continue
 
     # 计算每个 step 的 P50/P95/P99（用线性插值近似）
     for step, buckets in buckets_by_step.items():
-        buckets.sort(key=lambda x: x[0])
+        finite = sorted((le, cnt) for le, cnt in buckets if le != float("inf"))
         total = buckets[-1][1] if buckets else 0
+        total = max(total, finite[-1][1] if finite else 0)
         if total <= 0:
             continue
-        p = {}
+        upper_bound = finite[-1][0] if finite else None
+        p: dict[str, Any] = {
+            "count": int(total),
+            "upper_bound": upper_bound,
+            "mean": None,
+        }
+        total_sum, total_count = sum_count_by_step.get(step, (0.0, 0.0))
+        if total_count > 0:
+            p["mean"] = total_sum / total_count
         for q, label in [(0.5, "p50"), (0.95, "p95"), (0.99, "p99")]:
-            target = total * q
-            prev_le, prev_cnt = 0.0, 0.0
-            for le, cnt in buckets:
-                if cnt >= target:
-                    # 线性插值
-                    if cnt == prev_cnt:
-                        p[label] = le
-                    else:
-                        ratio = (target - prev_cnt) / (cnt - prev_cnt)
-                        p[label] = prev_le + ratio * (le - prev_le)
-                    break
-                prev_le, prev_cnt = le, cnt
-            else:
-                p[label] = buckets[-1][0]
+            p[label] = _histogram_quantile(finite, total, total * q)
         result["by_step"][step] = p
 
-    # overall: 跨 step 累加 P95 的简单平均（足够看趋势）
-    if result["by_step"]:
+    # overall：端到端 = 4 个 step 串行相加。
+    # 早先这里算的是「各步同名分位数的平均」—— 把 P50 和 P99 混在一起求平均，
+    # 得到的数没有任何统计含义。同名相加才是端到端分位数的合理近似；
+    # mean 用各步均值之和，由期望的线性性可知就是精确的 E[端到端]。
+    # 任一步骤不可解时整体同样不可解，返回 None 而不是半个真半个假。
+    steps = list(result["by_step"].values())
+    if steps:
+        overall = result["overall"]
+        overall["count"] = min(s["count"] for s in steps)
         for q in ("p50", "p95", "p99"):
-            vals = [s.get(q) for s in result["by_step"].values() if s.get(q) is not None]
-            if vals:
-                result["overall"][q] = sum(vals) / len(vals)
+            vals = [s.get(q) for s in steps]
+            overall[q] = sum(vals) if all(v is not None for v in vals) else None
+        means = [s.get("mean") for s in steps]
+        overall["mean"] = sum(means) if all(m is not None for m in means) else None
+        bounds = [s.get("upper_bound") for s in steps]
+        overall["upper_bound"] = sum(bounds) if all(b is not None for b in bounds) else None
     return result
+
+
+def _histogram_quantile(
+    finite_buckets: list[tuple[float, float]], total: float, target: float
+) -> Optional[float]:
+    """在**有限**桶里做线性插值求分位数；不可解时返回 None。
+
+    刻意不接受 +Inf 桶：target 落进 +Inf 说明这个分位数超出直方图量程，
+    直方图本身没有足够信息给出真值。此时返回 None，由调用方决定怎么呈现。
+    """
+    if not finite_buckets or total <= 0:
+        return None
+    prev_le, prev_cnt = 0.0, 0.0
+    for le, cnt in finite_buckets:
+        if cnt >= target:
+            if cnt == prev_cnt:
+                return le
+            ratio = (target - prev_cnt) / (cnt - prev_cnt)
+            return prev_le + ratio * (le - prev_le)
+        prev_le, prev_cnt = le, cnt
+    # 连最大的有限桶都没到 target —— 全部样本在 +Inf 里，不可解
+    return None
 
 
 @router.get("/api/v1/admin/tags")
@@ -2049,6 +2115,13 @@ async def admin_distill_p95(
         return {
             "cached": False,
             "by_step": {},
-            "overall": {"p50": None, "p95": None, "p99": None},
+            "overall": {
+                "p50": None,
+                "p95": None,
+                "p99": None,
+                "count": 0,
+                "mean": None,
+                "upper_bound": None,
+            },
             "error": str(exc),
         }
