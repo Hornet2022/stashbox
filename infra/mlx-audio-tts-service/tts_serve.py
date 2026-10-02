@@ -294,6 +294,108 @@ def install_model_aliases() -> dict[str, str]:
     return aliases
 
 
+class ErrorDetailSanitizer:
+    """把 5xx 响应里的内部异常细节换成一句中性提示。
+
+    ## 为什么需要（2026-10-03 实测发现）
+
+    打错模型名时（传了不存在的 `tingting`）服务返回 500，body 是：
+
+        {"detail": "Failed to load model 'tingting': Got: ConnectTimeout:
+         [Errno 60] Operation timed out\\nAn error happened while trying to
+         locate the files on the Hub, and we cannot find the appropriate
+         snapshot folder for the specified revision on the local disk."}
+
+    这不是我们写的文案 —— mlx_audio 抛的异常被 FastAPI 默认包成
+    `{"detail": str(exc)}` 原样回给了调用方。它泄露的是：连了哪个 Hub、
+    本地快照目录怎么命名、有没有走网络、什么 revision。
+
+    风险等级不高（没有密钥、没有真实绝对路径），但 TTS 服务在内网监听
+    127.0.0.1:8010，任何能访问它的进程都能拿到这些内部拓扑信息。
+    详细错误**保留在服务端日志**里，排障不受影响。
+
+    4xx 不动 —— 那些是调用方自己的问题（参数错、格式不支持），原样回传才有
+    助于客户端给出正确提示。
+    """
+
+    #: 5xx 一律替换成这句。调用方只需知道"服务端合成失败"。
+    PUBLIC_DETAIL = "TTS 合成失败，请检查服务日志"
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        start_msg: dict = {}
+        body_parts: list[bytes] = []
+        out_headers: list[tuple[bytes, bytes]] = []
+
+        async def _buffer(message):
+            """先把内层响应**缓冲**下来，不急着转发。
+
+            5xx 的判定要等到 `http.response.start` 才知道，而 body 是在它之后
+            才发过来的 —— 所以必须整段收完再决定转发什么。边转发边判断会导致
+            「先发原始 500，再补一份脱敏 500」，客户端收到两份响应。
+
+            ⚠️ 这里必须 `nonlocal out_headers`：闭包里裸赋值会被当成**新的局部
+            变量**，外层的 headers 永远是空列表 —— 2xx 的 content-type
+            会全丢（ruff F841 抓到过这个）。
+            """
+            nonlocal out_headers
+            if message.get("type") == "http.response.start":
+                start_msg.update(message)
+                out_headers = list(message.get("headers", []))
+            elif message.get("type") == "http.response.body":
+                body_parts.append(message.get("body", b""))
+
+        try:
+            await self.app(scope, receive, _buffer)
+        except Exception as exc:
+            # 异常一路冒到 ASGI 层（ServerErrorMiddleware 之外）的情况
+            log.exception("TTS 请求处理失败: %s", exc)
+            await _json_response(send, 500, self.PUBLIC_DETAIL)
+            return
+
+        status = start_msg.get("status", 200)
+
+        if status >= 500:
+            log.error("TTS 返回 %d，已对调用方隐藏内部细节", status)
+            await _json_response(send, status, self.PUBLIC_DETAIL)
+            return
+
+        # 正常响应：原样转发（含音频字节流，一个字节都不能动）
+        body = b"".join(body_parts)
+        if not any(k.lower() == b"content-length" for k, _ in out_headers):
+            out_headers.append((b"content-length", str(len(body)).encode()))
+
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": out_headers,
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
+async def _json_response(send, status: int, detail: str) -> None:
+    body = json.dumps({"detail": detail}).encode()
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
+
+
 def main() -> None:
     import argparse
 
@@ -337,8 +439,11 @@ def main() -> None:
     # 那样会绕过我们上面挂的适配层。自己 run 并直接传 app 对象才可控。
     import uvicorn
 
-    app = RefAudioAdapter(server.app)
+    # 挂载顺序：ErrorDetailSanitizer 在最外层，才能兜住内层一切 5xx
+    # （内层抛出的异常会冒到 ASGI 层，被这里统一转成中性提示）。
+    app = ErrorDetailSanitizer(RefAudioAdapter(server.app))
     log.info("ref_audio base64→文件 适配层已挂载（目录 %s）", _REF_DIR)
+    log.info("5xx 内部细节脱敏层已挂载（调用方只看到中性提示）")
     log.info("监听 http://%s:%d", args.host, args.port)
     uvicorn.run(app, host=args.host, port=args.port, workers=1, loop="asyncio")
 

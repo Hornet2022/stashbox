@@ -63,8 +63,17 @@ async def test_tag_subscriptions_table_exists():
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_admin_create_tag():
-    """admin create 端点：mock user 创 tag（幂等 slug → 409）"""
+    """admin create 端点：mock user 创 tag（幂等 slug → 409）
+
+    ⚠️ 2026-10-03 修：原来 name 写死 `"测试标签"`，而 cleanup 只按 slug 删。
+    slug 每次随机所以**没被清掉的行会一直累积**（stashbox_test 里已堆到 33 行），
+    而 name 固定 → 第二次跑必然 `409 tag name 已存在`。
+    也就是说这条用例**只能跑一次**，第二遍必红 —— 很容易被误判成回归。
+
+    现在 name 也带唯一后缀，两边都能对上。
+    """
     slug = _unique_slug()
+    name = f"测试标签-{slug[-8:]}"
     # 原来这里写死 {"id": 999, ...}，但 tags.creator_id 有外键指向 users.id，
     # users 表里并没有 999 → ForeignKeyViolation（test_admin_create_tag 长期红）。
     admin_id, _ = await new_user(tier="admin")
@@ -75,12 +84,12 @@ async def test_admin_create_tag():
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post(
                 "/api/v1/tags",
-                json={"slug": slug, "name": "测试标签", "category": "test"},
+                json={"slug": slug, "name": name, "category": "test"},
             )
         assert resp.status_code == 200, f"期望 200，实际 {resp.status_code}: {resp.text}"
         data = resp.json()
         assert data["id"] == slug
-        assert data["name"] == "测试标签"
+        assert data["name"] == name
         assert data["category"] == "test"
 
     # cleanup
