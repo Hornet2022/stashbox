@@ -202,6 +202,38 @@ class OSSStorage(Storage):
         except Exception:
             return False
 
+    async def fetch(self, key: str) -> bytes:
+        """读回对象 bytes（CP7.3.0 按需转码用）。
+
+        之前这里是基类空壳（NotImplementedError），后果是**多码率转码在生产上
+        100% 失败**：`audio_variant_service.ensure_variant` 靠 `storage.fetch()`
+        拉主音频，OSS 存的是 SeaweedFS → 直接 NotImplementedError → 被 catch 成
+        静默 `return None`。安卓端 `warmVariant` 接线是完整的，所以表现为
+        「按钮能点、返回 200、但 `article_audio_variants` 永远 0 条」。
+        （另一条走不通的路是 STORAGE_PROVIDER 缺省成 local → 去 /tmp/audio 找，
+        音频同样不在那儿。两条都断，见 .env 补 STORAGE_PROVIDER=oss。）
+
+        与 `LocalStorage.fetch` 语义对齐：读不到就抛，**不返回 None**——
+        调用方靠异常区分「转码失败」和「拿到空音频」。
+
+        错误语义：key 不存在时 boto3 抛 `ClientError`（NoSuchKey / 404），
+        原样冒泡不转换——比包装成 FileNotFoundError 多带 request id，
+        排查 SeaweedFS 问题时更有用，而 `ensure_variant` 的 `except Exception`
+        两种都能兜住。
+        """
+        s3 = self._s3()
+
+        def _get() -> bytes:
+            # get_object 和 Body.read 必须在**同一个线程**里跑完：
+            # StreamingBody 持有底层连接，跨线程读会撕裂。
+            # 所以这里合成一个同步函数，只过一次 asyncio.to_thread。
+            resp = s3.get_object(Bucket=self.bucket_name, Key=key)
+            return resp["Body"].read()
+
+        data = await self._run(_get)
+        log.info("OSS 下载成功 key=%s bytes=%d", key, len(data))
+        return data
+
     async def delete(self, key: str) -> None:
         s3 = self._s3()
         await self._run(s3.delete_object, Bucket=self.bucket_name, Key=key)
