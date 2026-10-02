@@ -190,6 +190,22 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
             "rewrite_hook": parts.hook,
             "rewrite_sections": parts.sections,
             "rewrite_outro": parts.outro,
+            # CP-AGENT-IS-PERSONALIZED（2026-10-02 端到端自测）：
+            # 之前 `AgentState` 里压根没有这个字段，agent 全目录零处产生它，
+            # 于是 distill_task.py:547 的 `bool(final.get("is_personalized"))`
+            # **恒为 False**，`is_personalized` 列全表 false。报表据此说
+            # 「个性化没上线」，但实际 few-shot 是真的注进 prompt 了
+            # （`_maybe_inject_memory` 就在上面几行）。
+            #
+            # 现在如实记录「这次改写到底有没有用上个性化记忆」。注意它表达的是
+            # **as-treated**（实际处理），而 ab_group 表达的是 **ITT**（分组意图）——
+            # 两者不等是正常的，ab_report 对比的就是这个。
+            #
+            # ⚠️ 但这不代表 A/B 实验恢复有效：load_few_shots 不按 user_id 过滤，
+            # 所有用户拿到的样本相同，所以两组 is_personalized 会同时为 True。
+            # 真正的实验前提修复是让选样按 user_id 分组，那是另一件事。
+            "is_personalized": bool(few_shot_examples)
+            or bool(user_profile and user_profile.get("preferences")),
             "rewrite_quality_score": None,
             "rewrite_tags": [],
             # CP-AGENT-PASSTHROUGH：LangGraph 默认 reducer 不一定保留

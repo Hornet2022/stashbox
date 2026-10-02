@@ -297,7 +297,10 @@ async def test_compute_ab_report_metrics():
         assert n["eval_count"] == 0
         assert n["avg_overall_score"] is None
         assert n["play_pairs"] == 1
-        assert "pre_experiment" in report["caveats"][0]
+        # 2026-10-02：caveats 最前面插了「实验前提不成立」那条硬声明，
+        # 所以这里不能绑死 [0] —— 原意是「pre_experiment 的警告还在」，
+        # 不是「它必须排第一」。位置会随 caveat 增减变化，内容才是契约。
+        assert any("pre_experiment" in c for c in report["caveats"])
     finally:
         await engine.dispose()
 
@@ -386,7 +389,13 @@ async def test_ab_report_endpoint(b4_client):
     body = r.json()
     assert len(body["groups"]) == 3
     assert body["groups"][0]["group"] == "personalized"  # 排序：personalized 在前
-    assert len(body["caveats"]) == 2
+    # 2026-10-02：caveats 从 2 条涨到 3 条（新增「实验前提不成立」硬声明）。
+    # 这里锁「至少含原有的两条」而不是写死总数 —— caveat 是会增补的，
+    # 写死 len 会让每加一条说明就得改测试，而说明本身不是 bug。
+    assert len(body["caveats"]) >= 2
+    assert any("pre_experiment" in c for c in body["caveats"])
+    # 前提不成立必须显式标记，否则前端无从拦这一屏
+    assert body["experiment_valid"] is False
 
 
 async def test_ab_report_endpoint_empty_db(b4_client):

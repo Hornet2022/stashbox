@@ -44,6 +44,10 @@ class AgentState(TypedDict, total=False):
     rewrite_outro: Optional[str]
     rewrite_quality_score: Optional[float]
     rewrite_tags: Optional[list[str]]
+    # CP-AGENT-IS-PERSONALIZED：as-treated 口径 —— 这次改写**实际**有没有用上
+    # 个性化记忆（few-shot 或用户画像）。之前这个字段不存在，导致
+    # distill_task 的 `bool(final.get("is_personalized"))` 恒为 False。
+    is_personalized: Optional[bool]
     tts_audio_url: Optional[str]  # step3 TTS 合成音频 OSS URL
     tts_audio_path: Optional[str]  # 音频本地落盘路径（OSS 未就绪时的真实产物）
     tts_duration_sec: Optional[int]

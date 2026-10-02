@@ -199,8 +199,22 @@ async def compute_ab_report(
             g["skip_rate"] = round(g["skip_count"] / g["tasks"], 4)
 
     caveats = [
+        # ⚠️ 这条是「结论不可用」的硬声明，排在最前面（2026-10-02 端到端自测）。
+        #
+        # 前提不成立的原因：个性化分组靠 `ab_group = user_id % 100 < 30` 在**落库时**
+        # 硬算（distill_task.py:546），而个性化本身却从未真正分组生效 ——
+        # `agent.memory.load_few_shots` 读 few-shot 池时**不按 user_id 过滤**，
+        # 所有用户拿到的是同一批样本。于是 personalized 和 general 两组的
+        # 改写输入完全相同，任何指标差异都只能来自噪声。
+        #
+        # 所以下面那两组数字**必然**得出「无差异」，而这不是实验结论，
+        # 是实验没做。运营如果照着报表决策会得出错误判断。
+        # 恢复 A/B 语义需要先把 few-shot 选样按 user_id 分组（个人池优先），
+        # 之后重跑积累足够样本，本条 caveat 才能撤掉。
+        "⛔ 实验前提不成立：personalized / general 两组当前拿到完全相同的 few-shot "
+        "样本（load_few_shots 不按 user_id 过滤），改写输入一致，本报表差异不可作为实验结论。",
         "0029 迁移上线前的历史蒸馏数据 ab_group=NULL，归入 pre_experiment 组，不可用于 A/B 结论",
         "A/B 结论需从 ab_group 落库部署日起重新计 2 周（方案 §2.7-D 周期）",
     ]
     ordered = [groups[k] for k in _GROUP_ORDER if k in groups]
-    return {"groups": ordered, "caveats": caveats}
+    return {"groups": ordered, "caveats": caveats, "experiment_valid": False}
