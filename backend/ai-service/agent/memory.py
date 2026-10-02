@@ -210,7 +210,7 @@ class MemoryStore:
                     rows = (
                         await db.execute(
                             text(
-                                "SELECT source_pattern, rewrite_text, score_avg, kind "
+                                "SELECT id, source_pattern, rewrite_text, score_avg, kind "
                                 "FROM few_shot_examples "
                                 "WHERE active = true AND kind = :k "
                                 "ORDER BY score_avg DESC LIMIT :n"
@@ -222,7 +222,7 @@ class MemoryStore:
                     rows = (
                         await db.execute(
                             text(
-                                "SELECT source_pattern, rewrite_text, score_avg, kind "
+                                "SELECT id, source_pattern, rewrite_text, score_avg, kind "
                                 "FROM few_shot_examples "
                                 "WHERE active = true "
                                 "ORDER BY score_avg DESC LIMIT :n"
@@ -245,8 +245,64 @@ class MemoryStore:
             for r in rows
         ]
 
+        # CP-AGENT-MEMORY-FEW-SHOT-USAGE：记一次「被取用」。
+        #
+        # 之前只有 `few_shot_pool.select_few_shot` 会累加 usage_count，而它只被
+        # `hooks_impl.FewShotSelectorHook` 调用 —— 那条路径是**死代码**（生产蒸馏
+        # 走 LangGraph agent，hooks 根本不执行）。生产真正用的就是这个
+        # `load_few_shots`，它只 SELECT 不记账，于是 usage_count 恒 0：
+        #   · admin 后台直接把 usage_count 展示给运营看 → 一直显示假数据
+        #   · 池健康度 / LRU 择取排序（few_shot_pool.py:215 按 usage_count DESC）
+        #     全都建立在这个恒 0 的列上
+        #
+        # best-effort：**调用点也兜一层**（不只是 _bump_usage 内部）。池子统计
+        # 崩了不该拖垮蒸馏，计一次数无关紧要到不值得冒这个险。
+        if rows:
+            try:
+                await self._bump_usage([r.id for r in rows if r.id])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("memory_few_shot_usage_swallowed error=%s", exc)
+
         self._few_shot_cache[cache_key] = (time.time(), examples)
         return examples
+
+    async def _bump_usage(self, ids: list[str]) -> None:
+        """给这批 few-shot 样本 usage_count += 1（**独立 session**，用完即提交）。
+
+        ⚠️ 必须开自己的 session，**不能**借用上面 SELECT 那个
+        `async with self._session_factory() as db` 里的 db。
+
+        那个 session 在 SELECT 返回时就已经出栈关闭，把 db 拿到块外执行写操作，
+        会复用连接池里那条**仍持锁未提交**的连接：第二次调用就永久阻塞在
+        `Lock ... transactionid`（pg_blocking_pids 能查到自阻塞链），且是
+        静默挂起 —— 实测在这里卡了两轮才定位到。
+
+        另外也别指望「跟蒸馏主事务一起提交」：load_few_shots 自己开 session，
+        压根没有调用方事务可挂。记账记录的也是一件独立的既成事实
+        （这些 prompt 已经被拿去注入了），本就该立刻落库。
+        """
+        from sqlalchemy import bindparam, func, update
+
+        from stashbox.backend.common.models import FewShotExample
+
+        if not ids:
+            return
+        try:
+            async with self._session_factory() as db:
+                await db.execute(
+                    update(FewShotExample)
+                    .where(FewShotExample.id.in_(bindparam("ids", expanding=True)))
+                    .values(
+                        # coalesce：列允许 NULL，`NULL + 1` 还是 NULL，这次取用白记
+                        usage_count=func.coalesce(FewShotExample.usage_count, 0) + 1,
+                        updated_at=func.now(),
+                    )
+                    .execution_options(synchronize_session=False),
+                    {"ids": list(ids)},
+                )
+                await db.commit()
+        except Exception as exc:  # noqa: BLE001 —— 记账失败不阻断蒸馏
+            log.warning("memory_bump_few_shot_usage_failed ids=%s error=%s", ids, exc)
 
     def inject_into_prompt(
         self,
