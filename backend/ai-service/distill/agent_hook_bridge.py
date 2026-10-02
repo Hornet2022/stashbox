@@ -87,10 +87,40 @@ def build_ctx_from_agent_final(
     raw_content: str,
     final: dict[str, Any],
 ) -> DistillContext:
-    """用 agent 的 final state 合成 hook 用的 DistillContext。"""
+    """用 agent 的 final state 合成 hook 用的 DistillContext。
+
+    hook/sections/outro **优先取 agent 解析出来的结构化字段**（CP-AGENT-REWRITE-
+    STRUCTURED），只在字段缺失时才回退 `_split_script` 猜。
+
+    为什么不能一直靠猜：入池走的是 `FewShotPoolHook` → `ctx.rewrite.hook`，
+    而猜的依据是「整稿第一段 = hook」。这条假设在 2026-10-02 之前是**错的** ——
+    agent 输��的是扁平纯文本，LLM 带出的音效标注「（轻松开场音乐淡出）」正好
+    落在第一段，于是用户给优质开场白打 4 分，系统把音效标注当高分范例存进池子
+    （实测池里当时唯一一条就是这个）。
+
+    rewrite_node 修好后拼接格式确实对齐了，「猜」也能猜对，但那是**巧合**：
+    只要降级路径产出非预期段落结构，猜就会悄悄错回去，而 few-shot 池不会有
+    任何告警。直接用结构化字段才是契约。
+    """
     script = final.get("rewritten_script") or ""
     duration = final.get("tts_duration_sec")
     audio_url = final.get("final_audio_url") or final.get("tts_audio_url") or ""
+
+    has_structured = any(
+        final.get(k) for k in ("rewrite_hook", "rewrite_sections", "rewrite_outro")
+    )
+    if has_structured:
+        rewrite = RewriteOutput(
+            hook=final.get("rewrite_hook") or "",
+            sections=list(final.get("rewrite_sections") or []),
+            outro=final.get("rewrite_outro") or "",
+            word_count=len(script),
+        )
+        # 结构化字段在但 hook 空（LLM 只给了正文）→ 退回切分至少能拿到首段
+        if not rewrite.hook and script:
+            rewrite = _split_script(script)
+    else:
+        rewrite = _split_script(script)
 
     ctx = DistillContext(
         task_id=task_id,
@@ -98,7 +128,7 @@ def build_ctx_from_agent_final(
         user_id=user_id,
         url=url,
         raw_content=raw_content or "",
-        rewrite=_split_script(script),
+        rewrite=rewrite,
     )
 
     if audio_url:
