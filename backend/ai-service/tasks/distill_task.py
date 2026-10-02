@@ -409,6 +409,27 @@ async def distill_task(
             pass
 
 
+async def _make_refund_lock_client() -> "redis_async.Redis":  # noqa: F821
+    """CP-AGENT-QUOTA-REFUND-SEAM：构造退款幂等锁用的 Redis 客户端。
+
+    ## 为什么要单独抽一个函数（2026-10-03）
+
+    原来 `_refund_quota_once` 里直接 `import redis.asyncio` 然后
+    `redis_async.Redis(connection_pool=...)`。要测它就只能 monkeypatch
+    `redis.asyncio.Redis` 这个**全局模块属性** —— 而 `cache_service` 早就把
+    client 缓存下来了，于是 patch 期间被别的测试拿到的就是测试的 FakeRedis，
+    表现为大批用例报 `'FakeRedis' object has no attribute 'aclose'`。
+
+    抽成模块级函数后，测试只 patch 这一个点，**不碰 redis 模块本身**，
+    污染范围为零。
+    """
+    import redis.asyncio as redis_async
+
+    from stashbox.backend.common.redis_client import get_redis_pool
+
+    return redis_async.Redis(connection_pool=get_redis_pool())
+
+
 async def _refund_quota_once(task_id: str, user_id: int) -> None:
     """CP-AGENT-QUOTA-REFUND：退还 1 次配额，Redis SETNX 保证幂等（跨 Arq retry）。
 
@@ -416,12 +437,9 @@ async def _refund_quota_once(task_id: str, user_id: int) -> None:
     Redis 不可用时降级为无锁（不阻塞失败流程）。
     """
     from stashbox.backend.common import quota_service
-    from stashbox.backend.common.redis_client import get_redis_pool
 
     try:
-        import redis.asyncio as redis_async
-
-        client = redis_async.Redis(connection_pool=get_redis_pool())
+        client = await _make_refund_lock_client()
         locked = await client.set(f"refund:{task_id}", "1", nx=True, ex=86400)
         if not locked:
             log.info("quota_refund_skipped_already_refunded", task_id=task_id, user_id=user_id)

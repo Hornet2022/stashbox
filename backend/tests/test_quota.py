@@ -176,26 +176,18 @@ async def test_redistill_does_not_double_charge():
     assert await db_quota_used(uid) == 1
 
 
-@pytest.mark.slow
-@pytest.mark.asyncio
-async def test_refund_on_distill_failure_NOT_COVERED():
-    """⚠️ **当前无法在单测里覆盖** —— 保留在此只为记录这个缺口。
-
-    蒸馏失败退款由 ai-service/tasks/distill_task.py::_refund_quota_once 承担
-    （带 Redis 锁 refund:{task_id}，每个 task 只退一次）。要测它必须让蒸馏
-    真的跑到 failed 态，但生产蒸馏早已改成 LangGraph agent + 真实 TTS 队列：
-    实测 20 秒后任务仍是 `pending`（真实 TTS 单篇约 12 分钟），原用例注释里
-    说的「mock 流水线 4 步 × 2s」早已不存在。
-
-    也就是说：**退款逻辑目前没有任何有效测试覆盖**。要补需要给
-    distill_task 注入一个可替换的流水线 seam（类似 admin_router 的
-    _fetch_ai_metrics 那样能 monkeypatch 的边界），否则只能靠真实跑一篇
-    失败文章来验证，那是分钟级且依赖 TTS 可用性的集成测试。
-
-    这里**故意不用 assert 去假装覆盖** —— 写一个断言 pending 的用例并叫它
-    「退款测试」，比没有测试更糟。修复方式：加 seam，然后把它改回真断言。
-    """
-    pytest.skip("需要 distill_task 的可注入 seam；见 docstring")
+# ---------------------------------------------------------------------------
+# 4b. 退款覆盖：已移到 tests/ai/test_distill_quota_refund.py
+# ---------------------------------------------------------------------------
+# 原先这里挂着一条 `test_refund_on_distill_failure_NOT_COVERED`（pytest.skip），
+# 记录「退款逻辑没有任何有效测试覆盖」这个缺口 —— 理由是要触发退款必须让蒸馏
+# 真跑到 failed，而生产蒸馏走 LangGraph agent + 真实 TTS 队列（单篇约 12 分钟）。
+#
+# 2026-10-03 补上了：`_refund_quota_once` 的两个依赖（Redis SETNX 幂等锁、
+# `quota_service.refund`）都是可替换的，monkeypatch 掉就能直接测，不需要跑真
+# 蒸馏。见 backend/tests/ai/test_distill_quota_refund.py（8 个用例，含
+# 「Arq 重试 3 次只退 1 次」这条幂等断言、以及 Redis 宕机时仍要退款的降级）。
+# 缺口已关闭，这里不再留 skip 占位。
 
 
 # ---------------------------------------------------------------------------

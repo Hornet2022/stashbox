@@ -76,7 +76,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    bind = op.get_bind()
+    # 原来这里有 `bind = op.get_bind()`，但下面全程用 `op.execute`，
+    # 从没读过它 —— 全仓唯一的 ruff error（F841）就出在这儿。
+    # 纯死变量，删掉不改变任何行为；已应用过的 upgrade 不受影响。
     for table in ("push_notifications", "admin_operation_logs"):
         op.execute(
             sa.text(
