@@ -155,16 +155,31 @@ class _FailingLLM:
         return None
 
 
+class EmptyArticleContentError(RuntimeError):
+    """文章没有可蒸馏的正文（2026-10-03）。
+
+    为什么不复用 [ArticleNotFoundError]：走那条路 Arq 会**无限重试**，
+    而"没正文"重试一万次还是没正文 —— 那是数据问题不是瞬时故障。
+    这条会带着明确的失败原因落成 articles.status=failed，用户立刻看到。
+    """
+
+
 async def _load_raw_content(db: AsyncSession, article_id: str) -> str:
     """从 articles.raw_content JSONB 读 content_text（CP2 + CP3 打通）。
 
     优先级：
     1. raw_content["content_text"] (CP-CREATE-ARTICLE 写入的 FetchResult)
-    2. fallback: raw_content["title"] + raw_content["url"] + "[无正文]"
-    3. 文章不存在 / raw_content 为空 → "[empty article]"
+    2. 抛 [EmptyArticleContentError] —— **不再兜底成占位串**
 
-    Raises:
-        ArticleNotFoundError: 文章不存在（让 Arq 走 retry）
+    2026-10-03 改。原来的 fallback 链是：
+        content_text → f"[无正文] title=… url=…" → f"[empty article] title=… url=…"
+    也就是说**抓取失败建出来的空文章，会把这两句占位符当正文喂进 LLM**：
+    烧 token、跑几分钟、产出垃圾或失败，而真正的原因（网络/风控/404）在
+    建库那一步就被 `except` 吞了，永远传不到这里。
+
+    现在内容拿不到就直接抛。剪藏入口（content-service）已经在建库前拦掉了
+    绝大部分抓取失败，这里是给"绕过了入口"的其他路径兜底 —— 比如历史遗留的
+    pending 文章、手工造的数据。宁可明确失败，也不要静默烧钱。
     """
     art = await db.scalar(select(Article).where(Article.id == article_id))
     if art is None:
@@ -172,16 +187,18 @@ async def _load_raw_content(db: AsyncSession, article_id: str) -> str:
 
     raw = art.raw_content
     if not isinstance(raw, dict):
-        return f"[empty article] title={art.title or '(无标题)'} url={art.url}"
+        raise EmptyArticleContentError(
+            f"article {article_id} raw_content is {type(raw).__name__}, not dict (抓取未成功)"
+        )
 
     content_text = raw.get("content_text")
     if content_text and content_text.strip():
         return content_text
 
-    # fallback：标题 + URL
     title = raw.get("title") or art.title or "(无标题)"
-    url = raw.get("url") or art.url
-    return f"[无正文] title={title} url={url}"
+    raise EmptyArticleContentError(
+        f"article {article_id} content_text 为空 title={title} url={art.url}（抓取未取到正文）"
+    )
 
 
 async def distill_task(
@@ -267,8 +284,38 @@ async def distill_task(
             )
 
     # CP2 + CP3 打通：从 articles.raw_content JSONB 读真正文（替代占位文本）
-    async with AsyncSessionLocal() as db:
-        raw_content = await _load_raw_content(db, article_id)
+    #
+    # 2026-10-03：拿不到正文时 **明确失败，不重试**。
+    # 下面的通用 except 会 `raise` 交给 Arq retry（默认 retry_max=2），
+    # 但"没正文"是数据问题不是瞬时故障 —— 重试两次也是同样的结果，
+    # 每次都白跑一次状态回写。走下面的专用收口：置 failed + 退配额 + 不抛。
+    try:
+        async with AsyncSessionLocal() as db:
+            raw_content = await _load_raw_content(db, article_id)
+    except EmptyArticleContentError as e:
+        log.warning("arq_distill_skipped_empty_content", task_id=task_id, error=str(e))
+        try:
+            async with AsyncSessionLocal() as db:
+                await track(
+                    db,
+                    EventName.DISTILL_FAILED,
+                    user_id=user_id,
+                    article_id=article_id,
+                    reason="empty_article_content",
+                    metadata={"error": str(e)[:200]},
+                )
+                await track_simple(db, EventName.DISTILL_QUOTA_REFUND, user_id, article_id)
+                await db.execute(
+                    update(Article).where(Article.id == article_id).values(status="failed")
+                )
+                await db.commit()
+        except Exception as track_exc:
+            log.warning(
+                "empty_content_mark_failed_err", article_id=article_id, error=str(track_exc)
+            )
+        # 配额照退：用户在剪藏时已经为这篇付过一次了。
+        await _refund_quota_once(task_id=task_id, user_id=user_id)
+        return {"task_id": task_id, "status": "failed", "reason": "empty_article_content"}
 
     # CP-AGENT-RUNNER-INTEGRATION：distill 走 LangGraph agent（替代硬编码 pipeline）
     # - raw_content 直接当 fetched_content 喂入（避免真实 fetch_url 调外部网络）

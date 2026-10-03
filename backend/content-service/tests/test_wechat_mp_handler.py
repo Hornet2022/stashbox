@@ -10,6 +10,7 @@
 
 前置：本机 PG 5432 + Redis 6379 已起（仅 E2E 用到，建 article）。
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -152,7 +153,12 @@ def test_map_unsupported_to_2001():
     )
     assert exc.code == 2001
     assert exc.http_status == 400
-    assert "not supported" in exc.message
+    # 2026-10-03：message 改成面向用户的中文，技术细节挪到 detail。
+    # 原来 message 里塞 "url not supported: ..." 这种英文 + 内部代号，
+    # 终端用户看不懂也不知道该换什么链接 —— 剪藏失败率的一大来源。
+    assert "暂不支持" in exc.message
+    assert "not supported" not in exc.message
+    assert "placeholder" in exc.detail
 
 
 def test_map_network_to_2002():
@@ -161,7 +167,30 @@ def test_map_network_to_2002():
     )
     assert exc.code == 2002
     assert exc.http_status == 502
-    assert "generic_url/fetcher.network" in exc.message
+    assert "没能连上" in exc.message
+    # 技术细节（哪个 fetcher / 哪类错误）留给日志，不进响应体
+    assert "generic_url/fetcher.network" in exc.detail
+    assert "generic_url" not in exc.message
+
+
+def test_map_auth_message_tells_user_what_to_do():
+    """微信风控是最高频的抓取失败，文案必须给出可操作的下一步。"""
+    exc = map_fetcher_error(
+        FetcherError(FetcherErrorCode.AUTH, "wechat requires in-app browser", source="wechat_mp")
+    )
+    assert exc.code == 2002
+    assert "微信" in exc.message and "复制链接" in exc.message
+    # 内部代号 / 英文异常信息一律不出现在 message
+    assert "wechat_mp" not in exc.message
+    assert "in-app browser" not in exc.message
+
+
+def test_map_not_found_message():
+    exc = map_fetcher_error(
+        FetcherError(FetcherErrorCode.NOT_FOUND, "http 404", source="wechat_mp")
+    )
+    assert exc.code == 2002
+    assert "删除" in exc.message or "失效" in exc.message
 
 
 def test_map_parse_to_2002():
@@ -181,9 +210,7 @@ def test_map_auth_to_2002():
 
 
 def test_map_internal_to_2002():
-    exc = map_fetcher_error(
-        FetcherError(FetcherErrorCode.INTERNAL, "boom", source="douyin")
-    )
+    exc = map_fetcher_error(FetcherError(FetcherErrorCode.INTERNAL, "boom", source="douyin"))
     assert exc.code == 2002
     assert exc.http_status == 500  # INTERNAL 与其它 2002 不同：500 不是 502
 
@@ -305,7 +332,11 @@ async def test_handler_stores_fetch_result_raw_content(monkeypatch):
     ) as c:
         r = await c.post(
             MP_URL,
-            json={"from_user": "o_openid_123", "text": "https://example.com/media", "create_time": 1},
+            json={
+                "from_user": "o_openid_123",
+                "text": "https://example.com/media",
+                "create_time": 1,
+            },
         )
 
     assert r.status_code == 200, r.text
@@ -339,7 +370,11 @@ async def test_handler_response_includes_fetch_metadata(monkeypatch):
     ) as c:
         r = await c.post(
             MP_URL,
-            json={"from_user": "o_openid_123", "text": "https://example.com/meta", "create_time": 1},
+            json={
+                "from_user": "o_openid_123",
+                "text": "https://example.com/meta",
+                "create_time": 1,
+            },
         )
 
     assert r.status_code == 200, r.text

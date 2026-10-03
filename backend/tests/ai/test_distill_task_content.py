@@ -1,6 +1,11 @@
 """CP3-CONTENT：distill_task 从 articles.raw_content 读真抓取内容。
 
-覆盖 `_load_raw_content` 的 3 种返回 + distill_task 端到端（真 PG + 真 DistillPipeline）。
+覆盖 `_load_raw_content` 的三种情形（有正文 / 空白正文 / 无抓取结果）
++ distill_task 端到端（真 PG + 真 DistillPipeline）。
+
+2026-10-03：后两种从「返回占位串」改成「抛 EmptyArticleContentError」。
+占位串会被当正文喂给 LLM，是剪藏失败被放大成 12 分钟等待 + 白烧 token
+的最后一环。
 """
 
 import pytest
@@ -20,24 +25,31 @@ async def test_load_raw_content_with_content_text(article_with_raw_content, db_s
     assert result == "测试真内容 1+2=3"
 
 
-async def test_load_raw_content_fallback_to_title_and_url(article_factory, db_session):
-    """raw_content["content_text"] 空 → fallback 到 "[无正文] title=X url=Y"。"""
+async def test_load_raw_content_refuses_blank_content_text(article_factory, db_session):
+    """raw_content["content_text"] 只有空白 → **抛错**，不再 fallback 成占位串。
+
+    2026-10-03：原来这里返回 `"[无正文] title=X url=Y"`，而这段占位符会被
+    当作正文喂给 LLM —— 烧 token、跑几分钟、产出垃圾。剪藏入口
+    （content-service）已经在建库前拦掉抓取失败，这里是给绕过入口的路径兜底。
+    """
     art = await article_factory(
         {"content_text": "   ", "title": "空正文标题", "url": "https://example.com/empty"}
     )
 
-    result = await dt_module._load_raw_content(db_session, art.id)
+    with pytest.raises(dt_module.EmptyArticleContentError) as ei:
+        await dt_module._load_raw_content(db_session, art.id)
 
-    assert result == "[无正文] title=空正文标题 url=https://example.com/empty"
+    # 错误信息要能定位到是哪篇、为什么
+    assert art.id in str(ei.value)
+    assert "空正文标题" in str(ei.value)
 
 
 async def test_load_raw_content_empty_raw_content(article_factory, db_session):
-    """raw_content 为 NULL → "[empty article]"。"""
+    """raw_content 为 NULL（抓取失败建出来的就是这种）→ 抛错，绝不返回 "[empty article]"。"""
     art = await article_factory(None, title="无抓取结果")
 
-    result = await dt_module._load_raw_content(db_session, art.id)
-
-    assert result == f"[empty article] title=无抓取结果 url={art.url}"
+    with pytest.raises(dt_module.EmptyArticleContentError):
+        await dt_module._load_raw_content(db_session, art.id)
 
 
 async def test_load_raw_content_article_not_found_raises(db_session):

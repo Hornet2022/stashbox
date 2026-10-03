@@ -19,12 +19,16 @@ class BizException(Exception):
     code: int = 40000
     message: str = "Business error"
     http_status: int = 400
+    #: 只给日志看的技术细节。**不进响应体** —— message 是给终端用户看的，
+    #: 两者混在一起就等于把内部实现（fetcher 名、异常栈信息）泄给客户端。
+    detail: str = ""
 
     def __init__(
         self,
         message: str | None = None,
         code: int | None = None,
         http_status: int | None = None,
+        detail: str | None = None,
     ):
         if message:
             self.message = message
@@ -32,6 +36,8 @@ class BizException(Exception):
             self.code = code
         if http_status is not None:
             self.http_status = http_status
+        if detail:
+            self.detail = detail
         super().__init__(self.message)
 
 

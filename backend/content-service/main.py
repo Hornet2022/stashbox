@@ -52,6 +52,7 @@ from clients.ai_client import get_ai_client  # noqa: E402
 from fetchers import (  # noqa: E402
     FetcherError,
     FetcherErrorCode,
+    fetch_error_user_message,
     get_fetcher,
     map_fetcher_error,
 )
@@ -371,6 +372,52 @@ def _to_raw_content(result) -> dict:
     return json.loads(json.dumps(asdict(result), default=_json_default))
 
 
+async def _prefetch_for_capture(url: str):
+    """剪藏前置抓取：拿到正文才允许建文章。
+
+    2026-10-03 改。**为什么改成硬失败**：
+
+    原来抓取失败被 `_create_article` 里的 `except FetcherError` 整个吞掉，
+    文章照样建成 `status=pending` + `raw_content=None`，蒸馏任务照派。
+    到了 ai-service，`_load_raw_content` 拿不到正文就返回字面量
+    `"[empty article] title=… url=…"`，**这段占位符被当成正文喂给了 LLM**。
+
+    于是一次抓取失败会连锁放大成：
+      扣掉 1 次配额 → 派一个注定失败的蒸馏任务 → 白烧 LLM token →
+      用户等 12 分钟看到失败，而剪藏接口当时返回的是 200。
+
+    剪藏成功率是听匣的命门，失败必须**当场**、**带可操作原因**返回给用户，
+    不能变成一个 12 分钟后才知道结果的黑洞。服务号回调（wechat_mp）
+    早就是这个行为，其余入口只是漏改了。
+
+    本函数是纯读操作：不写库、不扣配额、不派任务，失败只抛异常。
+    """
+    fetcher = get_fetcher(url)
+    if fetcher is None:
+        # GenericURLFetcher 是 catch-all，走到这里说明 URL 连通用兜底都匹配不上
+        # （如 scheme 不对）。原来这里直接 return，文章建成无正文 —— 同样必炸。
+        raise BizException(
+            code=2001, message=fetch_error_user_message(FetcherErrorCode.UNSUPPORTED)
+        )
+    try:
+        return await fetcher.fetch(url, timeout=10.0)
+    except FetcherError as exc:
+        log.info(
+            f"capture_fetch_fail: url={url} code={exc.code.value} "
+            f"source={exc.source} msg={exc.message}"
+        )
+        raise map_fetcher_error(exc) from exc
+    except Exception as exc:
+        # 超时 / SSL / 解析这类连 FetcherError 都没包的意外，同样不能软降级。
+        log.warning(f"capture_fetch_unexpected: url={url} err={type(exc).__name__}: {exc}")
+        raise BizException(
+            code=2002,
+            message=fetch_error_user_message(FetcherErrorCode.NETWORK),
+            http_status=502,
+            detail=f"{type(exc).__name__}: {exc}",
+        ) from exc
+
+
 async def _create_article(
     url: str,
     user_id: int,
@@ -384,34 +431,26 @@ async def _create_article(
     dedup: bool = True,  # True=同用户同 URL 已有未删文章则复用（CP-DUPLICATE-CLIP）
 ) -> Article:
     # CP11.0.7 P1.1：建库前同步抓一下页面，拿到 title/source/raw_content。
-    # 失败软降级（fetcher 抛任何错都不阻塞 add,只是没 title/source/raw_content），
-    # 客户端看到 status="pending" + title=null 就是"待抓取"，等下次重试。
+    #
+    # 2026-10-03：失败不再软降级，改为抛错（见 _prefetch_for_capture 的注释）。
+    # 抓不到正文就没有可蒸馏的东西，硬失败比"建一条注定失败的记录"诚实得多，
+    # 也把用户等待 12 分钟才知道结果的时间差抹掉了。
     if fetch_on_create and (title is None or source == "web" or raw_content is None):
-        try:
-            fetcher = get_fetcher(url)
-            if fetcher is not None:
-                fr = await fetcher.fetch(url, timeout=10.0)
-                if title is None and fr.title:
-                    title = fr.title
-                if source == "web" and fr.source and fr.source != "unknown":
-                    source = fr.source
-                if raw_content is None:
-                    # 必须走 _to_raw_content：asdict 不转换 datetime（publish_time），
-                    # 裸 asdict 写 JSONB 会在 INSERT 时抛 "datetime is not JSON serializable"
-                    # → flush 失败污染 session → commit/refresh 连环 InvalidRequestError → 500
-                    # （真机「剪藏文档链接→服务暂不可用」的根因，2026-09-23）。
-                    raw_content = _to_raw_content(fr)
-                log.info(
-                    "fetch_ok on add",
-                    extra={"url": url, "fetcher": fr.source, "title_len": len(fr.title or "")},
-                )
-        except FetcherError as exc:
-            log.info(f"fetch_fail on add (soft): url={url} code={exc.code.value} msg={exc.message}")
-        except Exception as exc:
-            # 任何意外（超时/SSL/解析）都不让 add 失败 —— 用户体验优先
-            log.warning(
-                f"fetch_unexpected on add (soft): url={url} err={type(exc).__name__}: {exc}"
-            )
+        fr = await _prefetch_for_capture(url)
+        if title is None and fr.title:
+            title = fr.title
+        if source == "web" and fr.source and fr.source != "unknown":
+            source = fr.source
+        if raw_content is None:
+            # 必须走 _to_raw_content：asdict 不转换 datetime（publish_time），
+            # 裸 asdict 写 JSONB 会在 INSERT 时抛 "datetime is not JSON serializable"
+            # → flush 失败污染 session → commit/refresh 连环 InvalidRequestError → 500
+            # （真机「剪藏文档链接→服务暂不可用」的根因，2026-09-23）。
+            raw_content = _to_raw_content(fr)
+        log.info(
+            "fetch_ok on add",
+            extra={"url": url, "fetcher": fr.source, "title_len": len(fr.title or "")},
+        )
 
     # CP-DUPLICATE-CLIP：同一用户重复剪藏同一 URL → 复用已有文章，不再建新行。
     #
@@ -520,8 +559,27 @@ async def submit_article(
             log.warning(f"auto_distill_trigger_failed (dup): article={dup.id} error={exc}")
         return _to_response(dup)
 
+    # 2026-10-03：**先抓后扣**。
+    #
+    # 原来是「先扣配额 → 再建库（内部抓取）」，而抓取失败是软降级的，于是
+    # 一次网络抖动 = 扣掉 1 次配额 + 建一条无正文的文章 + 派一个注定失败的
+    # 蒸馏任务，而接口返回 200。用户什么都没得到，还少了配额。
+    #
+    # 现在先做一次纯读的抓取：失败直接 2001/2002 返回，既不建库也不计费。
+    # 抓到了再扣配额建库 —— 这时建库只差一次 DB insert。
+    fr = await _prefetch_for_capture(req.url)
+
     quota = await quota_service.consume(db, uid)  # 用尽抛 QuotaExceededError(3001)
-    art = await _create_article(req.url, uid, req.source, None, db, event=EventName.ARTICLE_SUBMIT)
+    art = await _create_article(
+        req.url,
+        uid,
+        req.source,
+        req.title or fr.title or None,
+        db,
+        raw_content=_to_raw_content(fr),
+        event=EventName.ARTICLE_SUBMIT,
+        fetch_on_create=False,  # 上面已经抓过了，别再抓一次
+    )
     await cache_service.mark_article_quota(art.id)  # 打标：该文章已扣过配额
 
     # 自动派蒸馏：失败仅 log 不破请求（ai-service 不可达时文章仍 pending，等下次重试）
@@ -1550,6 +1608,12 @@ async def d9_add_article(
         raise InvalidRequest(message="device_id required for anonymous D9", code=4001)
     _validate_url(req.url)
 
+    # 2026-10-03：同 submit_article，**先抓后扣**。
+    # D9 是微信里「更多打开方式」进来的路径，用户看到的是系统级的分享返回，
+    # 抓不到正文却返回成功 = 微信里显示"已打开"、听匣里 12 分钟后失败。
+    # 抓不到就当场报错，别建一条空文章也别扣配额。
+    fr = await _prefetch_for_capture(req.url)
+
     if user is not None:
         uid = _uid(user)
         # CP-DUPLICATE-CLIP：先查重再扣费。重复剪藏同一链接复用已有文章，
@@ -1574,7 +1638,15 @@ async def d9_add_article(
         uid = ANONYMOUS_USER_ID
         await _ensure_anonymous_user(db)
 
-    art = await _create_article(req.url, uid, req.source, req.title, db)
+    art = await _create_article(
+        req.url,
+        uid,
+        req.source,
+        req.title or fr.title or None,
+        db,
+        raw_content=_to_raw_content(fr),
+        fetch_on_create=False,  # 上面已抓过
+    )
     # 打标：该文章已扣过配额（匿名不计费也算），避免 ai-service 蒸馏时重复扣
     await cache_service.mark_article_quota(art.id)
 
