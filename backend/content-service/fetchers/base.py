@@ -25,6 +25,7 @@ class FetcherErrorCode(str, Enum):
     NOT_FOUND = "fetcher.not_found"  # 文章已被删除/404
     UNSUPPORTED = "fetcher.unsupported"  # URL 不被本 fetcher 支持
     SSRF_BLOCKED = "fetcher.ssrf_blocked"  # 目标指向内网/回环/链路本地，被安全策略拦下
+    BOT_CHALLENGE = "fetcher.bot_challenge"  # 目标站要求人机验证/滑块/验证码才能继续
     INTERNAL = "fetcher.internal"  # 内部错误
 
     def __str__(self) -> str:

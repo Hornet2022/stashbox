@@ -56,6 +56,10 @@ _FETCH_ERROR_USER_MESSAGE: dict[FetcherErrorCode, str] = {
     FetcherErrorCode.AUTH: "对方网站限制了非官方客户端访问，微信文章请在微信里打开后重新复制链接",
     FetcherErrorCode.NOT_FOUND: "这篇文章已被删除或链接已失效",
     FetcherErrorCode.PARSE: "没能提取出文章正文，页面可能需要登录后才能查看",
+    # 单独成句，不复用 PARSE 的"可能需要登录"：对方要的是人机验证，不是登录。
+    # 复用会让用户以为自己漏了登录动作，白花时间找不存在的原因。
+    # 也不承诺"我们能过" —— 事实上多数情况下不能（实测百度 5 种浏览器姿态全被拦）。
+    FetcherErrorCode.BOT_CHALLENGE: "这个网站要求人机验证后才能查看，听匣无法自动通过。可以换个来源的链接试试",
     FetcherErrorCode.INTERNAL: "抓取出错了，请稍后再试",
 }
 
@@ -70,7 +74,7 @@ def map_fetcher_error(exc: FetcherError) -> BizException:
 
     fetcher 私有错误码（fetcher.*）→ 业务错误码的**唯一映射点**，不散在 Handler 里：
     - UNSUPPORTED / SSRF_BLOCKED → 2001（这个链接不能用，HTTP 400）
-    - NETWORK/PARSE/NOT_FOUND/AUTH/RATE_LIMIT → 2002（抓取失败，HTTP 502）
+    - NETWORK/PARSE/NOT_FOUND/AUTH/RATE_LIMIT/BOT_CHALLENGE → 2002（抓取失败，HTTP 502）
     - INTERNAL → 2002（抓取失败，HTTP 500）
 
     SSRF_BLOCKED 归到 2001 而不是 2002：被拦下是**用户提交的 URL 本身有问题**

@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 
 from stashbox.backend.common import fetch_metrics
 
+from .antibot import detect_bot_challenge
 from .base import FetcherError, FetcherErrorCode, FetchResult
 from .net import Deadline
 
@@ -57,6 +58,18 @@ ESCALATABLE_CODES: frozenset[FetcherErrorCode] = frozenset(
         FetcherErrorCode.RATE_LIMIT,
         FetcherErrorCode.AUTH,
         FetcherErrorCode.PARSE,
+        # 撞了人机验证仍值得试一次浏览器：验证墙本质是**指纹**判定，
+        # 而浏览器通道的指纹和 HTTP 通道不同，有些站点只对陌生 UA 出验证码。
+        #
+        # 代价是有界的（只发生在已经失败的路径上，且受 BROWSER_TIER_CAP 约束），
+        # 而收益是"本来要失败的链接被救回"。既然剪藏成功率是第一优先级，先赌这一把。
+        #
+        # 怎么知道这个赌注划不划算？**指标已经能回答**，不用猜：
+        #   fetch_escalations_total{from_tier="http",code="fetcher.bot_challenge"}  高
+        #   且 fetch_attempts_total{tier="browser",outcome="success"} 也在涨
+        #   -> 升级在赚钱，保持开启；
+        #   若前者高而后者长期为 0 -> 升级纯属浪费时间，再把这里挪出白名单。
+        FetcherErrorCode.BOT_CHALLENGE,
     }
 )
 
@@ -106,6 +119,36 @@ class Tier:
     acquire: Acquire | None
 
 
+#: `PARSE` 是**兜底类别**：走到它意味着"我们知道失败，但不知道具体为什么"。
+#: 所以它永远不该盖掉一个已经查明原因的错误。
+#:
+#: 本轮实测的踩坑：百家号在 HTTP 通道被识别为 BOT_CHALLENGE（撞验证码），
+#: 浏览器通道落到"这里空空如也"只能报 PARSE。按"取最后一个"上报时，
+#: 用户和运维看到的是"没提取出正文"，而真正原因被抹平。
+_SPECIFICITY: dict[FetcherErrorCode, int] = {
+    FetcherErrorCode.BOT_CHALLENGE: 5,  # 最具体：连"对方要人机验证"都知道了
+    FetcherErrorCode.SSRF_BLOCKED: 5,
+    FetcherErrorCode.NOT_FOUND: 4,
+    FetcherErrorCode.RATE_LIMIT: 4,
+    FetcherErrorCode.AUTH: 4,
+    FetcherErrorCode.UNSUPPORTED: 3,
+    FetcherErrorCode.NETWORK: 2,
+    FetcherErrorCode.INTERNAL: 2,
+    FetcherErrorCode.PARSE: 1,  # 兜底，最低优先级
+}
+
+
+def _pick_better_error(current: FetcherError | None, new: FetcherError) -> FetcherError:
+    """在多个通道各自的失败里，挑信息量最大的那个上报。
+
+    规则：新错误更具体就换，否则保留当前（先到的通常是判定更早、结论更明确的通道）。
+    相同具体度时**不换**，保证"先到先得"的行为可预测。
+    """
+    if current is None:
+        return new
+    return new if _SPECIFICITY.get(new.code, 0) > _SPECIFICITY.get(current.code, 0) else current
+
+
 async def fetch_with_escalation(
     *,
     url: str,
@@ -122,9 +165,16 @@ async def fetch_with_escalation(
         只能靠这两个字段在日志里看出来。
 
     Raises:
-        FetcherError：所有通道都失败时抛**最后一节**的错误（信息量最大：
-                     最后一节通常是成本最高、结论最强的那次尝试）
+        FetcherError：所有通道都失败时抛**最有信息量的那个**错误，
+                     而不是简单取最后一个 —— 见 `_pick_better_error`。
+
+    关于"抛哪个错"：本轮实测撞出过一个真问题。百家号文章在 HTTP 通道被明确
+    识别为「撞了百度图形验证码」（BOT_CHALLENGE，说清了原因），但浏览器通道
+    落到「这里空空如也」的错误页，只能报一个笼统的 PARSE。若按"最后一个"上报，
+    用户看到的就是"没提取出正文" —— 而 PARSE 是**兜底类别**（我们不知道原因），
+    拿它去覆盖一个已经知道的明确原因，等于把结论抹平。
     """
+
     last_error: FetcherError | None = None
     tried: list[str] = []
     started = time.monotonic()
@@ -150,7 +200,7 @@ async def fetch_with_escalation(
                 )
                 fetch_metrics.record_failure(tier.name, exc.code.value, time.monotonic() - started)
                 raise
-            last_error = exc
+            last_error = _pick_better_error(last_error, exc)
             fetch_metrics.record_escalation(tier.name, exc.code.value)
             log.info(
                 "fetch_escalate url=%s tier=%s code=%s msg=%s",
@@ -181,9 +231,17 @@ async def fetch_with_escalation(
                 )
             continue
 
-        # 拿到 HTML 了，但解析仍可能失败（比如渲染后仍抽不到正文）——
-        # 那属于解析结论，同样按升级规则处理。
+        # 拿到 HTML 了，但**不代表它是文章**。先判是不是人机验证页，再进解析器。
+        #
+        # 顺序很关键：挑战页进解析器会被报成"抽不到正文"，那既误导用户
+        # （他不是要登录，是对方要他做人机验证），也让运维在指标里误以为该去查抽取器。
+        # 放在 pipeline 而不是各 fetcher 的 parse 里：一处覆盖所有通道和所有站点。
+        #
+        # ⚠️ 必须和 parse 放在**同一个 try** 里：挑战页判定的升级路径要和解析
+        # 失败走同一套规则，否则 BOT_CHALLENGE 会被当成终态直接上抛，
+        # 浏览器通道永远没机会试（这是本轮实测发现的接线错误，不是设计）。
         try:
+            detect_bot_challenge(acquired.html, final_url=acquired.final_url, source=source)
             result = parse(acquired)
         except FetcherError as exc:
             if exc.code not in ESCALATABLE_CODES:
@@ -196,7 +254,7 @@ async def fetch_with_escalation(
                 )
                 fetch_metrics.record_failure(tier.name, exc.code.value, time.monotonic() - started)
                 raise
-            last_error = exc
+            last_error = _pick_better_error(last_error, exc)
             fetch_metrics.record_escalation(tier.name, exc.code.value)
             log.info(
                 "fetch_parse_escalate url=%s tier=%s code=%s msg=%s",
