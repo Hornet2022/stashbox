@@ -5,6 +5,7 @@
 sys.modules —— 直接 `import fetchers` 会命中自己，所以用 importlib 以别名
 `cs_fetchers` 加载被测包（做法同 tests/content/helpers.py 的 `_load_app`）。
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -65,6 +66,40 @@ def test_all_fetchers_inherit_abstract_base():
         assert isinstance(fetcher.supports("https://example.com"), bool)
 
 
+def test_every_fetcher_fetch_accepts_the_abc_contract():
+    """所有 fetcher 的 `fetch` 签名必须与 ABC 一致（**这条是被真 bug 逼出来的**）。
+
+    上一轮给 `Fetcher.fetch` 加了 `budget` 参数（降级链总时限），
+    wechat / generic_url / pdf 都跟上了，**唯独 douyin 漏改**。
+    后果是生产上每个抖音链接都会炸：
+
+        TypeError: DouyinFetcher.fetch() got an unexpected keyword argument 'budget'
+
+    而 TypeError 不是 FetcherError，会被 `_prefetch_for_capture` 的兜底 except
+    收敛成 2002「抓取出错了」—— 抖音整条链路静默全废，
+    且因为 TypeError 不属于任何 FetcherErrorCode，日志里连原因都很难对上。
+
+    抖音是本轮唯一没被端到端碰过的链路，所以这个漏改没被发现。
+    签名一致性属于契约，必须由测试守住，不能靠"改到哪算哪"。
+    """
+    import inspect
+
+    expected = {
+        name: p.default
+        for name, p in inspect.signature(Fetcher.fetch).parameters.items()
+        if name != "self" and p.default is not inspect.Parameter.empty
+    }
+    for cls in ALL_FETCHER_CLASSES:
+        params = inspect.signature(cls.fetch).parameters
+        for name, default in expected.items():
+            assert name in params, f"{cls.__name__}.fetch 缺参数 {name}"
+            assert params[name].default == default, f"{cls.__name__}.fetch.{name} 默认值不一致"
+        # 只允许 ABC 声明的关键字参数，多出来的也要看见（改了契约就该同步）
+        assert set(params) - {"self", "url"} == set(
+            expected
+        ), f"{cls.__name__}.fetch 的关键字参数与 ABC 不一致：{set(params) - {'self', 'url'}}"
+
+
 async def test_fetch_placeholder_raises():
     """CP2.1 占位：wechat / douyin 的 fetch 抛 FetcherError(UNSUPPORTED)。
 
@@ -90,7 +125,9 @@ def test_fetcher_error_format():
 
 def test_fetch_result_defaults():
     """FetchResult 只有 4 个必填字段，其余有默认值。"""
-    result = FetchResult(url="https://example.com/a", title="t", content_html="<p/>", content_text="t")
+    result = FetchResult(
+        url="https://example.com/a", title="t", content_html="<p/>", content_text="t"
+    )
     assert result.author is None
     assert result.publish_time is None
     assert result.media_urls == []

@@ -142,7 +142,12 @@ class DouyinFetcher(Fetcher):
     def supports(self, url: str) -> bool:
         return any(host in url for host in DOUYIN_HOSTS)
 
-    async def fetch(self, url: str, *, timeout: float = TIMEOUT) -> FetchResult:
+    async def fetch(
+        self, url: str, *, timeout: float = TIMEOUT, budget: float | None = None
+    ) -> FetchResult:
+        # budget = 整条抓取的总时限（见 fetchers/base.py 契约）。
+        # 抖音目前**不接**无头浏览器通道（三路径 JSON 兜底已经是主路径，
+        # 渲染 H5 壳拿不到 iteminfo），所以 budget 只约束内部各次 HTTP 请求。
         # 非抖音 URL 不发请求（CP2.1 契约：supports() 说了算），否则会被厂商当爬虫
         if not self.supports(url):
             raise FetcherError(

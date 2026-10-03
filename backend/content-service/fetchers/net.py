@@ -126,9 +126,19 @@ _WECHAT_UA = (
     "(KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.45(0x18002d39) "
     "NetType/WIFI Language/zh_CN"
 )
+# 桌面 UA 刻意**不带** `StashBox/0.1` 这类自报家门的 token。
+#
+# 改造前 4 个 fetcher 里只有 wechat/douyin 的 UA 是"干净"的，generic 和 pdf
+# 却在 UA 末尾挂了 `StashBox/0.1`。这等于主动告诉每一个反爬站点
+# "我是个爬虫，来封我" —— 带自己的 token 没有任何好处，却让这些站点
+# 拥有一条零成本的精确封禁规则。
+#
+# 也没有做 UA 轮换：剪藏是低频动作，**稳定的回访指纹比每次都换一个新身份更可信**。
+# 目标站眼里"同一个客户端反复来读"像真人，"每次都换 UA"反而像群控。
+# （业界推荐的 UA 轮换是给高并发采集用的，剪藏不是那个场景。）
 _DESKTOP_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 StashBox/0.1"
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 _MOBILE_UA = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 "
