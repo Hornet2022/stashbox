@@ -15,3 +15,16 @@ prometheus-client>=0.21
 structlog>=24.1
 # CP11.0.8 P3.3: PDF 抓取器依赖（pypdf 纯 Python，MIT license，无 native 编译）
 pypdf>=6.0
+# 剪藏 Tier 2 抓取通道：无头浏览器（fetchers/browser.py）。
+#
+# 这是**剪藏成功率**的第二道保障：纯 httpx 拿不到必须执行 JS 才有正文的页面
+# （实测 JS 占位页在 HTTP 通道下只能抽到 7 个字 "loading"，
+#   换成浏览器通道 1.5s 拿到 396 字真正文）。
+#
+# 浏览器二进制**不随 pip 安装**（~150MB），部署时需额外执行：
+#   backend/.venv/bin/playwright install chromium
+#
+# 没装 / 没下载时不会让剪藏失败：fetchers/browser.py 抛 BrowserUnavailable，
+# 降级链静默跳过 Tier 2，行为退回纯 HTTP 通道。
+# 所以这一项缺失是"少一层兜底"而不是"服务起不来"。
+playwright>=1.48

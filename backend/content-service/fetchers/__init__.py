@@ -48,6 +48,9 @@ def get_fetcher(url: str) -> Fetcher | None:
 # 技术细节（fetcher 名、异常类型）走日志，不进这个字符串。
 _FETCH_ERROR_USER_MESSAGE: dict[FetcherErrorCode, str] = {
     FetcherErrorCode.UNSUPPORTED: "暂不支持这个链接来源，换个网站再试试",
+    # 刻意不点破"内网/安全策略"：告诉攻击者"这个地址被识别了、我们拦了内网"，
+    # 等于给 SSRF 探测一个免费 oracle。用户只需要知道"这个链接不能用"。
+    FetcherErrorCode.SSRF_BLOCKED: "暂不支持这个链接来源，换个网站再试试",
     FetcherErrorCode.NETWORK: "没能连上这个网站，可能是网络不通或对方站点暂时不可用，请稍后重试",
     FetcherErrorCode.RATE_LIMIT: "对方网站暂时限制了访问，请过几分钟再试",
     FetcherErrorCode.AUTH: "对方网站限制了非官方客户端访问，微信文章请在微信里打开后重新复制链接",
@@ -66,14 +69,18 @@ def map_fetcher_error(exc: FetcherError) -> BizException:
     """FetcherError → BizException（v1 §3.x 文章模块错误码）。
 
     fetcher 私有错误码（fetcher.*）→ 业务错误码的**唯一映射点**，不散在 Handler 里：
-    - UNSUPPORTED → 2001（URL 不支持，HTTP 400）
+    - UNSUPPORTED / SSRF_BLOCKED → 2001（这个链接不能用，HTTP 400）
     - NETWORK/PARSE/NOT_FOUND/AUTH/RATE_LIMIT → 2002（抓取失败，HTTP 502）
     - INTERNAL → 2002（抓取失败，HTTP 500）
+
+    SSRF_BLOCKED 归到 2001 而不是 2002：被拦下是**用户提交的 URL 本身有问题**
+    （指向内网），不是我们服务挂了。报 502 会让客户端以为是"我们这边故障"从而重试，
+    而重试一个永远会被拦的链接毫无意义。
 
     码值和 HTTP 状态是对外契约，不要改；message 改成用户可读的中文，
     技术细节由调用方打日志（见 capture 端点的 fetch_fail 日志）。
     """
-    if exc.code == FetcherErrorCode.UNSUPPORTED:
+    if exc.code in (FetcherErrorCode.UNSUPPORTED, FetcherErrorCode.SSRF_BLOCKED):
         biz = BizException(code=2001, message=fetch_error_user_message(exc.code))
         biz.detail = f"[{exc.source}/{exc.code.value}] {exc.message}"
         return biz

@@ -5,6 +5,7 @@
 
 集成测全部走 httpx.MockTransport，**不发真实网络请求**。
 """
+
 from __future__ import annotations
 
 import importlib
@@ -77,7 +78,7 @@ def test_title_extractor_basic():
 def test_title_extractor_with_og_title():
     """og:title 优先于 <title>。"""
     html = (
-        '<html><head><title>浏览器标签标题</title>'
+        "<html><head><title>浏览器标签标题</title>"
         '<meta property="og:title" content="社交分享用的标题">'
         "</head><body></body></html>"
     )
@@ -101,14 +102,18 @@ def test_author_extractor_multiple_sources():
 
     # 缺 author 时走 article:author
     assert (
-        _AuthorExtractor().parse(
+        _AuthorExtractor()
+        .parse(
             '<meta property="article:author" content="第二作者">'
             '<meta name="twitter:creator" content="@third">'
-        ).best
+        )
+        .best
         == "第二作者"
     )
     # 只剩 twitter:creator
-    assert _AuthorExtractor().parse('<meta name="twitter:creator" content="@third">').best == "@third"
+    assert (
+        _AuthorExtractor().parse('<meta name="twitter:creator" content="@third">').best == "@third"
+    )
     # 一个都没有 → None（不是空串，FetchResult.author 默认 None）
     assert _AuthorExtractor().parse("<p>没有作者</p>").best is None
 
@@ -150,7 +155,12 @@ def test_media_extractor_with_relative_urls():
         "https://example.com/media/v.mp4",
     ]
     # data: / javascript: 伪协议不收
-    assert _MediaExtractor(base_url="https://example.com").parse('<img src="data:image/png;base64,AA">').urls == []
+    assert (
+        _MediaExtractor(base_url="https://example.com")
+        .parse('<img src="data:image/png;base64,AA">')
+        .urls
+        == []
+    )
 
 
 def test_content_extractor_density_ranking():
@@ -262,8 +272,12 @@ async def test_fetch_handles_redirect():
 async def test_fetch_handles_relative_urls_in_html():
     """<img src="/static/x.png"> → media_urls 里是绝对 URL。"""
     html = (
-        '<html><head><title>相对路径测试</title></head><body>'
-        '<p>' + "正文内容必须足够长才能通过密度阈值，否则会被当成导航段落丢掉。" * 2 + '</p>'
+        "<html><head><title>相对路径测试</title></head><body>"
+        # 正文必须达到 parser.MIN_ARTICLE_CHARS（200）：抓取层现在有一道
+        # "整篇合理性闸门"，低于阈值判为"没抓到正文"（JS 渲染 / 需登录）而不是
+        # 假成功。fixture 用真实篇幅，否则这条测试会被闸门误伤 —— 而它本来
+        # 要验的是相对路径解析，与正文长度无关。
+        "<p>" + "正文内容必须足够长才能通过密度阈值，否则会被当成导航段落丢掉。" * 8 + "</p>"
         '<img src="/static/x.png"><img src="../up/y.png">'
         "</body></html>"
     )

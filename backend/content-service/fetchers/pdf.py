@@ -28,6 +28,16 @@ from .base import (
     FetcherError,
     FetcherErrorCode,
 )
+from .net import (
+    HeaderProfile,
+    HOST_THROTTLE,
+    acquire_client,
+    build_client_kwargs,
+    build_headers,
+    fetch_with_retry,
+    to_fetcher_error,
+)
+from .tiers import host_of
 
 log = logging.getLogger(__name__)
 
@@ -49,10 +59,8 @@ class PdfFetcher(Fetcher):
     catch-all 性低（只在 URL 看起来是 .pdf 时接），所以放在 generic_url 前面。
     """
 
-    UA = (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 StashBox/0.1"
-    )
+    UA = build_headers(HeaderProfile.PDF)["User-Agent"]
+    PROFILE = HeaderProfile.PDF
     TIMEOUT = 60.0  # PDF 下载给 60s（大文件需要更久）
 
     def __init__(self, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
@@ -69,7 +77,9 @@ class PdfFetcher(Fetcher):
             return False
         return parsed.path.lower().endswith(".pdf")
 
-    async def fetch(self, url: str, *, timeout: float = TIMEOUT) -> FetchResult:
+    async def fetch(
+        self, url: str, *, timeout: float = TIMEOUT, budget: float | None = None
+    ) -> FetchResult:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise FetcherError(
@@ -78,46 +88,45 @@ class PdfFetcher(Fetcher):
                 source=self.name,
             )
 
-        # 1. 下载 PDF
-        client_kwargs: dict[str, Any] = {
-            "timeout": timeout,
-            "follow_redirects": True,
-            # CP9.x fix：trust_env=False 防止 HTTP_PROXY 拦内网/本机请求
-            "trust_env": False,
-            "headers": {
-                "User-Agent": self.UA,
-                "Accept": "application/pdf,*/*;q=0.8",
-            },
-        }
-        if self._transport is not None:
-            client_kwargs["transport"] = self._transport
-        try:
-            async with httpx.AsyncClient(**client_kwargs) as client:
-                response = await client.get(url)
-        except httpx.TimeoutException as exc:
-            raise FetcherError(
-                code=FetcherErrorCode.NETWORK,
-                message=f"timeout after {timeout}s",
-                source=self.name,
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise FetcherError(
-                code=FetcherErrorCode.NETWORK,
-                message=f"request failed: {type(exc).__name__}: {exc}",
-                source=self.name,
-            ) from exc
+        # PDF **不接**无头浏览器通道：浏览器渲出来的是 PDF 阅读器外壳，不是文件字节，
+        # 正文得靠 pypdf 抽二进制，渲染通道在这里没有任何增益（与其花 12s 换一份
+        # 抽不出正文的 HTML，不如把时间留给大文件下载）。
+        # 但共享层的 SSRF 防护 / 退避重试 / 按 host 节流一样要吃 —— PDF 是 catch-all
+        # 性最低的 fetcher 之一，却曾经是**完全裸奔**的（改造前无任何 SSRF hook）。
+        await HOST_THROTTLE.wait(host_of(url))
+        client_kwargs = build_client_kwargs(
+            self.PROFILE,
+            guard_ssrf=self._transport is None,
+            transport=self._transport,
+        )
+        client = acquire_client(self.PROFILE, **client_kwargs)
 
-        if response.status_code in (404, 410):
-            raise FetcherError(
-                code=FetcherErrorCode.NOT_FOUND,
-                message=f"http {response.status_code}",
-                source=self.name,
+        async def send(per_attempt: float) -> httpx.Response:
+            return await client.get(url, timeout=min(per_attempt, timeout))
+
+        try:
+            response = await fetch_with_retry(
+                send, on_retry=lambda n, why: log.info("pdf_retry attempt=%d %s", n, why)
             )
-        if response.status_code >= 400:
+        except httpx.HTTPError as exc:
+            raise to_fetcher_error(exc, source=self.name, timeout=timeout) from exc
+
+        status = response.status_code
+        if status in (404, 410):
             raise FetcherError(
-                code=FetcherErrorCode.NETWORK,
-                message=f"http {response.status_code}",
-                source=self.name,
+                code=FetcherErrorCode.NOT_FOUND, message=f"http {status}", source=self.name
+            )
+        if status == 429:
+            raise FetcherError(
+                code=FetcherErrorCode.RATE_LIMIT, message=f"http {status}", source=self.name
+            )
+        if status in (401, 403):
+            raise FetcherError(
+                code=FetcherErrorCode.AUTH, message=f"http {status}", source=self.name
+            )
+        if status >= 400:
+            raise FetcherError(
+                code=FetcherErrorCode.NETWORK, message=f"http {status}", source=self.name
             )
 
         # 2. Content-Type 校验

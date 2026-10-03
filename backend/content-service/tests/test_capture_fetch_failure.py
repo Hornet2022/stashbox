@@ -74,7 +74,8 @@ class _StubFetcher:
     def supports(self, url: str) -> bool:
         return True
 
-    async def fetch(self, url: str, *, timeout: float = 10.0):
+    async def fetch(self, url: str, *, timeout: float = 10.0, budget: float | None = None):
+        # budget 是降级链总时限（见 fetchers/base.py 的契约），桩要跟上签名
         self.calls += 1
         if self._exc is not None:
             raise self._exc

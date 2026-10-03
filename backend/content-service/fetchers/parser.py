@@ -18,6 +18,7 @@ CP2.4 在 generic_url.py 里写的 5 个 stdlib HTMLParser，CP2.2 抽到这里�
 从 generic_url.py 平移时**行为不改**（阈值 / 段落数 / 截断位置全部照搬），
 CP2.4 的 5 个解析测试（test_generic_url.py）就是回归验证。
 """
+
 from __future__ import annotations
 
 import re
@@ -38,6 +39,23 @@ MAX_BLOCK_TEXT = 20_000  # 单段纯文本上限（超过截断，不算丢弃�
 MAX_CONTENT_TEXT = 50 * 1024  # content_text 总上限 50KB（防爆）
 MAX_CONTENT_HTML = 200 * 1024  # content_html 总上限 200KB（按整段累加，不切断标签）
 MAX_HTML_CHARS = 2 * 1024 * 1024  # 解析前 HTML 截断，防超大页面把内存打爆
+
+#: 整篇正文的最小合理字符数。低于此值**不是**文章，是"没抓到正文"。
+#:
+#: 为什么需要这条（实测踩到过，不是假想）：密度启发式只看**单段**，
+#: 一个 JS 占位页 `<div id="app">loading</div>` 的纯文本/原始长度比是 7/25=0.28，
+#: 稳稳高过 `MIN_TEXT_DENSITY` 的 0.25，于是被当成合法正文返回。
+#: 结果是剪藏"成功"了，正文只有 7 个字（"loading"），
+#: 用户拿到一篇 7 字的音频，而抓取层没有任何异常可报。
+#:
+#: 这和上一轮修的「`[empty article]` 占位符被当正文喂给 LLM」是同一类故障：
+#: **失败伪装成成功**。密度解决不了它，因为壳页里确实有一段"高密度"文本。
+#:
+#: 取 200 的理由：低于 200 字的网页对"听完一篇文章"这个产品目标没有价值
+#: （听 200 字不到 1 分钟），而正常公众号/新闻正文轻松过万字。
+#: 宁可对极短公告误报一次（用户看到"没提取到正文"，还能反馈），
+#: 也不要让垃圾正文进蒸馏链烧 token。
+MIN_ARTICLE_CHARS = 200
 
 # 参与"正文候选"竞争的标签（容器型标签若含嵌套候选段会被判为容器而排除）
 _BLOCK_TAGS = frozenset({"p", "div", "article", "section"})
@@ -342,6 +360,7 @@ __all__ = [
     "MAX_PARAGRAPHS",
     "MIN_PARAGRAPH_CHARS",
     "MIN_TEXT_DENSITY",
+    "MIN_ARTICLE_CHARS",
     "MediaExtractor",
     "TimeExtractor",
     "TitleExtractor",

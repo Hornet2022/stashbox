@@ -42,7 +42,17 @@ from .base import (
     FetcherError,
     FetcherErrorCode,
 )
+from .net import (
+    HeaderProfile,
+    HOST_THROTTLE,
+    acquire_client,
+    build_client_kwargs,
+    build_headers,
+    fetch_with_retry,
+    to_fetcher_error,
+)
 from .parser import _norm
+from .tiers import host_of
 
 # 抖音的三种常见域名：
 # - www.douyin.com     分享出来的视频/图文页
@@ -115,7 +125,8 @@ class DouyinFetcher(Fetcher):
     → 老 iteminfo 接口；全失败 → UNSUPPORTED(2001)。
     """
 
-    UA = MOBILE_UA
+    UA = build_headers(HeaderProfile.MOBILE)["User-Agent"]
+    PROFILE = HeaderProfile.MOBILE
     TIMEOUT = 30.0
     FALLBACK_TIMEOUT = 10.0  # 三路径兜底请求超时（独立短超时，避免拖死主流程）
     MAX_HTML_CHARS = 2 * 1024 * 1024  # 解析前 HTML 截断（对齐 wechat / generic_url 的防爆上限）
@@ -164,45 +175,35 @@ class DouyinFetcher(Fetcher):
                 source=self.name,
             )
 
-        client_kwargs: dict[str, Any] = self._client_kwargs()
-        if self._transport is not None:
-            client_kwargs["transport"] = self._transport
-        async with httpx.AsyncClient(**client_kwargs) as client:
-            aweme = await self._fetch_mobile_h5(client, aweme_id)
-            if aweme is None:
-                aweme = await self._fetch_iesdouyin_h5(client, aweme_id)
-            if aweme is None:
-                aweme = await self._fetch_iesdouyin_api(client, aweme_id)
-            if aweme is None:
-                raise FetcherError(
-                    code=FetcherErrorCode.UNSUPPORTED,
-                    message=f"抖音视频抓取全路径失败: {aweme_id}",
-                    source=self.name,
-                )
-            return self._build_result(aweme, url=url, final_url=final_url, status_code=status_code)
+        client = self._client()
+        aweme = await self._fetch_mobile_h5(client, aweme_id)
+        if aweme is None:
+            aweme = await self._fetch_iesdouyin_h5(client, aweme_id)
+        if aweme is None:
+            aweme = await self._fetch_iesdouyin_api(client, aweme_id)
+        if aweme is None:
+            raise FetcherError(
+                code=FetcherErrorCode.UNSUPPORTED,
+                message=f"抖音视频抓取全路径失败: {aweme_id}",
+                source=self.name,
+            )
+        return self._build_result(aweme, url=url, final_url=final_url, status_code=status_code)
 
     # -- 下载 ---------------------------------------------------------------
     async def _download(self, url: str, *, timeout: float) -> tuple[str, int, str]:
         """抓 HTML：移动端 UA + follow_redirects（解 v.douyin.com 短链），返回 (html, status, final_url)。"""
-        client_kwargs: dict[str, Any] = self._client_kwargs()
-        client_kwargs["timeout"] = timeout
-        if self._transport is not None:
-            client_kwargs["transport"] = self._transport
+        await HOST_THROTTLE.wait(host_of(url))
+        client = acquire_client(self.PROFILE, **self._client_kwargs())
+
+        async def send(per_attempt: float) -> httpx.Response:
+            return await client.get(url, timeout=min(per_attempt, timeout))
+
         try:
-            async with httpx.AsyncClient(**client_kwargs) as client:
-                response = await client.get(url)
-        except httpx.TimeoutException as exc:
-            raise FetcherError(
-                code=FetcherErrorCode.NETWORK,
-                message=f"timeout after {timeout}s",
-                source=self.name,
-            ) from exc
+            response = await fetch_with_retry(
+                send, on_retry=lambda n, why: logger.info("douyin_retry attempt={} {}", n, why)
+            )
         except httpx.HTTPError as exc:
-            raise FetcherError(
-                code=FetcherErrorCode.NETWORK,
-                message=f"request failed: {type(exc).__name__}: {exc}",
-                source=self.name,
-            ) from exc
+            raise to_fetcher_error(exc, source=self.name, timeout=timeout) from exc
 
         if response.status_code in (404, 410):
             raise FetcherError(
@@ -225,19 +226,23 @@ class DouyinFetcher(Fetcher):
         return html, response.status_code, str(response.url)
 
     def _client_kwargs(self) -> dict[str, Any]:
-        """三路径兜底 / 下载共用的 client 参数（移动端 UA + follow_redirects）。"""
-        return {
-            "timeout": self.FALLBACK_TIMEOUT,
-            "follow_redirects": True,
-            # CP9.x fix：trust_env=False 防止 HTTP_PROXY 拦内网/本机请求
-            "trust_env": False,
-            "headers": {
-                "User-Agent": self.UA,
-                "Referer": "https://www.douyin.com/",
-                "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            },
-        }
+        """三路径兜底 / 下载共用的 client 参数（共享层统一发放）。
+
+        改造前这里是**第三份**手抄的 headers（wechat / generic_url / pdf 各一份），
+        四份内容各不相同。现在全部由 `net.build_client_kwargs()` 按画像发放 ——
+        SSRF 防护、退避重试、按 host 节流、显式代理都从这一处来，
+        新增 fetcher 也不可能漏挂 SSRF 钩子（改造前只有 generic_url 有）。
+        """
+        return build_client_kwargs(
+            self.PROFILE,
+            extra_headers={"Referer": "https://www.douyin.com/"},
+            guard_ssrf=self._transport is None,
+            transport=self._transport,
+        )
+
+    def _client(self) -> httpx.AsyncClient:
+        """取 client（无 transport 的生产路径走池，复用连接与 cookie）。"""
+        return acquire_client(self.PROFILE, **self._client_kwargs())
 
     # -- aweme_id 抽取 ------------------------------------------------------
     @staticmethod
@@ -259,11 +264,9 @@ class DouyinFetcher(Fetcher):
             return aweme_id
         # 最后兜底：抓页面抽 aweme_id（短链跳转后的 H5 页面常带）
         try:
-            client_kwargs: dict[str, Any] = self._client_kwargs()
-            if self._transport is not None:
-                client_kwargs["transport"] = self._transport
-            async with httpx.AsyncClient(**client_kwargs) as client:
-                resp = await client.get(url)
+            await HOST_THROTTLE.wait(host_of(url))
+            async with httpx.AsyncClient(**self._client_kwargs()) as client:
+                resp = await client.get(url, timeout=self.FALLBACK_TIMEOUT)
             if resp.status_code == 200:
                 m = _AWEME_ID_IN_HTML_RE.search(resp.text)
                 if m:

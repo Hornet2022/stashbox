@@ -6,6 +6,7 @@
 注意：FetcherErrorCode 是 fetcher 私有的业务错误码，**不**并入 v1 §3.x 的 biz_code 体系，
 对外暴露时由上层（CP2.5 服务号 Handler）再映射成统一错误响应。
 """
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -23,6 +24,7 @@ class FetcherErrorCode(str, Enum):
     RATE_LIMIT = "fetcher.rate_limit"  # 被目标站限速
     NOT_FOUND = "fetcher.not_found"  # 文章已被删除/404
     UNSUPPORTED = "fetcher.unsupported"  # URL 不被本 fetcher 支持
+    SSRF_BLOCKED = "fetcher.ssrf_blocked"  # 目标指向内网/回环/链路本地，被安全策略拦下
     INTERNAL = "fetcher.internal"  # 内部错误
 
     def __str__(self) -> str:
@@ -77,12 +79,20 @@ class Fetcher(ABC):
         ...
 
     @abstractmethod
-    async def fetch(self, url: str, *, timeout: float = 30.0) -> FetchResult:
-        """真正抓取（CP2.2-CP2.4 实现，本期 raise FetcherError 占位）。
+    async def fetch(
+        self, url: str, *, timeout: float = 30.0, budget: float | None = None
+    ) -> FetchResult:
+        """真正抓取。
 
         Args:
             url: 目标 URL
-            timeout: 超时秒数（默认 30s，CP2.7 集成测可调）
+            timeout: **单次 HTTP 请求**的超时秒数（默认 30s，CP2.7 集成测可调）
+            budget: **整条降级链**的总时限秒数（None = 不限）。
+
+                为什么要有 budget：抓取是多通道降级（见 `pipeline.py`），
+                每级各有超时，串起来最坏到分钟级。而剪藏是**同步接口**，
+                用户盯着转圈等 —— 所以总时限必须是显式的、由 HTTP 边界给的硬约束，
+                不能让各 fetcher 各自随便串。
 
         Returns:
             FetchResult：统一格式

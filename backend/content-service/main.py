@@ -28,6 +28,7 @@ CP1.7：D9 端到端 —— 不要求登录态 → 建文章 → 自动触发 ai
 """
 
 import json
+import os
 import re
 import sys
 import time
@@ -372,6 +373,25 @@ def _to_raw_content(result) -> dict:
     return json.loads(json.dumps(asdict(result), default=_json_default))
 
 
+#: 剪藏抓取的总时限预算（秒），覆盖「HTTP 退避重试 + 无头浏览器兜底」整条降级链。
+#:
+#: 30s 的取法：Tier 1 单次 10s（沿用改造前的值）+ 退避 + Tier 2 浏览器 12s 上限
+#: （见 fetchers/pipeline.BROWSER_TIER_CAP）+ 余量。够跑完两级通道，又不至于
+#: 让用户对着转圈等到以为应用挂了。可用环境变量覆盖（云端网络差时调大）。
+_ENV_CAPTURE_FETCH_BUDGET = "STASHBOX_CAPTURE_FETCH_BUDGET"
+_CAPTURE_FETCH_BUDGET_DEFAULT = 30.0
+
+
+def _capture_fetch_budget() -> float:
+    try:
+        return max(
+            5.0,
+            float(os.environ.get(_ENV_CAPTURE_FETCH_BUDGET) or "") or _CAPTURE_FETCH_BUDGET_DEFAULT,
+        )
+    except ValueError:
+        return _CAPTURE_FETCH_BUDGET_DEFAULT
+
+
 async def _prefetch_for_capture(url: str):
     """剪藏前置抓取：拿到正文才允许建文章。
 
@@ -400,7 +420,13 @@ async def _prefetch_for_capture(url: str):
             code=2001, message=fetch_error_user_message(FetcherErrorCode.UNSUPPORTED)
         )
     try:
-        return await fetcher.fetch(url, timeout=10.0)
+        # budget = **整条降级链**的总时限（HTTP 重试 + 无头浏览器兜底共用）。
+        #
+        # 为什么必须显式给：抓取现在是多通道降级（见 fetchers/pipeline.py），
+        # 每级都有自己的超时，串起来最坏能到分钟级。而剪藏是同步接口，用户盯着
+        # 一个转圈等 —— 30 秒还没回来，他已经认定应用坏了。所以总时限是硬约束，
+        # 由这一层（HTTP 边界）定，而不是让 fetcher 自己随便串。
+        return await fetcher.fetch(url, timeout=10.0, budget=_capture_fetch_budget())
     except FetcherError as exc:
         log.info(
             f"capture_fetch_fail: url={url} code={exc.code.value} "

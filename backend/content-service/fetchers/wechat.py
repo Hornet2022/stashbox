@@ -43,6 +43,7 @@ AUTH。判据已改为「无 `#js_content` + 剔 script 后扫可见文本」双
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -57,7 +58,18 @@ from .base import (
     FetcherError,
     FetcherErrorCode,
 )
+from .net import (
+    Deadline,
+    HeaderProfile,
+    HOST_THROTTLE,
+    acquire_client,
+    build_client_kwargs,
+    build_headers,
+    fetch_with_retry,
+    to_fetcher_error,
+)
 from .parser import (
+    MIN_ARTICLE_CHARS,
     AuthorExtractor,
     MediaExtractor,
     TimeExtractor,
@@ -65,6 +77,10 @@ from .parser import (
     _norm,
     _parse_datetime,
 )
+from .pipeline import Acquired, fetch_with_escalation
+from .tiers import host_of, standard_tiers
+
+log = logging.getLogger("stashbox.fetch.wechat")
 
 # 公众号文章域名：正文页 mp.weixin.qq.com
 WECHAT_HOST = "mp.weixin.qq.com"
@@ -191,12 +207,10 @@ class WechatFetcher(Fetcher):
     - 二维码长按场景：二维码解出的 URL 也是 mp.weixin.qq.com
     """
 
-    # 必须带 MicroMessenger 段：少了这一段微信会回"请在微信中打开"壳页（实测）。
-    UA = (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 "
-        "(KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.45(0x18002d39) "
-        "NetType/WIFI Language/zh_CN"
-    )
+    # UA 单点来自 HeaderProfile（net.py 是唯一事实来源），
+    # 保留类属性是因为 4 件套契约测试直接断言它，且外部也在读。
+    UA = build_headers(HeaderProfile.WECHAT)["User-Agent"]
+    PROFILE = HeaderProfile.WECHAT
     TIMEOUT = 30.0
     MAX_HTML_CHARS = MAX_HTML_CHARS  # 8MB：真实公众号文章普遍 3.5MB 左右
     MIN_SHELL_BYTES = MIN_SHELL_BYTES  # 低于 10KB 判定为空壳
@@ -212,7 +226,9 @@ class WechatFetcher(Fetcher):
     def supports(self, url: str) -> bool:
         return WECHAT_HOST in url
 
-    async def fetch(self, url: str, *, timeout: float = TIMEOUT) -> FetchResult:
+    async def fetch(
+        self, url: str, *, timeout: float = TIMEOUT, budget: float | None = None
+    ) -> FetchResult:
         # 非公众号 URL 不发请求（CP2.1 契约：supports() 说了算），否则会被厂商当爬虫
         if not self.supports(url):
             raise FetcherError(
@@ -227,56 +243,83 @@ class WechatFetcher(Fetcher):
                 message=f"unsupported url scheme: {url!r}",
                 source=self.name,
             )
+        # SSRF：supports() 是子串匹配，`http://mp.weixin.qq.com@127.0.0.1:8100/`
+        # 这类 userinfo 写法照样命中（实测请求真的打到了本机 8100 网关）。
+        # 拦截点统一在 net.build_client_kwargs()，新增 fetcher 也不会漏挂。
+        deadline = Deadline(budget)
+        return await fetch_with_escalation(
+            url=url,
+            parse=self.parse,
+            source=self.name,
+            deadline=deadline,
+            tiers=standard_tiers(
+                url,
+                http=lambda: self._acquire(url, timeout=timeout),
+                profile=self.PROFILE,
+                deadline=deadline,
+                with_browser=self._transport is None,
+            ),
+        )
 
-        html, status_code, final_url = await self._download(url, timeout=timeout)
-        _check_wechat_block(html)
-        return self.parse_article(html, url=url, final_url=final_url, status_code=status_code)
+    def parse(self, acq: Acquired) -> FetchResult:
+        """pipeline 要求的解析入口（浏览器通道拿到的 HTML 也走这里）。
+
+        反爬判定放在这里而不是 `_download` 之后：浏览器通道的 HTML 也必须过同一道闸，
+        否则渲染出来的风控页会被当成正文页建库。
+        """
+        _check_wechat_block(acq.html)
+        return self.parse_article(
+            acq.html,
+            url=acq.url or acq.final_url,
+            final_url=acq.final_url,
+            status_code=acq.status or 200,
+        )
 
     # -- 下载 ---------------------------------------------------------------
-    async def _download(self, url: str, *, timeout: float) -> tuple[str, int, str]:
-        """抓 HTML：微信 4 件套齐发，返回 (html, status, final_url)。"""
-        client_kwargs: dict[str, Any] = {
-            "timeout": timeout,
-            "follow_redirects": True,
-            # CP9.x fix：trust_env=False 防止 HTTP_PROXY 拦内网/本机请求
-            "trust_env": False,
-            "headers": {
-                "User-Agent": self.UA,
-                "Referer": "https://mp.weixin.qq.com/",
-                # application/xml 不能省：缺了部分 CDN 返 406（SOP §1.4）
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9",
-            },
-        }
-        if self._transport is not None:
-            client_kwargs["transport"] = self._transport
-        try:
-            async with httpx.AsyncClient(**client_kwargs) as client:
-                response = await client.get(url)
-        except httpx.TimeoutException as exc:
-            raise FetcherError(
-                code=FetcherErrorCode.NETWORK,
-                message=f"timeout after {timeout}s",
-                source=self.name,
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise FetcherError(
-                code=FetcherErrorCode.NETWORK,
-                message=f"request failed: {type(exc).__name__}: {exc}",
-                source=self.name,
-            ) from exc
+    async def _acquire(self, url: str, *, timeout: float) -> Acquired:
+        """降级链的 HTTP 通道：节流 → 退避重试 → 状态码判定。"""
+        html, status_code, final_url = await self._download(url, timeout=timeout)
+        return Acquired(html=html, final_url=final_url, status=status_code, tier="http", url=url)
 
-        if response.status_code in (404, 410):
-            raise FetcherError(
-                code=FetcherErrorCode.NOT_FOUND,
-                message=f"http {response.status_code}",
-                source=self.name,
+    async def _download(self, url: str, *, timeout: float) -> tuple[str, int, str]:
+        """抓 HTML：微信 4 件套齐发（+ SSRF 防护 / 退避重试 / 按 host 节流）。"""
+        await HOST_THROTTLE.wait(host_of(url))
+        client_kwargs = build_client_kwargs(
+            self.PROFILE,
+            # 注入了 MockTransport 就不跑 DNS 校验：mock 不发真实请求，
+            # 跑校验只会让用例依赖外网。生产路径永远带防护。
+            guard_ssrf=self._transport is None,
+            transport=self._transport,
+        )
+        client = acquire_client(self.PROFILE, **client_kwargs)
+
+        async def send(per_attempt: float) -> httpx.Response:
+            return await client.get(url, timeout=per_attempt)
+
+        try:
+            response = await fetch_with_retry(
+                send, on_retry=lambda n, why: log.info("wechat_retry attempt=%d %s", n, why)
             )
-        if response.status_code >= 400:
+        except httpx.HTTPError as exc:
+            raise to_fetcher_error(exc, source=self.name, timeout=timeout) from exc
+
+        status = response.status_code
+        if status in (404, 410):
             raise FetcherError(
-                code=FetcherErrorCode.NETWORK,
-                message=f"http {response.status_code}",
-                source=self.name,
+                code=FetcherErrorCode.NOT_FOUND, message=f"http {status}", source=self.name
+            )
+        if status == 429:
+            # 单独分一个码：重试语义完全不同（换通道 / 等更久），文案也不同
+            raise FetcherError(
+                code=FetcherErrorCode.RATE_LIMIT, message=f"http {status}", source=self.name
+            )
+        if status in (401, 403):
+            raise FetcherError(
+                code=FetcherErrorCode.AUTH, message=f"http {status}", source=self.name
+            )
+        if status >= 400:
+            raise FetcherError(
+                code=FetcherErrorCode.NETWORK, message=f"http {status}", source=self.name
             )
 
         html = response.text[: self.MAX_HTML_CHARS]
@@ -284,7 +327,7 @@ class WechatFetcher(Fetcher):
             raise FetcherError(
                 code=FetcherErrorCode.PARSE, message="empty html body", source=self.name
             )
-        return html, response.status_code, str(response.url)
+        return html, status, str(response.url)
 
     # -- 解析 ---------------------------------------------------------------
     def parse_article(
@@ -340,6 +383,18 @@ class WechatFetcher(Fetcher):
             raise FetcherError(
                 code=FetcherErrorCode.PARSE,
                 message="wechat article body (#js_content) is empty",
+                source=self.name,
+            )
+        # 合理性闸门：`#js_content` 存在 ≠ 有正文。反爬空壳页偶尔会带一个
+        # 几乎空的 js_content（实测"环境异常"页就有），只判空会把垃圾当成功。
+        # 抛 PARSE（可升级错误码）让降级链去试无头浏览器通道。
+        if len(content_text) < MIN_ARTICLE_CHARS:
+            raise FetcherError(
+                code=FetcherErrorCode.PARSE,
+                message=(
+                    f"wechat article body too short: {len(content_text)} chars "
+                    f"< {MIN_ARTICLE_CHARS} — 多半是反爬空壳页"
+                ),
                 source=self.name,
             )
 

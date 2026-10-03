@@ -254,7 +254,11 @@ def test_real_article_page_with_blocklist_words_in_js_is_not_blocked():
         "<html><head><title>x</title>"
         "<script>var tips=['请在微信中打开','环境异常','该公众号已迁移'];</script>"
         "</head><body>"
-        '<div id="js_content"><p>正文第一段。</p><p>正文第二段。</p></div>'
+        # 正文达到 parser.MIN_ARTICLE_CHARS：抓取层现在有"整篇合理性闸门"，
+        # 低于阈值判为反爬空壳页。这条要验的是"有 #js_content 就放行"，
+        # 与正文长度无关，所以 fixture 用真实篇幅。
+        '<div id="js_content"><p>正文第一段。</p><p>正文第二段。</p>'
+        "<p>" + "这是一篇真实公众号文章会有的正文段落。" * 12 + "</p></div>"
         "<script>window.__webpack_payload__=1;</script>"
         "</body></html>"
     )
