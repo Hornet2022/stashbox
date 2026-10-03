@@ -34,8 +34,11 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+
+from stashbox.backend.common import fetch_metrics
 
 from .base import FetcherError, FetcherErrorCode, FetchResult
 from .net import Deadline
@@ -124,6 +127,7 @@ async def fetch_with_escalation(
     """
     last_error: FetcherError | None = None
     tried: list[str] = []
+    started = time.monotonic()
 
     for tier in tiers:
         if tier.acquire is None:
@@ -144,8 +148,10 @@ async def fetch_with_escalation(
                     exc.code.value,
                     exc.message,
                 )
+                fetch_metrics.record_failure(tier.name, exc.code.value, time.monotonic() - started)
                 raise
             last_error = exc
+            fetch_metrics.record_escalation(tier.name, exc.code.value)
             log.info(
                 "fetch_escalate url=%s tier=%s code=%s msg=%s",
                 url,
@@ -188,8 +194,10 @@ async def fetch_with_escalation(
                     exc.code.value,
                     exc.message,
                 )
+                fetch_metrics.record_failure(tier.name, exc.code.value, time.monotonic() - started)
                 raise
             last_error = exc
+            fetch_metrics.record_escalation(tier.name, exc.code.value)
             log.info(
                 "fetch_parse_escalate url=%s tier=%s code=%s msg=%s",
                 url,
@@ -201,11 +209,19 @@ async def fetch_with_escalation(
 
         result.raw_metadata["fetch_tier"] = tier.name
         result.raw_metadata["fetch_tiers_tried"] = tried
+        fetch_metrics.record_success(tier.name, time.monotonic() - started)
         log.info("fetch_ok url=%s tier=%s tried=%s", url, tier.name, tried)
         return result
 
     if last_error is not None:
+        fetch_metrics.record_failure(
+            # 归到"最后一节"而不是"http"：失败发生在哪一节决定了下次该修哪一层
+            tried[-1] if tried else "none",
+            last_error.code.value,
+            time.monotonic() - started,
+        )
         raise last_error
+    fetch_metrics.record_failure("none", "no_tier_available", time.monotonic() - started)
     raise FetcherError(
         code=FetcherErrorCode.NETWORK,
         message="no fetch tier available (budget exhausted or all tiers disabled)",

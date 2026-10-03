@@ -20,6 +20,17 @@ from .pipeline import BROWSER_TIER_CAP, Acquired, Tier
 log = logging.getLogger("stashbox.fetch.tiers")
 
 
+def _mark_browser_unavailable() -> None:
+    """浏览器通道不可用就打点 —— 线上**少了一层兜底**，这类静默降级必须有指标。
+
+    只计"不可用"，不记"可用"：rate() 为 0 就说明通道健康，
+    而"可用次数"这种分母会随流量涨落，看了也不知道该修什么。
+    """
+    from stashbox.backend.common import fetch_metrics
+
+    fetch_metrics.fetch_browser_tier_unavailable_total.inc()
+
+
 def browser_acquirer(
     url: str,
     *,
@@ -45,7 +56,13 @@ def browser_acquirer(
         budget = deadline.slice(BROWSER_TIER_CAP) or 0.0
         if budget <= 0.0:
             raise BrowserUnavailable("no budget left for browser tier")
-        page = await get_renderer().render(url, user_agent=user_agent, timeout=budget)
+        try:
+            page = await get_renderer().render(url, user_agent=user_agent, timeout=budget)
+        except BrowserUnavailable:
+            # 打点：浏览器通道静默不可用 = 线上**少了一层兜底**。
+            # 这类降级如果只有日志没人看，等于悄悄丢掉了剪藏成功率。
+            _mark_browser_unavailable()
+            raise
         if page.status is not None and page.status >= 400:
             # 渲染的是错误页，交回状态码让 pipeline 用统一的错误码语义去判
             from .base import FetcherError, FetcherErrorCode
