@@ -13,6 +13,7 @@
 - ✅ 401：未登录
 - ✅ 403：改别人的 favorite（user_id != owner）
 """
+
 from sqlalchemy import delete, select
 
 from stashbox.backend.common.database import AsyncSessionLocal
@@ -240,6 +241,7 @@ async def test_delete_favorite():
 async def test_add_favorite_article_not_found():
     uid, token = await new_user()
     import uuid
+
     missing = f"art_{uuid.uuid4().hex[:24]}"
     try:
         async with client(token) as c:
@@ -287,3 +289,51 @@ async def test_update_other_user_favorite_returns_404():
         assert rows[0].folder == "tech"
     finally:
         await _purge(owner_id, other_id)
+
+
+# ---------------------------------------------------------------------------
+# 12. 回归：幂等分支必须回全字段（安卓 AddFavoriteResponse.folder 无默认值）
+# ---------------------------------------------------------------------------
+async def test_idempotent_add_returns_folder_field():
+    """同一文章 + 同一 folder 重复收藏，后端走幂等分支，**必须回 folder**。
+
+    回归守卫。修复前幂等分支是：
+
+        return {"ok": True, "already_favorited": True, "id": existing.id}
+
+    而安卓侧是：
+
+        data class AddFavoriteResponse(
+            val ok: Boolean,
+            val id: Int,
+            val folder: String,      // 无默认值
+        )
+
+    kotlinx 的 `ignoreUnknownKeys = true` 只忽略**多余**键，
+    **不补缺失的必填键** —— 所以第二次收藏同一文章到同一 folder
+    （连点两次心形、列表数据过期后再点，都会走到这里）会抛
+    MissingFieldException 当场崩掉。
+
+    正常分支返回 {ok, id, folder}，幂等分支必须和它同构，
+    否则"两个分支字段不一致"就是一颗定时炸弹。
+    """
+    uid, token = await new_user()
+    art_id = await new_article(uid)
+    try:
+        async with client(token) as c:
+            first = await c.post(ADD_URL.format(art_id), json={"folder": "tech"})
+            second = await c.post(ADD_URL.format(art_id), json={"folder": "tech"})
+
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+
+        second_body = second.json()
+        assert second_body.get("already_favorited") is True, second_body
+        # 安卓反序列化必需的三个字段，一个都不能少
+        for field in ("ok", "id", "folder"):
+            assert field in second_body, f"幂等响应缺字段 {field}: {second_body}"
+        assert second_body["folder"] == "tech"
+        # 两个分支同构：id 应指向同一条收藏
+        assert second_body["id"] == first.json()["id"]
+    finally:
+        await _purge(uid)

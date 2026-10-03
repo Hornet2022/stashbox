@@ -1209,7 +1209,17 @@ async def add_favorite(
         )
     )
     if existing:
-        return {"ok": True, "already_favorited": True, "id": existing.id}
+        # 幂等分支必须回全字段：`folder` 在正常分支有，缺了它安卓
+        # `AddFavoriteResponse.folder: String`（无默认值）反序列化直接
+        # MissingFieldException 崩掉 —— kotlinx 的 ignoreUnknownKeys 只忽略
+        # **多余**键，不补**缺失的必填**键，所以这层兜不住。
+        # 触发路径很日常：连点两次心形、列表数据过期后再点一次。
+        return {
+            "ok": True,
+            "already_favorited": True,
+            "id": existing.id,
+            "folder": existing.folder,
+        }
 
     fav = Favorite(user_id=uid, article_id=article_id, folder=folder, note=note)
     db.add(fav)
