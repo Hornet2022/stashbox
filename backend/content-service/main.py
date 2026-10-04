@@ -818,16 +818,33 @@ async def list_listened(user: dict = Depends(require_user), db: AsyncSession = D
 async def get_article(
     article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
 ):
-    cached = await cache_service.get_article(article_id)
+    """文章详情（含蒸馏全文）。
+
+    ⚠️ **缓存必须在属主校验之后才有资格被信任**（2026-10 修的越权读）：
+
+    原来是「先查缓存、命中就直接 return」，把 `_get_owned_with_task` 整段跳过了。
+    而 `article:detail:{id}` 这个 key 不带 user 维度，于是任何登录用户只要知道
+    别人的 article_id，就能在缓存存活期（300s）内直接读到**完整 payload** ——
+    标题、原文链接、蒸馏全文 —— 本该是 403。
+
+    旁边所有兄弟端点（`/status`、`/audio-url`）都是先 `_get_owned_with_task` 再干活，
+    只有这里把缓存放在了前面，所以这不是设计取舍，是个离群点。
+
+    现在缓存命中要带 `user_id` 一起判（`cache_service.get_article` 里做，见其说明）：
+    属主对得上才直接返回，对不上就当没命中、落到下面正常的属主校验拿 403。
+    属主仍然享受「不查库」的快路径，越权者拿不到任何东西。
+    """
+    uid = _uid(user)
+    cached = await cache_service.get_article(article_id, user_id=uid)
     if cached:
         return cached
 
-    art, task = await _get_owned_with_task(article_id, _uid(user), db)
+    art, task = await _get_owned_with_task(article_id, uid, db)
     # CP-DISTILL-TEXT：详情页返回蒸馏稿全文（列表页只要 120 字摘要）
     payload = _to_response(
         art, task, full_script=True, tts_voice=await _tts_voice_brief(task)
     ).model_dump()
-    await cache_service.set_article(article_id, payload)  # ttl 300s
+    await cache_service.set_article(article_id, payload, owner_id=art.user_id)  # ttl 300s
     return payload
 
 
