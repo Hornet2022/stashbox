@@ -30,6 +30,7 @@ if _THIS_DIR not in sys.path:
 import httpx
 import structlog
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -290,7 +291,24 @@ async def proxy_fallback(request: Request, path: str):
     """路由表没命中的兜底：按第一段路径猜下游（CP1.4/1.5 行为，逐步被路由表取代）。"""
     target_base = _resolve_target(path)
     if target_base is None:
-        return Response(status_code=404, content=b'{"detail":"no downstream route"}')
+        # 必须走业务信封，不能返回裸 Response。
+        #
+        # 原来这里直接 `Response(404, b'{"detail":"no downstream route"}')`，
+        # 绕过了 register_exception_handlers 装的所有处理器。后果：
+        # 安卓 `ApiEnvelope.parseEnvelope()` 期望 {code, message, data}，
+        # 解不出来就把 bizCode 置 0，于是 ErrorMessages.kt 里
+        # isAudioNotReady(40400) / isQuotaExceeded(3001) / isAuthExpired(40100)
+        # / isCaptureFetchFailed(2001|2002) **四个分支全部落空**，
+        # 最后落到 404 的兜底文案「内容不存在或已删除」。
+        #
+        # 也就是说：**端点没上线**被误报成**文章被删了** —— 和 admin-web 侧
+        # client.ts 的 isEndpointMissing() 专门区分 404/501 的动机正好相反。
+        #
+        # 走 BizException 拿 40400，与全局 _STATUS_CODE_MAP 的既有约定一致。
+        return JSONResponse(
+            status_code=404,
+            content={"code": 40400, "message": "接口不存在", "data": None},
+        )
 
     url = f"{target_base}/api/v1/{path}"
     body = await request.body()
