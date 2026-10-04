@@ -6,6 +6,7 @@
   无法作为 Python 包导入。故本测试直接用 event_collect.router 创建测试 app，
   避免跨目录包导入问题。
 """
+
 import pytest
 from unittest.mock import AsyncMock, patch
 from fastapi import FastAPI
@@ -25,14 +26,19 @@ def test_app():
 @pytest.fixture
 def client(test_app):
     """TestClient with fresh rate-limit state."""
-    _rate_limit.clear()
+    from stashbox.backend.common import event_collect
+
+    event_collect._rate_limit.clear()
+    event_collect._sweep_counter = 0  # 清扫计数器也是模块级状态，别漏到别的用例
     with TestClient(test_app) as c:
         yield c
-    _rate_limit.clear()
+    event_collect._rate_limit.clear()
+    event_collect._sweep_counter = 0
 
 
 class MockDB:
     """模拟 AsyncSession + feedback 写成功。"""
+
     id_counter = 1
 
     def add(self, record):
@@ -48,7 +54,9 @@ class TestCollectEventValid:
 
     def test_collect_event_valid_writes_feedback(self, client):
         """有效请求返回 200 且 event_id 非 None。"""
-        with patch("stashbox.backend.common.event_collect.track", new_callable=AsyncMock) as mock_track:
+        with patch(
+            "stashbox.backend.common.event_collect.track", new_callable=AsyncMock
+        ) as mock_track:
             mock_track.return_value = 42
             resp = client.post(
                 "/api/v1/events/collect",
@@ -82,7 +90,9 @@ class TestCollectEventRateLimit:
         _rate_limit.clear()
         device = "ratelimit_device"
 
-        with patch("stashbox.backend.common.event_collect.track", new_callable=AsyncMock) as mock_track:
+        with patch(
+            "stashbox.backend.common.event_collect.track", new_callable=AsyncMock
+        ) as mock_track:
             mock_track.return_value = 1
 
             # 前 100 个成功
@@ -109,7 +119,9 @@ class TestCollectEventMinimal:
 
     def test_collect_event_minimal_request(self, client):
         """只传必填字段（event_name + device_id）应返回 200。"""
-        with patch("stashbox.backend.common.event_collect.track", new_callable=AsyncMock) as mock_track:
+        with patch(
+            "stashbox.backend.common.event_collect.track", new_callable=AsyncMock
+        ) as mock_track:
             mock_track.return_value = 7
             resp = client.post(
                 "/api/v1/events/collect",
@@ -205,3 +217,115 @@ class TestServiceLifespanEvent:
         assert call_args[0][1] == EventName.SERVICE_STOP
         assert call_args[0][2] == 0
         assert call_args[0][3] == "n/a"
+
+
+# ---------------------------------------------------------------------------
+# user_id 归属：只能来自 token，不能来自请求体（2026-10 回归）
+#
+# 原来 `user_id=req.user_id or 0` 直接采信请求体，而 feedback.user_id 的外键
+# 已被 0018 迁移删掉 —— 任意 user_id 都写得进去。于是任何人 POST 一下就能往
+# 运营看板和反馈 CSV 里灌「某用户在做了 X」的假记录。
+#
+# 判据是「track 实际收到的 user_id」：不看 HTTP 状态（本修复前后都是 200），
+# 因为请求照样要成功 —— 匿名上报是设计内的能力。
+# ---------------------------------------------------------------------------
+
+
+def _capture_user_id(client, body: dict, token: str | None = None):
+    """跑一次 collect，返回 track 收到的 user_id。"""
+    from stashbox.backend.common import event_collect
+
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    with patch.object(event_collect, "track", new_callable=AsyncMock) as mock_track:
+        mock_track.return_value = 1
+        resp = client.post("/api/v1/events/collect", json=body, headers=headers)
+    assert resp.status_code == 200, resp.text
+    return mock_track.call_args.kwargs["user_id"]
+
+
+class TestUserIdNotSpoofable:
+    def test_请求体里的_user_id_不采信(self, client):
+        """匿名 + 伪造 user_id → 落库记成 0（匿名），不是请求体里那个号。"""
+        got = _capture_user_id(
+            client, {"event_name": "user_login", "device_id": "d1", "user_id": 999}
+        )
+        assert got == 0, f"采信了请求体的 user_id（记成 {got}）—— 可冒名写埋点"
+
+    def test_带_token_时以_token_为准(self, client):
+        """带 token → 记 token 那个用户，即便 body 里写了别人的号。"""
+        from stashbox.backend.common.auth import create_access_token
+
+        token = create_access_token("42")
+        got = _capture_user_id(
+            client, {"event_name": "user_login", "device_id": "d2", "user_id": 999}, token
+        )
+        assert got == 42, f"应以 token 为准，实际 {got}"
+
+    def test_匿名上报仍然可用(self, client):
+        """device_id 必填的设计本意就是允许未登录设备上报 —— 别给端点加硬鉴权。"""
+        from stashbox.backend.common import event_collect
+
+        with patch.object(event_collect, "track", new_callable=AsyncMock) as mock_track:
+            mock_track.return_value = 1
+            resp = client.post(
+                "/api/v1/events/collect", json={"event_name": "article_submit", "device_id": "d3"}
+            )
+        assert resp.status_code == 200, resp.text
+        assert mock_track.call_args.kwargs["user_id"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 限流字典不能只增不减（2026-10 回归）
+# ---------------------------------------------------------------------------
+
+
+class TestRateLimitBounded:
+    def test_过期桶会被清扫掉(self, client):
+        """限流是按客户端自报的 device_id 算的，所以 key 只增不减就会被撑爆内存。
+
+        原实现只裁剪桶内时间戳、从不删 key。这里直接打一把「全过期」的桶，
+        触发清扫后它们必须从字典里消失。
+        """
+        from stashbox.backend.common import event_collect
+
+        event_collect._rate_limit.clear()
+        for i in range(50):
+            event_collect._rate_limit[f"dead_{i}"] = [1.0]  # 1970 年，早已出窗
+
+        event_collect._sweep_rate_limit(event_collect.time.time())
+
+        assert event_collect._rate_limit == {}, "过期桶没被清掉 —— 字典会单调涨到 OOM"
+
+    def test_活跃桶不会被清扫(self, client):
+        """清扫只清过期的：窗口内的桶必须留着，否则限流形同虚设。"""
+        import time as _time
+
+        from stashbox.backend.common import event_collect
+
+        event_collect._rate_limit.clear()
+        now = _time.time()
+        event_collect._rate_limit["live"] = [now]
+
+        event_collect._sweep_rate_limit(now)
+
+        assert "live" in event_collect._rate_limit, "把活跃设备的限流桶也清了"
+
+    def test_轮换_device_id_不会无限增长字典(self, client):
+        """端到端视角：轮换 device_id 灌 600 条（跨过清扫阈值），字典不能爆。
+
+        限流被绕开这件事本身改不掉（key 来自客户端），但至少不能让内存跟着
+        请求数一起涨。
+        """
+        from stashbox.backend.common import event_collect
+
+        event_collect._rate_limit.clear()
+        for i in range(600):
+            with patch.object(event_collect, "track", new_callable=AsyncMock) as m:
+                m.return_value = 1
+                client.post(
+                    "/api/v1/events/collect",
+                    json={"event_name": "user_login", "device_id": f"rot_{i}"},
+                )
+
+        assert len(event_collect._rate_limit) <= event_collect._RATE_LIMIT_MAX_KEYS
+        event_collect._rate_limit.clear()
