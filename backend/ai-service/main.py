@@ -371,9 +371,18 @@ async def distill_start(
             voice_name=voice.display_name,
         )
 
-    if existed_da is None and not await cache_service.has_article_quota(req.article_id):
-        await quota_service.consume(db, uid)  # 用尽抛 3001
-        await cache_service.mark_article_quota(req.article_id)
+    # 扣费权用 `claim_article_quota`（SET NX）原子认领，而不是
+    # 「EXISTS 看看 → 扣 → SET 标记」：后者是非原子的 check-then-act，
+    # 两个并发请求都会看到「没扣过」而各扣一次。认领在前、扣费失败则还回去，
+    # 详见 cache_service.claim_article_quota 的说明。
+    if existed_da is None and await cache_service.claim_article_quota(req.article_id):
+        try:
+            await quota_service.consume(db, uid)  # 用尽抛 3001
+        except Exception:
+            # 扣费失败（配额用尽 3001 / DB 故障）就把认领还回去，否则「已扣费」
+            # 标记会挡住这篇文章之后所有重试 —— 用户就再也不会被扣，等于白送。
+            await cache_service.clear_article_quota(req.article_id)
+            raise
 
     task_id = _requeue_or_create(db, existed_da, req.article_id)
     art.status = "distilling"
@@ -496,9 +505,17 @@ async def distill_article(
     # 比依赖某个哨兵行的数值更不容易被下次改配置时踩坏。
     is_system_content = uid == 0
     if not already_charged and not is_system_content:
-        quota = await quota_service.consume(db, uid)  # 用尽抛 3001
-        quota_used = quota["quota_used"]
-        await cache_service.mark_article_quota(article_id)
+        # 原子认领扣费权（`marked` 那次 EXISTS 只当预判，真正的仲裁在这里，
+        # 两者判据是同一个 key）。并发下只有一个赢家会扣费。
+        if await cache_service.claim_article_quota(article_id):
+            try:
+                quota = await quota_service.consume(db, uid)  # 用尽抛 3001
+                quota_used = quota["quota_used"]
+            except Exception:
+                # 扣费失败就把认领还回去：否则「已扣费」标记会让这篇之后
+                # 永远不再被扣，等于白送一次蒸馏。见 cache_service.claim_article_quota
+                await cache_service.clear_article_quota(article_id)
+                raise
 
     # CP-DISTILL-DUP 修复：article_id 有唯一约束（distilled_articles_article_id_key），
     # 二次蒸馏（failed 重试 / ready 后重蒸）不能再 INSERT —— 之前直接撞

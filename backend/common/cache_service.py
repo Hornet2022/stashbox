@@ -230,6 +230,32 @@ async def has_article_quota(article_id: str) -> bool:
         await client.aclose()
 
 
+async def claim_article_quota(article_id: str) -> bool:
+    """原子地「认领」这篇文章的扣费权：抢到返回 True，已被认领返回 False。
+
+    扣费必须先抢认领再扣，不能反过来。原因是 `has_article_quota`（EXISTS）
+    加上 `mark_article_quota`（无条件 SET）合起来是个**非原子的 check-then-act**：
+    两个并发请求都能看到「还没扣过」，于是各扣一次，用户为一篇文章付两次。
+    而这个并发不是理论 —— `/articles/{id}/distill` 曾经被真机实测到
+    163ms 内被调两次；两个请求各自 `consume` 成功（`consume` 自己 commit），
+    后到的那个再撞 `distilled_articles.article_id` 唯一约束变成 500，
+    而多扣的那一次没人退还（refund 只在 distill_failed 触发）。
+
+    `SET NX` 把「判定 + 占位」压成一条命令，只有一个赢家会去扣费。
+
+    认领在扣费**之前**、失败时用 `clear_article_quota` 还回去，方向是刻意选的：
+      - 扣费成功后进程崩溃 → 标记说「扣过」，实际也真扣了，一致；
+      - 认领后扣费失败并已还回 → 下次还能正常扣，一致；
+      - 认领后扣费失败但**还回失败** → 最多白送一次蒸馏，24h 后 TTL 自然过期。
+    换来的是消除「重复扣费」这个方向 —— 宁可偶尔白送，不要每次并发都收两次钱。
+    """
+    client = _client()
+    try:
+        return bool(await client.set(article_quota_key(article_id), "1", nx=True, ex=86400))
+    finally:
+        await client.aclose()
+
+
 async def clear_article_quota(article_id: str) -> None:
     client = _client()
     try:

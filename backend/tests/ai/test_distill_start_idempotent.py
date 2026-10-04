@@ -108,9 +108,16 @@ def dispatcher_spy(monkeypatch):
             return f"job_{len(calls)}"
 
     async def _no_quota(article_id: str) -> bool:
+        # 仍是 distill 端点的「预判」读（already_charged 的一部分），保留桩
         return False
 
-    async def _mark_quota(article_id: str) -> None:
+    async def _claim_quota(article_id: str) -> bool:
+        # 扣费权认领。桩统一返回 True = 「认定没人扣过，赢家是你」，
+        # 这样本目录的入队幂等用例走的是「会扣费」那条路径（更接近真实）。
+        # 认领本身的并发语义由 test_distill_quota_claim.py 单独覆盖。
+        return True
+
+    async def _release_quota(article_id: str) -> None:
         return None
 
     async def _consume(db, user_id, amount=1):
@@ -125,7 +132,8 @@ def dispatcher_spy(monkeypatch):
 
     monkeypatch.setattr(module, "get_dispatcher", lambda: _FakeDispatcher())
     monkeypatch.setattr(module.cache_service, "has_article_quota", _no_quota)
-    monkeypatch.setattr(module.cache_service, "mark_article_quota", _mark_quota)
+    monkeypatch.setattr(module.cache_service, "claim_article_quota", _claim_quota)
+    monkeypatch.setattr(module.cache_service, "clear_article_quota", _release_quota)
     monkeypatch.setattr(module.quota_service, "consume", _consume)
 
     async def _get_quota(db, user_id):
