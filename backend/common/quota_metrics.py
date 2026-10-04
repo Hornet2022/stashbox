@@ -9,6 +9,7 @@
   - quota_cache_miss_total      Counter
   - quota_reset_total           Counter
 """
+
 from prometheus_client import Counter, Histogram
 
 quota_consume_total = Counter(
@@ -42,6 +43,10 @@ quota_cache_miss_total = Counter(
 quota_reset_total = Counter(
     "quota_reset_total",
     "quota 月度重置次数",
+)
+quota_reset_loop_error_total = Counter(
+    "quota_reset_loop_error_total",
+    "quota 月度重置定时器单次 tick 失败次数（持续增长 = 跨月重置已失效，配额不会自动恢复）",
 )
 quota_request_total = Counter(
     "quota_request_total",

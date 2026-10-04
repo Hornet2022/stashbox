@@ -329,7 +329,15 @@ async def wechat_login(req: WechatLoginRequest, db: AsyncSession = Depends(get_d
     result = await db.execute(select(User).where(User.open_id == open_id))
     user = result.scalar_one_or_none()
     if user is None:
-        user = User(open_id=open_id, nickname="听友", tier="free")
+        # quota_reset_at 一定要在建号时就写上，别留给 NULL：
+        # 定时器的到期判定含 `quota_reset_at IS NULL`，NULL 行会让「任意匿名注册」
+        # 命中到期名单（2026-10 修，见 quota_service.quota_reset_loop）。
+        user = User(
+            open_id=open_id,
+            nickname="听友",
+            tier="free",
+            quota_reset_at=quota_service.next_reset_at_naive(),
+        )
         db.add(user)
         await db.flush()  # 先拿 user.id 供埋点
         await db.refresh(user)
