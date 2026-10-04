@@ -501,7 +501,14 @@ async def decision_router_node(state: AgentState) -> dict[str, Any]:
             log.warning(
                 f"agent_router_llm_error_fallback article_id={article_id} error={exc!s} fallback={default}"
             )
-        action = default
+            # 兜底**只能**在这里。
+            #
+            # 原来这行 `action = default` 缩进在 try/except 之后的无条件位置，
+            # 于是它每次都执行，把上面 `action = _parse_next_action(raw)` 的
+            # LLM 解析结果直接覆盖掉 —— `AGENT_ROUTER_MODE=llm` 变成
+            # "花 2~5s 和真实 token 换一个必然被丢弃的结果"。
+            # 默认 `rules` 走不到这个分支，所以这个缺陷一直潜伏着。
+            action = default
 
     # CP-AGENT-ROUTER-FINALIZE：action="done" 时直接 finalize state（status="done"）
     # 不依赖后续 concat_node 设置 status。routing 把 action=done 路由到 __end__，
