@@ -77,10 +77,47 @@ def decode_refresh_token(token: str) -> dict:
     return payload
 
 
+def decode_access_token(token: str) -> dict:
+    """解析 access token：无效/过期 → 401；**是 refresh token → 401**。
+
+    为什么必须显式把 refresh 挡在外面：
+
+      - `create_access_token` 不打 type 声明，有效期 7 天；
+      - `create_refresh_token` 打 `type=refresh`，有效期 30 天（access 的 4 倍多）；
+      - 而业务端点用的 `require_user` 原来直接 `decode_token` —— 对两者一视同仁。
+
+    结果是**一个本该只用于 `/auth/refresh-token` 的 token，能访问全部业务接口**。
+    安卓端确实只把 access token 放进 Authorization 头（`AuthInterceptor`），
+    所以这不是"客户端在用"的兼容问题，而是一道从来没关上的门。
+
+    而且泄露后没有补救手段：refresh 端点做轮换（发新的 refresh）但**不吊销旧的**，
+    攻击者拿一个泄露的 refresh 可以反复换出新的 30 天 —— 30 天根本不是上限。
+    吊销要引入 jti + 黑名单状态，不在这次范围内，这里先把「能不能当 access 用」
+    这件事关掉。
+
+    注意 admin 端点不受影响也不需要担心越权：`require_admin` 的 `tier` 缺省是
+    `free`，而 refresh token 不带 tier 声明 → 403，fail-closed。
+    """
+    payload = decode_token(token)
+    if payload.get("type") == "refresh":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token cannot be used as an access token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return payload
+
+
 async def require_user(
     authorization: Annotated[str | None, Header()] = None,
 ) -> dict:
-    """FastAPI 依赖：从 Authorization header 取 token，返回 user payload"""
+    """FastAPI 依赖：从 Authorization header 取 token，返回 user payload。
+
+    走 `decode_access_token` 而不是 `decode_token`：refresh token 必须在业务
+    端点被拒绝（理由见该函数的说明）。这是全项目业务鉴权的唯一入口
+    （`require_admin` / `require_admin_or_operator` 都挂在它上面），所以
+    「refresh 不能当 access 用」这一条只需要在这里守住一次。
+    """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -88,16 +125,21 @@ async def require_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     token = authorization[7:]  # 去掉 "Bearer "
-    return decode_token(token)
+    return decode_access_token(token)
 
 
 async def require_user_optional(
     authorization: Annotated[str | None, Header()] = None,
 ) -> dict | None:
-    """可选鉴权 - 用于匿名也能访问但登录有增强功能的接口"""
+    """可选鉴权 - 用于匿名也能访问但登录有增强功能的接口。
+
+    拿着 refresh token 来 = 视同未登录（返回 None），与「token 无效/过期」的
+    现有行为一致 —— 都是不给权限、只是不报错。反过来说不会因为这次改动把
+    原本能匿名访问的端点变成 401。
+    """
     if not authorization or not authorization.startswith("Bearer "):
         return None
     try:
-        return decode_token(authorization[7:])
+        return decode_access_token(authorization[7:])
     except HTTPException:
         return None
