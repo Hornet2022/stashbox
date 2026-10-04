@@ -482,9 +482,17 @@ async def _refund_quota_once(task_id: str, user_id: int) -> None:
 
     与 DistillPipeline._refund_quota 同语义，但由任务层调用（agent 路径不经过 pipeline）。
     Redis 不可用时降级为无锁（不阻塞失败流程）。
+
+    ⚠️ **退款失败必须把锁还回去**（2026-10 修）：锁的语义是「这笔已经退过了」，
+    但落锁早于退款成功。中间失败（乐观锁冲突、DB 抖一下）会留下一把撒谎的锁，
+    之后 24h 内所有 Arq 重试都被挡掉 —— 用户为一次失败的蒸馏照付钱，且零告警。
+    详见 `quota_service.release_refund_lock`。
     """
     from stashbox.backend.common import quota_service
 
+    # 先置 None：落锁那一步自己抛异常时 client 不会被绑定，
+    # 下面 except 里引用它会变成 NameError，把退款失败盖成一个更费解的错。
+    client = None
     try:
         client = await _make_refund_lock_client()
         locked = await client.set(f"refund:{task_id}", "1", nx=True, ex=86400)
@@ -500,7 +508,15 @@ async def _refund_quota_once(task_id: str, user_id: int) -> None:
         async with AsyncSessionLocal() as session:
             await quota_service.refund(session, user_id)
     except Exception as exc:
+        # 复用落锁时那个 client：让「落锁」和「还锁」走同一份可替换依赖
+        await quota_service.release_refund_lock(task_id, client=client)
         log.warning(f"quota_refund_failed task_id={task_id} user_id={user_id} error={exc!s}")
+        try:
+            from stashbox.backend.common import quota_metrics
+
+            quota_metrics.quota_refund_failed_total.labels(trigger="distill_task").inc()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

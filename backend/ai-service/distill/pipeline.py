@@ -505,6 +505,9 @@ class DistillPipeline:
         from stashbox.backend.common.redis_client import get_redis_pool
 
         # 幂等检查：SET NX EX 86400（覆盖整个 retry 窗口）
+        # client 先置 None：落锁这步自己抛异常时它不会被绑定，
+        # 下面退款失败分支引用它会变成 NameError，把真正的退款错误盖掉。
+        client = None
         try:
             import redis.asyncio as redis_async
 
@@ -525,5 +528,27 @@ class DistillPipeline:
                 error=str(e),
             )
 
-        async with self.session_factory() as session:
-            await quota_service.refund(session, ctx.user_id)
+        try:
+            async with self.session_factory() as session:
+                await quota_service.refund(session, ctx.user_id)
+        except Exception as exc:
+            # 退款失败必须还锁，否则「已退款」标记会撒谎 24 小时，把后续所有 Arq
+            # 重试都挡在门外（用户为失败的蒸馏付钱且无告警）。见
+            # quota_service.release_refund_lock。
+            #
+            # 另外这里原来是裸 await：退款一抛，异常会从 except 块里二次抛出，
+            # 把上面那行 `raise` 本该抛出的**蒸馏原始失败原因**顶掉，日志里从此
+            # 只看得到退款错误。接住它，原始失败原因才能正常冒泡。
+            await quota_service.release_refund_lock(ctx.task_id, client=client)
+            log.warning(
+                "quota_refund_failed",
+                task_id=ctx.task_id,
+                user_id=ctx.user_id,
+                error=str(exc),
+            )
+            try:
+                from stashbox.backend.common import quota_metrics
+
+                quota_metrics.quota_refund_failed_total.labels(trigger="distill_pipeline").inc()
+            except Exception:
+                pass

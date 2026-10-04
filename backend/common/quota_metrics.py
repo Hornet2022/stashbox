@@ -32,6 +32,11 @@ quota_refund_total = Counter(
     "quota 退还次数",
     ["trigger"],  # distill_failed/admin/distill_step_error
 )
+quota_refund_failed_total = Counter(
+    "quota_refund_failed_total",
+    "quota 退还失败次数（退不回去 = 用户为失败的蒸馏付费；持续增长说明要人工补退）",
+    ["trigger"],  # distill_task/distill_pipeline
+)
 quota_cache_hit_total = Counter(
     "quota_cache_hit_total",
     "quota cache 命中次数",

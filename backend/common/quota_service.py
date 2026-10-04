@@ -165,6 +165,39 @@ async def refund(
         raise
 
 
+async def release_refund_lock(task_id: str, *, client=None) -> None:
+    """退款失败时把幂等锁 `refund:{task_id}` 删掉，让 Arq 重试还能补上这笔退款。
+
+    为什么非有不可：两个退款调用点（`ai-service/tasks/distill_task.py` 的
+    `_refund_quota_once`、`ai-service/distill/pipeline.py` 的 `_refund_quota`）都是
+    「先 SETNX 落锁、再退款」。而这把锁的语义是「这笔已经退过了」——它落锁的时刻
+    却**早于**退款成功的时刻。中间任何一次失败（乐观锁重试耗尽的 QuotaConflictError、
+    瞬时 DB 故障）都会留下一个「声称退过款、其实没退」的锁，接下来 24h 内所有 Arq
+    重试都被它挡在门外。
+
+    后果是用户为一次失败的蒸馏付了钱，而且没有任何告警 —— 这是纯亏钱、不报错、
+    事后才看得见的账。
+
+    `client`：传入调用方落锁时已经建好的 Redis 客户端（**推荐**）。不给才自己建
+    一个。复用同一个 client 不是为了省连接，而是为了让「落锁」和「还锁」走同一份
+    可替换的依赖 —— 否则单测里 FakeRedis 落的锁会被真 Redis 的 DEL 落空，
+    测试反而测不出东西（这正是 distill_task 抽 `_make_refund_lock_client` 的原因）。
+    """
+    import redis.asyncio as redis_async
+
+    from stashbox.backend.common.redis_client import get_redis_pool
+
+    owns_client = client is None
+    try:
+        c = client if client is not None else redis_async.Redis(connection_pool=get_redis_pool())
+        await c.delete(f"refund:{task_id}")
+        if owns_client:
+            await c.aclose()
+    except Exception as exc:
+        # 释放失败不抛：原始的退款异常比这个更值得看，不能被它盖掉
+        log.warning("quota_refund_lock_release_failed", task_id=task_id, error=str(exc))
+
+
 async def get_quota(session: AsyncSession, user_id: int) -> dict:
     """读配额：先 Redis，miss 则查 DB + 回填。"""
     cached = await cache_service.get_quota(user_id)

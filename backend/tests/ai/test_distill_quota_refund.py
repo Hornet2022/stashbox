@@ -41,12 +41,13 @@ if AI_SERVICE_DIR not in sys.path:
 
 
 class FakeRedis:
-    """够用的 Redis 替身：只实现 set(nx=True) 和 set/get 状态。"""
+    """够用的 Redis 替身：set(nx=True) / delete / aclose。"""
 
     def __init__(self, *, available: bool = True):
         self._available = available
         self.store: dict[str, str] = {}
         self.set_calls: list[tuple[str, bool]] = []
+        self.deleted: list[str] = []
 
     async def set(self, key, value, nx=False, ex=None):
         self.set_calls.append((key, nx))
@@ -56,6 +57,13 @@ class FakeRedis:
             return None  # 没抢到锁
         self.store[key] = value
         return True
+
+    async def delete(self, key):
+        self.deleted.append(key)
+        return 1 if self.store.pop(key, None) is not None else 0
+
+    async def aclose(self):
+        return None
 
 
 class FakeSessionFactory:
@@ -218,7 +226,95 @@ async def test_退款失败不向上抛(refund_env, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 5. 接线：失败路径确实调它
+# 5. 退款失败要还锁（2026-10 补）
+#
+# 锁的语义是「这笔已经退过了」，但它落锁的时刻**早于**退款成功的时刻 ——
+# 中间任何一次失败都会留下一把「声称退过款、其实没退」的锁，之后 24h 内
+# 所有 Arq 重试都被它挡在门外。用户于是为一次失败的蒸馏照付钱，且零告警。
+# 这不是理论：退款失败有真实路径（乐观锁重试耗尽的 QuotaConflictError、
+# 瞬时 DB 故障），而 Arq 的 retry 恰恰是这条链路上必然会发生的。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_退款失败会删掉幂等锁(refund_env, monkeypatch):
+    from stashbox.backend.common import quota_service
+    from tasks.distill_task import _refund_quota_once
+
+    async def boom(session, user_id):
+        raise RuntimeError("数据库炸了")
+
+    monkeypatch.setattr(quota_service, "refund", boom)
+
+    await _refund_quota_once(task_id="dst_1", user_id=42)
+
+    # 判据是「DEL 确实打到那把锁上」：锁最终不在 store 里，正是因为它被删了
+    assert "refund:dst_1" in refund_env.redis.deleted, "退款失败了却没还锁"
+    assert "refund:dst_1" not in refund_env.redis.store, "锁还留着，重试将被永久挡掉"
+
+
+@pytest.mark.asyncio
+async def test_退款失败后_arq_重试能补上退款(refund_env, monkeypatch):
+    """上面那条的业务后果：用户的钱要能在重试时拿回来。
+
+    第一次退款失败（DB 抖一下）→ Arq 重试 → 第二次退款成功。判据是 `refunded`
+    里出现了 user_id，也就是**这笔退款最终真的发生了**。
+    """
+    from stashbox.backend.common import quota_service
+    from tasks.distill_task import _refund_quota_once
+
+    calls = {"n": 0}
+
+    async def flaky_refund(session, user_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("第一次：数据库抖了")
+        refund_env.refunded.append(user_id)
+
+    monkeypatch.setattr(quota_service, "refund", flaky_refund)
+
+    await _refund_quota_once(task_id="dst_1", user_id=42)  # 首跑：退款失败
+    await _refund_quota_once(task_id="dst_1", user_id=42)  # Arq retry：必须还能退
+
+    assert refund_env.refunded == [42], "重试没补上退款 —— 用户为失败的蒸馏付了钱"
+
+
+@pytest.mark.asyncio
+async def test_退款成功后锁仍在_重复退仍被挡(refund_env):
+    """还锁不能矫枉过正：退款成功时锁必须留着，幂等才是本分。
+
+    和上一条成对看 —— 失败时删锁、成功时留锁，两条都绿才算修对。
+    只实现前半条会变成「每次重试都退一次」，用户白赚 2~3 次配额。
+    """
+    from tasks.distill_task import _refund_quota_once
+
+    for _ in range(3):  # 首跑 + 2 次重试，全部成功
+        await _refund_quota_once(task_id="dst_1", user_id=42)
+
+    assert refund_env.refunded == [42], f"退太多次了：{refund_env.refunded}"
+    assert refund_env.redis.deleted == [], "退款成功时不该删锁"
+
+
+def test_pipeline_退款失败也会还锁():
+    """源码级断言：pipeline 那条退款路径同样接了释放锁。
+
+    两个调用点各写一遍「失败就还锁」，漏掉一个就留下半条链 —— 而 pipeline
+    是非 agent 路径（`DistillPipeline.run`），生产上两条都在跑。
+    """
+    src = (Path(AI_SERVICE_DIR) / "distill" / "pipeline.py").read_text()
+
+    assert "release_refund_lock" in src, "pipeline 的退款失败没有还锁"
+    # 还锁必须包在 refund 的失败分支里，而不是无条件执行
+    refund_pos = src.index("await quota_service.refund(session, ctx.user_id)")
+    release_pos = src.index("release_refund_lock(ctx.task_id")
+    assert refund_pos < release_pos, "release 应该在 refund 之后（失败分支里）"
+    # 还锁必须复用落锁时那个 client，否则单测的 FakeRedis 落的锁会被真 Redis 的
+    # DEL 落空（测试看着绿，线上其实各连各的）
+    assert "release_refund_lock(ctx.task_id, client=client)" in src, "还锁没复用落锁的 client"
+
+
+# ---------------------------------------------------------------------------
+# 6. 接线：失败路径确实调它
 # ---------------------------------------------------------------------------
 
 
