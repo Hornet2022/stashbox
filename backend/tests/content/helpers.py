@@ -9,11 +9,11 @@ import uuid
 from pathlib import Path
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from stashbox.backend.common.auth import create_access_token
 from stashbox.backend.common.database import AsyncSessionLocal
-from stashbox.backend.common.models import Article, DistilledArticle, User
+from stashbox.backend.common.models import Article, DistilledArticle, Feedback, User
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 
@@ -128,7 +128,38 @@ async def article_row(article_id: str) -> Article | None:
         return result.scalar_one_or_none()
 
 
+async def article_row_by_url(url: str, user_id: int | None = None) -> Article | None:
+    """按原始 URL 查文章。
+
+    用于「不该建文章」的负向断言 —— 这类用例拿不到 article_id（正因为端点
+    压根没建），只能回头问库「这个 URL 到底有没有落库」。
+    """
+    async with AsyncSessionLocal() as session:
+        stmt = select(Article).where(Article.url == url)
+        if user_id is not None:
+            stmt = stmt.where(Article.user_id == user_id)
+        result = await session.execute(stmt.limit(1))
+        return result.scalar_one_or_none()
+
+
 async def quota_used(user_id: int) -> int:
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(User.quota_used).where(User.id == user_id))
+        return int(result.scalar())
+
+
+async def feedback_count(user_id: int, article_id: str, type_: str) -> int:
+    """统计某类埋点行数 —— 用于幂等断言。
+
+    `feedback` 表只有索引、没有唯一约束，所以重复写入**不会**报错，
+    只会让统计被灌水。这类断言必须直接数行，光看接口返回 200 是看不出来的。
+    """
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(func.count(Feedback.id)).where(
+                Feedback.user_id == user_id,
+                Feedback.article_id == article_id,
+                Feedback.type == type_,
+            )
+        )
         return int(result.scalar())

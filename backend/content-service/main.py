@@ -903,6 +903,14 @@ async def mark_listened(
         log.warning(f"AUDIO_COMPLETE 埋点异常（忽略）: article={article_id} err={exc}")
 
     await db.commit()
+    # 两个缓存都要失效（2026-10 补：这两条写路径原先一个都没失效）
+    #
+    # 待听列表按 `status.in_(["pending","distilling","ready"])` 过滤，
+    # 而本端点把状态改成 `listened` —— 这篇文章本该从待听里消失。
+    # 只失效详情缓存不够：用户 60 秒内打开过待听页，点完「听完了」列表里那一条
+    # 还赖着不走（`pending` 缓存 ttl 60s），再点一次还是同一个结果，像按钮坏了。
+    await cache_service.invalidate_article(article_id)
+    await cache_service.invalidate_pending(_uid(user))
     return {"id": article_id, "status": "listened"}
 
 
@@ -998,6 +1006,15 @@ async def user_retry_distill(
     # 写推送"换源重试"卡片（CP5.4b push 队列）
     await push_retry_message(art_user_id, article_id)
 
+    # 缓存失效（2026-10 补：原先这条写路径一个都没失效）
+    #
+    # 状态从 failed 变回 pending，待听列表的过滤条件（pending/distilling/ready）
+    # 随之从「不包含」变成「包含」—— 重试成功的文章应该重新出现在待听里，
+    # 不失效的话用户得等最多 60s 才知道。详情缓存同理（ttl 300s，
+    # 里面还带着改之前的 status）。
+    await cache_service.invalidate_article(article_id)
+    await cache_service.invalidate_pending(art_user_id)
+
     return {
         "article_id": article_id,
         "status": "pending",
@@ -1079,14 +1096,35 @@ async def favorite(
       - articles.favorite = True
       - feedback(type="favorite") —— 同一事务
       - 写库后 invalidate article detail 缓存（CP8.6 Bug 1）
-      - 幂等：重复点 favorite 不会重复写 feedback 行（_write_feedback 只 add，
-        SQLAlchemy 同一事务内第二次 add 会抛 IntegrityError —— TODO：如果要真
-        幂等需要在 _write_feedback 加 dedup，目前客户端应避免双击）
+      - 幂等：重复点 favorite 不重复写 feedback 行（2026-10 修）
 
-    用法：列表 / 详情页的 ❤️「收藏」按钮，点一下完成。无 folder / note。
+    幂等按**目标状态**判重，不按事件次数：只有「当前已经是收藏态、且已存在
+    favorite 埋点行」才直接返回。取消收藏后再收藏仍会写新行 —— 那是一次真实
+    的状态回转，不该被吃掉。
+
+    这里曾长期标注「TODO：客户端应避免双击」，把幂等性推给了调用方。实际后果
+    不是报错：`feedback` 表只有索引、没有唯一约束（见 common/models/feedback.py），
+    双击不会抛 IntegrityError，而是**静默写入重复埋点行**，收藏类事件统计被灌水。
+    原注释描述的故障模式本身就不成立。现已对齐复数 /favorites 的预查写法。
     """
     uid = _uid(user)
     art = await _get_owned(article_id, uid, db)
+
+    if art.favorite:
+        existing = await db.scalar(
+            select(Feedback)
+            .where(
+                Feedback.user_id == uid,
+                Feedback.article_id == article_id,
+                Feedback.type == "favorite",
+            )
+            .order_by(Feedback.id.desc())
+            .limit(1)
+        )
+        if existing is not None:
+            await cache_service.invalidate_article(article_id)
+            return {"id": article_id, "favorite": True, "feedback_id": existing.id}
+
     art.favorite = True
     fb = await _write_feedback(db, uid, article_id, "favorite")
     await db.commit()
@@ -2234,7 +2272,12 @@ async def unsubscribe_tag(
     return {"ok": True, "tag_id": tag_id, "tag_slug": tag_slug}
 
 
-# TODO: tag_filter 埋点（CP5.3b）—— v1 §11.5 没明确 filter 触发位置，GET /api/v1/articles ?tag=xxx 是 CP5.3 后续工作，留在 [known issues] 报备
+# [已搁置 2026-10] tag_filter 埋点（原 CP5.3b）。
+# 当时留给下一个人是因为 v1 §11.5 没写清 filter 的触发位置。现在正式搁置：
+# 按 tag 筛选发生在前端本地（列表页 chip），后端 GET /api/v1/articles 收到的
+# tag 参数是运营后台的筛选，不存在「用户点了某个 tag」这个可供归因的独立事件。
+# 真要做，需要先定义清楚埋的是哪一次交互，再补一条 alembic 无关的 analytics 事件。
+# 在那之前留一条 TODO 只会让 grep TODO 的人以为有活没干完。
 
 if __name__ == "__main__":
     import uvicorn

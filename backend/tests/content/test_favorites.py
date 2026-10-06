@@ -19,7 +19,7 @@ from sqlalchemy import delete, select
 from stashbox.backend.common.database import AsyncSessionLocal
 from stashbox.backend.common.models import Article, Favorite
 
-from helpers import client, new_article, new_user
+from helpers import client, feedback_count, new_article, new_user
 
 ADD_URL = "/api/v1/articles/{}/favorites"
 LIST_URL = "/api/v1/favorites"
@@ -335,5 +335,57 @@ async def test_idempotent_add_returns_folder_field():
         assert second_body["folder"] == "tech"
         # 两个分支同构：id 应指向同一条收藏
         assert second_body["id"] == first.json()["id"]
+    finally:
+        await _purge(uid)
+
+
+# ---------------------------------------------------------------------------
+# 单数 /favorite 快轨道的幂等（2026-10 修，bug #13）
+#
+# 原实现无幂等预查，注释把责任推给「客户端应避免双击」。实际后果不是注释里
+# 说的 IntegrityError —— feedback 表只有索引没有唯一约束，双击不会报错，
+# 而是**静默写入重复埋点行**，收藏类事件统计被灌水且无人察觉。
+#
+# 幂等按「目标状态」判重而非「事件次数」：取消收藏后再收藏是一次真实状态回转，
+# 必须写新行。所以下面的第三条断言是这道修复最容易写错的地方，锁住它。
+# ---------------------------------------------------------------------------
+FAVORITE_URL = "/api/v1/articles/{}/favorite"
+UNFAVORITE_URL = "/api/v1/articles/{}/unfavorite"
+
+
+async def test_favorite_singular_is_idempotent():
+    uid, token = await new_user()
+    art_id = await new_article(uid)
+    try:
+        async with client(token) as c:
+            first = await c.post(FAVORITE_URL.format(art_id))
+            second = await c.post(FAVORITE_URL.format(art_id))
+
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        # 只写一行
+        assert await feedback_count(uid, art_id, "favorite") == 1
+        # 两个分支同构，且指向同一条反馈（安卓按 feedback_id 反序列化）
+        assert second.json()["feedback_id"] == first.json()["feedback_id"]
+        assert second.json()["favorite"] is True
+        assert second.json()["id"] == art_id
+    finally:
+        await _purge(uid)
+
+
+async def test_favorite_after_unfavorite_writes_a_new_row():
+    """取消后再收藏是真实状态回转，不能被幂等预查吞掉。"""
+    uid, token = await new_user()
+    art_id = await new_article(uid)
+    try:
+        async with client(token) as c:
+            await c.post(FAVORITE_URL.format(art_id))
+            await c.post(UNFAVORITE_URL.format(art_id))
+            again = await c.post(FAVORITE_URL.format(art_id))
+
+        assert again.status_code == 200, again.text
+        assert await feedback_count(uid, art_id, "favorite") == 2
+        assert await feedback_count(uid, art_id, "unfavorite") == 1
+        assert again.json()["favorite"] is True
     finally:
         await _purge(uid)
