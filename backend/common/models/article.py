@@ -8,6 +8,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -52,4 +53,9 @@ class Article(Base, TimestampMixin):
     __table_args__ = (
         Index("idx_articles_user_status", "user_id", "status"),
         Index("idx_articles_created", "created_at"),
+        # 0035：三个用户列表端点的形状是
+        # WHERE user_id = ? AND deleted_at IS NULL ORDER BY created_at DESC。
+        # 上面两个索引各覆盖一半（一个定位到人拿不到有序结果，一个按序扫再逐行过滤），
+        # 复合索引一次搞定。
+        Index("idx_articles_user_created", "user_id", text("created_at DESC")),
     )

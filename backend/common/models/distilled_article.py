@@ -53,4 +53,10 @@ class DistilledArticle(Base, TimestampMixin):
     __table_args__ = (
         Index("idx_distilled_article_id", "article_id"),
         Index("idx_distilled_tts_voice", "tts_voice_id"),
+        # 0035：后台统计面板全是 `status = ? AND updated_at > ?` 的形状
+        # （失败数、近 7 天趋势、按天聚合）。
+        Index("idx_distilled_status_updated", "status", "updated_at"),
+        # 0035：按标签筛选走 JSONB 包含运算符 `tags.contains([name])`（底层 `@>`），
+        # 没有 GIN 就是整表顺序扫 + 逐行 JSON 解析。用默认 jsonb_ops。
+        Index("idx_distilled_tags_gin", "tags", postgresql_using="gin"),
     )

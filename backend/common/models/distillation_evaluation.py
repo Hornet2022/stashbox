@@ -98,4 +98,9 @@ class DistillationEvaluation(Base, TimestampMixin):
         ),
         Index("idx_eval_task", "task_id"),
         Index("idx_eval_user_score", "user_id", "overall_score"),
+        # 0035：admin 评测分页是**无过滤**的 ORDER BY created_at DESC + LIMIT，
+        # 上面两个索引都帮不上（一个按 task_id、一个按 user_id 起头）。
+        # hooks_impl / main.py 里还有
+        # `task_id = ? AND auto_flag = false ORDER BY created_at DESC`。
+        Index("idx_eval_created", "created_at"),
     )
