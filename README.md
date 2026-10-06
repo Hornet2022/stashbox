@@ -4,26 +4,45 @@
 
 ## 项目状态
 
+> 2026-10-06 更新。此前本表停在 CP1.5、CP2–CP8 全部 🔒，与代码严重不符。
+
 | 维度 | 状态 |
 |---|---|
 | 方案 | v1 r13 / v2 r13（已定版，详见 [`docs/技术方案_v1.md`](./docs/技术方案_v1.md) / [`docs/技术方案_v2.md`](./docs/技术方案_v2.md)）|
 | 决策点 | D1-D53，53/53 ✅ |
 | 域名 | `stashbox.cn`（个人备案，备案审核中）|
-| 当前阶段 | **CP1.5 基础数据层**（一人 vibecoding 节奏）|
-| 客户端 | iOS + Android 双端设计，**一期只做 Android** |
+| 当前阶段 | **CP12 附近**（后端最新 cp11.0.8，安卓 main 有 cp12.0.1 接口对齐）|
+| 客户端 | iOS + Android 双端设计，**一期只做 Android**（iOS 未启动）|
 
 ## Checkpoint 进度
 
 | CP | 名称 | 状态 |
 |---|---|---|
-| CP1 | 基础架构 + D9 集成 | ⏳ CP1.4 骨架✅ / CP1.5 数据层✅ / D9 集成🔒 |
-| CP2 | 收集层 + 多源抓取 | 🔒 |
-| CP3 | L4 蒸馏引擎首篇 demo | 🔒 |
-| CP4 | App 端 v1（**只 Android**）| 🔒 |
-| CP5 | UX 优化 | 🔒 |
-| CP6 | 内测准备 + D10 评估 | 🔒 |
-| CP7 | 内测 + 反馈 | 🔒 |
-| CP8 | 调优 + 上线 | 🔒 |
+| CP1 | 基础架构 + D9 集成 | ✅ |
+| CP2 | 收集层 + 多源抓取 | ✅ |
+| CP3 | L4 蒸馏引擎 | ✅（真 LLM / TTS 已接，见「技术选型」下方的更正）|
+| CP4 | App 端 v1（只 Android）| ✅ 功能基本完整 |
+| CP5 | UX 优化 | ✅ |
+| CP6 | 内测准备 + D10 评估 | ✅ |
+| CP7 | 内测 + 反馈 | ⏳ |
+| CP8 | 调优 + 上线 | ⏳ |
+| CP9–CP12 | 听感运营 / 数据闭环 / 跨端对齐 | ✅ 进行中 |
+
+**当前真实形态**（与本表早期描述的差异见下方「与早期描述的偏差」）：
+
+- 后端四服务齐全 + PG/Redis + 35 个 alembic 迁移 + 112 个测试文件
+- 蒸馏链路已接**真实** LLM 与 TTS（多 provider，可插拔）
+- 安卓是单模块 `:app`，111 个 kt 文件 / 16.3k 行 / 16 条路由
+- 管理后台 18 个页面，设计系统已重建
+
+## 技术选型的两处更正
+
+| 维度 | 早期描述 | 实际 |
+|---|---|---|
+| 多模态 LLM | Qwen2.5-VL-72B | **可插拔**，默认 `openai`，另有 `qwen_vl`（`ai-service/config_llm.py`）|
+| TTS | 豆包 TTS | **多 provider**：`indextts`（默认，自建 mlx-audio）/ `edge` / `openai` / `doubao` / `local`；mock 仅作兜底 |
+| 接口契约 | OpenAPI 3.0 | OpenAPI **3.1**，落盘于 `backend/docs/openapi/stashbox-openapi.json`（改动端点后需重跑 `backend/scripts/export_openapi.py`）|
+
 
 ## 仓库结构（多仓独立，非 monorepo）
 
@@ -64,12 +83,29 @@ stashbox-admin-web/           # 仓库 C：运营后台（React19 + Vite8 + Tail
 | 后端框架 | FastAPI（异步 + 自动 OpenAPI） |
 | 数据库 | PostgreSQL（业务数据）+ Redis（缓存/队列）|
 | 任务队列 | Arq（Redis 后端，蒸馏 worker，见 `backend/ai-service/arq_settings.py`）|
-| 多模态 LLM | Qwen2.5-VL-72B（多模态理解）|
-| 听感改写 | Claude 4 Sonnet |
-| ASR / TTS | 豆包 ASR + 豆包 TTS |
+| 多模态 LLM | 可插拔，默认 `openai`；另有 `qwen_vl`。见上方更正 |
+| 听感改写 | 同一套 LLM 工厂 |
+| ASR / TTS | 多 provider 可插拔，默认自建 IndexTTS（mlx-audio）。见上方更正 |
 | 部署 | 阿里云 ACK + RDS + Redis + OSS + CDN |
 | Android | Kotlin + Jetpack Compose + MediaSession |
-| 接口契约 | OpenAPI 3.0 + 自动生成 Kotlin SDK |
+| 接口契约 | OpenAPI 3.1 + 自动生成 Kotlin SDK |
+
+## 本地测试
+
+```bash
+cd backend && source .venv/bin/activate
+
+# 全量（与 CI 同参数；1099 passed / 7 skipped，约 30s）
+CI=true STASHBOX_E2E_SKIP_DEVICE=1 pytest tests/ -q
+
+# 单个服务目录
+pytest tests/content -q          # 135 passed
+
+# 跨端契约校验（在 ../stashbox-admin-web 下）
+cd ../stashbox-admin-web && pnpm contract
+```
+
+真机 e2e（`tests/e2e/`）需要设备与**隔离**后端，生产端口会被守卫拒绝执行。
 
 ## 快速开始（开发者）
 
