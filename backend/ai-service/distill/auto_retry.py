@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import os
+
+import redis.asyncio as aioredis
 import structlog
 
 log = structlog.get_logger("distill.auto_retry")
@@ -67,43 +69,51 @@ async def get_user_daily_retry_count(user_id: int) -> int:
 
     之前 hook 里是 `user_daily_retry_count = 0` 写死，限流形同虚设 ——
     真接上入队后不配限流，一次低分就能把队列打爆。
+
+    2026-10：原来这里（以及下面 bump）自己 `aioredis.from_url(...)` 现建连接池，
+    有两个问题，都不是「性能」而是「正确性」：
+
+    1. **漏了密码**。`settings.redis_url`（common/config.py）拼 URL 时带
+       `redis://:<password>@host:port/db`，而这里手搓的
+       `redis://{host}:{port}/{db}` 不带。Redis 一旦启用密码，这两个函数
+       每一次都认证失败 —— 而 except 把失败吞成 `return 0`。后果是**限流
+       完全失效**：读永远是 0（< 3 → 永远放行），写也永远是 0（计数不动），
+       且日志只有一条 warning。
+    2. **每次调用新建一个连接池**再 aclose 掉。一次重试要建两次池，
+       高频调用下是纯粹的握手开销，且与非并发安全的自建池生命周期纠缠。
+
+    现在统一走 `common.redis_client.get_redis_pool()`（进程级共享池）。
+    借来的池**不需要也不能**在这里关：命令执行时向池借一条连接、用完立即归还，
+    薄客户端本身不持有连接；而 `Redis(connection_pool=...)` 的
+    `auto_close_connection_pool` 是 False，真去 aclose 也断不掉共享池 ——
+    两点都已对着 redis-py 5.3.1 的源码和实际行为确认过（from_url 路径才是 True，
+    那正是旧代码每次新建再关掉自己那个池的机制）。
     """
+    from stashbox.backend.common.redis_client import get_redis_pool
+
     try:
-        from stashbox.backend.common.config import settings
-
-        import redis.asyncio as aioredis
-
-        client = aioredis.from_url(
-            f"redis://{settings.redis_host}:{settings.redis_port}/{settings.redis_db}"
-        )
-        try:
-            val = await client.get(_RETRY_COUNT_KEY.format(user_id=user_id))
-            return int(val) if val else 0
-        finally:
-            await client.aclose()
+        client = aioredis.Redis(connection_pool=get_redis_pool())
+        val = await client.get(_RETRY_COUNT_KEY.format(user_id=user_id))
+        return int(val) if val else 0
     except Exception as exc:
         log.warning("auto_retry_count_read_failed", user_id=user_id, error=str(exc))
         return 0
 
 
 async def bump_user_daily_retry_count(user_id: int) -> int:
-    """计数 +1，返回当天累计次数。计数器带 24h 过期。"""
+    """计数 +1，返回当天累计次数。计数器带 24h 过期。
+
+    连接池与鉴权的问题同 `get_user_daily_retry_count`，见那里的说明。
+    """
+    from stashbox.backend.common.redis_client import get_redis_pool
+
     try:
-        from stashbox.backend.common.config import settings
-
-        import redis.asyncio as aioredis
-
-        client = aioredis.from_url(
-            f"redis://{settings.redis_host}:{settings.redis_port}/{settings.redis_db}"
-        )
-        try:
-            key = _RETRY_COUNT_KEY.format(user_id=user_id)
-            count = await client.incr(key)
-            if count == 1:
-                await client.expire(key, 24 * 3600)
-            return int(count)
-        finally:
-            await client.aclose()
+        client = aioredis.Redis(connection_pool=get_redis_pool())
+        key = _RETRY_COUNT_KEY.format(user_id=user_id)
+        count = await client.incr(key)
+        if count == 1:
+            await client.expire(key, 24 * 3600)
+        return int(count)
     except Exception as exc:
         log.warning("auto_retry_count_write_failed", user_id=user_id, error=str(exc))
         return 0
