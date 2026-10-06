@@ -38,7 +38,17 @@ from stashbox.backend.common.redis_client import get_redis_pool
 from stashbox.backend.common.analytics import track_simple
 from stashbox.backend.common.events import EventName
 
-from dispatcher import get_dispatcher, shutdown_dispatcher
+# ai-service 目录名带连字符，不能当包导入；且 dispatcher 等平级模块（DistillDispatcher、
+# arq_settings 等）需要本目录在 sys.path 上才能 `from dispatcher import ...`。
+# 补上这一行是为了与 content-service/main.py:50 的写法对齐。
+#
+# 没有它的时候：从 `backend/` 跑 pytest tests/observability 会在收集期抛
+# `ModuleNotFoundError: No module named 'dispatcher'`（observability 7 个文件里
+# 6 个 ERROR）—— 因为那条路径是按文件路径加载 main.py 的，cwd 不是 ai-service/。
+# 平时靠 run_dev.sh 从服务目录起服，掩盖了这个问题。
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # noqa: E402
+
+from dispatcher import get_dispatcher, shutdown_dispatcher  # noqa: E402
 
 log = logging.getLogger(__name__)
 
