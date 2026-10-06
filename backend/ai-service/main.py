@@ -404,6 +404,14 @@ async def distill_start(
         user_id=uid,
         url=url,
         title=title,
+        # 本端点与下面 /articles/{id}/distill 的计费口径**不一样**，所以这里是
+        # 恒 True 而那边是 `not is_system_content`：
+        #   - claim_article_quota 抢到 → 此刻 consume，真扣了；
+        #   - 没抢到 / existed_da 存在 → 扣在 content-service 剪藏那步或更早的
+        #     一次调用上，同样是「已扣」；
+        #   - uid==0 → consume 抛 3001，请求根本走不到这行。
+        # 显式写出来，免得后来者照抄隔壁端点的动态表达式。
+        quota_charged=True,
     )
     # 提前解析一次音色回给 App（worker 里会再解析一次；这里纯粹为了回显，
     # 两次之间用户改了偏好的话以 worker 那次为准，不追求强一致）
@@ -548,6 +556,12 @@ async def distill_article(
         url=url,
         title=title,
         simulate_failure=simulate_failure,
+        # 系统内容（匿名剪藏 / 后台手动录入）上面**跳过**了计费，失败时不能退 ——
+        # users.id=0 那行 quota_used 本就是 0，退款会在 quota_service._apply 里撞
+        # 「used + delta < 0」抛 3003，被 _refund_quota_once 吞成一条
+        # quota_refund_failed 告警：钱没白赚，但把「退款坏了」和「本来就没扣」
+        # 两种完全不同的故障混在同一条日志里。
+        quota_charged=not is_system_content,
     )
     # 埋点已在 commit() 之前完成（DISTILL_START）
 

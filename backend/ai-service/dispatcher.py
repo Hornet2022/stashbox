@@ -46,11 +46,17 @@ class DistillDispatcher:
         url: str,
         title: str | None = None,
         simulate_failure: bool = False,
+        quota_charged: bool = True,
     ) -> str:
         """入队蒸馏任务，返回 Arq job_id（入队失败时抛异常，由调用方决定降级策略）。
 
         Args:
             simulate_failure: 模拟失败（用于 E2E 验证 CP1.6 退还路径）
+            quota_charged: 本次任务**是否已经从用户配额里扣过一次**。
+                True（默认）= 正常剪藏入队，扣发生在 content-service；
+                失败时任务层会退还。False = 补偿性重跑（auto_retry），
+                从未扣过，失败时就**不能**退 —— 否则白赚一次配额。
+                见 distill_task 里同名字段的说明。
         """
         await self.connect()
         job = await self._pool.enqueue_job(
@@ -61,6 +67,7 @@ class DistillDispatcher:
             url=url,
             title=title,
             simulate_failure=simulate_failure,
+            quota_charged=quota_charged,
         )
         return job.job_id if job else ""
 

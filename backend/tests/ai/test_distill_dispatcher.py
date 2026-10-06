@@ -90,7 +90,27 @@ async def test_enqueue_distill_passes_all_args_to_arq(fake_pool):
         "url": "https://mp.weixin.qq.com/s/x",
         "title": "标题",
         "simulate_failure": True,
+        # 默认 True：剪藏正常路径在 content-service 就扣了配额，失败必须能退。
+        # 不显式透传的话 distill_task 会用自己的默认值，两处默认值一旦漂移
+        # 就静默错账 —— 这条断言同时钉住「dispatcher 必须转发该参数」。
+        "quota_charged": True,
     }
+
+
+async def test_enqueue_distill_forwards_quota_charged_false(fake_pool):
+    """auto_retry 那条：必须能把「没扣过配额」原样传到 worker。"""
+    pool, _ = fake_pool
+
+    await DistillDispatcher().enqueue_distill(
+        task_id="retry_1",
+        article_id="art_1",
+        user_id=7,
+        url="https://x.com/a",
+        quota_charged=False,
+    )
+
+    _function, kwargs = pool.enqueued[0]
+    assert kwargs["quota_charged"] is False
 
 
 async def test_enqueue_distill_uses_configured_queue_name(fake_pool):

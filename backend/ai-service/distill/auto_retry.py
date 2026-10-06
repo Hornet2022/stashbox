@@ -120,19 +120,37 @@ async def enqueue_auto_retry(
 
     刻意不复用原 task_id —— Arq 用 job_id 去重，沿用旧 id 会被判为重复任务
     直接跳过。重蒸是一次全新的尝试，需要新的 id。
+
+    2026-10 修 P0：原来这里写的是 `from .dispatcher import Dispatcher`。
+    `distill/` 下**没有** dispatcher.py —— dispatcher 在 `ai-service/dispatcher.py`
+    （类名是 `DistillDispatcher`）。这个 ImportError 被下面的 `except Exception`
+    吞掉，只留一行 `auto_retry_enqueue_failed` 日志。
+
+    而调用方 hooks_impl.py:424 的 `bump_user_daily_retry_count()` 在**调用之前**
+    就已经执行了（那里的注释明确写着「先占额度再入队」）。两者相加的后果是：
+
+        用户打 1-2 星 → 扣掉一次重试额度 → 入队失败被吞 → 什么都没发生
+
+    功能等于不存在，用户还白白损失每天 3 次里的额度。评分闭环在体验上是断的，
+    而 `auto_retry_triggered` 那条 info 日志还让人以为它跑通了。
     """
     import uuid
 
     try:
-        from .dispatcher import Dispatcher
+        # dispatcher 在 ai-service/ 下、是 distill/ 的**兄弟**而非子模块，
+        # 所以不能用相对导入。用顶层名（ai-service 目录已由 main.py 加进 sys.path）。
+        from dispatcher import DistillDispatcher
 
-        dispatcher = Dispatcher()
+        dispatcher = DistillDispatcher()
         job_id = await dispatcher.enqueue_distill(
             task_id=f"retry_{uuid.uuid4().hex[:24]}",
             article_id=article_id,
             user_id=user_id,
             url=url,
             title=title,
+            # 重试是给差评的补偿重跑，**不扣用户配额**（真正的闸门是每天 3 次限流）。
+            # 既然没扣，失败时就也不该退 —— 见 distill_task 里 quota_charged 的说明。
+            quota_charged=False,
         )
         log.info(
             "auto_retry_enqueued",

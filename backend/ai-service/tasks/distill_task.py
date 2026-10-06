@@ -209,6 +209,7 @@ async def distill_task(
     url: str,
     title: str | None = None,
     simulate_failure: bool = False,
+    quota_charged: bool = True,
 ) -> dict:
     """Arq worker task：跑 DistillPipeline。
 
@@ -220,6 +221,17 @@ async def distill_task(
         url: 文章 URL
         title: 文章标题
         simulate_failure: 模拟失败（走真实失败路径：FAILED + 退还配额 + 抛异常给 Arq retry）
+        quota_charged: 本次任务是否**已经从用户配额扣过一次**。
+
+            True（默认，剪藏正常路径）—— content-service 剪藏入库时就扣了，
+            蒸馏失败必须退，否则用户白扣。
+            False（auto_retry 补偿重跑）—— 从没扣过，失败时就**不能**退，
+            否则等于凭重试白赚配额。
+
+            2026-10 修 P0：这两个退款点此前是无条件执行的。auto_retry 走的也是
+            同一个 distill_task，于是「一次都没扣」的补偿重跑失败后照样退款 ——
+            用户白赚额度。反过来若改成靠 task_id 是否 `retry_` 前缀去嗅探，
+            等于把隐式约定当契约，换个调用方就再错一次。显式参数。
 
     Raises:
         ArticleNotFoundError: articles 里查不到 article_id（交给 Arq retry）
@@ -314,7 +326,15 @@ async def distill_task(
                 "empty_content_mark_failed_err", article_id=article_id, error=str(track_exc)
             )
         # 配额照退：用户在剪藏时已经为这篇付过一次了。
-        await _refund_quota_once(task_id=task_id, user_id=user_id)
+        if quota_charged:
+            await _refund_quota_once(task_id=task_id, user_id=user_id)
+        else:
+            log.info(
+                "quota_refund_skipped_not_charged",
+                task_id=task_id,
+                user_id=user_id,
+                reason="auto_retry_never_charged",
+            )
         return {"task_id": task_id, "status": "failed", "reason": "empty_article_content"}
 
     # CP-AGENT-RUNNER-INTEGRATION：distill 走 LangGraph agent（替代硬编码 pipeline）
@@ -442,7 +462,16 @@ async def distill_task(
         # CP-AGENT-QUOTA-REFUND：配额退还原先由 DistillPipeline._refund_quota 承担，
         # agent 路径绕过了 pipeline，必须在任务级补回（否则用户蒸馏失败白扣配额）。
         # Redis SETNX 幂等锁：Arq 默认 retry_max=2，避免首跑 + 重试多次退双倍。
-        await _refund_quota_once(task_id=task_id, user_id=user_id)
+        # quota_charged=False（auto_retry）：本来就没扣，退款等于白送额度。
+        if quota_charged:
+            await _refund_quota_once(task_id=task_id, user_id=user_id)
+        else:
+            log.info(
+                "quota_refund_skipped_not_charged",
+                task_id=task_id,
+                user_id=user_id,
+                reason="auto_retry_never_charged",
+            )
         raise  # 让 Arq 走 retry 逻辑
     finally:
         # CP-AGENT-RUNNER-INTEGRATION：agent 路径下 LLM client 由 agent.runner 内部
