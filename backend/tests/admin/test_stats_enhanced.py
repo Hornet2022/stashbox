@@ -132,6 +132,24 @@ async def _cleanup_orders():
         await s.commit()
 
 
+@pytest.fixture(autouse=True)
+async def _no_orders_leak():
+    """用例结束后**必定**删掉 orders 夹具表。
+
+    原来是在用例里手工配对调 `_seed_orders()` / `_cleanup_orders()`。一旦用例
+    在两者之间失败（assert 挂了、抛异常、进程被杀），清理就不执行 —— orders
+    表留在库里。本机就是这么留下一张 0 行残留表的，而它的直接后果是
+    `alembic check` 一直报 "New upgrade operations detected: remove_table orders"，
+    拖动检测工具自己失去意义。
+
+    这里只保证「收尾删干净」，不代替建表：用到 orders 的那个用例需要自己控制
+    「表不存在 → 建表 → 再删表」的过程（它测的就是 revenue_available 随表
+    在不在而变）。teardown 由 pytest 兜住，用例失败照样执行。
+    """
+    yield
+    await _cleanup_orders()
+
+
 @pytest.mark.asyncio
 async def test_stats_required_fields_present_on_empty_db():
     """DB 空时所有 11 个字段都存在且类型正确（含 7 个原字段 + 4 个新增）。"""
