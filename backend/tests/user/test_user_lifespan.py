@@ -1,6 +1,32 @@
+import importlib.util
+import sys
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
-from main import app
+
+BACKEND_DIR = Path(__file__).resolve().parents[2]
+
+
+def _load_app(name: str, rel: str):
+    """服务目录名带连字符（user-service），不能当包 import，按文件路径加载。
+
+    本文件原先写的是 `from main import app` —— 只有在 `user-service/` 恰好在
+    sys.path 上时才成立，从 `backend/` 跑 pytest 时不成立，收集期直接
+    `ModuleNotFoundError: No module named 'main'`。
+
+    这正是 CI 里那条 `--ignore=tests/user/test_user_lifespan.py` 的由来。
+    同目录的 test_notifications / test_onboarding / test_quota_reset_loop
+    早就统一用这个 _load_app 写法了，只有本文件漏改。
+    """
+    spec = importlib.util.spec_from_file_location(name, BACKEND_DIR / rel)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module.app
+
+
+app = _load_app("_lifespan_user_main", "user-service/main.py")
 
 
 @pytest.fixture

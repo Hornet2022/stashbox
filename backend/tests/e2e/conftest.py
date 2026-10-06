@@ -45,16 +45,35 @@ _PRODUCTION_PORTS = {8100, 8101, 8102, 8103, 8104}
 
 
 def _assert_not_production(gateway: str) -> None:
+    """守卫：这套 e2e 会真的建用户/文章/派蒸馏任务，不能打到生产。"""
     from urllib.parse import urlparse
 
     port = urlparse(gateway).port
-    if port in _PRODUCTION_PORTS:
-        raise RuntimeError(
-            f"拒绝执行：STASHBOX_GATEWAY={gateway} 指向生产端口 {port}。\n"
-            "  这套 e2e 会真的建用户/文章/派蒸馏任务，打生产等于污染生产库 + 占 TTS 队列。\n"
-            "  · 先起隔离后端再指过去（例如 admin-web 的 e2e-backend.sh，:18100）\n"
-            "  · 或显式确认后设 STASHBOX_ALLOW_PROD_E2E=1（不建议）"
-        )
+    if port not in _PRODUCTION_PORTS:
+        return
+    if os.getenv("STASHBOX_ALLOW_PROD_E2E") == "1":
+        return
+
+    # 这里用 **skip 而不是 raise**，是 2026-10 的修正。
+    #
+    # 原来抛 RuntimeError，发生在 conftest 导入期 —— 属于 collection error，
+    # 后果是整个 pytest 收集中断：CI 里 1000+ 个与真机 e2e 毫无关系的用例
+    # 也一起跑不起来（实测退出码 2）。
+    #
+    # 保护意图是对的（默认值 8100 确实是生产端口，见上方注释里那次踩坑记录），
+    # 但手段过钝：为了防一套用例污染生产，代价是让全套 CI 失去信号 ——
+    # 这正是 content 目录被 `--ignore` 掉、进而让一批卡死的用例长期没人
+    # 发现的起点。
+    #
+    # skip(allow_module_level=True) 保留「不跑生产 e2e」这个硬保证，同时
+    # 只跳过本模块，其余测试照常收集执行。
+    pytest.skip(
+        f"跳过真机 e2e：STASHBOX_GATEWAY={gateway} 指向生产端口 {port}。\n"
+        "  这套用例会真的建用户/文章/派蒸馏任务，打生产等于污染生产库 + 占 TTS 队列。\n"
+        "  · 先起隔离后端再指过去（例如 admin-web 的 e2e-backend.sh，:18100）\n"
+        "  · 或显式确认后设 STASHBOX_ALLOW_PROD_E2E=1（不建议）",
+        allow_module_level=True,
+    )
 
 
 _assert_not_production(GATEWAY)

@@ -95,14 +95,23 @@ jobs:
 
       - name: Run pytest
         working-directory: backend
-        # 跳过 collection error 的目录（pre-existing 已知）
+        # 2026-10 收敛忽略清单。原版按注释「跳过 collection error 的目录
+        # （pre-existing 已知）」硬编码了 5 条 --ignore，其中 4 条早已失效：
+        #   content / gateway / observability / test_quota.py
+        # 它们当初被 ignore 是因为收集期报错；问题修掉后没人回来清理，
+        # 于是 215 个用例长期在 CI 之外 —— 其中就包括会连真实公网、
+        # 把整个套件拖死的那批 content 用例。ignore 清单替 bug 兜了底，
+        # 也让 bug 永远暴露不出来。
+        #
+        # 真机 e2e 不再需要 --ignore：tests/e2e/conftest.py 的生产守卫已从
+        # `raise RuntimeError` 改为 `pytest.skip(allow_module_level=True)`。
+        # 原来抛异常发生在收集期，会连带中断其余 1000+ 个用例（CI 退出码 2）。
+        #
+        # STASHBOX_E2E_SKIP_DEVICE=1：无真机时只跑不需要设备的用例。
+        env:
+          STASHBOX_E2E_SKIP_DEVICE: "1"
         run: |
           poetry run pytest tests/ \
-            --ignore=tests/user/test_user_lifespan.py \
-            --ignore=tests/content \
-            --ignore=tests/gateway \
-            --ignore=tests/observability \
-            --ignore=tests/test_quota.py \
             --junitxml=pytest-report.xml \
             -v
 
