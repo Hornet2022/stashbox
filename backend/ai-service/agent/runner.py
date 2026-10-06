@@ -304,8 +304,8 @@ async def tts_node(state: AgentState) -> dict[str, Any]:
             ToolError(
                 "empty",
                 f"tts_synthesize 已执行 {len(prev_tts)} 次但拿不到 audio_url"
-                "（音频已落本地磁盘；OSS 上传未实现，storage/oss.py 仍是空壳）。"
-                "停止重复合成 —— 上传能力就绪前不会再重试。",
+                "（音频已落本地磁盘；请查 OSS 上传失败原因，storage/oss.py 已有真实实现）。"
+                "停止重复合成 —— 上传恢复前不会再重试。",
             ),
         )
 

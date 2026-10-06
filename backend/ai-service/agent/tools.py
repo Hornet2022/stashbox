@@ -116,10 +116,13 @@ async def tts_synthesize_tool(state: dict[str, Any], args: dict[str, Any]) -> di
           → 无限循环，每轮白合成一遍（实测一次任务合成了 3 遍、8MB+ 音频）
 
     现在改为**真实落盘**：音频写到 `INDEXTTS_AUDIO_DIR/{article_id}.{fmt}`，
-    audio_path 一定有值；audio_url 只在 OSS 可用时才有值（当前
-    `OSSStorage.save` 是空实现，会 NotImplementedError，所以这里是 None，
-    distill_task 会记 `audio_url_not_http` 且不标 ready —— 这是既有约定，
-    不要为了让它变绿而伪造 URL）。
+    audio_path 一定有值；audio_url 只在 OSS 可用时才有值（`_try_upload_to_oss`
+    失败时为 None，distill_task 会记 `audio_url_not_http` 且不标 ready —— 这是
+    既有约定，不要为了让它变绿而伪造 URL）。
+
+    历史更正：本段原注释称「`OSSStorage.save` 是空实现，会 NotImplementedError」。
+    那是 CP-OSS-S3 之前的状态，`app/services/storage/oss.py` 早已补齐 save/fetch
+    实现。保留那句话只会让人以为上传能力还没做，从而绕开真正的上传失败原因。
     """
     script = state.get("rewritten_script") or args.get("script")
     voice = state.get("voice") or args.get("voice")
@@ -214,8 +217,10 @@ async def tts_synthesize_tool(state: dict[str, Any], args: dict[str, Any]) -> di
 async def _try_upload_to_oss(article_id: str, audio: bytes, fmt: str) -> str | None:
     """尝试上传 OSS；不可用时返回 None（**不要伪造 URL**）。
 
-    当前 `app/services/storage/oss.py` 的 `OSSStorage.save` 是 NotImplementedError
-    空实现，所以这里预期就是 None。上传可用后本函数会自动产出真实 URL。
+    原 docstring 称 `OSSStorage.save` 是 NotImplementedError 空实现、预期必然返回
+    None —— 那是 CP-OSS-S3 之前的状态，现已补齐真实实现。这里**会**在 OSS 可用时
+    返回真实 URL；返回 None 只代表上传真的失败了（凭证缺失、网络、bucket 不存在
+    等），调用方据此判 `audio_url_not_http` 是合理的。
     """
     try:
         from stashbox.backend.app.services.storage.oss import OSSStorage
