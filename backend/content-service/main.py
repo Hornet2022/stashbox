@@ -45,6 +45,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 # content-service 目录名带连字符，不能当包导入，故把自身目录加入 sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # noqa: E402
@@ -702,6 +703,51 @@ async def admin_create_article(
     }
 
 
+# --- 列表端点共享的两个约束（2026-10 P0）----------------------------------
+#
+# 1) 不要 select 出 raw_content。
+#    articles.raw_content 是抓取后的原始正文 JSONB —— fetchers/parser.py 把
+#    content_text 限 50KB / content_html 限 200KB，单行可达 ~250KB。而
+#    `_to_response` **一次都不读它**（只用 id/url/source/title/user_id/
+#    status/favorite/skip/created_at/updated_at + task 那侧字段）。
+#    列表 select 整行 ORM 实体 = 把 250KB × N 从 PG 搬进进程再原样丢掉：
+#      - 20 条就是 ~5MB/次请求，纯搬运开销；
+#      - pending / listened 两个端点此前**还没有 LIMIT**，行数随用户历史线性
+#        增长，老用户一次请求就能把 content-service 内存打爆。
+#
+#    `defer` 只改 SELECT 的列清单，返回的还是同一个 ORM 对象，_to_response 无需改。
+#    ⚠️ 反面风险：将来若给 _to_response 加上读 raw_content 的分支，defer 过的
+#    端点会在访问那一刻触发 lazy load → async 上下文抛 MissingGreenlet（500，
+#    不是 None）。所以 defer **只能**用在逐个核对过「不读该列」的端点上，
+#    不要图省事整仓套上去。
+_LISTING_DEFER = defer(Article.raw_content)
+
+# 2) 无分页列表端点的行数上限。
+#    取 200 是「足够覆盖任何真实用户的未处理列表」与「即使忘了 defer 也不会
+#    打死进程」之间的折中，不是拍脑袋的产品决策 —— 见下面截断时的告警。
+_LIST_PAGE_CAP = 200
+
+
+def _truncate_for_list(rows: list, cap: int, *, endpoint: str, uid: int) -> list:
+    """把结果截到 cap，**并在真的截断时打一条 warning**。
+
+    为什么要告警：静默截断是最难查的一类问题 —— 用户少了内容、日志一片干净、
+    监控全绿。宁可吵一点。有这条日志，看到「少了几篇」时能立刻确认是截断
+    而不是查询出错。
+    """
+    if len(rows) <= cap:
+        return rows
+    log.warning(
+        "list_truncated",
+        endpoint=endpoint,
+        user_id=uid,
+        returned=cap,
+        fetched=len(rows),
+        cap=cap,
+    )
+    return rows[:cap]
+
+
 @app.get("/api/v1/articles")
 async def list_articles(
     user: dict = Depends(require_user),
@@ -746,6 +792,7 @@ async def list_articles(
     result = await db.execute(
         select(Article, DistilledArticle)
         .outerjoin(DistilledArticle, DistilledArticle.article_id == Article.id)
+        .options(_LISTING_DEFER)  # 见 _LISTING_DEFER：_to_response 不读 raw_content
         .where(*base_filter)
         .order_by(Article.created_at.desc())
         .limit(limit)
@@ -785,14 +832,17 @@ async def list_pending(user: dict = Depends(require_user), db: AsyncSession = De
     result = await db.execute(
         select(Article, DistilledArticle)
         .outerjoin(DistilledArticle, DistilledArticle.article_id == Article.id)
+        .options(_LISTING_DEFER)  # 见 _LISTING_DEFER
         .where(
             Article.user_id == uid,
             Article.status.in_(["pending", "distilling", "ready"]),
             Article.skip.is_(False),
             Article.deleted_at.is_(None),
         )
+        .order_by(Article.created_at.desc())
+        .limit(_LIST_PAGE_CAP + 1)  # +1 用于判别是否触发截断
     )
-    rows = result.all()
+    rows = _truncate_for_list(result.all(), _LIST_PAGE_CAP, endpoint="list_pending", uid=uid)
     items = [_to_response(art, task).model_dump() for art, task in rows]
     await cache_service.set_pending(uid, items)  # 回填（ttl 60s）
     return {"articles": items, "count": len(items), "cached": False}
@@ -800,16 +850,20 @@ async def list_pending(user: dict = Depends(require_user), db: AsyncSession = De
 
 @app.get("/api/v1/articles/listened")
 async def list_listened(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
+    uid = _uid(user)
     result = await db.execute(
         select(Article, DistilledArticle)
         .outerjoin(DistilledArticle, DistilledArticle.article_id == Article.id)
+        .options(_LISTING_DEFER)  # 见 _LISTING_DEFER
         .where(
-            Article.user_id == _uid(user),
+            Article.user_id == uid,
             Article.status == "listened",
             Article.deleted_at.is_(None),
         )
+        .order_by(Article.created_at.desc())  # 截断时必须给出确定顺序，否则被丢的是随机行
+        .limit(_LIST_PAGE_CAP + 1)  # +1 用于判别是否触发截断
     )
-    rows = result.all()
+    rows = _truncate_for_list(result.all(), _LIST_PAGE_CAP, endpoint="list_listened", uid=uid)
     items = [_to_response(art, task).model_dump() for art, task in rows]
     return {"articles": items, "count": len(items)}
 
