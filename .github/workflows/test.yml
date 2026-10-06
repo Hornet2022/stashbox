@@ -72,6 +72,18 @@ jobs:
       # backend 里的代码按 `stashbox.backend.*` 绝对包名导入，
       # 需要仓库根目录的父目录在 sys.path 上（同 tests/conftest.py 的 parents[3]）。
       PYTHONPATH: ${{ github.workspace }}/..
+      # common/config.py 的 jwt_secret 校验器禁止用默认 dev 密钥（否则任何人
+      # 都能伪造 token），它的 docstring 明确写了「CI / 集成测试用
+      # STASHBOX_ALLOW_DEV_JWT=1 显式放行」—— 就是这一行。
+      #
+      # 2026-10 之前 CI 一直没设它，于是 `alembic upgrade head` 在
+      # import config 阶段就 ValidationError 退出 1，后面两个 pytest 步骤
+      # 根本轮不到跑。这个红点在 job 列表里看起来像「数据库迁移坏了」，
+      # 和真正原因（少一个环境变量）毫无关系，很容易被误判成偶发。
+      #
+      # 选它而不是往仓库里写死一个 JWT_SECRET 字面量：不在仓库里留任何
+      # 看起来像密钥的东西，误拷到生产的可能性为零。
+      STASHBOX_ALLOW_DEV_JWT: '1'
 
     steps:
       - uses: actions/checkout@v4
