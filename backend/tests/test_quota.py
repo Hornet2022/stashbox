@@ -15,6 +15,7 @@ import uuid
 from pathlib import Path
 
 import httpx
+import pytest
 import redis
 import redis.asyncio
 from sqlalchemy import select
@@ -90,6 +91,43 @@ async def get_quota(user_id: int, token: str) -> dict:
 async def submit(token: str, url: str = "https://example.com/a") -> httpx.Response:
     async with client(content_app, token) as c:
         return await c.post("/api/v1/articles", json={"url": url})
+
+
+@pytest.fixture(autouse=True)
+def _fake_capture_fetch(monkeypatch):
+    """剪藏建文章不依赖真实外网抓取。
+
+    本文件所有用例都通过 `submit()` 打 POST /api/v1/articles，而该端点自
+    10-03 起「先抓后建」——不真的抓到正文就不建文章。于是每个用例都在**真
+    去抓 `https://example.com/...`**。
+
+    两个后果：
+      1. 慢且脆：单文件几十秒起，套件整体被拖住。
+      2. 直接红：SSRF 守卫（10-03 同批补的）会解析目标并拦下回环/内网地址，
+         而 `example.com` 在沙箱/企业 split-DNS 下正好解析到 127.0.0.1
+         → 返回 2001「暂不支持这个链接来源」，6 个用例全挂。
+
+    守卫本身是对的（实测确实拦住了环回地址）；脆的是这些用例 —— 它们要验的是
+    **配额扣减**，跟能不能抓到网页毫无关系。这里切断抓取，与
+    tests/content/test_d9_callback.py、tests/gateway/conftest.py 同一套做法。
+    """
+    from fetchers.base import FetchResult
+
+    class _FakeFetcher:
+        async def fetch(self, url: str, timeout=None, budget=None):
+            return FetchResult(
+                url=url,
+                title="测试文章",
+                content_html="<p>正文</p>",
+                content_text="测试正文",
+                source="generic_url",
+            )
+
+    # 本文件自己按文件路径加载了一份 content-service（见 _load_app），
+    # `_cp16_content_main` 就是那个实例；模块级变量 content_app 已是它的 .app。
+    monkeypatch.setattr(
+        sys.modules["_cp16_content_main"], "get_fetcher", lambda _url: _FakeFetcher()
+    )
 
 
 # ---------------------------------------------------------------------------

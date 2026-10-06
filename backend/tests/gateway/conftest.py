@@ -7,6 +7,7 @@
   - 需要造 5xx / 固定响应时，用 stub_app() 自己 mount 一个替身覆盖默认上游
   - 上游收到的请求记在 upstream_requests 里（httpx event_hooks）
 """
+
 import importlib.util
 import sys
 from pathlib import Path
@@ -123,3 +124,35 @@ def stub_app():
         return app
 
     return _make
+
+
+@pytest.fixture(autouse=True)
+def fake_capture_fetch(monkeypatch):
+    """切断剪藏/回调链路的**真实抓取**，让 gateway 代理用例不发外网请求。
+
+    为什么需要：`test_articles_add_proxy.py` 与 `test_d9_proxy.py` 会 POST
+    `https://mp.weixin.qq.com/s/{随机}` —— 上游是真实 content-service，于是
+    真的会去抓那个不存在的公众号文章。这两个文件单个 >60s 跑不完，整套
+    tests/ 也会被拖死；断网环境下更是直接 ConnectError。
+
+    与 tests/content/test_d9_callback.py 是**同一个根因的第二个现场**
+    （2026-10 修复）。那一处当初没被发现，是因为 tests/gateway 一直在 CI 的
+    --ignore 清单里，从没被跑到过 —— ignore 清单替 bug 兜了底。
+
+    这里用 autouse：本目录的每个用例都不该碰真实外网。upstream 走的是
+    in-process ASGITransport（不发真实 HTTP），只有**抓取**这一步会出去。
+    """
+    from fetchers.base import FetchResult
+
+    class _FakeFetcher:
+        async def fetch(self, url: str, timeout=None, budget=None):
+            return FetchResult(
+                url=url,
+                title="测试文章",
+                content_html="<p>正文</p>",
+                content_text="测试正文",
+                source="wechat_mp",
+            )
+
+    # helpers 加载的那份 content-service 才是 upstream 实际在跑的实例
+    monkeypatch.setattr(helpers.content_main, "get_fetcher", lambda _url: _FakeFetcher())

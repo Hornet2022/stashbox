@@ -1,4 +1,5 @@
 """CP6.4-pre：`/metrics` Prometheus 抓取端点（text/plain 0.0.4 + 3 个指标族）。"""
+
 import sys
 from pathlib import Path
 
@@ -48,7 +49,7 @@ async def test_metrics_exposes_all_three_families(content_app, asgi_client):
     assert _samples(body, "http_request_errors_total")
 
 
-async def test_post_article_is_counted(content_app, asgi_client):
+async def test_post_article_is_counted(content_app, asgi_client, fake_capture_fetch):
     """§4.3：请求 POST /api/v1/articles 后，对应 endpoint + method 的计数 >= 1。"""
     _uid, token = await new_user(monthly_quota=5)
 
