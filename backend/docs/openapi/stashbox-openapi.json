@@ -2962,6 +2962,7 @@
       },
       "delete": {
         "summary": "Admin Delete Voice",
+        "description": "删除音色。\n\nreason ≥5 字符必填并写审计日志，与 tag / article 的破坏性操作口径一致。\n\n此前这个端点不收任何 body、也不写 admin_operation_logs：删除一个**默认音色**\n会让全平台用户静默降级到全局 TTS 配置，而事后审计日志里查不到是谁删的、\n为什么删。tags / articles / quota 都有 reason，只有音色库是例外。",
         "operationId": "admin_delete_voice_api_v1_admin_tts_voices__voice_id__delete",
         "parameters": [
           {
@@ -2990,6 +2991,16 @@
             }
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoiceDeleteIn"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -3557,6 +3568,7 @@
     "/api/v1/articles/{article_id}": {
       "get": {
         "summary": "Get Article",
+        "description": "文章详情（含蒸馏全文）。\n\n⚠️ **缓存必须在属主校验之后才有资格被信任**（2026-10 修的越权读）：\n\n原来是「先查缓存、命中就直接 return」，把 `_get_owned_with_task` 整段跳过了。\n而 `article:detail:{id}` 这个 key 不带 user 维度，于是任何登录用户只要知道\n别人的 article_id，就能在缓存存活期（300s）内直接读到**完整 payload** ——\n标题、原文链接、蒸馏全文 —— 本该是 403。\n\n旁边所有兄弟端点（`/status`、`/audio-url`）都是先 `_get_owned_with_task` 再干活，\n只有这里把缓存放在了前面，所以这不是设计取舍，是个离群点。\n\n现在缓存命中要带 `user_id` 一起判（`cache_service.get_article` 里做，见其说明）：\n属主对得上才直接返回，对不上就当没命中、落到下面正常的属主校验拿 403。\n属主仍然享受「不查库」的快路径，越权者拿不到任何东西。",
         "operationId": "get_article_api_v1_articles__article_id__get",
         "parameters": [
           {
@@ -3800,7 +3812,7 @@
     "/api/v1/articles/{article_id}/favorite": {
       "post": {
         "summary": "Favorite",
-        "description": "「收藏一下」快轨道（v1 §3.1 单数）。\n\nCP8.6 Bug 3 文档化决策：与 /api/v1/favorites（复数，folder + note 双轨）\n并存，不合并。详见下方 __doc_decision_favorite_vs_favorites__ 注释。\n\n行为：\n  - articles.favorite = True\n  - feedback(type=\"favorite\") —— 同一事务\n  - 写库后 invalidate article detail 缓存（CP8.6 Bug 1）\n  - 幂等：重复点 favorite 不会重复写 feedback 行（_write_feedback 只 add，\n    SQLAlchemy 同一事务内第二次 add 会抛 IntegrityError —— TODO：如果要真\n    幂等需要在 _write_feedback 加 dedup，目前客户端应避免双击）\n\n用法：列表 / 详情页的 ❤️「收藏」按钮，点一下完成。无 folder / note。",
+        "description": "「收藏一下」快轨道（v1 §3.1 单数）。\n\nCP8.6 Bug 3 文档化决策：与 /api/v1/favorites（复数，folder + note 双轨）\n并存，不合并。详见下方 __doc_decision_favorite_vs_favorites__ 注释。\n\n行为：\n  - articles.favorite = True\n  - feedback(type=\"favorite\") —— 同一事务\n  - 写库后 invalidate article detail 缓存（CP8.6 Bug 1）\n  - 幂等：重复点 favorite 不重复写 feedback 行（2026-10 修）\n\n幂等按**目标状态**判重，不按事件次数：只有「当前已经是收藏态、且已存在\nfavorite 埋点行」才直接返回。取消收藏后再收藏仍会写新行 —— 那是一次真实\n的状态回转，不该被吃掉。\n\n这里曾长期标注「TODO：客户端应避免双击」，把幂等性推给了调用方。实际后果\n不是报错：`feedback` 表只有索引、没有唯一约束（见 common/models/feedback.py），\n双击不会抛 IntegrityError，而是**静默写入重复埋点行**，收藏类事件统计被灌水。\n原注释描述的故障模式本身就不成立。现已对齐复数 /favorites 的预查写法。",
         "operationId": "favorite_api_v1_articles__article_id__favorite_post",
         "parameters": [
           {
@@ -5319,17 +5331,35 @@
           "events"
         ],
         "summary": "Collect Event",
-        "description": "客户端 SDK 上报事件端点（CP6.2.2.1 最小化版）。\n\n协议：device_id 必填 + event_name 在 EventName 枚举内。\n落库：直接走 feedback 表（CP6.2.1 已建）。",
+        "description": "客户端 SDK 上报事件端点（CP6.2.2.1 最小化版）。\n\n协议：device_id 必填 + event_name 在 EventName 枚举内。\n落库：直接走 feedback 表（CP6.2.1 已建）。\n\n⚠️ **user_id 一律从 token 取，绝不采信请求体**（2026-10 修）：\n\n原来直接 `user_id=req.user_id or 0`，等于「谁都能以任意用户的名义写埋点」。\n而 `feedback.user_id` 的外键已在 `alembic/versions/0018_drop_feedback_user_fk.py`\n被删掉，模型里只是裸 BigInteger —— 任意 user_id 都写得进去。被污染的行会流进\n运营看板和 `content-service/admin_router.py` 的反馈 CSV 导出。\n\n「device_id 必填」的设计本意是允许未登录设备上报，所以**匿名上报要继续可用**\n（没有 token → user_id=0，与 analytics.track 的约定一致）。改变的只是：\n带 token 时以 token 为准、带别人的 user_id 也不行。",
         "operationId": "collect_event_api_v1_events_collect_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
         "requestBody": {
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/EventCollectRequest"
               }
             }
-          },
-          "required": true
+          }
         },
         "responses": {
           "200": {
@@ -5337,8 +5367,8 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
                   "type": "object",
+                  "additionalProperties": true,
                   "title": "Response Collect Event Api V1 Events Collect Post"
                 }
               }
@@ -8938,6 +8968,22 @@
           "ref_text"
         ],
         "title": "VoiceCreateIn"
+      },
+      "VoiceDeleteIn": {
+        "properties": {
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Reason",
+            "description": "删除原因，会写入审计日志"
+          }
+        },
+        "type": "object",
+        "required": [
+          "reason"
+        ],
+        "title": "VoiceDeleteIn",
+        "description": "删除音色的原因（写入审计日志）。\n\n与 tag / article 的破坏性操作同口径：必填、≥5 字符、落 admin_operation_logs。"
       },
       "VoiceListOut": {
         "properties": {
