@@ -11,7 +11,11 @@
 .env
 .env.local
 .env.*.local
-.env.bak
+# 2026-10-06 补：原先只写 `.env.bak` + `*.bak`，`.env.bak2` 正好从两个模式
+# 之间漏过去，被 d60a040「working tree 合并」带进了历史，直到 GitHub push
+# protection 拦下其中的 Volcengine Ark key 才暴露。备份文件的花名没有穷举，
+# 这里用通配一次覆盖。
+.env.bak*
 *.bak
 *.pem
 *.key
