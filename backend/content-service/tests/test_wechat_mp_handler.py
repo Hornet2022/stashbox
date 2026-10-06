@@ -69,6 +69,24 @@ from stashbox.backend.common.models import Article  # noqa: E402
 
 MP_URL = "/api/v1/callback/wechat-mp-message"
 
+# 端点挂了 `require_callback_secret` 之后（fail-closed：没配密钥就 503），
+# 这批 E2E 一直没跟着改 —— 因为它们不在 CI 里，跑红也没人知道。
+_TEST_SECRET = "test-callback-secret"
+
+
+@pytest.fixture
+def callback_secret(monkeypatch):
+    """配好回调密钥，返回要随请求带上的请求头。
+
+    用 monkeypatch 改 settings 实例而不是改环境变量：pydantic v2 的 Settings
+    在**构造时**就把环境变量读进字段了，事后再 os.environ[...] = ... 不会生效
+    （这个坑踩过一次：设了变量却仍返回 503）。
+    """
+    from stashbox.backend.common.config import settings
+
+    monkeypatch.setattr(settings, "callback_shared_secret", _TEST_SECRET, raising=False)
+    return {"X-Callback-Secret": _TEST_SECRET}
+
 
 @pytest.fixture(autouse=True)
 async def _dispose_pools():
@@ -218,12 +236,30 @@ def test_map_internal_to_2002():
 # ---------------------------------------------------------------------------
 # 5.4 端点 E2E（1）
 # ---------------------------------------------------------------------------
+# 正文长度按生产阈值 MIN_ARTICLE_CHARS 生成，不写死数字。
+#
+# 这段夹具原来只有 39 个字，注释还写着「足够长……通过长度阈值检查」——
+# 作者的**意图**是对的，只是后来 parser 把门槛提到 200 字（MIN_ARTICLE_CHARS，
+# 理由是「低于 200 字的网页听完不到 1 分钟」），夹具没跟着改。因为这批用例不在
+# CI 里，跑红也没人知道，于是它一直烂在这儿。
+#
+# 更要紧的是：这个失败长得像「测试数据不严谨」，实际是**夹具和生产规则脱钩**。
+# 所以正文由阈值生成，并配一条用例守住（见 test_夹具正文_真的过得了生产阈值）——
+# 将来再调阈值，这里会自动跟着变，不会又悄悄烂掉。
+_BODY_SENTENCE = "这是一段足够长的正文内容，用来通过正文抽取的密度与长度阈值检查，确保抓取成功。"
+
+
+def _body_paragraph() -> str:
+    """生成一段正文，长度明确超过生产要求的 MIN_ARTICLE_CHARS。"""
+    need = cs_fetchers.parser.MIN_ARTICLE_CHARS + 50
+    reps = -(-need // len(_BODY_SENTENCE))  # 向上取整
+    return "<p>" + _BODY_SENTENCE * reps + "</p>"
+
+
 _FAKE_HTML = (
     "<html><head>"
     '<meta property="og:title" content="听匣服务号测试标题">'
-    "</head><body>"
-    "<p>这是一段足够长的正文内容，用来通过正文抽取的密度与长度阈值检查，确保抓取成功。</p>"
-    "</body></html>"
+    "</head><body>" + _body_paragraph() + "</body></html>"
 )
 
 
@@ -234,7 +270,7 @@ def _mock_transport(request: httpx.Request) -> httpx.Response:
 
 
 @pytest.mark.asyncio
-async def test_wechat_mp_message_happy_path(monkeypatch):
+async def test_wechat_mp_message_happy_path(monkeypatch, callback_secret):
     """MockTransport 拦截 GenericURLFetcher → 建 article + 触发 distill。"""
     fake_ai = FakeAIClient()
     monkeypatch.setattr(content_main, "get_ai_client", lambda: fake_ai)
@@ -250,6 +286,7 @@ async def test_wechat_mp_message_happy_path(monkeypatch):
     ) as c:
         r = await c.post(
             MP_URL,
+            headers=callback_secret,
             json={
                 "from_user": "o_openid_123",
                 "text": "推荐 https://example.com/article 看看。",
@@ -305,9 +342,9 @@ _HTML_WITH_MEDIA = (
     '<meta property="og:title" content="带图片的原文标题">'
     '<meta property="article:published_time" content="2026-01-15T08:30:00+00:00">'
     "</head><body>"
-    "<p>这是一段足够长的正文内容，用来通过正文抽取的密度与长度阈值检查，确保抓取成功。</p>"
-    '<p><img src="https://example.com/pic1.jpg"></p>'
-    "</body></html>"
+    + _body_paragraph()
+    + '<p><img src="https://example.com/pic1.jpg"></p>'
+    + "</body></html>"
 )
 
 
@@ -318,7 +355,7 @@ def _mock_transport_with_media(request: httpx.Request) -> httpx.Response:
 
 
 @pytest.mark.asyncio
-async def test_handler_stores_fetch_result_raw_content(monkeypatch):
+async def test_handler_stores_fetch_result_raw_content(monkeypatch, callback_secret):
     """Handler 把 FetchResult 全字段落到 articles.raw_content。"""
     monkeypatch.setattr(content_main, "get_ai_client", lambda: FakeAIClient())
     monkeypatch.setattr(
@@ -332,6 +369,7 @@ async def test_handler_stores_fetch_result_raw_content(monkeypatch):
     ) as c:
         r = await c.post(
             MP_URL,
+            headers=callback_secret,
             json={
                 "from_user": "o_openid_123",
                 "text": "https://example.com/media",
@@ -356,7 +394,7 @@ async def test_handler_stores_fetch_result_raw_content(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_handler_response_includes_fetch_metadata(monkeypatch):
+async def test_handler_response_includes_fetch_metadata(monkeypatch, callback_secret):
     """Handler 响应含 fetched_at / content_text_length / has_media。"""
     monkeypatch.setattr(content_main, "get_ai_client", lambda: FakeAIClient())
     monkeypatch.setattr(
@@ -370,6 +408,7 @@ async def test_handler_response_includes_fetch_metadata(monkeypatch):
     ) as c:
         r = await c.post(
             MP_URL,
+            headers=callback_secret,
             json={
                 "from_user": "o_openid_123",
                 "text": "https://example.com/meta",
@@ -382,3 +421,41 @@ async def test_handler_response_includes_fetch_metadata(monkeypatch):
     datetime.fromisoformat(data["fetched_at"])  # ISO 字符串可解析
     assert data["content_text_length"] > 0
     assert data["has_media"] is True
+
+
+# ---------------------------------------------------------------------------
+# 夹具自身的守卫（防止这段腐烂重演）
+# ---------------------------------------------------------------------------
+
+
+def test_夹具正文_真的过得了生产阈值():
+    """把夹具丢给**生产解析器**，确认它真能抽出 ≥ MIN_ARTICLE_CHARS 的正文。
+
+    不这么测的话，「夹具太短」这件事只有在跑端点 E2E 时才会以 502 的形式
+    露出来 —— 而报错信息是「没能提取出文章正文」，指向的是解析器，
+    没人会想到是夹具烂了。这就是它能一直烂在 CI 之外的原因。
+    """
+    parser = cs_fetchers.parser
+
+    text = parser.ContentExtractor().parse(_FAKE_HTML).content_text()
+
+    assert text, "夹具连正文都没解析出来"
+    assert len(text) >= parser.MIN_ARTICLE_CHARS, (
+        f"夹具正文只有 {len(text)} 字，低于生产阈值 {parser.MIN_ARTICLE_CHARS} —— "
+        "端点 E2E 会以 502「没能提取出文章正文」失败，而报错会指向解析器"
+    )
+
+
+def test_带图片夹具_同样过得了生产阈值():
+    """第二个夹具同样守住：只测第一个的话，改第二个时会重演。"""
+    parser = cs_fetchers.parser
+
+    text = parser.ContentExtractor().parse(_HTML_WITH_MEDIA).content_text()
+
+    assert text
+    assert len(text) >= parser.MIN_ARTICLE_CHARS, f"只有 {len(text)} 字"
+
+
+def test_夹具正文长度_超过阈值():
+    """防止有人把 _body_paragraph 改回固定短字符串。"""
+    assert len(_body_paragraph()) > cs_fetchers.parser.MIN_ARTICLE_CHARS

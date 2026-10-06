@@ -12,6 +12,7 @@ DB 隔离：Handler 走自己的 session 并 commit，测试侧 rollback 挡不�
 
 真实网络失败（超时 / 5xx / 限速）由用例 pytest.skip，不判 fail。
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -139,6 +140,30 @@ async def redis_setup():
 def content_app():
     """被测 FastAPI app（content-service main.py，按文件路径加载）。"""
     return content_main.app
+
+
+@pytest.fixture(autouse=True)
+def callback_secret(monkeypatch):
+    """配好回调端点的共享密钥，让 Handler 真的能跑通。
+
+    端点挂了 `require_callback_secret`（fail-closed：没配就 503）之后，
+    `test_fetch_e2e.py` 的 10 个参数化用例**全部**以 503 收场 —— 而那个文件
+    在失败时是 `pytest.skip` 掉的，于是 13 个用例静悄悄地全部 skip，
+    报告上看起来是绿的，实际一个断言都没跑到。
+
+    这就是「最危险的测试失败模式」：被测对象坏了，测试自己决定跳过，
+    并且不发出任何声音。现在密钥配上了，它们要么真跑、要么因站点原因 skip
+    （skip 原因会明确写在报告里）。
+    """
+    from stashbox.backend.common.config import settings
+
+    monkeypatch.setattr(settings, "callback_shared_secret", "test-callback-secret", raising=False)
+
+
+@pytest.fixture
+def callback_secret_header():
+    """配合上面的 fixture：请求要带的头。"""
+    return {"X-Callback-Secret": "test-callback-secret"}
 
 
 @pytest.fixture

@@ -93,26 +93,56 @@ jobs:
         working-directory: backend
         run: poetry run alembic upgrade head
 
-      - name: Run pytest
+      - name: Run pytest (tests/)
         working-directory: backend
         # 2026-10 收敛忽略清单。原版按注释「跳过 collection error 的目录
         # （pre-existing 已知）」硬编码了 5 条 --ignore，其中 4 条早已失效：
         #   content / gateway / observability / test_quota.py
         # 它们当初被 ignore 是因为收集期报错；问题修掉后没人回来清理，
-        # 于是 215 个用例长期在 CI 之外 —— 其中就包括会连真实公网、
-        # 把整个套件拖死的那批 content 用例。ignore 清单替 bug 兜了底，
+        # 于是 215 个用例长期在 CI 之外。ignore 清单替 bug 兜了底，
         # 也让 bug 永远暴露不出来。
         #
         # 真机 e2e 不再需要 --ignore：tests/e2e/conftest.py 的生产守卫已从
         # `raise RuntimeError` 改为 `pytest.skip(allow_module_level=True)`。
         # 原来抛异常发生在收集期，会连带中断其余 1000+ 个用例（CI 退出码 2）。
         #
+        # `-m "not network"`：排除标记为 network 的真出网用例。
+        # 目前 tests/ 下没有这种用例，加它是为了将来有人加的时候自动生效，
+        # 而不用再改 workflow（那正是本次事故的机制）。
+        #
         # STASHBOX_E2E_SKIP_DEVICE=1：无真机时只跑不需要设备的用例。
         env:
           STASHBOX_E2E_SKIP_DEVICE: "1"
         run: |
           poetry run pytest tests/ \
+            -m "not network" \
             --junitxml=pytest-report.xml \
+            -v
+
+      - name: Run pytest (content-service/tests/)
+        working-directory: backend
+        # 同一批问题换了个位置：content-service/tests/ 有 150 个用例，
+        # 2026-10 之前**整目录**不在 CI 里。真正该排除的只有
+        # integration/test_fetch_e2e.py 一个文件 —— 它打的是 techcrunch.com /
+        # news.sina.com.cn 等 10 个真实站点，外部抖动会让 job 随机变红，
+        # 而它对「本仓代码有没有坏」提供不了稳定信号。
+        #
+        # 所以改成在代码里打 pytest.mark.network（见 pyproject.toml 的
+        # markers 注册），CI 只按标记排除。依据写在代码里而不是 workflow
+        # 注释里 —— 上一轮丢信号就是因为「该跑什么」只存在于注释中。
+        #
+        # **必须与 tests/ 分两次跑**，不能合成一条命令：
+        # content-service/tests/fetchers/ 目录名就叫 `fetchers`，与真实的
+        # content-service/fetchers 包同名。同一进程里收集两棵树时，
+        # sys.path 的先后顺序决定谁顶掉谁，9 个模块直接
+        # ModuleNotFoundError（test_wechat_mp_handler.py 头部注释记了同一件事）。
+        # 分开跑则各自沿用原有的 path 假设，行为与本地单跑一致。
+        env:
+          STASHBOX_E2E_SKIP_DEVICE: "1"
+        run: |
+          poetry run pytest content-service/tests/ \
+            -m "not network" \
+            --junitxml=pytest-content-service-report.xml \
             -v
 
       - name: Report pytest results
@@ -120,5 +150,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pytest-report
-          path: backend/pytest-report.xml
+          # 两棵树的报告分开上传：合成一个文件时，后跑的那棵树会覆盖前一棵，
+          # 于是「只有 content-service 的报告」这种情况看起来完全正常。
+          path: |
+            backend/pytest-report.xml
+            backend/pytest-content-service-report.xml
         continue-on-error: true

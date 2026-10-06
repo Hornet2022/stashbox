@@ -28,7 +28,8 @@ import sys
 import uuid
 from pathlib import Path
 
-from sqlalchemy import select
+import pytest
+from sqlalchemy import delete, select
 
 # article_purge.py 在 content-service/ 下（目录名带连字符，不可当包 import）
 CONTENT_SERVICE_DIR = Path(__file__).resolve().parents[2]
@@ -51,8 +52,59 @@ from stashbox.backend.common.models import (  # noqa: E402
     PushNotification,
 )
 
-TEST_USER_ID = 6892  # dev 联调账号，测试库必然存在
+TEST_USER_ID = 6892  # 见 user_row fixture：测试自己保证这一行存在
 TEST_SOURCE = "purge_test"  # 本测试在 articles 表的命名空间（便于清理）
+
+# 本文件建过的 article_id 全集。purge 的设计意图是**保留**反馈与分析数据
+# （只断引用），所以这些 FeedbackV2 行在用例结束时仍然存在、且仍引用
+# TEST_USER_ID —— user_row 想删用户行就得先按精确 id 把它们清掉。
+# 用 id 而非业务值匹配，和本文件 _cleanup 的原则一致（不误删同值行）。
+_CREATED_ARTICLE_IDS: set[str] = set()
+
+
+@pytest.fixture
+async def user_row():
+    """保证 TEST_USER_ID 那一行 users 存在，用例结束后复原。
+
+    原来是注释里那句「dev 联调账号，测试库必然存在」——那是个**关于某个
+    本机数据库状态的假设**，不是代码保证。放进 CI（全新 postgres）后这个假设
+    立刻不成立：`articles_user_id_fkey` 报 ForeignKeyViolationError，
+    整条 purge 回归路径直接测不了。
+
+    这正是这批用例长期不在 CI 里的后果：它们靠本机环境的隐式前提才能跑。
+    显式建行 + 复原后，用例只依赖代码，不依赖谁的机器上有什么数据。
+    """
+    from sqlalchemy import select as _select
+
+    from stashbox.backend.common.database import AsyncSessionLocal
+    from stashbox.backend.common.models import User
+
+    async with AsyncSessionLocal() as db:
+        existed = await db.scalar(_select(User).where(User.id == TEST_USER_ID))
+        created = existed is None
+        if created:
+            db.add(User(id=TEST_USER_ID, nickname="purge 测试账号"))
+            await db.commit()
+
+    try:
+        yield TEST_USER_ID
+    finally:
+        # 只删自己建的那一行。已存在的（dev 库里的联调账号）原样保留 ——
+        # 测试不该动它，更不该因为自己需要它就把它删了。
+        if created:
+            async with AsyncSessionLocal() as db:
+                # purge 刻意保留的反馈行仍引用着这个 user，先按精确 id 清掉，
+                # 否则 feedback_v2_user_id_fkey 会让删用户行直接失败。
+                if _CREATED_ARTICLE_IDS:
+                    await db.execute(
+                        delete(FeedbackV2).where(
+                            FeedbackV2.user_id == TEST_USER_ID,
+                            FeedbackV2.article_id.in_(_CREATED_ARTICLE_IDS),
+                        )
+                    )
+                await db.execute(delete(User).where(User.id == TEST_USER_ID))
+                await db.commit()
+        _CREATED_ARTICLE_IDS.clear()
 
 
 def _rid(prefix: str) -> str:
@@ -71,6 +123,7 @@ async def _seed_full_graph(db, article_id: str, task_id: str) -> dict[str, str]:
     """
     eval_id = _rid("eval")
     variant_id = _rid("avar")
+    _CREATED_ARTICLE_IDS.add(article_id)
     db.add(
         Article(
             id=article_id,
@@ -180,7 +233,7 @@ async def _cleanup(db, article_id: str, task_id: str, ids: dict[str, str]) -> No
     await db.commit()
 
 
-async def test_purge_full_graph_does_not_raise_and_clears_children(db_setup):
+async def test_purge_full_graph_does_not_raise_and_clears_children(db_setup, user_row):
     """全子表文章删除：不抛异常 + 关联清空 + 分析数据保留断引用。"""
     db = db_setup
     article_id = _rid("art")
@@ -259,7 +312,7 @@ async def test_purge_full_graph_does_not_raise_and_clears_children(db_setup):
         await _cleanup(db, article_id, task_id, ids)
 
 
-async def test_purge_missing_article_returns_none(db_setup):
+async def test_purge_missing_article_returns_none(db_setup, user_row):
     """幂等：删不存在的文章返回 None，不抛异常（越权/重复删走 404 语义）。"""
     missing = _rid("art")
     result = await purge_mod.purge_article(db_setup, missing)

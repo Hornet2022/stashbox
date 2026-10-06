@@ -15,8 +15,15 @@
 报告：每个 URL 打一行 `E2E|url|http|title_len|content_len|err|note`，
 配合 `-s` 落到 /tmp/cp27_e2e.log，由 generate_report.py 解析成 E2E_REPORT.md
 （报告不进 git，见 README.md）。
+
+⚠️ 本文件带 `pytest.mark.network`，CI 不跑（`-m "not network"`）。同目录下的
+test_article_purge.py 不出网，**在** CI 里跑 —— 别因为这个目录叫 integration
+就整目录排除，那正是 2026-10 之前 139 个用例白白失去信号的原因。
 """
+
 from __future__ import annotations
+
+import ssl
 
 import httpx
 import pytest
@@ -24,6 +31,12 @@ import pytest
 from stashbox.backend.common.models import Article  # noqa: E402
 
 MP_URL = "/api/v1/callback/wechat-mp-message"
+
+# 本文件**唯一**的职责是「打真实公网」。CI 靠这个标记把它排除
+# （见 pyproject.toml 的 markers 注册与 .github/workflows/test.yml 的
+# `-m "not network"`）。它绝不能被无脑塞进 CI：外部站点抖动会让 job 随机变红，
+# 而它对「本仓代码有没有坏」提供不了稳定信号。
+pytestmark = pytest.mark.network
 
 # 10 个真实 URL（不重复站点）：
 # 2 baseline + 3 社区/博客 + 2 新闻 + 2 技术文档 + 1 中文站点
@@ -46,23 +59,40 @@ def _report(url: str, http_status: int, title_len: int, content_len: int, err: s
     print(f"E2E|{url}|{http_status}|{title_len}|{content_len}|{err}|{note}", flush=True)
 
 
+#: 传输层的真实网络故障。HTTP 层的失败（4xx/5xx）走下面 if 分支处理，
+#: 但 SSL 握手失败之类直接抛异常，连响应都没有 —— 同样属于「站点侧问题」，
+#: 按本文件既定策略（不判 fail）应当 skip 而不是让整个用例红掉。
+_NETWORK_ERRORS = (
+    httpx.TransportError,
+    ssl.SSLError,
+    ssl.SSLWantReadError,
+    RuntimeError,  # "Event loop is closed"：真网络连接的收尾跨过了用例的事件循环
+)
+
+
+async def _post_or_skip(client, url: str, secret_header: dict):
+    """打回调端点；传输层故障按站点问题 skip。"""
+    try:
+        return await client.post(
+            MP_URL,
+            headers=secret_header,
+            json={"from_user": "cp27_openid", "text": f"看看 {url}", "create_time": 1234567890},
+        )
+    except _NETWORK_ERRORS as exc:
+        _report(url, 0, 0, 0, type(exc).__name__, str(exc)[:80])
+        pytest.skip(f"真实网络故障（站点侧，非本仓代码问题）: {type(exc).__name__}: {exc}")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("url", URLS)
 async def test_fetch_real_url(
-    url, content_app, db_setup, redis_setup, ai_client_stub, fetch_recorder
+    url, content_app, db_setup, redis_setup, ai_client_stub, fetch_recorder, callback_secret_header
 ):
     """E2E：发真网络 → 服务号 Handler → 验证 article 入库 + title 非空。"""
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=content_app), base_url="http://test"
     ) as client:
-        r = await client.post(
-            MP_URL,
-            json={
-                "from_user": "cp27_openid",
-                "text": f"看看 {url}",
-                "create_time": 1234567890,
-            },
-        )
+        r = await _post_or_skip(client, url, callback_secret_header)
 
     if r.status_code != 200:
         body = r.json()
@@ -111,7 +141,7 @@ DOUYIN_LIVE_URLS = [
 @pytest.mark.integration
 @pytest.mark.parametrize("url", DOUYIN_LIVE_URLS)
 async def test_fetch_douyin_real_url(
-    url, content_app, db_setup, redis_setup, ai_client_stub, fetch_recorder
+    url, content_app, db_setup, redis_setup, ai_client_stub, fetch_recorder, callback_secret_header
 ):
     """E2E（抖音）：发真网络 → DouyinFetcher 三路径 → 验证 article 入库 + title 非空。
 
@@ -121,14 +151,7 @@ async def test_fetch_douyin_real_url(
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=content_app), base_url="http://test"
     ) as client:
-        r = await client.post(
-            MP_URL,
-            json={
-                "from_user": "cp231_openid",
-                "text": f"看看 {url}",
-                "create_time": 1234567890,
-            },
-        )
+        r = await _post_or_skip(client, url, callback_secret_header)
 
     if r.status_code != 200:
         body = r.json()
@@ -150,4 +173,3 @@ async def test_fetch_douyin_real_url(
     assert art.url == url
 
     _report(url, 200, len(art.title), -1, "-", "ok")
-

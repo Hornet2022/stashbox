@@ -41,6 +41,19 @@ openapi-spec-validator = "^0.7.0"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# network：会真的发起公网请求的用例。CI 用 `-m "not network"` 排除。
+#
+# 为什么要显式注册而不是在 workflow 里写死路径：`content-service/tests/integration/
+# test_fetch_e2e.py` 打的是 example.com / techcrunch.com / news.sina.com.cn 等
+# 10 个真实站点。在 CI 里跑它，后果不是「慢」，而是整个 job 被外部站点拖死或
+# 因网络抖动随机变红 —— 而它对「本仓代码有没有坏」这件事又提供不了稳定信号。
+#
+# 之前这批用例连同 content-service/tests 整目录被 `--ignore` 挡在 CI 之外，
+# 于是连**不**出网的 139 个用例也跟着一起失去了信号。改成标记之后，
+# 该跑的跑、该排除的排除，且排除依据写在代码里而不是写在注释里。
+markers = [
+    "network: 真的访问公网，CI 排除（-m 'not network'）",
+]
 
 [tool.ruff]
 line-length = 100
