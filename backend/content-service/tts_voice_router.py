@@ -35,11 +35,14 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from stashbox.backend.common.auth import require_user
 from stashbox.backend.common.auth_admin import require_admin_or_operator
+from stashbox.backend.common.database import get_db
 from stashbox.backend.common.exceptions import InvalidRequest, NotFound
 from stashbox.backend.common.logging import get_logger
+from stashbox.backend.common.models import AdminOperationLog
 from stashbox.backend.common.tts_voice_service import (
     MAX_REF_AUDIO_BYTES,
     UNSET,
@@ -57,6 +60,18 @@ from stashbox.backend.common.tts_voice_service import (
 )
 
 log = get_logger(__name__)
+
+
+def _uid(user: dict) -> int:
+    """与 content-service/main.py 的同名函数同口径：从 sub 解析，失败兜底 0。
+
+    require_user / require_admin_or_operator 返回的 payload 没有 id 字段。
+    """
+    try:
+        return int(user["sub"])
+    except (KeyError, ValueError, TypeError):
+        return 0
+
 
 router = APIRouter()
 
@@ -143,6 +158,15 @@ class VoiceUpdateIn(BaseModel):
 
 class VoicePreviewIn(BaseModel):
     text: str = "这是一段试听文本，用来确认这个音色的效果。"
+
+
+class VoiceDeleteIn(BaseModel):
+    """删除音色的原因（写入审计日志）。
+
+    与 tag / article 的破坏性操作同口径：必填、≥5 字符、落 admin_operation_logs。
+    """
+
+    reason: str = Field(..., min_length=1, description="删除原因，会写入审计日志")
 
 
 class VoicePreviewOut(BaseModel):
@@ -376,11 +400,47 @@ async def admin_update_voice(
 
 
 @router.delete("/api/v1/admin/tts/voices/{voice_id}")
-async def admin_delete_voice(voice_id: str, user: dict = Depends(require_admin_or_operator)):
+async def admin_delete_voice(
+    voice_id: str,
+    req: VoiceDeleteIn,
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """删除音色。
+
+    reason ≥5 字符必填并写审计日志，与 tag / article 的破坏性操作口径一致。
+
+    此前这个端点不收任何 body、也不写 admin_operation_logs：删除一个**默认音色**
+    会让全平台用户静默降级到全局 TTS 配置，而事后审计日志里查不到是谁删的、
+    为什么删。tags / articles / quota 都有 reason，只有音色库是例外。
+    """
+    if len(req.reason.strip()) < 5:
+        raise InvalidRequest(message="reason 至少 5 个字符")
+
     try:
         await delete_voice(voice_id)
     except VoiceError as exc:
         raise NotFound(message=str(exc)) from exc
+
+    log_row = AdminOperationLog(
+        admin_id=_uid(user),
+        admin_tier=user.get("tier", "unknown"),
+        action="delete_voice",
+        target_type="tts_voice",
+        target_id=voice_id,
+        reason=req.reason,
+        method="DELETE",
+        path=f"/api/v1/admin/tts/voices/{voice_id}",
+        request_body={"reason": req.reason},
+        response_status=200,
+    )
+    db.add(log_row)
+    try:
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 —— 审计写失败不掩盖已完成的删除
+        log.warning("delete_voice 审计写入失败 voice_id=%s err=%s", voice_id, exc)
+        await db.rollback()
+
     return {"deleted": voice_id}
 
 
