@@ -115,6 +115,23 @@ def get_llm_client() -> LLMClient:
     return _client
 
 
+def build_adhoc_client(config: dict[str, Any]) -> LLMClient:
+    """按**传入的** config 造一个一次性 client —— 不读 DB、不回落 env。
+
+    存在的理由：管理后台的「测试调用」必须验证**运营刚填进表单**的那份配置。
+    走 `reload()` 拿生效配置去测，会让填错的 base_url / model / api_key 也测出
+    绿灯（测的是上一份已保存的配置），保存后才在生产推理时炸 —— 一次静默失败。
+
+    与模块级单例的差别（这几条是刻意的）：
+      - **不碰 `_client` 全局**：测试不该影响正在服务推理的那个 client；
+      - 调用方负责 `await client.close()` —— 它不是共享实例。
+
+    `config` 的键名与 `build_client` 完全一致（provider 前缀式：
+    `openai_llm_api_key` / `qwen_vl_model` …），由调用方从请求体做映射。
+    """
+    return build_client(config)
+
+
 async def reload() -> LLMClient:
     """重读配置（Redis 5s 缓存挡 DB 压力），配置变了才重建 client。"""
     global _client, _signature

@@ -1948,6 +1948,63 @@
           "content-service",
           "api-gateway"
         ]
+      },
+      "post": {
+        "summary": "Admin Llm Test With Config",
+        "description": "按**请求里的配置**发一次 chat()，不读已保存的、不写库。\n\n为什么需要它：GET 版本走 `reload()` 拿的是**已保存**的配置。运营改了\nbase_url / model 点「测试调用」，看到的是旧配置的绿灯 —— 填错的地址能通过\n测试、保存成功，然后在生产推理时才炸。整条链路上没有任何一处提示测的\n不是你填的东西，而那正是这个页面存在的唯一理由。\n\nGET 版本保留（老前端 / 脚本仍可用），前端不再用它。",
+        "operationId": "admin_llm_test_with_config_api_v1_admin_llm_test_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LLMTestRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
       }
     },
     "/api/v1/admin/push-notifications": {
@@ -2713,6 +2770,63 @@
             }
           }
         ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      },
+      "post": {
+        "summary": "Admin Tts Test With Config",
+        "description": "按**请求里的配置**合一次音，不读已保存的、不写库。\n\n与 /api/v1/admin/llm/test 的 POST 版同因：GET 版走 `tts_reload()` 拿的是\n**已保存**的配置，运营改了 provider / base_url / key 点「测试调用」，\n看到的是旧配置的绿灯 —— 填错的地址能通过测试、保存后才在生产合成时炸。\n\n合并语义与 PUT 完全一致（复用同一段字段覆盖逻辑），区别只在最后一步：\nPUT 落库 + reload，这里只 `tts_resolve_config` 出一个内存态 client，\n测完即关，不入 factory 的缓存。",
+        "operationId": "admin_tts_test_with_config_api_v1_admin_tts_test_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TTSConfigUpdate"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -8481,6 +8595,41 @@
           "provider"
         ],
         "title": "LLMConfigUpdate"
+      },
+      "LLMTestRequest": {
+        "properties": {
+          "provider": {
+            "type": "string",
+            "title": "Provider"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "api_key": {
+            "type": "string",
+            "title": "Api Key",
+            "default": ""
+          },
+          "base_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "provider",
+          "model"
+        ],
+        "title": "LLMTestRequest",
+        "description": "「测试调用」要验的那份配置 —— 运营**刚填进表单**的值，不落库。"
       },
       "ListenCompleteRequest": {
         "properties": {

@@ -55,6 +55,7 @@ from stashbox.backend.common.models import (
     User,
 )
 from stashbox.backend.app.services.llm import (
+    build_adhoc_client,
     SUPPORTED_PROVIDERS,
     reload,
     resolve_config,
@@ -681,6 +682,97 @@ def _classify_llm_error(exc: BaseException) -> dict[str, Any]:
     }
 
 
+class LLMTestRequest(BaseModel):
+    """「测试调用」要验的那份配置 —— 运营**刚填进表单**的值，不落库。"""
+
+    provider: str
+    model: str
+    api_key: str = ""
+    base_url: str | None = None
+
+
+@router.post("/api/v1/admin/llm/test")
+async def admin_llm_test_with_config(
+    req: LLMTestRequest,
+    user: dict = Depends(require_admin_or_operator),
+):
+    """按**请求里的配置**发一次 chat()，不读已保存的、不写库。
+
+    为什么需要它：GET 版本走 `reload()` 拿的是**已保存**的配置。运营改了
+    base_url / model 点「测试调用」，看到的是旧配置的绿灯 —— 填错的地址能通过
+    测试、保存成功，然后在生产推理时才炸。整条链路上没有任何一处提示测的
+    不是你填的东西，而那正是这个页面存在的唯一理由。
+
+    GET 版本保留（老前端 / 脚本仍可用），前端不再用它。
+    """
+    if os.getenv("ENABLE_LLM_TEST_ENDPOINT", "1").lower() in {"0", "false", "no"}:
+        raise NotFound(message="llm test endpoint disabled")
+
+    provider = req.provider.strip().lower()
+    if provider not in SUPPORTED_PROVIDERS:
+        raise InvalidRequest(
+            message=f"provider 必须是 {list(SUPPORTED_PROVIDERS)} 之一，当前 {provider!r}"
+        )
+
+    # app/services/llm 用 provider 前缀式键名，这里从请求体映射过去
+    cfg: dict[str, Any] = {
+        "provider": provider,
+        f"{provider}_llm_model": req.model,
+        f"{provider}_llm_api_key": req.api_key,
+        f"{provider}_llm_base_url": req.base_url,
+    }
+    if provider == "qwen_vl":
+        # qwen_vl 的 provider 名带 _vl，键名是 qwen_vl_llm_*（与 build_client 一致）
+        cfg["qwen_vl_llm_model"] = req.model
+        cfg["qwen_vl_llm_api_key"] = req.api_key
+        cfg["qwen_vl_llm_base_url"] = req.base_url
+
+    result: dict[str, Any] = {"provider": provider, "model": req.model}
+    client = None
+    try:
+        client = build_adhoc_client(cfg)
+    except Exception as exc:  # noqa: BLE001 —— provider/参数非法也要给可读分类
+        cls = _classify_llm_error(exc)
+        result.update(
+            ok=False,
+            error=cls["hint"],
+            error_kind=cls["kind"],
+            status_code=cls["status_code"],
+            hint=cls["hint"],
+            detail=cls["detail"],
+        )
+        return result
+
+    try:
+        text = await client.chat("CP7.3 hot-reload smoke test：用一句话总结这段话。")
+        result.update(
+            ok=True,
+            text=text,
+            error=None,
+            error_kind=None,
+            status_code=None,
+            hint=None,
+            detail=None,
+        )
+    except Exception as exc:
+        cls = _classify_llm_error(exc)
+        result.update(
+            ok=False,
+            error=cls["hint"],
+            error_kind=cls["kind"],
+            status_code=cls["status_code"],
+            hint=cls["hint"],
+            detail=cls["detail"],
+        )
+    finally:
+        # 一次性 client：close() 会真关底层 httpx 池，测试端点不该留下连接
+        try:
+            await client.close()
+        except Exception:  # noqa: BLE001 —— 关闭失败不该覆盖测试结果
+            log.warning("adhoc llm client close failed", exc_info=True)
+    return result
+
+
 @router.get("/api/v1/admin/llm/test")
 async def admin_llm_test(user: dict = Depends(require_admin_or_operator)):
     """CP7.3 联调真验用：用当前 factory 的 client 发一次 chat()，确认 provider 真换了。
@@ -853,6 +945,100 @@ async def admin_tts_config_put(
         "db",
         row["updated_at"].isoformat() if row["updated_at"] else None,
     )
+
+
+@router.post("/api/v1/admin/tts/test")
+async def admin_tts_test_with_config(
+    req: TTSConfigUpdate,
+    user: dict = Depends(require_admin_or_operator),
+):
+    """按**请求里的配置**合一次音，不读已保存的、不写库。
+
+    与 /api/v1/admin/llm/test 的 POST 版同因：GET 版走 `tts_reload()` 拿的是
+    **已保存**的配置，运营改了 provider / base_url / key 点「测试调用」，
+    看到的是旧配置的绿灯 —— 填错的地址能通过测试、保存后才在生产合成时炸。
+
+    合并语义与 PUT 完全一致（复用同一段字段覆盖逻辑），区别只在最后一步：
+    PUT 落库 + reload，这里只 `tts_resolve_config` 出一个内存态 client，
+    测完即关，不入 factory 的缓存。
+    """
+    if os.getenv("ENABLE_LLM_TEST_ENDPOINT", "1").lower() in {"0", "false", "no"}:
+        raise NotFound(message="tts test endpoint disabled")
+
+    provider = req.provider.strip().lower()
+    if provider not in TTS_SUPPORTED_PROVIDERS:
+        raise InvalidRequest(
+            message=f"provider 必须是 {list(TTS_SUPPORTED_PROVIDERS)} 之一，当前 {provider!r}"
+        )
+
+    from stashbox.backend.app.services.tts import build_client
+
+    stored = dict(await system_config.get_config(system_config.KEY_TTS) or {})
+    stored["provider"] = provider
+    fields = req.model_fields_set
+    for fname in (
+        "edge_voice",
+        "openai_base_url",
+        "openai_model",
+        "openai_voice",
+        "doubao_voice",
+        "doubao_resource_id",
+        "local_voice",
+        "ffmpeg_bin",
+        "indextts_base_url",
+        "indextts_model",
+        "indextts_ref_audio",
+        "indextts_ref_text",
+    ):
+        if fname in fields:
+            v = getattr(req, fname)
+            stored[fname] = (v or "").strip() or None
+    if "openai_api_key" in fields and req.openai_api_key:
+        stored["openai_api_key"] = req.openai_api_key
+    if "doubao_api_key" in fields and req.doubao_api_key:
+        stored["doubao_api_key"] = req.doubao_api_key
+    if "doubao_token" in fields and req.doubao_token:
+        stored["doubao_token"] = req.doubao_token
+    if "doubao_app_id" in fields:
+        stored["doubao_app_id"] = (req.doubao_app_id or "").strip() or None
+
+    effective = tts_resolve_config(stored)
+    result: dict[str, Any] = {
+        "provider": provider,
+        "voice": effective.get(f"{provider}_voice")
+        if provider != "edge"
+        else effective.get("edge_voice"),
+    }
+    client = None
+    try:
+        client = build_client(effective)
+        b = await client.synthesize("听匣 TTS 连通性测试。", voice=result["voice"])
+        result.update(
+            ok=bool(b),
+            bytes_len=len(b or b""),
+            error=None,
+            error_kind=None,
+            status_code=None,
+            hint=None,
+            detail=None,
+        )
+    except Exception as exc:  # noqa: BLE001 —— provider 非法 / 网络 / 鉴权都要可读分类
+        cls = _classify_llm_error(exc)
+        result.update(
+            ok=False,
+            error=cls["hint"],
+            error_kind=cls["kind"],
+            status_code=cls["status_code"],
+            hint=cls["hint"],
+            detail=cls["detail"],
+        )
+    finally:
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:  # noqa: BLE001 —— 关闭失败不该覆盖测试结果
+                log.warning("adhoc tts client close failed", exc_info=True)
+    return result
 
 
 @router.get("/api/v1/admin/tts/test")

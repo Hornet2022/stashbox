@@ -291,11 +291,17 @@ ROUTES += [
     Route("GET", "/api/v1/admin/llm/config", "content-service", _url("content-service")),
     Route("PUT", "/api/v1/admin/llm/config", "content-service", _url("content-service")),
     Route("GET", "/api/v1/admin/llm/test", "content-service", _url("content-service")),
+    # 2026-10：POST 版带请求体，测**表单里刚填的**配置。
+    # GET 版走 reload() 拿的是已保存配置 —— 运营改完点「测试调用」验的是旧值，
+    # 填错的 base_url 也能测出绿灯，保存后才在生产推理时炸。GET 版保留兼容。
+    Route("POST", "/api/v1/admin/llm/test", "content-service", _url("content-service")),
     # CP TTS-Config：admin TTS 配置（content-service /api/v1/admin/tts/*）。
     # 同样需进路由表：admin 段不在 fallback 的第一段前缀匹配里。
     Route("GET", "/api/v1/admin/tts/config", "content-service", _url("content-service")),
     Route("PUT", "/api/v1/admin/tts/config", "content-service", _url("content-service")),
     Route("GET", "/api/v1/admin/tts/test", "content-service", _url("content-service")),
+    # 2026-10：同上，POST 版带请求体，测未保存的表单配置
+    Route("POST", "/api/v1/admin/tts/test", "content-service", _url("content-service")),
     # admin-web 用的 POST /api/v1/tags + GET /api/v1/notifications（CP3.6-A2 + CP5.4a）
     Route("POST", "/api/v1/tags", "content-service", _url("content-service")),
     Route("GET", "/api/v1/notifications", "user-service", _url("user-service")),
