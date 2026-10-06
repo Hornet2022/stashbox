@@ -62,9 +62,21 @@ async def test_llm_decision_is_actually_used():
     """LLM 解析出的动作必须被采纳，不能被兜底覆盖。
 
     修复前这里会返回 `default`（因为无条件 `action = default` 覆盖了）。
+
+    ⚠️ 必须同时 mock `_llm_module.get_llm_client`（2026-10 补）：
+    `decision_router_node` 是**先** `llm = _llm_module.get_llm_client()`、
+    **再** `await _chat_text(llm, ...)`。只 mock `_chat_text` 的话，
+    第一行就可能抛异常（没配 LLM 时必抛）→ 走 `except` 兜底 →
+    `_chat_text` 那个 mock 根本没被调用 → 断言拿到的自然是 `_default_next_action`，
+    而 `_state()` 里没有 `fetched_content`，兜底值恰好是 `'fail'`。
+
+    于是这条用例在**有** LLM 配置的机器上（开发机读得到 .env）永远绿，
+    在 CI 这种干净环境里稳定红 —— 它测的是「LLM 决策被采纳」，
+    却偷偷依赖了「LLM 客户端能建起来」。两个都 mock 掉，判定才与机器无关。
     """
     with (
         patch.object(runner, "ROUTER_MODE", "llm"),
+        patch.object(runner._llm_module, "get_llm_client", lambda: object()),
         patch.object(
             runner,
             "_chat_text",
@@ -76,6 +88,28 @@ async def test_llm_decision_is_actually_used():
     assert (
         out["next_action"] == "skip_to_tts"
     ), f"LLM 的决策被覆盖了，实际拿到 {out.get('next_action')!r}"
+
+
+@pytest.mark.asyncio
+async def test_取不到_llm_客户端时_退回兜底而不是崩():
+    """反向保障：兜底路径本身仍可用（这正是上面那条漏掉的分支）。
+
+    没有这条的话，「llm 决策被采纳」这条测试可能只是在验证兜底逻辑 ——
+    两条一起看，LLM 分支与兜底分支才算都被钉住。
+    """
+    with (
+        patch.object(runner, "ROUTER_MODE", "llm"),
+        patch.object(
+            runner._llm_module,
+            "get_llm_client",
+            lambda: (_ for _ in ()).throw(RuntimeError("没配 LLM")),
+        ),
+    ):
+        out = await runner.decision_router_node(_state())
+
+    assert (
+        out["next_action"] == "fail"
+    ), "取不到 LLM 客户端时应该退回启发式兜底（_state 无 fetched_content → fail）"
 
 
 @pytest.mark.asyncio

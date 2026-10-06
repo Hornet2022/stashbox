@@ -97,6 +97,20 @@ jobs:
       - name: Install Poetry
         run: pip install poetry
 
+      # ffmpeg 不是「可选的测试依赖」：ai-service/distill/steps.py 的
+      # 音频分段拼接与时长探测真的调它（`_find_bin` 会在 PATH 和几个常见
+      # 目录里找 ffmpeg/ffprobe）。开发机有 homebrew 所以一直绿，CI 上没有 →
+      # 6 个 audio_variant / tts 用例 FileNotFoundError。
+      #
+      # 不用「找不到就 skip」处理：这些用例测的正是 ffmpeg 行为，skip 掉等于
+      # 把音频链路完全交给人工验证。装它。
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
       - name: Install dependencies
         working-directory: backend
         run: poetry install --no-interaction
