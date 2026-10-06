@@ -26,6 +26,15 @@ arq = "^0.26.0"
 langfuse = "^2.57.0"
 # CP11.0.8 P3.3: PDF 抓取器依赖
 pypdf = "^6.0"
+# CP-AGENT-RUNNER-INTEGRATION：蒸馏走 LangGraph agent（ai-service/agent/runner.py
+# 的 StateGraph / END / START，distill_task → _run_distill_via_agent → agent_app）。
+#
+# 这一条是**补记**：代码一直在用它，但它从未出现在本文件里，只存在于某台机器的
+# venv 里（当初手工装的）。后果不是「少装个包」，而是按本文件装依赖的新环境
+# **根本跑不起蒸馏** —— ai-service 的主链路一 import 就 ModuleNotFoundError。
+# CI 直到把 tests/ 真正跑起来才暴露出来（5 个测试模块在 collection 期报错）。
+aiofiles = "^24.1.0"
+langgraph = "^1.2.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"
