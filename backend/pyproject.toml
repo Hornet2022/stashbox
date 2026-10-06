@@ -5,27 +5,41 @@ description = "Stashbox backend - AI audio subscription platform"
 authors = ["Huang Feng <hornetyyq@qq.com>"]
 package-mode = false
 
+# ── 版本下限的依据（2026-10 统一）──────────────────────────────────────────
+#
+# 下面这些下限**不是**随手写的，它们等于本机 backend/.venv 里实际安装、
+# 且 1160 个用例全绿时的那套版本。此前声明写的是更老的一批（fastapi ^0.115、
+# pytest ^8、pytest-asyncio ^0.24、structlog ^24 …），但代码一直在新版本上跑 ——
+# 老版本只是「声明里好看」。CI 按老声明装完的结果是 106 条失败/错误
+# （其中 37 条与缺包无关，全是版本差异：pydantic-settings 报
+# illegal environment variable name、pytest 报 path-like args is not allowed）。
+#
+# 所以定这条规矩：**声明必须与被验证过的环境一致**，否则「本地全绿」对 CI 毫无
+# 说服力 —— 那只是因为两边跑的不是同一套东西。
+#
+# 改动这里的版本后，请同步 backend/.venv（pip install 对应版本）并跑一遍两棵树，
+# 不要只改数字。
 [tool.poetry.dependencies]
 python = "^3.11"
-fastapi = "^0.115.0"
-uvicorn = {extras = ["standard"], version = "^0.32.0"}
-pydantic = "^2.9.0"
-pydantic-settings = "^2.6.0"
-sqlalchemy = "^2.0.36"
-asyncpg = "^0.30.0"
-alembic = "^1.14.0"
-redis = "^5.2.0"
-python-jose = {extras = ["cryptography"], version = "^3.3.0"}
+fastapi = "^0.141.0"
+uvicorn = {extras = ["standard"], version = "^0.53.0"}
+pydantic = "^2.13.0"
+pydantic-settings = "^2.15.0"
+sqlalchemy = "^2.0.54"
+asyncpg = "^0.31.0"
+alembic = "^1.20.0"
+redis = "^5.3.1"
+python-jose = {extras = ["cryptography"], version = "^3.5.0"}
 passlib = {extras = ["bcrypt"], version = "^1.7.4"}
-httpx = "^0.28.0"
-python-multipart = "^0.0.20"
-loguru = "^0.7.2"
-prometheus-client = "^0.21.0"
-structlog = "^24.1.0"
-arq = "^0.26.0"
-langfuse = "^2.57.0"
+httpx = "^0.28.1"
+python-multipart = "^0.0.32"
+loguru = "^0.7.3"
+prometheus-client = "^0.26.0"
+structlog = "^26.1.0"
+arq = "^0.28.0"
+langfuse = "^2.60.10"
 # CP11.0.8 P3.3: PDF 抓取器依赖
-pypdf = "^6.0"
+pypdf = "^6.19.0"
 # CP-AGENT-RUNNER-INTEGRATION：蒸馏走 LangGraph agent（ai-service/agent/runner.py
 # 的 StateGraph / END / START，distill_task → _run_distill_via_agent → agent_app）。
 #
@@ -34,18 +48,43 @@ pypdf = "^6.0"
 # **根本跑不起蒸馏** —— ai-service 的主链路一 import 就 ModuleNotFoundError。
 # CI 直到把 tests/ 真正跑起来才暴露出来（5 个测试模块在 collection 期报错）。
 aiofiles = "^24.1.0"
-langgraph = "^1.2.0"
+langgraph = "^1.2.14"
+# ── 以下四个是「运行时惰性 import，但确实要装」的功能依赖 ──────────────────
+#
+# 它们的 import 都写在函数体里（配 clear 的报错文案），所以缺包时不会在启动
+# 阶段炸，而是等到用户真的用到那个功能才炸 —— 这恰恰是最难排查的形态：
+# 「部署好好的，一剪藏就 500，日志里只有一行 ModuleNotFoundError」。
+#
+# CI 把 tests/ 真正跑起来后才发现这几个全都没声明（和 langgraph 一批）。
+# 放在主依赖而不是 extras：放 extras 意味着 CI 永远装不上、这些代码路径永远
+# 测不到，那才是真正的隐患。惰性 import 保留 —— 不为没人用的功能付启动开销。
+
+# app/services/storage/oss.py：S3/SeaweedFS/OSS 存取。
+# 注意 storage_provider 默认就是 "oss"（common/config.py），也就是**默认路径**
+# 需要它，不是「可选的边缘 provider」。
+boto3 = "^1.43"
+# app/services/tts/edge.py：Edge TTS 音色合成
+edge-tts = "^7.2"
+# content-service/fetchers/browser.py：抓取 Tier 2 无头浏览器通道
+playwright = "^1.63"
+# ai-service/agent/mcp_client.py：agent 的 MCP 工具接入
+mcp = "^2.2"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^8.3.0"
-pytest-asyncio = "^0.24.0"
-pytest-cov = "^6.0.0"
-ruff = "^0.7.0"
+pytest = "^9.1.1"
+pytest-asyncio = "^1.4.0"
+pytest-cov = "^7.1.0"
+ruff = "^0.7.4"
 mypy = "^1.13.0"
 # tests/test_openapi_export.py 用（CP6.6）。也列在 backend/requirements.txt，
 # 但 CI 走 `poetry install`，不装 requirements.txt —— 缺了会在 collection 阶段
 # ImportError 直接中断整轮 pytest（CP6.10 定位）。
-openapi-spec-validator = "^0.7.0"
+openapi-spec-validator = "^0.9.0"
+# tests/ai/test_admin_endpoints_b2.py、test_ab_attribution_b4.py 等用
+# `sqlite+aiosqlite:///:memory:` 起内存库（那几个模块要验 ORM 层逻辑，
+# 不值得为此起真 PG）。之前它只存在于某台机器的 venv 里，CI 上那 20 多个用例
+# 在 fixture 里直接 ModuleNotFoundError。
+aiosqlite = "^0.22"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
