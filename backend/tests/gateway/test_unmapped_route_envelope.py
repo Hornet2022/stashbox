@@ -28,7 +28,16 @@ from pathlib import Path
 
 import pytest
 
-GATEWAY_DIR = Path("/Users/hornet/work/stashbox/backend/api-gateway")
+# ⚠️ 原来这里写的是硬编码的 `/Users/hornet/work/stashbox/backend/api-gateway` ——
+# 也就是**我这台机器的绝对路径**。CI 上该路径不存在，`sys.path.insert` 于是成了
+# 空操作，紧随其后的 `import main as gw` 就绑到了 sys.path 上**别的** `main`
+# （tests/content/helpers.py 会把 content-service 目录加进去，于是绑成
+# content-service 的 main）。症状是这条用例在 CI 上稳定报
+# `405 Method Not Allowed` 而不是期望的 404 —— 断言的根本不是网关的路由。
+#
+# 教训：测试里出现绝对路径 = 换台机器就跑测的是别的东西，而且往往不报错、
+# 只是「结果不对」。路径一律从 __file__ 推。
+GATEWAY_DIR = Path(__file__).resolve().parents[2] / "api-gateway"
 if str(GATEWAY_DIR) not in sys.path:
     sys.path.insert(0, str(GATEWAY_DIR))
 

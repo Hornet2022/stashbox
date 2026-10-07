@@ -37,8 +37,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-AI_SERVICE = Path("/Users/hornet/work/stashbox/backend/ai-service")
-REPO_ROOT = Path("/Users/hornet/work/stashbox")
+# 同上：原来也是硬编码的绝对路径。CI 上 insert 成了空操作，只因为
+# tests/ai/conftest.py 已经把 ai-service 放进 sys.path 才碰巧能跑 ——
+# 「碰巧」不是理由，换台机器/换个 conftest 就会变成加载了别的东西。
+# 一律从 __file__ 推。
+AI_SERVICE = Path(__file__).resolve().parents[2] / "ai-service"
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 if str(AI_SERVICE) not in sys.path:
