@@ -116,13 +116,16 @@ async def tts_synthesize_tool(state: dict[str, Any], args: dict[str, Any]) -> di
           → 无限循环，每轮白合成一遍（实测一次任务合成了 3 遍、8MB+ 音频）
 
     现在改为**真实落盘**：音频写到 `INDEXTTS_AUDIO_DIR/{article_id}.{fmt}`，
-    audio_path 一定有值；audio_url 只在 OSS 可用时才有值（`_try_upload_to_oss`
+    audio_path 一定有值；audio_url 取自当前环境配置的 storage（`_try_save_audio`
     失败时为 None，distill_task 会记 `audio_url_not_http` 且不标 ready —— 这是
     既有约定，不要为了让它变绿而伪造 URL）。
 
-    历史更正：本段原注释称「`OSSStorage.save` 是空实现，会 NotImplementedError」。
-    那是 CP-OSS-S3 之前的状态，`app/services/storage/oss.py` 早已补齐 save/fetch
-    实现。保留那句话只会让人以为上传能力还没做，从而绕开真正的上传失败原因。
+    ⚠️ 落盘走的是**存储工厂**（`get_storage()`），与 `distill/pipeline.py:_save_audio`
+    同一条路。原来这里写死 `OSSStorage()`，于是 agent 路径**无视 STORAGE_PROVIDER**：
+    设成 local 的环境（dev / e2e 隔离）照样把音频传到生产 OSS bucket，URL 指向生产
+    地址 —— 设备/浏览器取不到（实测 e2e：audio_url 落到 192.168.3.100:8333，
+    本地 LOCAL_AUDIO_DIR 里没有文件，真机播放报 ExoPlaybackException Source error）。
+    这正是 `e2e-backend.sh` 注释里记的那次事故的同一形状，只是漏的是这一处。
     """
     script = state.get("rewritten_script") or args.get("script")
     voice = state.get("voice") or args.get("voice")
@@ -195,7 +198,7 @@ async def tts_synthesize_tool(state: dict[str, Any], args: dict[str, Any]) -> di
     out_path = out_dir / f"{article_id}.{fmt}"
     out_path.write_bytes(audio)
 
-    audio_url = await _try_upload_to_oss(article_id, audio, fmt)
+    audio_url = await _try_save_audio(article_id, audio, fmt)
     return {
         "audio_path": str(out_path),
         "audio_url": audio_url,
@@ -214,21 +217,25 @@ async def tts_synthesize_tool(state: dict[str, Any], args: dict[str, Any]) -> di
     }
 
 
-async def _try_upload_to_oss(article_id: str, audio: bytes, fmt: str) -> str | None:
-    """尝试上传 OSS；不可用时返回 None（**不要伪造 URL**）。
+async def _try_save_audio(article_id: str, audio: bytes, fmt: str) -> str | None:
+    """把音频存到**当前环境配置的 storage**；失败时返回 None（**不要伪造 URL**）。
 
-    原 docstring 称 `OSSStorage.save` 是 NotImplementedError 空实现、预期必然返回
-    None —— 那是 CP-OSS-S3 之前的状态，现已补齐真实实现。这里**会**在 OSS 可用时
-    返回真实 URL；返回 None 只代表上传真的失败了（凭证缺失、网络、bucket 不存在
-    等），调用方据此判 `audio_url_not_http` 是合理的。
+    走 `get_storage()` 工厂而不是直接 `OSSStorage()`：agent 路径必须和
+    `distill/pipeline.py:_save_audio` 尊重同一个 `STORAGE_PROVIDER`，
+    否则「设成 local 的环境」会被这处静默绕开、把音频写进生产 OSS ——
+    隔离环境看上去配好了，实际产物落在生产 bucket，且返回的 URL 在
+    本环境根本取不到（e2e 实测：真机播放 Source error）。
+
+    返回 None 只代表写入真的失败了（凭证缺失、网络、bucket 不存在、
+    本地目录不可写等），调用方据此判 `audio_url_not_http` 是合理的。
     """
     try:
-        from stashbox.backend.app.services.storage.oss import OSSStorage
+        from stashbox.backend.app.services.storage import get_storage
 
-        storage = OSSStorage()
+        storage = get_storage()
         return await storage.save(f"audio/{article_id}.{fmt}", audio)
     except Exception as exc:
-        log.info("agent_tts_oss_unavailable article_id=%s err=%s", article_id, exc)
+        log.info("agent_tts_storage_unavailable article_id=%s err=%s", article_id, exc)
         return None
 
 
