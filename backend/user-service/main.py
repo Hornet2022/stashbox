@@ -788,7 +788,7 @@ async def admin_retry_push_notification(
     notif.sent_at = now
 
     log_row = AdminOperationLog(
-        admin_id=int(user["sub"]),
+        admin_id=await _resolve_audit_admin_id(db, user.get("sub")),
         admin_tier=user.get("tier", "unknown"),
         action="retry_push_notification",
         target_type="push_notification",
@@ -891,6 +891,42 @@ async def admin_list_users(
     return AdminUserListResponse(total=total, items=items)
 
 
+async def _resolve_audit_admin_id(db: AsyncSession, sub: str | None) -> int | None:
+    """把 JWT 的 sub 解析成可写进 admin_operation_logs.admin_id 的值。
+
+    为什么必须有这一步：`admin_operation_logs.admin_id` 上有
+    `FOREIGN KEY (admin_id) REFERENCES users(id) ON DELETE SET NULL`。
+    原来的写法是 `admin_id=int(user["sub"])` —— 直接相信 token 里的 sub
+    一定对应某个 users 行。**它并不保证**：
+
+      · 跨端 E2E 签的 admin token 用 sub='9018'（沿用 tests/e2e/conftest.py
+        的约定），而 users 表里**从来没有 9018 这一行**（生产库和隔离库都实测
+        count=0）；
+      · 任何用非 users 主键签出来的 token 都一样。
+
+    后果不只是审计行写不进去：审计行和业务改动**同事务**（见 quota-adjust 的
+    「与目标更新同事务提交，失败一起回滚」），于是 commit 时 flush 审计 INSERT
+    撞外键 → IntegrityError → **整个事务回滚** → 管理员的配额改动被静默丢弃，
+    接口回 500。实测：POST /api/v1/admin/users/1/quota-adjust 返回 500，
+    而 users.monthly_quota 并未被改动。
+
+    `ON DELETE SET NULL` 说明这张表本就允许「admin 不存在」（被删掉的账号仍要留
+    审计痕迹），只是**从未存在**的 sub 没被兜住。所以这里查不到就写 NULL：
+    审计行照样落库（action/target/reason 都在），只是不挂到某个具体账号上。
+
+    刻意**不**用 try/except 包住 INSERT：那样只是把外键冲突换个地方冒出来，
+    并且仍然回滚业务改动。这里是把「可能写不进去」变成「一开始就不写」。
+    """
+    try:
+        admin_id = int(sub)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if admin_id <= 0:
+        return None
+    exists = await db.scalar(select(User.id).where(User.id == admin_id))
+    return admin_id if exists is not None else None
+
+
 @app.post("/api/v1/admin/users/{user_id}/quota-adjust", response_model=UserQuotaResponse)
 async def admin_quota_adjust(
     user_id: int,
@@ -938,7 +974,7 @@ async def admin_quota_adjust(
 
     # 审计日志：与目标更新同事务提交，失败一起回滚
     log_row = AdminOperationLog(
-        admin_id=int(user["sub"]),
+        admin_id=await _resolve_audit_admin_id(db, user.get("sub")),
         admin_tier=user.get("tier", "unknown"),
         action="quota_adjust",
         target_type="user",
