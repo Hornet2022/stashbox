@@ -167,9 +167,40 @@ async def test_wechat_url_full_distill_pipeline():
 # 测试 1b：蒸馏失败退还配额（CP1.7 + CP3）
 # ---------------------------------------------------------------------------
 
+
 # ai-service 直连端口（gateway 路由 articles/* → content-service，
 # 不走 /articles/{id}/distill 故需直打 ai-service）
-AI_SERVICE_URL = "http://localhost:8103"
+def _ai_service_url() -> str:
+    """ai-service 直连地址 —— 从网关地址推导，**不写死端口**。
+
+    为什么必须推导：这条用例要直打 ai-service（`/articles/{id}/distill` 在
+    gateway 里 fallback 到 content-service，那边没这个端点）。原来这里写死
+    `http://localhost:8103`，而 8103 是**生产** ai-service 的端口，且它真的在
+    监听（本机 lsof 实测）。于是把 STASHBOX_GATEWAY 指向 e2e 网关（:18100）
+    跑这套用例时，会发生最坏的一种组合：
+
+        用户/文章建在**隔离库**（stashbox_e2e）
+        蒸馏任务却入队到**生产** ai-service
+
+    —— 用例在"隔离环境"跑，却往生产队列派活、占 TTS、写生产库。
+    和 e2e-backend.sh 注释里记的那次事故同一类（那次是网关上游没全指到 e2e
+    实例，音色写进了生产 bucket）：静默默认值比没有默认值危险。
+
+    推导规则：两套环境网关与 ai-service 的端口差都是 +3
+    （生产 8100→8103、e2e 18100→18103），所以从网关端口 +3 即可。
+    需要覆盖时显式设 STASHBOX_AI_SERVICE。
+    """
+    override = os.getenv("STASHBOX_AI_SERVICE")
+    if override:
+        return override
+    parsed = urlparse(GATEWAY_URL)
+    scheme = parsed.scheme or "http"
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if scheme == "https" else 80)
+    return f"{scheme}://{host}:{port + 3}"
+
+
+AI_SERVICE_URL = _ai_service_url()
 
 
 @pytest.mark.asyncio
