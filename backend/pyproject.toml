@@ -101,6 +101,11 @@ testpaths = ["tests"]
 # 该跑的跑、该排除的排除，且排除依据写在代码里而不是写在注释里。
 markers = [
     "network: 真的访问公网，CI 排除（-m 'not network'）",
+    # content-service/tests/integration/test_fetch_e2e.py 在用，但一直没注册。
+    # 未注册不会报错（除非开 --strict-markers），只会每次跑都吐一条
+    # PytestUnknownMarkWarning —— 而这正是「标记写了、没人看得见」的那类隐患：
+    # 真到有人靠标记做筛选时，它并不会报错，只是静默不生效。
+    "integration: 需要多服务/跨服务边界的集成用例",
 ]
 
 [tool.ruff]
