@@ -78,12 +78,34 @@ from stashbox.backend.app.services.storage.base import Storage  # noqa: E402
 MemoryStorage.key_from_url = Storage.key_from_url
 
 
+def _ffmpeg() -> str:
+    """定位 ffmpeg —— 用生产代码那套探测，不自己写死路径。
+
+    原来这里直接写死 `/opt/homebrew/bin/ffmpeg`（某台开发机的 homebrew 路径）。
+    CI 上没有 homebrew，于是这 5 个用例稳定 FileNotFoundError —— 而它们测的
+    恰恰是转码链路，失败信息却指向「找不到 ffmpeg」，很容易被误判成
+    「CI 环境缺依赖」而用 skip 糊过去（那就等于把音频链路完全交给人工验证）。
+
+    探测直接复用 `distill.audio_variant_service._find_bin`：测试自己另写一份
+    探测逻辑的话，生产代码改了它不会跟着变，测试就会在验证一个不存在的行为。
+    """
+    from distill.audio_variant_service import _find_bin
+
+    found = _find_bin("ffmpeg")
+    if not found:
+        pytest.skip(
+            "找不到 ffmpeg —— 本用例真的要用它生成测试音频（不能 mock）。"
+            "CI 已在 workflow 里 apt-get 安装；本地请 brew install ffmpeg"
+        )
+    return found
+
+
 def _sine_m4a(tmp_dir: Path, seconds: int = 1) -> bytes:
     """真 ffmpeg 生成测试源音频（128k mono AAC）。"""
     out = tmp_dir / f"src_{uuid.uuid4().hex[:6]}.m4a"
     proc = subprocess.run(
         [
-            "/opt/homebrew/bin/ffmpeg",
+            _ffmpeg(),
             "-y",
             "-f",
             "lavfi",

@@ -12,10 +12,16 @@ import uuid
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from stashbox.backend.common.database import AsyncSessionLocal
-from stashbox.backend.common.models import Article, Feedback, User
+from stashbox.backend.common.models import (
+    Article,
+    ArticleAudioVariant,
+    DistilledArticle,
+    Feedback,
+    User,
+)
 
 AI_SERVICE_DIR = Path(__file__).resolve().parents[2] / "ai-service"
 
@@ -92,7 +98,37 @@ async def article_factory(db_session, test_user):
         return art
 
     yield _create_tracked
+
+    # ⚠️ 清理必须按依赖顺序：先删子表，再删 articles。
+    #
+    # 原来只 `delete(article)`。而用到 article_with_raw_content 的用例会跑真
+    # distill_task，它写出一行 distilled_articles（article_id 指向这篇文章）——
+    # 于是 teardown 撞 distilled_articles_article_id_fkey，pytest 记成
+    # "ERROR at teardown"，用例本身明明是绿的。
+    #
+    # 这类失败最烦人的地方：报错出现在**别的**用例名下、且只在某些环境出现
+    # （取决于跑之前有没有别的东西把那张子表行清掉），排查时很难联想到
+    # 「是你这条用例自己建的行挡住了删除」。所以清理不该假设「测试没留下
+    # 依赖行」，而要自己把它们收干净。
     for art in created:
+        task_ids = [
+            t
+            for t in (
+                await db_session.scalars(
+                    select(DistilledArticle.id).where(DistilledArticle.article_id == art.id)
+                )
+            ).all()
+        ]
+        if task_ids:
+            # article_audio_variants 外键指向 distilled_articles，得先删它
+            await db_session.execute(
+                delete(ArticleAudioVariant).where(
+                    ArticleAudioVariant.distilled_article_id.in_(task_ids)
+                )
+            )
+            await db_session.execute(
+                delete(DistilledArticle).where(DistilledArticle.article_id == art.id)
+            )
         await db_session.delete(art)
     await db_session.commit()
 
