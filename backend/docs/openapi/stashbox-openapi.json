@@ -2117,7 +2117,7 @@
     "/api/v1/admin/push-notifications/{notification_id}/retry": {
       "post": {
         "summary": "Admin Retry Push Notification",
-        "description": "v1 §端点需求_admin推送队列_v1 §2.3：失败推送重推。\n\n鉴权：require_admin_or_operator（admin / operator 通过；free/viewer 403）。\n仅 `status=failed` 可重推（pending 还在队列、sent 已成功，重推无意义）。\nreason 必填且 5..200 字符（与 quota-adjust 同口径）。\n\n副作用（与目标更新同事务）：\n  1. 重置 push_notifications.status='sent' / error=NULL / sent_at=now\n     （重置为「已重发」便于 admin 视角立即看效果；真推送 CP4.6 上线后\n      可改为 status='pending' 让 worker 重投,改动只需这一行）\n  2. 写 admin_operation_logs(action='retry_push_notification',target_id=str(id))\n     reason 与请求体一致——便于运营复盘「为什么重推」\n失败整体回滚：reason 校验失败 / status 非 failed / id 不存在 都不会落库。",
+        "description": "v1 §端点需求_admin推送队列_v1 §2.3：失败推送重推。\n\n鉴权：require_admin_or_operator（admin / operator 通过；free/viewer 403）。\nreason 必填且 5..200 字符（与 quota-adjust 同口径）。\n\n## 2026-10-21：它现在**真的会推**\n\n原来这个端点的副作用是：\n\n    notif.status = \"sent\"; notif.error = None; notif.sent_at = now\n\n—— 直接把状态改成\"已发送\"，**一个网络请求都不发**。\n运营在后台看到\"已发送\"，用户手机上什么都没收到。\n那是整条推送链路上最坏的一种状态：**看起来是绿的，实际上没做**。\n\n现在走真的投递：取该用户的设备令牌 → 调 provider → 按真实结果写状态。\n没配通道、用户没注册设备、网关报错，都会如实写 failed + 原因。\n\n允许重推的状态：failed / pending / sending（sent 不给重推，\n因为那会真的给用户再发一遍）。",
         "operationId": "admin_retry_push_notification_api_v1_admin_push_notifications__notification_id__retry_post",
         "parameters": [
           {
@@ -2180,6 +2180,55 @@
         },
         "tags": [
           "user-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/push/health": {
+      "get": {
+        "summary": "Admin Push Health",
+        "description": "推送通道是否真的接好了 + 当前注册了多少设备。\n\n## 为什么要有这个端点\n\n推送这件事的失败模式特别隐蔽：**没配通道时，通知会如实写成\n\"failed: 未配置推送通道\"，但系统里一切正常** —— 没有异常、没有堆栈、\n没有 5xx。管理后台的列表里全是失败行，但没人知道根因是\"压根没接通道\"。\n\n更早的时候更糟：那个「重推」端点直接把 status 改成 'sent'，\n运营看到\"已发送\"，用户手机上什么都没有。\n\n所以这个端点把\"接没接\"这件事变成一个**可以被查、被部署脚本检查**的答案。\n`deploy/preflight.sh` 也会读同样的信息。\n\n查不到通道 → `configured: false` + 明确的原因，别让人猜。",
+        "operationId": "admin_push_health_api_v1_admin_push_health_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "ai-service",
           "api-gateway"
         ]
       }
@@ -3371,6 +3420,29 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/app/version": {
+      "get": {
+        "summary": "Get App Version",
+        "description": "当前发布的 App 版本信息（应用内更新用）。\n\n**公开端点**：更新检查发生在\"用户还没登录\"和\"App 刚启动\"的时候。\n\n值从环境变量读（见 .env.example）：\n  STASHBOX_APP_LATEST_VERSION_CODE / _NAME / _DOWNLOAD_URL\n  STASHBOX_APP_MIN_SUPPORTED_VERSION_CODE / _NOTES\n\n为什么用环境变量而不是 DB：内测阶段每次发版都要改一次，\n而\"改一个环境变量 + 重启 user-service\"比\"加一个管理页面\"轻得多。\n真要运营自助，改成 SystemConfig 即可（表已存在）。",
+        "operationId": "get_app_version_api_v1_app_version_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppVersionResponse"
                 }
               }
             }
@@ -6049,6 +6121,27 @@
         ]
       }
     },
+    "/api/v1/policies/privacy": {
+      "get": {
+        "summary": "Get Privacy Policy",
+        "description": "当前隐私政策正文。\n\n**公开端点**：用户还没登录时也要能读政策（首次启动的同意页就在登录之前）。",
+        "operationId": "get_privacy_policy_api_v1_policies_privacy_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service",
+          "api-gateway"
+        ]
+      }
+    },
     "/api/v1/subscription/plans": {
       "get": {
         "summary": "Get Plans",
@@ -6445,6 +6538,351 @@
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/users/me/account/delete": {
+      "post": {
+        "summary": "Delete My Account",
+        "description": "注销账号（删除我的账号）。\n\n## 做什么\n\n1. **匿名化**（立即，不可逆）：open_id / union_id / phone / apple_id / email /\n   avatar_url / password_hash 清空，nickname 改成\"已注销用户\"，open_id 换成\n   一个**不可逆**的随机串（保留原值没有意义，但也得满足 unique 约束）。\n2. **软删**该用户的全部文章（articles.deleted_at）—— 音频文件在 OSS 上，\n   由运营按 30 天期限批量清理（不在这个请求里做）。\n3. **停用**该用户的全部设备推送令牌。\n4. **删掉**同意记录（那是关于\"这个人\"的个人信息）。\n5. **吊销**该用户已签发的所有 token（见 common/revocation.py）——\n   这一步是\"注销后立即停止提供服务\"的兑现点。\n6. 软删用户行本身（users.deleted_at）。\n\n## 幂等\n\n重复调用返回 200 + already_deleted=true，不报错 ——\n客户端重试（网络抖动）不该让用户看到\"注销失败\"。\n\n## 为什么是软删而不是硬删\n\n- articles 挂着外键到 users，硬删会连带删掉别人的评论/标签关联\n- 审计与计费口径需要保留\"曾经有过这个人\"的痕迹（但不含个人内容）\n- 真要物理删除，是运营侧的批量清理任务（30 天期限），不在用户请求里做",
+        "operationId": "delete_my_account_api_v1_users_me_account_delete_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccountDeleteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountDeleteResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/users/me/consent": {
+      "get": {
+        "summary": "Get My Consent",
+        "description": "我当前的同意状态。\n\n客户端用它决定\"要不要弹同意页\"：当前政策版本 != 已同意的版本 → 弹。",
+        "operationId": "get_my_consent_api_v1_users_me_consent_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsentStateResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service",
+          "api-gateway"
+        ]
+      },
+      "put": {
+        "summary": "Update My Consent",
+        "description": "记录 / 撤回同意。\n\n允许**撤回**：accepted=false 是合法操作（合规要求\"撤回同意不影响撤回前已进行的处理\"）。\n\n版本号必须与服务端当前版本一致 —— 客户端不能拿着旧版本号来\"同意\"，\n那等于同意了一份用户没看过的政策。",
+        "operationId": "update_my_consent_api_v1_users_me_consent_put",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsentUpdateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsentStateResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/users/me/devices": {
+      "get": {
+        "summary": "List My Devices",
+        "description": "我注册过的设备。",
+        "operationId": "list_my_devices_api_v1_users_me_devices_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DeviceResponse"
+                  },
+                  "title": "Response List My Devices Api V1 Users Me Devices Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service",
+          "api-gateway"
+        ]
+      },
+      "post": {
+        "summary": "Register My Device",
+        "description": "注册（或更新）一台设备的推送令牌。\n\n**幂等**：同一个 (token, provider) 再次注册 = 更新归属 + 重新激活。\n换账号登录时，客户端会用新账号的 token 调一次这里，把这台设备转过去 ——\n否则会出现\"登出后旧账号还在往这台手机推\"的情况。",
+        "operationId": "register_my_device_api_v1_users_me_devices_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeviceRegisterRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/users/me/devices/{device_id}": {
+      "delete": {
+        "summary": "Unregister My Device",
+        "description": "解绑一台设备（停用，不硬删 —— 留着才知道\"这台设备曾经推过\"）。",
+        "operationId": "unregister_my_device_api_v1_users_me_devices__device_id__delete",
+        "parameters": [
+          {
+            "name": "device_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Device Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountDeleteResponse"
+                }
               }
             }
           },
@@ -7277,6 +7715,62 @@
         ],
         "title": "ValidationError"
       },
+      "AccountDeleteRequest": {
+        "properties": {
+          "confirm_text": {
+            "type": "string",
+            "title": "Confirm Text"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "confirm_text"
+        ],
+        "title": "AccountDeleteRequest",
+        "description": "注销请求。\n\nconfirm_text 必须精确等于 :data:`ACCOUNT_DELETE_CONFIRM_TEXT`。\n为什么要\"打字确认\"：注销是**不可逆**的终局操作，一个误触就永久丢数据。\n这不是 UX 洁癖 —— 是让用户有机会意识到自己在做什么。"
+      },
+      "AccountDeleteResponse": {
+        "properties": {
+          "deleted": {
+            "type": "boolean",
+            "title": "Deleted"
+          },
+          "already_deleted": {
+            "type": "boolean",
+            "title": "Already Deleted"
+          },
+          "anonymized_fields": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Anonymized Fields"
+          },
+          "articles_soft_deleted": {
+            "type": "integer",
+            "title": "Articles Soft Deleted"
+          }
+        },
+        "type": "object",
+        "required": [
+          "deleted",
+          "already_deleted",
+          "anonymized_fields",
+          "articles_soft_deleted"
+        ],
+        "title": "AccountDeleteResponse"
+      },
       "AdminLoginRequest": {
         "properties": {
           "email": {
@@ -7688,6 +8182,243 @@
           "items"
         ],
         "title": "AdminUserListResponse"
+      },
+      "AppVersionResponse": {
+        "properties": {
+          "latest_version_code": {
+            "type": "integer",
+            "title": "Latest Version Code"
+          },
+          "latest_version_name": {
+            "type": "string",
+            "title": "Latest Version Name"
+          },
+          "min_supported_version_code": {
+            "type": "integer",
+            "title": "Min Supported Version Code"
+          },
+          "download_url": {
+            "type": "string",
+            "title": "Download Url"
+          },
+          "release_notes": {
+            "type": "string",
+            "title": "Release Notes"
+          },
+          "published_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Published At"
+          },
+          "mandatory": {
+            "type": "boolean",
+            "title": "Mandatory"
+          }
+        },
+        "type": "object",
+        "required": [
+          "latest_version_code",
+          "latest_version_name",
+          "min_supported_version_code",
+          "download_url",
+          "release_notes",
+          "published_at",
+          "mandatory"
+        ],
+        "title": "AppVersionResponse"
+      },
+      "ConsentStateResponse": {
+        "properties": {
+          "privacy_policy_version": {
+            "type": "string",
+            "title": "Privacy Policy Version"
+          },
+          "current_privacy_policy_version": {
+            "type": "string",
+            "title": "Current Privacy Policy Version"
+          },
+          "privacy_policy_accepted": {
+            "type": "boolean",
+            "title": "Privacy Policy Accepted"
+          },
+          "privacy_policy_accepted_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Privacy Policy Accepted At"
+          },
+          "personalization_enabled": {
+            "type": "boolean",
+            "title": "Personalization Enabled"
+          },
+          "cross_user_share_enabled": {
+            "type": "boolean",
+            "title": "Cross User Share Enabled"
+          }
+        },
+        "type": "object",
+        "required": [
+          "privacy_policy_version",
+          "current_privacy_policy_version",
+          "privacy_policy_accepted",
+          "privacy_policy_accepted_at",
+          "personalization_enabled",
+          "cross_user_share_enabled"
+        ],
+        "title": "ConsentStateResponse"
+      },
+      "ConsentUpdateRequest": {
+        "properties": {
+          "privacy_policy_version": {
+            "type": "string",
+            "title": "Privacy Policy Version"
+          },
+          "accepted": {
+            "type": "boolean",
+            "title": "Accepted"
+          },
+          "personalization_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Personalization Enabled"
+          },
+          "cross_user_share_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cross User Share Enabled"
+          }
+        },
+        "type": "object",
+        "required": [
+          "privacy_policy_version",
+          "accepted"
+        ],
+        "title": "ConsentUpdateRequest"
+      },
+      "DeviceRegisterRequest": {
+        "properties": {
+          "token": {
+            "type": "string",
+            "title": "Token"
+          },
+          "platform": {
+            "type": "string",
+            "title": "Platform",
+            "default": "android"
+          },
+          "provider": {
+            "type": "string",
+            "title": "Provider",
+            "default": "none"
+          },
+          "app_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "App Version"
+          },
+          "device_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Model"
+          }
+        },
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "title": "DeviceRegisterRequest"
+      },
+      "DeviceResponse": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "token": {
+            "type": "string",
+            "title": "Token"
+          },
+          "platform": {
+            "type": "string",
+            "title": "Platform"
+          },
+          "provider": {
+            "type": "string",
+            "title": "Provider"
+          },
+          "app_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "App Version"
+          },
+          "device_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Model"
+          },
+          "is_active": {
+            "type": "boolean",
+            "title": "Is Active"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "token",
+          "platform",
+          "provider",
+          "app_version",
+          "device_model",
+          "is_active"
+        ],
+        "title": "DeviceResponse"
       },
       "QuotaAdjustRequest": {
         "properties": {
