@@ -8,6 +8,7 @@ CP1.5：蒸馏任务写真实 PostgreSQL（distilled_articles 表），状态机
 
 import asyncio
 import logging
+import os
 import sys
 import uuid
 from contextlib import asynccontextmanager
@@ -18,7 +19,7 @@ from fastapi import Depends, FastAPI
 from fastapi.responses import Response
 from pydantic import BaseModel
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from stashbox.backend.common import cache_service, quota_service
@@ -202,6 +203,43 @@ def _new_task_id() -> str:
 #: 放在模块级而不是端点内，是为了和 `tests/ai/test_distill_start_idempotent.py`
 #: 里的 `IN_FLIGHT` 对齐 —— 判据散落两处迟早会漂。
 IN_FLIGHT_DISTILL_STATUSES = ("queued", "running")
+
+#: 陈旧任务窗口（秒）：状态还在 queued/running、但**多久没动过**了就算卡死。
+#:
+#: 原来这里**刻意没有**超时兜底 —— 理由是「超时窗口要按最慢一轮蒸馏耗时定
+#: （约 23 分钟），定短了会误杀正常长任务，真要做需要单独评估」。
+#: 那个评估现在做了（2026-10-21 实测）：
+#:     LLM 改写 ~11s + TTS 合成 2 段 ~100s + 落库 → 单篇 2~4 分钟
+#: 也就是说 15 分钟有 4 倍余量，定它不会误杀正常任务。
+#:
+#: 不加兜底的后果（实测踩到）：worker 崩溃 / Redis 丢消息 → 行永远停在
+#: 'queued' → 幂等守卫挡住一切重新派发 → **用户既不能重试也不能重生成**，
+#: 只能靠运维捞。而任务级重试恰恰是这套系统对抗上游抖动的唯一手段
+#: （上游 vLLM 会偶发把生成内容整个丢掉，见 distill_task 的 DistillRetry）。
+STALE_DISTILL_TASK_SEC = int(os.getenv("STALE_DISTILL_TASK_SEC", "900"))
+
+
+async def _stale_age_seconds(db: AsyncSession, da: DistilledArticle | None) -> float | None:
+    """这行任务「多久没动过」了（秒）；不是 in-flight 状态则返回 None。
+
+    ⚠️ **age 必须由 DB 算**，不能在 Python 里减。
+    `distilled_articles.updated_at` 是 `TIMESTAMP without time zone`（naive），
+    存的是**数据库会话时区**的墙上时间 —— 实测生产服务器是 **UTC+8**。
+    Python 进程若按 UTC 解释它，age 会算成**负数**，陈旧判定永远为假
+    （这个 bug 让兜底第一次上线时完全不生效）。
+
+    让 DB 用自己的 `now()` 去减，两边时区口径必然一致。
+    """
+    if da is None or da.status not in IN_FLIGHT_DISTILL_STATUSES:
+        return None
+    age = await db.scalar(
+        select(func.extract("epoch", func.now() - DistilledArticle.updated_at)).where(
+            DistilledArticle.id == da.id
+        )
+    )
+    if age is None:
+        return None
+    return float(age)
 
 
 def _requeue_or_create(
@@ -404,10 +442,23 @@ async def distill_start(
     # 和「失败重试」依赖的行为，一起挡掉会让重生成功能整个死掉
     # （见 tests/ai/test_distill_start_idempotent.py 的两个回归用例）。
     #
-    # ⚠️ 已知取舍：worker 崩溃会让行永远停在 `queued`，此时用户既不能重试也不能重生成，
-    # 只能靠运维捞。这是**刻意不**加超时兜底的原因 —— 超时窗口要按「最慢一轮蒸馏
-    # 耗时」定（本项目约 23 分钟），定短了会误杀正常长任务，真要做需要单独评估。
-    if existed_da is not None and existed_da.status in IN_FLIGHT_DISTILL_STATUSES:
+    # ⚠️ 原来这里是「worker 崩溃 → 行永远停在 queued → 用户既不能重试也不能
+    # 重生成，只能靠运维捞」的**刻意取舍**（理由是超时窗口没评估过）。
+    # 那个评估现在做了（2026-10-21 实测单篇 2~4 分钟，15 分钟有 4 倍余量），
+    # 所以加了**陈旧兜底**：状态还在 queued/running、但很久没动过 → 放行重新派发。
+    # 不加的话，任务级重试（对抗上游 vLLM 丢内容的唯一手段）一旦丢消息，
+    # 用户就永久失去对这篇文章的一切操作权。
+    stale_age = await _stale_age_seconds(db, existed_da)
+    if stale_age is not None and stale_age > STALE_DISTILL_TASK_SEC:
+        # 陈旧任务（worker 崩溃 / Redis 丢消息）→ 放行重新派发。
+        # 记一条日志：这是「用户为什么突然能重试了」的唯一线索。
+        log.warning(
+            "stale_distill_task_reclaimed article_id=%s status=%s age_sec=%.0f",
+            req.article_id,
+            existed_da.status if existed_da else None,
+            stale_age,
+        )
+    if stale_age is not None and stale_age <= STALE_DISTILL_TASK_SEC:
         voice = await resolve_voice_for_user(uid)
         return DistillStartResponse(
             task_id=existed_da.id,
@@ -538,7 +589,10 @@ async def distill_article(
     #
     # 只挡 queued / running；done / failed 放行 —— 那是「换音色重新生成」和
     # 「失败重试」依赖的行为，一起挡掉会让重生成功能死掉（同 distill_start 的取舍）。
-    if existed_da is not None and existed_da.status in IN_FLIGHT_DISTILL_STATUSES:
+    # 陈旧兜底：见 distill_start 的同款说明（worker 崩溃 → 永久卡在 queued
+    # → 用户既不能重试也不能重生成）。实测单篇 2~4 分钟，15 分钟窗口不会误杀。
+    stale_age = await _stale_age_seconds(db, existed_da)
+    if stale_age is not None and stale_age <= STALE_DISTILL_TASK_SEC:
         return {
             "article_id": article_id,
             "task_id": existed_da.id,
