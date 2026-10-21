@@ -79,6 +79,13 @@ AmbientCapabilities=
 ReadWritePaths=/var/lib/stashbox/tmp
 ReadWritePaths=/var/log/stashbox
 ReadWritePaths=-/opt/stashbox/stashbox/backend/ai-service/data
+ReadWritePaths=-/var/lib/stashbox/data
+# ⚠️ 上面这行是**本地音频目录**（LOCAL_AUDIO_DIR，默认
+# /var/lib/stashbox/data/audio）—— ProtectSystem=strict 会把整个
+# 文件系统设成只读，不显式加进白名单的话，TTS 落盘会直接报
+# "[Errno 30] Read-only file system"，而 LLM 步骤已经成功、
+# 报错发生在最后一步 —— 症状看起来像"TTS 坏了"，实际是沙箱没放行。
+# 前缀 `-` 表示目录不存在时忽略（用 OSS 存储时这个目录可能不存在）。
 
 StandardOutput=journal
 StandardError=journal

@@ -77,6 +77,7 @@ AmbientCapabilities=
 #   /var/log/stashbox      —— 文件日志。
 ReadWritePaths=/var/lib/stashbox/tmp
 ReadWritePaths=/var/log/stashbox
+ReadWritePaths=-/var/lib/stashbox/data
 
 StandardOutput=journal
 StandardError=journal

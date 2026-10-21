@@ -61,6 +61,7 @@ AmbientCapabilities=
 #   临时文件不该跟 PG 抢内存。
 #   其它路径全部由 ProtectSystem=strict 变成只读 —— 迁移不该写任何地方。
 ReadWritePaths=/var/lib/stashbox/tmp
+ReadWritePaths=-/var/lib/stashbox/data
 
 StandardOutput=journal
 StandardError=journal

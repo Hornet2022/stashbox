@@ -98,6 +98,7 @@ AmbientCapabilities=
 ReadWritePaths=/var/lib/stashbox/tmp
 ReadWritePaths=/var/log/stashbox
 ReadWritePaths=-/opt/stashbox/stashbox/backend/ai-service/data
+ReadWritePaths=-/var/lib/stashbox/data
 
 StandardOutput=journal
 StandardError=journal
