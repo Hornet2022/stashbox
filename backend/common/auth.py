@@ -16,6 +16,7 @@ from fastapi import Header, HTTPException, status
 from jose import JWTError, jwt
 
 from stashbox.backend.common.config import settings
+from stashbox.backend.common import revocation
 
 
 def create_access_token(
@@ -117,6 +118,11 @@ async def require_user(
     端点被拒绝（理由见该函数的说明）。这是全项目业务鉴权的唯一入口
     （`require_admin` / `require_admin_or_operator` 都挂在它上面），所以
     「refresh 不能当 access 用」这一条只需要在这里守住一次。
+
+    2026-10-21 加了**吊销检查**：注销账号后，该用户的旧 token 必须立刻作废
+    （见 common/revocation.py）。判据是 token 的 iat 早于吊销时刻。
+    这一步只多一次 Redis GET，不查库 —— 鉴权在热路径上，不能给每个请求
+    加一次 DB 往返。
     """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
@@ -125,7 +131,14 @@ async def require_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     token = authorization[7:]  # 去掉 "Bearer "
-    return decode_access_token(token)
+    payload = decode_access_token(token)
+    if await revocation.is_revoked(payload):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return payload
 
 
 async def require_user_optional(
@@ -136,10 +149,16 @@ async def require_user_optional(
     拿着 refresh token 来 = 视同未登录（返回 None），与「token 无效/过期」的
     现有行为一致 —— 都是不给权限、只是不报错。反过来说不会因为这次改动把
     原本能匿名访问的端点变成 401。
+
+    已吊销的 token 同样按"未登录"处理（返回 None），而不是 401 ——
+    对可选鉴权的端点来说，"没登录"比"报错了"更贴近语义。
     """
     if not authorization or not authorization.startswith("Bearer "):
         return None
     try:
-        return decode_access_token(authorization[7:])
+        payload = decode_access_token(authorization[7:])
     except HTTPException:
         return None
+    if await revocation.is_revoked(payload):
+        return None
+    return payload
