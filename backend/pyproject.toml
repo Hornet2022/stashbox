@@ -64,7 +64,16 @@ langgraph = "^1.2.14"
 # 需要它，不是「可选的边缘 provider」。
 boto3 = "^1.43"
 # app/services/tts/edge.py：Edge TTS 音色合成
-edge-tts = "^7.2"
+#
+# ⚠️ **必须 >= 7.3.1**（2026-10-21 实测）：
+#    7.2.x 连微软的 WebSocket 端点会被拒：
+#      aiohttp.client_exceptions.WSServerHandshakeError: 403, message='Invalid response status'
+#      url='wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?...'
+#    7.3.1 修复（实测合成出 16~23 KB 音频）。
+#    ⚠️ 这个故障的表现极具迷惑性：本地 1224 个用例全绿
+#    （测试用 mock/录制样本，不真连 edge），
+#    但生产上第一条蒸馏就会挂在 TTS 这一步。
+edge-tts = "^7.3.1"
 # content-service/fetchers/browser.py：抓取 Tier 2 无头浏览器通道
 playwright = "^1.63"
 # ai-service/agent/mcp_client.py：agent 的 MCP 工具接入
