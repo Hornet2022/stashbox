@@ -54,6 +54,20 @@ ROUTES: list[Route] = [
     Route("POST", "/api/v1/users/me/onboarding/start", "user-service", _url("user-service")),
     Route("POST", "/api/v1/users/me/onboarding/step", "user-service", _url("user-service")),
     Route("POST", "/api/v1/users/me/onboarding/done", "user-service", _url("user-service")),
+    # 2026-10-21 账号合规组：隐私政策同意 / 注销账号 / 设备注册。
+    # 注意 `/api/v1/users/...` 是**复数**，不在 proxy_fallback 的白名单里
+    # （那边只认 "user" / "subscription"），所以这些路径**必须**显式注册，
+    # 否则走兜底会拿到 404「接口不存在」，而客户端的 404 分支会把它
+    # 误报成「文章被删除」。
+    Route("GET", "/api/v1/users/me/consent", "user-service", _url("user-service")),
+    Route("PUT", "/api/v1/users/me/consent", "user-service", _url("user-service")),
+    Route("POST", "/api/v1/users/me/account/delete", "user-service", _url("user-service")),
+    Route("GET", "/api/v1/users/me/devices", "user-service", _url("user-service")),
+    Route("POST", "/api/v1/users/me/devices", "user-service", _url("user-service")),
+    Route("DELETE", "/api/v1/users/me/devices/{device_id}", "user-service", _url("user-service")),
+    # 公开端点：隐私政策正文（未登录也要能读）+ 应用版本（应用内更新）
+    Route("GET", "/api/v1/policies/privacy", "user-service", _url("user-service")),
+    Route("GET", "/api/v1/app/version", "user-service", _url("user-service")),
     Route("POST", "/api/v1/articles/add", "content-service", _url("content-service")),
     Route("GET", "/api/v1/articles/pending", "content-service", _url("content-service")),
     Route("GET", "/api/v1/articles/listened", "content-service", _url("content-service")),
@@ -156,6 +170,9 @@ ROUTES: list[Route] = [
     Route("GET", "/api/v1/admin/few-shot-pool", "ai-service", _url("ai-service")),
     Route("GET", "/api/v1/admin/evaluations", "ai-service", _url("ai-service")),
     Route("GET", "/api/v1/admin/audio-variants/stats", "ai-service", _url("ai-service")),
+    # 2026-10-21：推送通道自检 —— 部署前用它确认"到底接没接通道"，
+    # 而不是靠管理后台列表里一片 failed 去猜。
+    Route("GET", "/api/v1/admin/push/health", "ai-service", _url("ai-service")),
     Route("GET", "/api/v1/admin/consents", "ai-service", _url("ai-service")),
     # B4: A/B 实验报表
     Route("GET", "/api/v1/admin/ab-report", "ai-service", _url("ai-service")),

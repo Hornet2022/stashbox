@@ -111,15 +111,38 @@ app.add_middleware(RequestIDMiddleware)
 app.add_middleware(ErrorTrackingMiddleware)
 app.add_middleware(AuditMiddleware)
 install_health_endpoints(app)
-# CORS: 本机开发默认放行所有 origin（admin-web dev 在 5173）。生产用环境
-# 变量 STASHBOX_CORS_ALLOW_ORIGINS（逗号分隔）覆盖白名单。CP9.1.1 基础设施
-# 修复 — admin-web 浏览器调 /api/v1/admin/* 跨源被浏览器拦截。
-# 必须最后 add：FastAPI 中间件倒序执行（最后 add 最先 run = 最外层）。
+# CORS: 显式配置优先；没配就看环境。
+#
+# 2026-10-21 修：原来兜底是 ["*"] + allow_credentials=True。
+# 那等价于**任何网站**都能带着 admin cookie 调本网关的 /api/v1/admin/*，
+# 运营后台的 cookie 会被恶意站点带着发出去（CSRF）。
+# 而且 "*" + credentials 这个组合本身就不是合法 CORS 响应头
+# （浏览器要求 Access-Control-Allow-Origin 不能是 "*" 且同时带 credentials），
+# 实际是靠 Starlette 在带 cookie 时回显 Origin 才凑合能用 —— 能用不等于对。
+#
+# 现在的口径（对齐本仓库既有的"生产必须显式配置否则启动失败"惯例，
+# 见 common/config.py 的 jwt_secret 断言、android 的 release signing 门禁）：
+#   - 配了 STASHBOX_CORS_ALLOW_ORIGINS → 用它（逗号分隔）
+#   - prod 且没配 → **启动即失败**，并写清怎么填
+#   - dev/staging 且没配 → 只放行本机开发端口，不放行全网
 _cors_env = os.getenv("STASHBOX_CORS_ALLOW_ORIGINS", "").strip()
 if _cors_env:
     _cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+elif settings.environment == "prod":
+    raise RuntimeError(
+        "生产环境必须显式配置 STASHBOX_CORS_ALLOW_ORIGINS（逗号分隔的 origin 白名单）。"
+        "例如：https://stashbox.cn,https://admin.stashbox.cn。"
+        "不配置就启动失败是有意的：默认值放行全网等于把运营后台的 cookie 暴露给任意站点。"
+    )
 else:
-    _cors_origins = ["*"]
+    # 本机开发：admin-web dev 5173 / e2e 预览 4174。
+    _cors_origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4174",
+        "http://127.0.0.1:4174",
+    ]
+# 必须最后 add：FastAPI 中间件倒序执行（最后 add 最先 run = 最外层）。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -198,6 +221,91 @@ async def issue_token(req: TokenRequest):
     )
 
 
+# ── 网关 → 下游的调用超时（秒）────────────────────────────────────────────
+#
+# 必须 **大于** 下游最慢的同步端点，否则网关会在下游还在干活时先断开，
+# 客户端拿到一个没有业务信封的裸 500（安卓的四个错误码分支全部落空）。
+#
+# 2026-10-21 实测：剪藏（POST /api/v1/articles）的抓取预算
+# STASHBOX_CAPTURE_FETCH_BUDGET 默认 30s，加上无头浏览器兜底的实际开销，
+# 整条链最坏 ~40.6s；而网关原 timeout=30.0 **必然先超时**
+# （实测网关 30.012s 返回裸 500，同一请求直连下游 40.6s 返回正常的
+# 502 + {"code":2002,...} 信封）。
+#
+# 60s 留足浏览器兜底余量；仍可用环境变量覆盖。
+try:
+    _UPSTREAM_TIMEOUT = float(os.getenv("STASHBOX_GATEWAY_UPSTREAM_TIMEOUT", "60"))
+except ValueError:
+    _UPSTREAM_TIMEOUT = 60.0
+
+# 剪藏类路径：抓取在下游是**同步**的（建文章前必须先拿到正文），
+# 慢的时候能跑满整个抓取预算。这些路径超时时，文案必须告诉用户
+# 「可能已经提交」—— 因为下游其实已经把文章建好、配额也扣了。
+_CAPTURE_PATHS = frozenset({"/api/v1/articles", "/api/v1/articles/add"})
+
+
+def _client_ip(request: Request) -> str:
+    """解析真实客户端 IP（见 common/ip.py 的说明）。
+
+    网关是唯一对外的入口，它解析出来的 IP 会**覆盖**转发给下游的
+    X-Forwarded-For —— 下游（user-service 的登录限流）据此计数。
+    """
+    from stashbox.backend.common.ip import client_ip_from_request
+
+    return client_ip_from_request(request, settings.trusted_proxy_ips)
+
+
+def _set_forwarded_for(headers: dict[str, str], request: Request) -> None:
+    """把 headers 里的 X-Forwarded-For **替换**成网关解析出的真实 IP。
+
+    ⚠️ 必须先删掉所有大小写变体再写新的：
+    ASGI 把请求头名规范成小写（"x-forwarded-for"），而我们写的是
+    "X-Forwarded-For"。不删的话 httpx 会把**两个**头一起发出去，
+    下游读到的还是客户端伪造的那个 —— 覆盖就等于没做。
+    """
+    for key in [k for k in headers if k.lower() == "x-forwarded-for"]:
+        del headers[key]
+    headers["X-Forwarded-For"] = _client_ip(request)
+
+
+def _biz_envelope(status_code: int, code: int, message: str) -> JSONResponse:
+    """业务信封。
+
+    网关的 4xx/5xx 必须是 {code,message,data}，不能是裸文本 ——
+    安卓 parseEnvelope 靠这个信封分流（2001/2002 剪藏失败、3001 配额用尽、
+    40400 音频未就绪、40100 会话失效），解析不出来就只剩一句无意义的 500。
+    """
+    return JSONResponse(
+        status_code=status_code,
+        content={"code": code, "message": message, "data": None},
+    )
+
+
+def _upstream_error_response(path: str, exc: Exception) -> JSONResponse:
+    """下游不可达 / 超时 → 业务信封。
+
+    2026-10-21 修：原来 httpx 的异常直接冒泡给 Starlette，
+    返回的是纯文本 "Internal Server Error"（content-type: text/plain）。
+    后果不是"报错不好看"这么简单 —— 安卓的 isCaptureFetchFailed(2001|2002)
+    判定依赖信封里的业务码，裸 500 让它恒为假，用户看到的是"服务暂不可用"，
+    而后端那边文章已经建好、配额已经扣了。用户会反复重试，越扣越多。
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        if path in _CAPTURE_PATHS:
+            # 剪藏超时的特殊性：下游多半**已经**建好文章并扣了配额，
+            # 只是回应没赶上。文案必须说清"可能已提交"，
+            # 否则用户只会当成失败，然后重试 → URL 去重虽然能挡住重复建文章，
+            # 但重试的每一次都会重新走一遍抓取。
+            return _biz_envelope(
+                502,
+                2002,
+                "抓取耗时较长，这篇文章可能已经提交了，请稍后在文章列表查看",
+            )
+        return _biz_envelope(504, 50400, "服务处理超时，请稍后重试")
+    # 连不上下游：下游没起来 / 网络断了 / 进程崩了
+    return _biz_envelope(502, 50200, "暂时连不上后端服务，请稍后重试")
+
+
 async def proxy(request: Request, route: Route) -> Response:
     """统一代理：method / path / query / body / headers 全透传给下游。
 
@@ -212,15 +320,35 @@ async def proxy(request: Request, route: Route) -> Response:
     if "x-request-id" not in {k.lower() for k in headers}:
         headers["X-Request-ID"] = request.state.request_id
 
+    # 补 X-Forwarded-For：下游要靠它拿到**真实**客户端 IP。
+    #
+    # 不补的话，下游看到的 request.client.host 永远是网关自己 —— 限流和审计
+    # 就会把全部用户算成同一个来源，一人一刀就误伤所有人。
+    # 已有 XFF 的（客户端自己带的，或上游反代带的）不改写。
+    # ⚠️ 这里**覆盖**而不是透传（2026-10-21）。
+    #
+    # 原来是有就透传、无才补 —— 那等于把"客户端能伪造 XFF"这件事
+    # 直接传给了下游：任何人自己发一个 X-Forwarded-For 就能绕过
+    # 下游的登录限流（每次换一个假 IP 就行）。
+    #
+    # 现在由网关自己解析：只有来自**可信代理**（TRUSTED_PROXY_IPS）的
+    # XFF 才采信，直连的一律用 peer IP。解析结果**覆盖**掉客户端带的。
+    _set_forwarded_for(headers, request)
+
     client: httpx.AsyncClient = request.app.state.httpx
-    upstream = await client.request(
-        request.method,
-        f"{route.target_url}{request.url.path}",
-        params=request.query_params,
-        content=await request.body(),
-        headers=headers,
-        timeout=30.0,
-    )
+    try:
+        upstream = await client.request(
+            request.method,
+            f"{route.target_url}{request.url.path}",
+            params=request.query_params,
+            content=await request.body(),
+            headers=headers,
+            timeout=_UPSTREAM_TIMEOUT,
+        )
+    except httpx.RequestError as exc:
+        # 超时 / 连不上 / 下游崩了 → 业务信封，不是裸 500。
+        # 注意 httpx.TimeoutException 是 RequestError 的子类，这里靠 isinstance 区分。
+        return _upstream_error_response(request.url.path, exc)
     return Response(
         content=upstream.content,
         status_code=upstream.status_code,
@@ -315,16 +443,25 @@ async def proxy_fallback(request: Request, path: str):
     headers = {
         k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")
     }
+    # 同 proxy()：补 X-Forwarded-For，让下游拿得到真实客户端 IP（限流/审计要用）。
+    # 同上：覆盖而非透传（原因见 proxy() 里的说明）
+    _set_forwarded_for(headers, request)
 
     client = request.app.state.httpx
-    upstream = await client.request(
-        request.method,
-        url,
-        params=request.query_params,
-        content=body,
-        headers=headers,
-        timeout=30.0,
-    )
+    try:
+        upstream = await client.request(
+            request.method,
+            url,
+            params=request.query_params,
+            content=body,
+            headers=headers,
+            timeout=_UPSTREAM_TIMEOUT,
+        )
+    except httpx.RequestError as exc:
+        # 与 proxy() 同理：兜底路由也不能吐裸 500。
+        # path 形如 "articles" / "articles/add"（没有前导 /api/v1），
+        # 所以这里拼回完整路径再判是不是剪藏。
+        return _upstream_error_response(f"/api/v1/{path}", exc)
     return Response(
         content=upstream.content,
         status_code=upstream.status_code,
