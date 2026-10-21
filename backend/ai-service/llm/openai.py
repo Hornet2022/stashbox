@@ -154,7 +154,38 @@ class OpenAIClient(LLMClient):
         # 真正合法的空回复（模型拒答/被截断）completion_tokens 也是 0，
         # 那种情况重试也没用，应该直接返回空让上层报错。
         if not content and usage_data.get("completion_tokens", 0) > 0:
+            # ── 先试**流式**（2026-10-21 实测，这是根治手段）────────────────
+            #
+            # 实测（tertu.cn 的 vLLM 0.22.0 / Qwen3.8-27B，同一个 2925 字 prompt）：
+            #     非流式 → 4/4 返回 content=""（而 finish_reason="stop"、
+            #              completion_tokens 有值 —— 模型正常结束了却没写字）
+            #     流式   → 0/4 空，内容 756~1018 字
+            #
+            # 上游非流式路径上「增量解码 → 累积进 content」这步有缺陷，
+            # 而流式把累积交给客户端，正好绕开。所以**先试流式**，一次就够。
+            #
+            # 为什么放在非流式重试**之前**：非流式空 content 的概率实测约 40%
+            # （长 prompt 更高），每次空都要等 4 次尝试 × ~8 秒 = 30 秒。
+            # 先试流式则最坏情况也只多一次请求。
+            try:
+                log.warning(
+                    "llm_empty_content_switch_to_stream model=%s completion_tokens=%s",
+                    model,
+                    usage_data.get("completion_tokens"),
+                )
+                data = await self._post_stream(body)
+                message = data.get("choices", [{}])[0].get("message", {})
+                content = message.get("content", "")
+                tool_calls_raw = message.get("tool_calls")
+                usage_data = data.get("usage", {}) or usage_data
+                finish_reason = data.get("choices", [{}])[0].get("finish_reason", "stop")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("llm_stream_fallback_failed model=%s error=%s", model, repr(exc))
+
+            # 流式也空 → 退回常规非流式重试（上游偶发）
             for attempt in range(1, _EMPTY_CONTENT_RETRIES + 1):
+                if content:
+                    break
                 log.warning(
                     "llm_empty_content_retry attempt=%s/%s model=%s completion_tokens=%s",
                     attempt,
@@ -168,8 +199,6 @@ class OpenAIClient(LLMClient):
                 tool_calls_raw = message.get("tool_calls")
                 usage_data = data.get("usage", {})
                 finish_reason = data.get("choices", [{}])[0].get("finish_reason", "stop")
-                if content:
-                    break
             if not content:
                 # 重试完还是空 —— 明确记一条，别让上层把 repr 当内容用
                 log.error(
@@ -205,6 +234,96 @@ class OpenAIClient(LLMClient):
             tool_calls=tool_calls,
             latency_ms=(time.time() - start) * 1000,
         )
+
+    async def _post_stream(self, body: dict[str, Any]) -> dict[str, Any]:
+        """流式 POST，**客户端自己累积** delta.content。
+
+        ## 为什么需要它
+
+        实测（2026-10-21，tertu.cn 的 vLLM 0.22.0 / Qwen3.8-27B）：
+        同一个 2925 字的 prompt，非流式 4/4 返回 `content=""`（而
+        `finish_reason="stop"`、`completion_tokens` 有值 —— 模型**正常结束了**
+        却一个字都没写进 content），**流式 0/4 空**。
+
+        也就是说：上游非流式路径上「增量解码 → 累积进 content」这步有缺陷，
+        而**流式把累积交给客户端**，正好绕开它。
+
+        这也让长文不再需要拆段：2925 字的原文流式一次就过。
+
+        返回值与非流式同构：{choices:[{message:{content, tool_calls}, finish_reason}],
+        usage:{...}}，调用方无需区分。
+        """
+        import json as _json
+
+        payload = {**body, "stream": True}
+        # 流式下必须重新算总墙钟死线：httpx 的读超时是**每次 I/O 操作**的，
+        # 上游持续吐字节会不断重置读超时 → 请求可能无限期挂着
+        # （同 _post 里 CP-LLM-DEADLINE 记的那个坑）。
+        timeout = httpx.Timeout(self.timeout, read=self.timeout)
+        content_parts: list[str] = []
+        tool_calls_raw: Any = None
+        finish_reason = "stop"
+        usage_data: dict[str, Any] = {}
+        last_err: Exception | None = None
+
+        for attempt in range(self.max_retries):
+            content_parts = []
+            tool_calls_raw = None
+            finish_reason = "stop"
+            usage_data = {}
+            try:
+                async with asyncio.timeout(self.timeout):
+                    async with self._client.stream(
+                        "POST", f"{self.base_url}/chat/completions", json=payload, timeout=timeout
+                    ) as resp:
+                        if resp.status_code >= 400:
+                            body_text = (await resp.aread()).decode("utf-8", "replace")[:500]
+                            raise RuntimeError(f"OpenAI 流式错误 {resp.status_code}: {body_text}")
+                        async for line in resp.aiter_lines():
+                            if not line or not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if not data or data == "[DONE]":
+                                if data == "[DONE]":
+                                    break
+                                continue
+                            try:
+                                obj = _json.loads(data)
+                            except Exception:
+                                continue
+                            if obj.get("usage"):
+                                usage_data = obj["usage"] or {}
+                            for choice in obj.get("choices") or []:
+                                delta = choice.get("delta") or {}
+                                piece = delta.get("content")
+                                if piece:
+                                    content_parts.append(piece)
+                                if delta.get("tool_calls"):
+                                    tool_calls_raw = delta["tool_calls"]
+                                if choice.get("finish_reason"):
+                                    finish_reason = choice["finish_reason"]
+                if content_parts or usage_data.get("completion_tokens"):
+                    break
+                last_err = RuntimeError("流式响应没有任何内容")
+            except (TimeoutError, httpx.TimeoutException, httpx.TransportError) as e:
+                last_err = e
+                log.warning("llm_stream_transport_error", attempt=attempt, error=repr(e))
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                log.warning("llm_stream_error", attempt=attempt, error=repr(e))
+
+        if not content_parts and last_err is not None:
+            raise last_err
+
+        return {
+            "choices": [
+                {
+                    "message": {"content": "".join(content_parts), "tool_calls": tool_calls_raw},
+                    "finish_reason": finish_reason,
+                }
+            ],
+            "usage": usage_data,
+        }
 
     async def _post(self, body: dict[str, Any]) -> dict[str, Any]:
         """POST + 指数退避 retry（含 429 —— 动作 3，2026-09-24）。
