@@ -88,6 +88,30 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 60 * 24 * 7
     jwt_refresh_expire_minutes: int = 60 * 24 * 30  # refresh token 有效期 30 天（rotate 用）
 
+    #: 免费档每月配额（篇）。
+    #:
+    #: **为什么默认 50 而不是 5**（2026-10-21）：内测期**没有支付通道**
+    #: （付费墙如实写着"自助升级暂未开放"），配额用尽就是死路 ——
+    #: 用户剪 5 篇撞墙 → 弹付费墙 → 没法付 → 只能等运营手动加配额。
+    #: 真机 E2E 实测的 free tier 就是 5，内测用户几乎必然撞上。
+    #:
+    #: **接上支付之后把它改回 5**（`STASHBOX_FREE_TIER_QUOTA=5`），
+    #: 那时配额才重新成为"卖会员"的杠杆。
+    #:
+    #: 只影响**新建**账号 —— 已有账号的配额是库里的值，改这里不追溯。
+    #: 已有账号要调走 admin 的 `POST /admin/users/{id}/quota-adjust`。
+    free_tier_monthly_quota: int = 50
+
+    #: 可信代理的 IP / CIDR（逗号分隔）。
+    #:
+    #: **只有这里的代理传来的 X-Forwarded-For 才会被信任**。
+    #: 别的来源带 XFF 一律忽略 —— 否则任何人自己发一个
+    #: `X-Forwarded-For: 1.2.3.4` 就能绕过登录限流（每次换一个假 IP）。
+    #:
+    #: 生产环境要填自己的 nginx / 阿里云 SLB / Ingress 的出口网段。
+    #: 填 `*` 等于不设防，preflight 会判 FAIL。
+    trusted_proxy_ips: str = ""
+
     # 第三方回调（微信公众号服务号 / clawbot 等）的共享密钥。
     # 空 = 未配置 → 回调端点一律 503 拒绝（fail-closed），见 common/callback_auth.py。
     # 这类回调没有用户 JWT 可校验，历史上就是裸奔的匿名建文章入口。
