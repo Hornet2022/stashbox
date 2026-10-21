@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from llm import get_llm_client, maybe_close_llm_client
 from llm import reload as llm_reload
+from arq_settings import load_arq_config
 from stashbox.backend.app.services.tts import reload as tts_reload
 from stashbox.backend.common.database import AsyncSessionLocal
 from stashbox.backend.common import cache_service
@@ -459,6 +460,42 @@ async def distill_task(
         return {"task_id": task_id, "status": "done"}
     except Exception as e:
         log.exception("arq_distill_failed", task_id=task_id, article_id=article_id, error=str(e))
+
+        # ── 判断「还有没有下一次尝试」 ────────────────────────────────
+        #
+        # Arq 的 ctx 带 job_try（1=首次执行，2/3=第 1/2 次重试），
+        # max_tries = ARQ_RETRY_MAX + 1（arq_settings.load_arq_config）。
+        # job_try < max_tries 说明**Arq 还会自动重试**。
+        #
+        # ⚠️ 为什么这个判断重要（2026-10-21 内测实测踩到）：
+        #   原来这里**无条件**把 articles.status 标成 failed，注释写的是
+        #   「下次进入会把状态重新置回 distilling，因此不区分是否最后一次
+        #   尝试也能收敛到正确终态」—— 技术上确实收敛了，但**用户在这
+        #   15~45 秒的窗口里看到的是「失败 / 换个源试试？点击重新蒸馏」**。
+        #
+        #   实测案例：一篇稿子 LLM 返回空 content → 首轮失败 → 标 failed →
+        #   Arq 15 秒后重试 → **成功**（1052 字稿 / 250 秒音频 / 语速 4.21 正常）。
+        #   用户截到的正是中间态那张「失败」页。
+        #
+        #   代价是实打实的：用户以为彻底失败 → 点「重试蒸馏」→ 排一个重复
+        #   任务 → 白烧一次 LLM+TTS 费用、还可能撞配额上限。
+        #
+        # 所以：**还有下一次尝试时，状态保持 distilling**（用户看到「还在进行」，
+        # App 的轮询会一直等到成功或最后一次失败）；只有最后一次尝试仍失败
+        # 才标 failed（那时才是真的失败，「重试蒸馏」按钮该出现）。
+        job_try = int(ctx.get("job_try") or 1)
+        max_tries = load_arq_config().retry_max + 1
+        will_retry = job_try < max_tries
+        log.info(
+            "arq_distill_attempt_failed",
+            task_id=task_id,
+            article_id=article_id,
+            job_try=job_try,
+            max_tries=max_tries,
+            will_retry=will_retry,
+            error=str(e)[:200],
+        )
+
         # CP6.2.2.2b 埋点：DISTILL_RETRY（注：Arq 自动 retry，distill_task.py 内无显式 retry 计数器，
         # 此处代表 Arq 将在该异常抛出后触发重试）
         async with AsyncSessionLocal() as db:
@@ -474,28 +511,60 @@ async def distill_task(
         # feedback.reason 为 VARCHAR(64)，超长会触发 StringDataRightTruncationError，
         # 导致埋点失败（被忽略）且掩盖真实错误。截断到 60 字符并保留完整信息到 metadata。
         reason = str(e)[:60]
-        async with AsyncSessionLocal() as db:
-            await track(
-                db, EventName.DISTILL_FAILED, user_id=user_id, article_id=article_id, reason=reason
-            )
-            await track_simple(db, EventName.DISTILL_QUOTA_REFUND, user_id, article_id)
-            await db.commit()  # track() 只 flush 不 commit
+        if not will_retry:
+            # 只有**最后一次**尝试仍失败才算「这次蒸馏真的失败了」。
+            # 中间失败（还会重试）也记 DISTILL_FAILED 会让失败率统计虚高 ——
+            # 实测一篇最终成功的稿子也会留下 1 条 failed 记录，报表上看就是「失败了」。
+            async with AsyncSessionLocal() as db:
+                await track(
+                    db,
+                    EventName.DISTILL_FAILED,
+                    user_id=user_id,
+                    article_id=article_id,
+                    reason=reason,
+                )
+                await track_simple(db, EventName.DISTILL_QUOTA_REFUND, user_id, article_id)
+                await db.commit()  # track() 只 flush 不 commit
 
         # CP-DISTILL 状态回写（2026-09-24 修）：失败必须把 articles.status 置为
         # failed，否则与 distilled_articles.status='failed' 不一致，UI 永远「处理中」。
-        # 若 Arq 还会 retry，该任务下次进入时会把状态重新置回 distilling，
-        # 因此这里不区分「是否最后一次尝试」也能收敛到正确终态。
+        #
+        # 2026-10-21：**还有下一次尝试时保持 distilling**（见上面 will_retry 的说明）——
+        # 用户看到的是「还在进行」而不是「失败」，等 Arq 重试成功后直接变就绪。
+        # 只有最后一次尝试仍失败才标 failed（那时「重试蒸馏」按钮才该出现）。
         #
         # 2026-10-21：同时清掉 articles.audio_url —— 它是成功路径写回产物时
         # 镜像 distilled_articles.audio_url 的（见上面的 art.audio_url = da.audio_url）。
         # 失败时留着它，文章就是 status='failed' 却还挂着一个「可播」的旧地址。
+        # （中间态不清 —— 旧音频还能听，重跑成功后才被新音频替换。）
         try:
             async with AsyncSessionLocal() as db:
-                await db.execute(
-                    update(Article)
-                    .where(Article.id == article_id)
-                    .values(status="failed", audio_url=None)
-                )
+                if will_retry:
+                    await db.execute(
+                        update(Article)
+                        .where(Article.id == article_id)
+                        .values(status="distilling", error=str(e)[:200] or None)
+                    )
+                    # ⚠️ **产物表（distilled_articles）这里不动**。
+                    #
+                    # 曾试过把它改成 'running' 来表达「会重试」，但那有两个坏处：
+                    #  ① 'running'/'queued' 在 IN_FLIGHT_DISTILL_STATUSES 里 →
+                    #     幂等守卫会挡住用户手动重试，且 Arq 若没真正重试
+                    #     （worker 崩溃 / Redis 丢消息）就**永久卡住** ——
+                    #     用户既不能重试也不能重生成。
+                    #  ② 内容服务侧的 _derive_status 现在按 articles.status 判
+                    #     「还在进行」（articles.status=='distilling' 时不把
+                    #     task.status=='failed' 当终态），所以产物表保持 failed
+                    #     也不影响用户看到「正在重试」。
+                    #
+                    # 真正到最后一次仍失败时，articles.status='failed' 就够了 ——
+                    # _derive_status 会回落到它。
+                else:
+                    await db.execute(
+                        update(Article)
+                        .where(Article.id == article_id)
+                        .values(status="failed", audio_url=None, error=str(e)[:200] or None)
+                    )
                 await db.commit()
         except Exception as exc:
             log.warning("articles_status_failed_write_err", article_id=article_id, error=str(exc))
@@ -504,8 +573,33 @@ async def distill_task(
         # agent 路径绕过了 pipeline，必须在任务级补回（否则用户蒸馏失败白扣配额）。
         # Redis SETNX 幂等锁：Arq 默认 retry_max=2，避免首跑 + 重试多次退双倍。
         # quota_charged=False（auto_retry）：本来就没扣，退款等于白送额度。
+        #
+        # 2026-10-21：**只在最后一次尝试失败时才退**。
+        # 原来每次失败就退（SETNX 保证只退一次）—— 若之后 Arq 重试成功，
+        # 用户就白赚了 1 次配额（没真正拿到可用音频却退了钱）。
+        # 「失败才退」要在**最终**失败时才兑现。
+        # 中间态给客户端一个明确信号：「上一次尝试失败，正在重试」。
+        # 阶段值走既有的 stage 机制（agent 的 current_step 那条链路），
+        # 不另造一套状态字段。
+        if will_retry:
+            try:
+                from stashbox.backend.common.distill_stage import set_stage
+
+                await set_stage(article_id, "retry")
+            except Exception as exc:  # noqa: BLE001
+                log.debug("distill stage retry 上报失败 article=%s err=%s", article_id, exc)
+
         if quota_charged:
-            await _refund_quota_once(task_id=task_id, user_id=user_id)
+            if will_retry:
+                log.info(
+                    "quota_refund_deferred",
+                    task_id=task_id,
+                    user_id=user_id,
+                    job_try=job_try,
+                    reason="will_retry",
+                )
+            else:
+                await _refund_quota_once(task_id=task_id, user_id=user_id)
         else:
             log.info(
                 "quota_refund_skipped_not_charged",

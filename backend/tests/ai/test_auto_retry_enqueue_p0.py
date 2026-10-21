@@ -165,9 +165,13 @@ async def test_退款_只在_真扣过时发生(quota_charged, monkeypatch):
     monkeypatch.setattr(dt, "AsyncSessionLocal", _fake_session_factory())
     monkeypatch.setattr(dt, "_load_raw_content", _stub_raw_content())
 
+    # job_try=3 = 最后一次尝试（max_tries = ARQ_RETRY_MAX + 1 = 3）。
+    # 退款只在**最终**失败时发生 —— 中间失败就退的话，Arq 重试成功后
+    # 用户就白赚了 1 次配额（没拿到可用音频却退了钱）。见 distill_task
+    # 失败路径的 will_retry 判定。
     with pytest.raises(RuntimeError):
         await dt.distill_task(
-            {"job_id": "j", "redis": None},
+            {"job_id": "j", "redis": None, "job_try": 3},
             "dst_1",
             "art_1",
             7,
@@ -179,6 +183,37 @@ async def test_退款_只在_真扣过时发生(quota_charged, monkeypatch):
         f"quota_charged={quota_charged} 时退款调用应{'发生' if quota_charged else '不发生'}，"
         f"实际 refunded={refunded}"
     )
+
+
+@pytest.mark.asyncio
+async def test_中间失败不退款(monkeypatch):
+    """还有下一次尝试时**不**退款（Arq 重试可能成功，那时用户不该白赚配额）。"""
+    from tasks import distill_task as dt
+
+    refunded: list[str] = []
+
+    async def _recorder(task_id, user_id):
+        refunded.append(task_id)
+
+    async def _boom(*a, **k):
+        raise RuntimeError("模拟 agent 失败")
+
+    monkeypatch.setattr(dt, "_refund_quota_once", _recorder)
+    monkeypatch.setattr(dt, "_run_distill_via_agent", _boom)
+    monkeypatch.setattr(dt, "AsyncSessionLocal", _fake_session_factory())
+    monkeypatch.setattr(dt, "_load_raw_content", _stub_raw_content())
+
+    with pytest.raises(RuntimeError):
+        await dt.distill_task(
+            {"job_id": "j", "redis": None, "job_try": 1},
+            "dst_1",
+            "art_1",
+            7,
+            "https://x.com/a",
+            quota_charged=True,
+        )
+
+    assert refunded == [], "中间失败就退款，Arq 重试成功后用户白赚一次配额"
 
 
 @pytest.mark.asyncio

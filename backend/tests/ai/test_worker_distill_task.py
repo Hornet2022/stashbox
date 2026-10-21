@@ -196,6 +196,10 @@ async def _noop_refund(session, user_id, amount=1):
 
 
 CTX = {"job_id": "job-1", "redis": None}
+# Arq 的 ctx 带 job_try（1=首次执行，2/3=第 1/2 次重试）。
+# max_tries = ARQ_RETRY_MAX + 1 = 3 → job_try=3 是最后一次尝试。
+CTX_LAST = {"job_id": "job-1", "redis": None, "job_try": 3}
+CTX_RETRY = {"job_id": "job-1", "redis": None, "job_try": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +388,10 @@ def test_task_is_registered_in_worker():
 
 
 async def test_agent_failed_status_triggers_failure_path(fake_agent, monkeypatch):
-    """CP-AGENT-FAILURE-PROPAGATION：agent 返回 failed → 抛异常（不退化成 done）。"""
+    """CP-AGENT-FAILURE-PROPAGATION：agent 返回 failed → 抛异常（不退化成 done）。
+
+    **最后一次**尝试失败才退还配额（Arq 还会重试时不退 —— 见下面那个用例）。
+    """
     # 让 agent 返回失败态
     AgentCallRecorder.final_state = {
         "status": "failed",
@@ -403,12 +410,50 @@ async def test_agent_failed_status_triggers_failure_path(fake_agent, monkeypatch
     quota_service.refund = _refund
     try:
         with pytest.raises(RuntimeError, match="agent distill failed"):
-            await dt_module.distill_task(CTX, "dst_1", "art_1", 7, "https://x.com/a")
+            await dt_module.distill_task(CTX_LAST, "dst_1", "art_1", 7, "https://x.com/a")
     finally:
         quota_service.refund = original_refund
 
-    # 失败路径应退还配额
+    # 最后一次尝试失败 → 退还配额
     assert refund_calls == [7]
+
+
+async def test_intermediate_failure_keeps_distilling_and_defers_refund(fake_agent, monkeypatch):
+    """**还有下一次尝试时**：状态保持 distilling，且**不**退配额。
+
+    2026-10-21 内测实测踩到：一篇稿子 LLM 返回空 content → 首轮失败 →
+    旧实现无条件把 articles.status 标成 failed → 用户在 Arq 重试的
+    15~45 秒窗口里看到「失败 / 换个源试试？点击重新蒸馏」，而那次重试
+    **其实成功了**（1052 字稿 / 250 秒音频 / 语速 4.21 正常）。
+
+    代价是实打实的：用户以为彻底失败 → 点「重试蒸馏」→ 排重复任务 →
+    白烧一次 LLM+TTS 费用。
+
+    配额同理：中间失败就退（SETNX 只退一次），重试成功的话用户白赚一次。
+    """
+    AgentCallRecorder.final_state = {
+        "status": "failed",
+        "current_step": "failed",
+        "error": "LLM 返回空内容",
+        "error_kind": "internal",
+        "error_step": "rewrite",
+    }
+    refund_calls = []
+
+    async def _refund(session, user_id, amount=1):
+        refund_calls.append(user_id)
+        return {}
+
+    original_refund = quota_service.refund
+    quota_service.refund = _refund
+    try:
+        with pytest.raises(RuntimeError, match="agent distill failed"):
+            await dt_module.distill_task(CTX_RETRY, "dst_1", "art_1", 7, "https://x.com/a")
+    finally:
+        quota_service.refund = original_refund
+
+    # 还有下一次尝试 → 不退款
+    assert refund_calls == [], "中间失败就退款，重试成功的话用户白赚一次配额"
 
 
 # ---------------------------------------------------------------------------

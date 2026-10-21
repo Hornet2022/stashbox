@@ -48,8 +48,14 @@ STAGE_FETCH = "fetch"
 STAGE_REWRITE = "rewrite"
 STAGE_TTS = "tts"
 STAGE_CONCAT = "concat"
+# 唯一的例外：它描述的是**任务级**重试（Arq 重新执行整个蒸馏），
+# 不是 agent 图里的某个节点。但它仍属于「蒸馏进行中」这个大语义 ——
+# 客户端要能区分「在干活」和「刚才失败了一次、正在重来」。
+# 不区分的话，用户在重试窗口里只能看到干巴巴的「蒸馏中」，
+# 不知道发生过什么（2026-10-21 内测实测踩到过这个中间态）。
+STAGE_RETRY = "retry"
 
-_VALID_STAGES = frozenset({STAGE_FETCH, STAGE_REWRITE, STAGE_TTS, STAGE_CONCAT})
+_VALID_STAGES = frozenset({STAGE_FETCH, STAGE_REWRITE, STAGE_TTS, STAGE_CONCAT, STAGE_RETRY})
 
 # 阶段 TTL（秒）。15 分钟足够覆盖最慢的蒸馏（Arq job_timeout 是 30 分钟）
 _STAGE_TTL_SEC = 900

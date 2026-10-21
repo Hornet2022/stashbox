@@ -299,13 +299,42 @@ async def _get_owned_with_task(
 
 
 def _derive_status(art: Article, task: DistilledArticle | None) -> str:
-    """ai-service 只更新 distilled_articles，articles.status 会停在 distilling，故按任务派生。"""
+    """ai-service 只更新 distilled_articles，articles.status 会停在 distilling，故按任务派生。
+
+    ⚠️ 2026-10-21：`task.status == 'failed'` 但 `articles.status == 'distilling'`
+    时**不是终态** —— 那是「这次尝试失败了，但 Arq 还会自动重试」的中间态。
+
+    背景：内测实测一篇稿子 LLM 返回空 content → 首次尝试失败 → 产物表先被写成
+    failed → 15 秒后 Arq 重试**成功**（1052 字稿 / 250 秒音频 / 语速 4.21 正常）。
+    用户截到的正是中间态那张「失败 / 换个源试试？」的页面。
+
+    所以这里以 **articles.status 为准**判「还在进行」：蒸馏任务每次执行
+    （含 Arq 重试）都会把 articles.status 置回 distilling（见 distill_task），
+    真正失败时才会置成 failed。两者不一致 → 以 articles 为准。
+
+    另：中间态**不**把产物表写成 'running'/'queued' —— 那两个值在
+    IN_FLIGHT_DISTILL_STATUSES 里，会挡住用户手动重试，且 Arq 若没真正重试
+    就永久卡住（用户既不能重试也不能重生成）。
+    """
     if task is None:
         return art.status
     if task.status == "done":
         return "ready"
     if task.status == "failed":
-        return "failed"
+        # ⚠️ `articles.status` 不是终态 → 这次失败**还在重试**，不是最终失败。
+        #
+        # 两种「还在重试」：
+        #  ① Arq 自动重试：distill_task 把 articles.status 置回 'distilling'
+        #     （内测实测：一篇稿子 LLM 返回空 content → 首次失败 → 15 秒后
+        #      Arq 重试**成功**，用户截到的正是中间态那张「失败」页）
+        #  ② 用户手动点「重试蒸馏」：user_retry_distill 把 articles.status
+        #     置回 'pending'，但产物表要等 ai-service 回写新任务才更新 ——
+        #     在那之前 _derive_status 会继续返回 'failed'，用户点了「重试」
+        #     却还看到「失败」，像是按钮没生效（这是**既有行为**，之前没人当 bug）。
+        #
+        # 所以：**articles 不是终态就是「进行中」**，产物表的 failed 只是
+        # 「上一次尝试的结果」。
+        return art.status if art.status in ("pending", "distilling") else "failed"
     return art.status
 
 
