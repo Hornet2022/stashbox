@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+import os
 import statistics
 import structlog
 from pathlib import Path
@@ -36,8 +37,58 @@ log = structlog.get_logger("distill.tts_blind_test")
 # （实测 38 字 ≈ 24s），不限制的话一次盲测能跑到天亮。
 MAX_TEXT_CHARS = 200
 
-# 音频落盘目录（api-gateway 以 /audio 静态挂载 /tmp/audio）
-BLIND_TEST_DIR = Path("/tmp/audio/blind-test")
+
+# 音频落盘目录。
+#
+# ⚠️ **不能写死 /tmp**（2026-10-21 修的生产事故）：
+#   原来硬编码 `/tmp/audio/blind-test`，注释说"由 api-gateway 的 /audio 挂载"。
+#   但那只在**本地开发**成立：
+#     · 开发机：网关的 LOCAL_AUDIO_DIR 默认就是 /tmp/audio → 能播
+#     · 生产：网关挂的是 LOCAL_AUDIO_DIR（/var/lib/stashbox/data），
+#             而且 ai-worker 单元有 PrivateTmp=true —— /tmp 是**私有命名空间**，
+#             写进去的��件网关根本看不到。
+#   结果：盲测接口返回 200、audio_url 看着像模像样，但运营点"试听"一律 404，
+#   整个盲测功能在生产上是废的（而本地测试全绿）。
+#
+#   现在：从 LOCAL_AUDIO_DIR 派生，跟网关挂载的目录**永远一致**。
+#   LOCAL_AUDIO_DIR 本身就是 base_dir（storage key 自带 audio/ 前缀），
+#   所以盲测目录是 {LOCAL_AUDIO_DIR}/audio/blind-test。
+def _blind_test_dir() -> Path:
+    base = os.getenv("LOCAL_AUDIO_DIR", "/tmp/audio")
+    return Path(base) / "audio" / "blind-test"
+
+
+# 保留旧名做兼容（测试与外部引用可能用到）
+BLIND_TEST_DIR = _blind_test_dir()
+
+
+def _public_url_for(path: Path) -> str:
+    """把落盘文件路径换算成网关能服务的 URL。
+
+    网关把 ``/audio`` 静态路由挂到 ``LOCAL_AUDIO_DIR``（见
+    api-gateway/main.py），所以：
+
+        {LOCAL_AUDIO_DIR}/audio/blind-test/x.wav
+        →  /audio/audio/blind-test/x.wav
+
+    写死 "/audio/blind-test/x.wav" 会**少一层** —— 本地开发时
+    LOCAL_AUDIO_DIR 默认是 /tmp/audio，落盘也在 /tmp/audio/blind-test/，
+    恰好对得上；生产上 LOCAL_AUDIO_DIR 改成别的路径就全错位了。
+
+    从实际路径反推，两边永远一致。
+    """
+    base = Path(os.getenv("LOCAL_AUDIO_DIR", "/tmp/audio")).resolve()
+    try:
+        rel = path.resolve().relative_to(base)
+    except ValueError:
+        # 不在 base 下（配错了）—— 退回按文件名拼，至少能看出路径不对
+        log.warning(
+            "blind_test_path_outside_base",
+            path=str(path),
+            base=str(base),
+        )
+        return f"/audio/{path.name}"
+    return "/audio/" + str(rel).replace(os.sep, "/")
 
 
 class TtsBlindTest:
@@ -65,7 +116,10 @@ class TtsBlindTest:
             if not body:
                 return {"samples": {}, "order": [], "failed": list(providers)}
 
-            BLIND_TEST_DIR.mkdir(parents=True, exist_ok=True)
+            # 每次现取目录（不缓存成模块常量）—— env 改了要立刻生效，
+            # 且与网关的 LOCAL_AUDIO_DIR 保持同步
+            blind_dir = _blind_test_dir()
+            blind_dir.mkdir(parents=True, exist_ok=True)
             # 用文本+provider 的哈希做文件名：同一文本重复盲测不堆积文件，
             # 且文件名不含 provider 信息（双盲的前提）
             token = hashlib.sha256(body.encode()).hexdigest()[:12]
@@ -78,7 +132,11 @@ class TtsBlindTest:
                 sample_key = f"sample_{i + 1}"
                 try:
                     path = await self._synthesize_to_file(body, provider, token, i)
-                    samples[sample_key] = f"/audio/blind-test/{path.name}"
+                    # URL 从**实际落盘路径**反推，而不是写死 "/audio/blind-test/xxx"。
+                    # 写死会跟网关的挂载目录错位（网关挂的是 LOCAL_AUDIO_DIR，
+                    # 实际文件在其下的 audio/ 子目录里）—— 表现是接口 200、
+                    # audio_url 看着正常，但点"试听"一律 404。
+                    samples[sample_key] = _public_url_for(path)
                     ok_providers.append(provider)
                 except Exception as exc:
                     log.warning(
@@ -116,7 +174,7 @@ class TtsBlindTest:
         if not audio:
             raise RuntimeError(f"{provider} 合成返回空音频")
 
-        out = BLIND_TEST_DIR / f"{token}_{index}.wav"
+        out = _blind_test_dir() / f"{token}_{index}.wav"
         out.write_bytes(audio)
         log.info("blind_test_synth_ok", provider=provider, path=str(out), bytes=len(audio))
         return out
