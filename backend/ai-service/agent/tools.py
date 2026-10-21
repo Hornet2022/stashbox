@@ -254,9 +254,13 @@ async def _try_save_audio(article_id: str, audio: bytes, fmt: str) -> str | None
     """
     try:
         from stashbox.backend.app.services.storage import get_storage
+        from stashbox.backend.app.services.storage.base import versioned_audio_key
 
         storage = get_storage()
-        return await storage.save(f"audio/{article_id}.{fmt}", audio)
+        # key 带内容 hash —— 音频重新生成后 URL 必须变，否则客户端
+        # （Media3 SimpleCache，按 URL 缓存且永不重新验证）会一直播旧文件。
+        # 详见 app/services/storage/base.py:versioned_audio_key 的说明。
+        return await storage.save(versioned_audio_key(article_id, fmt, audio), audio)
     except Exception as exc:
         log.info("agent_tts_storage_unavailable article_id=%s err=%s", article_id, exc)
         return None

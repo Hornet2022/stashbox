@@ -399,7 +399,12 @@ class DistillPipeline:
             return
         try:
             storage = _get_storage()
-            audio_key = f"audio/{ctx.article_id}.{ctx.final.format}"
+            # key 带内容 hash —— 与 agent 路径（tools.py:_try_save_audio）保持一致。
+            # 音频重新生成后 URL 必须变，否则客户端（Media3 SimpleCache，按 URL
+            # 缓存且永不重新验证）会一直播旧文件。详见 base.py:versioned_audio_key。
+            from stashbox.backend.app.services.storage.base import versioned_audio_key
+
+            audio_key = versioned_audio_key(ctx.article_id, ctx.final.format, ctx.final.audio_bytes)
             audio_url = await storage.save(audio_key, ctx.final.audio_bytes)
             ctx.final.audio_url = audio_url
             log.info("audio_saved", article_id=ctx.article_id, audio_url=audio_url)

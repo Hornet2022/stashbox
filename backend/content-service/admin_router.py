@@ -304,8 +304,9 @@ async def admin_delete_article(
     if art is None:
         raise NotFound(message=f"article {article_id} not found")
     owner_user_id = art.user_id
+    audio_keys: list[str] = []
 
-    await purge_article(db, article_id)
+    await purge_article(db, article_id, audio_keys=audio_keys)
 
     log_row = AdminOperationLog(
         admin_id=_uid(user),
@@ -326,7 +327,7 @@ async def admin_delete_article(
     except Exception:
         await db.rollback()
         raise
-    await finish_purge(article_id, owner_user_id)
+    await finish_purge(article_id, owner_user_id, audio_keys=audio_keys)
     return {"article_id": article_id, "deleted": True}
 
 

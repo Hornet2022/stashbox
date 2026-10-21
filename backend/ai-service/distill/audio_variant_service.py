@@ -29,6 +29,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from stashbox.backend.app.services.storage import get_storage
+from stashbox.backend.app.services.storage.base import versioned_variant_key
 from stashbox.backend.common.models import ArticleAudioVariant, DistilledArticle
 
 if TYPE_CHECKING:
@@ -87,9 +88,19 @@ async def _enqueue_transcode(article_id: str, bitrate: int) -> None:
         )
 
 
-def _variant_key(article_id: str, bitrate: int, fmt: str = "m4a") -> str:
-    """storage key 规范：audio/{article_id}.{bitrate}k.{fmt}（主音频是 audio/{id}.m4a）。"""
-    return f"audio/{article_id}.{bitrate}k.{fmt}"
+def _variant_key(article_id: str, bitrate: int, fmt: str = "m4a", data: bytes | None = None) -> str:
+    """storage key 规范：`audio/{article_id}.{bitrate}k.{hash8}.{fmt}`。
+
+    带内容 hash 的理由与主音频一致 —— 变体重新生成后 URL 必须变，
+    否则客户端（Media3 SimpleCache，按 URL 缓存且永不重新验证）会一直播旧文件。
+    详见 app/services/storage/base.py:versioned_audio_key。
+
+    data 为 None 时退化成不带 hash 的旧格式（只用于历史兼容/查询，
+    **不要**用它去保存 —— 那样 URL 不会变）。
+    """
+    if data is None:
+        return f"audio/{article_id}.{bitrate}k.{fmt}"
+    return versioned_variant_key(article_id, bitrate, fmt, data)
 
 
 async def probe_duration_sec(audio_bytes: bytes) -> Optional[int]:
@@ -318,7 +329,7 @@ class AudioVariantService:
             return None
 
         # 4. 上传 + 写行
-        key = _variant_key(distilled_article.article_id, bitrate)
+        key = _variant_key(distilled_article.article_id, bitrate, "m4a", out_bytes)
         try:
             await self.storage.save(key, out_bytes, content_type="audio/mp4")
         except Exception as e:  # noqa: BLE001

@@ -1,6 +1,55 @@
 """Storage 抽象接口。"""
 
+import hashlib
 from abc import ABC, abstractmethod
+
+
+def content_hash(data: bytes, length: int = 8) -> str:
+    """内容 hash（sha256 前 length 位十六进制）。
+
+    用于给音频 key 加内容版本 —— 理由见 versioned_audio_key。
+    """
+    return hashlib.sha256(data).hexdigest()[:length]
+
+
+def versioned_audio_key(article_id: str, ext: str, data: bytes) -> str:
+    """内容寻址的音频 key：`audio/{article_id}.{hash8}.{ext}`。
+
+    ## 为什么 key 必须带内容 hash
+
+    客户端（安卓 Media3 SimpleCache）**按 URL 做缓存 key**，而且
+    SimpleCache 对已缓存的 URL **永不向服务器重新验证** —— 缓存里有什么就放什么。
+
+    而同一篇文章的音频是可以**被重新生成**的：
+    换音色重新生成、蒸馏重跑、重新蒸馏、失败后重试。
+    如果 URL 永远不变（`audio/{article_id}.{ext}`），客户端就会一直播**旧文件**：
+    稿子（script_text，从 API 拿）是新的，语音（音频，从缓存拿）是旧的。
+
+    实测（2026-10-21）：服务端音频已被重跑成 184s 的新版，客户端仍播缓存里
+    223s 的旧版，进度条停在 `3:43 / 3:43`（服务端文件实际是 3:04），
+    用户反馈「内容对、语音不对」。
+
+    key 里带内容 hash 后：内容变 → key 变 → URL 变 → 缓存自然失效。
+
+    这对 local 和 oss 都成立：
+    - local：文件名变 → 静态目录里的文件变 → URL 变
+    - oss：presigned URL 由 key 决定 → key 变 → URL 变
+      （presigned URL **不能**额外拼 query —— 那会破坏签名）
+
+    ## 代价
+
+    同一篇文章的历史版本文件会变成孤儿（文件名带旧 hash）。
+    清理见 content-service/article_purge.py（按 DB 里的实际 key 删）。
+    """
+    return f"audio/{article_id}.{content_hash(data)}.{ext}"
+
+
+def versioned_variant_key(article_id: str, bitrate: int, fmt: str, data: bytes) -> str:
+    """内容寻址的变体 key：`audio/{article_id}.{bitrate}k.{hash8}.{fmt}`。
+
+    变体（多码率 warm）同样会被重新生成，理由同 versioned_audio_key。
+    """
+    return f"audio/{article_id}.{bitrate}k.{content_hash(data)}.{fmt}"
 
 
 class Storage(ABC):
@@ -39,7 +88,9 @@ class Storage(ABC):
     async def delete(self, key: str) -> None:
         """删文件（幂等：文件不存在时静默返回，不抛错）。
 
-        用于文章硬删除时清理蒸馏音频（key 同 save，如 "audio/{article_id}.wav"）。
+        用于文章硬删除时清理蒸馏音频。key 与 save 一致 ——
+        音频 key 现在带内容 hash（见 versioned_audio_key），
+        所以调用方要从 DB 里的实际 audio_url / oss_key 反推，不能按模板硬拼。
         """
         pass
 

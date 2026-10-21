@@ -275,7 +275,7 @@ def test_transcode_bad_bytes_raises(tmp_path):
 
 async def test_ensure_variant_full_chain(tmp_path):
     """fetch 主音频 → 转码 → save → 写 DB 行；幂等二次命中。"""
-    from distill.audio_variant_service import AudioVariantService, _variant_key
+    from distill.audio_variant_service import AudioVariantService
 
     src = _sine_m4a(tmp_path, seconds=1)
     st = MemoryStorage()
@@ -288,11 +288,16 @@ async def test_ensure_variant_full_chain(tmp_path):
         row = await svc.ensure_variant(db, da, 64)
         assert row is not None
         assert row.bitrate == 64
-        assert row.oss_key == _variant_key(da.article_id, 64)
+        # key 带内容 hash（audio/{id}.{bitrate}k.{hash8}.{ext}）——
+        # 变体重新生成后 URL 必须变，否则客户端缓存不失效。
+        # 详见 app/services/storage/base.py:versioned_variant_key。
+        assert row.oss_key.startswith(f"audio/{da.article_id}.64k.")
+        assert row.oss_key.endswith(".m4a")
+        assert len(row.oss_key.split(".")) == 4, f"key 应含 hash 段：{row.oss_key}"
         assert row.file_size_bytes > 0
         assert row.duration_sec == 1  # probe 优先于 da.duration_sec=300
         assert row.mono is True
-        assert _variant_key(da.article_id, 64) in st.files
+        assert row.oss_key in st.files
 
         # 幂等：第二次不再转码（若重转，save 会被调用但结果一致；关键是不产生新行）
         row2 = await svc.ensure_variant(db, da, 64)

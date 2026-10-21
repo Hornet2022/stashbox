@@ -573,6 +573,35 @@ async def _make_refund_lock_client() -> "redis_async.Redis":  # noqa: F821
     return redis_async.Redis(connection_pool=get_redis_pool())
 
 
+async def _delete_superseded_audio(article_id: str, previous_audio_url: str) -> None:
+    """删掉被新版本覆盖掉的旧音频文件（best-effort）。
+
+    音频 key 现在带内容 hash（app/services/storage/base.py:versioned_audio_key），
+    所以「重新生成」= 新的文件名 + 新的 URL，旧文件不会被覆盖而是**变成孤儿**。
+    不删的话，每次重跑都在磁盘 / OSS 上留一份音频。
+
+    取舍：删失败只记日志，不影响本次产物 —— 宁可留孤儿文件等 GC，
+    不可音频没了文章还在（与 article_purge 的取舍一致）。
+    """
+    try:
+        from stashbox.backend.app.services.storage import get_storage
+
+        storage = get_storage()
+        key = storage.key_from_url(previous_audio_url)
+        if not key:
+            return
+        if await storage.exists(key):
+            await storage.delete(key)
+            log.info("superseded_audio_deleted", article_id=article_id, key=key)
+    except Exception as exc:
+        log.warning(
+            "superseded_audio_delete_failed",
+            article_id=article_id,
+            url=previous_audio_url[:120],
+            error=str(exc),
+        )
+
+
 async def _refund_quota_once(task_id: str, user_id: int) -> None:
     """CP-AGENT-QUOTA-REFUND：退还 1 次配额，Redis SETNX 保证幂等（跨 Arq retry）。
 
@@ -830,6 +859,10 @@ async def _persist_agent_final(
             da.status = "done" if status == "done" else "failed"
             if final.get("rewritten_script"):
                 da.script_text = final["rewritten_script"]
+            # 旧音频 URL（本次覆盖前的值）—— 覆盖后要删掉旧文件，否则每次重跑
+            # 都在磁盘 / OSS 上留一份孤儿。key 现在带内容 hash，所以旧 URL 与
+            # 新 URL 必然不同（见 app/services/storage/base.py:versioned_audio_key）。
+            previous_audio_url = da.audio_url
             if final.get("tts_audio_url"):
                 # 音频字段**整体**来自本次尝试（有 URL 才有时长，不留上一轮的）
                 da.audio_url = final["tts_audio_url"]
@@ -866,6 +899,11 @@ async def _persist_agent_final(
             # 先 flush 让 IntegrityError 在这里暴露（而不是拖到 commit 把事务搞废）
             await db.flush()
             await db.commit()
+            # 删掉被覆盖掉的旧音频文件（重跑 → 旧版本成孤儿）。
+            # best-effort：删不掉只记日志，不影响本次产物（宁可留孤儿文件
+            # 等 GC，不可音频没了文章还在 —— 与 article_purge 的取舍一致）。
+            if previous_audio_url and previous_audio_url != da.audio_url:
+                await _delete_superseded_audio(article_id, previous_audio_url)
         except Exception as exc:
             log.warning(
                 "agent_persist_failed",

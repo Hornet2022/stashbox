@@ -923,8 +923,9 @@ async def delete_article(
     if art is None or art.user_id != uid:
         raise NotFound(message=f"article {article_id} not found")
     owner_user_id = art.user_id
+    audio_keys: list[str] = []
 
-    await purge_article(db, article_id)
+    await purge_article(db, article_id, audio_keys=audio_keys)
 
     try:
         await track_simple(db, "article_delete", uid, article_id)
@@ -932,7 +933,7 @@ async def delete_article(
         log.warning(f"ARTICLE_DELETE 埋点异常（忽略）: article={article_id} err={exc}")
 
     await db.commit()
-    await finish_purge(article_id, owner_user_id)
+    await finish_purge(article_id, owner_user_id, audio_keys=audio_keys)
     return {"ok": True, "id": article_id, "deleted": True}
 
 
