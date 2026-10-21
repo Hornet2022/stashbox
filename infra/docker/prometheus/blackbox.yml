@@ -8,3 +8,17 @@ modules:
       valid_status_codes: [200]
       fail_if_ssl: false
       fail_if_not_ssl: false
+
+  # readyz 探测（2026-10-21 新增）。
+  #
+  # 配置和 healthz 一样 —— 探哪个 URL 由 prometheus.yml 的 target 决定，
+  # 模块名分开只是为了让 job / 告警的语义读起来是"就绪检查"而不是"健康检查"。
+  http_2xx_readyz:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      preferred_ip_protocol: ip4
+      valid_status_codes: [200]
+      fail_if_ssl: false
+      fail_if_not_ssl: false

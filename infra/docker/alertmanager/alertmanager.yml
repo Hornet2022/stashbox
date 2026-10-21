@@ -1,6 +1,27 @@
-# Alertmanager 告警路由（CP6.4-pre-2 建，CP6.5.2 补 warning 路由 + 抑制/静默）。
-# ⚠️ 飞书 webhook token 是占位符，CP1.8 才接真账号；本地 dev 阶段告警只在 Alertmanager UI 看。
-# ⚠️ CP6.5.2 范围：只做分组 + 抑制 + 静默占位，不接真飞书 webhook。
+# Alertmanager 告警路由（CP6.4-pre-2 建，CP6.5.2 补 warning 路由 + 抑制/静默，2026-10-21 改 url_file）。
+#
+# ## 为什么改成 url_file
+#
+# 原来三个 receiver 的 webhook 地址是**写在配置文件里的占位符**
+# （STASHBOX_WEBHOOK_TOKEN…）。那意味着：
+# - 要接真告警，必须**改这个被 git 跟踪的配置文件**；
+# - 改完之后 secret 就进了版本库；
+# - 而且从配置里看不出"到底接没接"——占位符长得和真地址一模一样。
+#
+# `url_file` 是 Alertmanager 原生支持的：地址从**文件**里读。
+# 于是：
+# - secret 住在 `secrets/` 目录（部署时挂进去，不进版本库）；
+# - 配置里不再出现任何地址，**一眼就能看出接没接**；
+# - 换地址 = 改一个文件，不用动被跟踪的 yml。
+#
+# 三个文件各放一个群机器人地址（内容就是一行的 URL）：
+#   secrets/feishu-webhook           兜底（severity 未打标签时）
+#   secrets/feishu-webhook-critical  critical
+#   secrets/feishu-webhook-warning   warning
+#
+# 仓库里放的是**占位地址**，所以 dev 栈照常起得来（告警发不出去，但
+# 在 Alertmanager UI 里看得到）。deploy/preflight.sh 会检查这三个文件
+# 是不是还是占位符 —— 是的话直接判 FAIL。
 global:
   resolve_timeout: 5m
 
@@ -29,20 +50,17 @@ receivers:
   # 兜底 receiver：severity 未打标签或值不在 critical/warning 时落到这里
   - name: "stashbox-feishu"
     webhook_configs:
-      # TODO(CP1.8): 换成真飞书机器人的 webhook 地址
-      - url: "https://open.feishu.cn/open-apis/bot/v2/hook/STASHBOX_WEBHOOK_TOKEN"
+      - url_file: /etc/alertmanager/secrets/feishu-webhook
         send_resolved: true
 
   - name: "stashbox-feishu-critical"
     webhook_configs:
-      # TODO(CP1.8): 换成真 critical 告警群的 webhook 地址
-      - url: "https://open.feishu.cn/open-apis/bot/v2/hook/STASHBOX_WEBHOOK_TOKEN_CRITICAL"
+      - url_file: /etc/alertmanager/secrets/feishu-webhook-critical
         send_resolved: true
 
   - name: "stashbox-feishu-warning"
     webhook_configs:
-      # TODO(CP1.8): 换成真 warning 告警群的 webhook 地址
-      - url: "https://open.feishu.cn/open-apis/bot/v2/hook/STASHBOX_WEBHOOK_TOKEN_WARNING"
+      - url_file: /etc/alertmanager/secrets/feishu-webhook-warning
         send_resolved: true
 
 inhibit_rules:

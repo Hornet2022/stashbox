@@ -80,6 +80,32 @@ scrape_configs:
       - target_label: __address__
         replacement: blackbox_exporter:9115
 
+  # readyz 探测（2026-10-21 新增）
+  #
+  # 为什么要单独一个 job：上面那个 blackbox job 探的是 /healthz（进程活着），
+  # 而 ReadinessCheckFailing 告警要的是 /readyz（PG / Redis 这些依赖还在不在）——
+  # 两者的失败含义完全不同：/healthz 挂 = 进程死了，/readyz 挂 = 进程活着但依赖断了。
+  # 用同一个 job 探两个端点也行，但那样一条告警就说不清到底是哪种故障。
+  - job_name: blackbox-readyz
+    metrics_path: /probe
+    params:
+      module: [http_2xx_readyz]
+    static_configs:
+      - targets:
+          - http://host.docker.internal:8100/readyz   # api-gateway
+          - http://host.docker.internal:8101/readyz   # user-service
+          - http://host.docker.internal:8102/readyz   # content-service
+          - http://host.docker.internal:8103/readyz   # ai-service
+        labels:
+          service: blackbox-readyz
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox_exporter:9115
+
   # redis 监控（v1 §10.5 规则 8）
   - job_name: redis
     static_configs:

@@ -60,6 +60,8 @@ services:
       - "9093:9093"
     volumes:
       - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      # 2026-10-21：webhook 地址从文件读（url_file），不再写在被跟踪的 yml 里
+      - ./alertmanager/secrets:/etc/alertmanager/secrets:ro
     command:
       - "--config.file=/etc/alertmanager/alertmanager.yml"
       - "--storage.path=/alertmanager"

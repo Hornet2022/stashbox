@@ -1,7 +1,13 @@
 # v1 §10.5 8 条核心告警规则（CP6.4-pre-2）。
 #
 # 说明：
-#   - service label 来自 prometheus.yml static_configs（api-gateway / user-service / content-service / ai-service）
+#   - service label 来自 prometheus.yml static_configs（api-gateway / user-service /
+#     content-service / ai-service）。**注意**：应用自己在 /metrics 里给的
+#     service label 是 `stashbox-ai-service` 这种带前缀的（取自 FastAPI 的
+#     app.title），但 Prometheus 默认 honor_labels=false —— 目标标签**覆盖**
+#     指标自带标签，冲突的那个被改名为 exported_service。
+#     所以这里按 `service="api-gateway"` 这种短名过滤是对的。
+#     ⚠️ 别看到 /metrics 里是 stashbox-* 就"修"成那样，那会把规则改坏。
 #   - ReadinessCheckFailing 依赖 blackbox_exporter 的 probe_success（未部署 → 空转）
 #   - RedisConnectionFailing 依赖 redis_exporter 的 redis_up（未部署 → 空转）
 #   - DistillTaskBacklog / LLMCostSpike 依赖 ai-service 后续接入的业务指标（CP3.5-pre-3+）
@@ -61,18 +67,33 @@ groups:
           description: "Prometheus 连续 1 分钟抓不到 {{ $labels.instance }} 的 /metrics"
 
       # 5. 服务 readyz 失败（依赖 blackbox_exporter）
+      #
+      # 2026-10-21 修：原来写的是 `probe_success{job=~"api-gateway|user-service|content-service|ai-service"}`。
+      # 但 blackbox 的 scrape job 名就叫 "blackbox"（见 prometheus.yml），
+      # 被探测的 4 个服务是**这个 job 的 target**，不是 4 个独立的 job ——
+      # 所以 `job=~"api-gateway|..."` 永远匹配不上，这条规则从来没触发过。
+      #
+      # 现在指向专门探测 /readyz 的 blackbox-readyz job（prometheus.yml 新增）。
+      # /readyz 才是"依赖（PG / Redis）还在不在"的那个端点，/healthz 只是进程活着。
       - alert: ReadinessCheckFailing
-        expr: probe_success{job=~"api-gateway|user-service|content-service|ai-service"} == 0
+        expr: probe_success{job="blackbox-readyz"} == 0
         for: 2m
         labels:
           severity: critical
         annotations:
-          summary: "{{ $labels.job }} readyz 检查失败"
+          summary: "{{ $labels.instance }} readyz 检查失败"
           description: "/readyz 返回非 200（PG / Redis 依赖异常）持续 2 分钟"
 
       # 6. 蒸馏任务积压（AI queue 长度）
+      #
+      # 2026-10-21 修：原来写的是 `arq_jobs_in_queue{queue="stashbox:distill"}`，
+      # 但**这个 metric 根本不存在** —— 全仓没有任何地方导出它，
+      # 真实的名字是 `distill_queue_size`（ai-service/observability/metrics.py），
+      # 由 ai-service 的队列 poller 每 30s 采样一次（实测有样本：
+      # distill_queue_size{queue="stashbox:distill"} 0.0）。
+      # 引用一个不存在的 metric，PromQL 恒为空 → 规则永远不触发。
       - alert: DistillTaskBacklog
-        expr: arq_jobs_in_queue{queue="stashbox:distill"} > 100
+        expr: distill_queue_size{queue="stashbox:distill"} > 100
         for: 5m
         labels:
           severity: warning
