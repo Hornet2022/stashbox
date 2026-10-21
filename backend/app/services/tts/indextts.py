@@ -71,14 +71,17 @@ import base64
 import io
 import logging
 import os
-import subprocess
-import tempfile
 import time
 import wave
 from pathlib import Path
 
 import httpx
 
+from .audio_chunks import (
+    concat_wav,
+    patch_riff_sizes,
+    split_into_chunks,
+)
 from .base import TTSClient
 
 log = logging.getLogger(__name__)
@@ -114,6 +117,9 @@ class IndexTTSError(RuntimeError):
 # 放大的收益远小于超时风险。
 _CHUNK_CHARS = int(os.getenv("INDEXTTS_CHUNK_CHARS", "200"))
 # 句读边界（中英文标点 + 换行），优先在这些位置切，避免把一句话劈两半。
+#
+# ⚠️ 切块与拼接的实现已抽到 audio_chunks.py（OpenAI 协议 provider 也要用同一套，
+#    详见那里的说明）。这里保留别名是为了不动本模块的既有引用与测试。
 _SENTENCE_END = "。！？；\n.!?;"
 
 
@@ -159,132 +165,12 @@ def _assert_not_truncated(text: str, audio: bytes) -> None:
         )
 
 
-def _split_into_chunks(text: str, limit: int) -> list[str]:
-    """按句读边界把长文本切成**严格不超过 limit 字**的块（CP-INDEXTTS-CHUNK）。
-
-    - 先按句读切句，再贪心装箱；保证每块 ≤ limit（这点很关键：块一旦超过
-      ~150 字，端点会静默截断，音频只保留开头）。
-    - 单句本身超长时按硬切兜底（不会丢字）。
-    """
-    if limit <= 0 or len(text) <= limit:
-        return [text]
-
-    # 1) 切成句子（保留句末标点）
-    sentences: list[str] = []
-    buf = ""
-    for ch in text:
-        buf += ch
-        if ch in _SENTENCE_END:
-            sentences.append(buf)
-            buf = ""
-    if buf:
-        sentences.append(buf)
-
-    # 2) 贪心装箱，严格不超 limit
-    chunks: list[str] = []
-    cur = ""
-    for sent in sentences:
-        if len(sent) > limit:
-            # 单句超长：先把当前块收尾，再硬切这句
-            if cur.strip():
-                chunks.append(cur.strip())
-                cur = ""
-            rest = sent
-            while len(rest) > limit:
-                chunks.append(rest[:limit])
-                rest = rest[limit:]
-            cur = rest
-            continue
-        if len(cur) + len(sent) <= limit:
-            cur += sent
-        else:
-            if cur.strip():
-                chunks.append(cur.strip())
-            cur = sent
-    if cur.strip():
-        chunks.append(cur.strip())
-    return [c for c in chunks if c]
-
-
-def _concat_wav(pieces: list[bytes]) -> bytes:
-    """把多段 WAV 字节拼成一段（CP-INDEXTTS-CHUNK）。
-
-    优先用 ffmpeg 的 concat demuxer（`-c copy`，不重编码、几乎零开销、
-    自动重算 WAV 头）；ffmpeg 不可用时退化为「取首段 WAV 头 + 顺次拼 PCM 载荷」。
-    退化路径对采样率/位宽/声道完全一致的 IndexTTS 输出是安全的。
-    """
-    if not pieces:
-        raise IndexTTSError("没有可拼接的音频分段")
-    if len(pieces) == 1:
-        return pieces[0]
-
-    ffmpeg = os.getenv("FFMPEG_BIN", "ffmpeg")
-    with tempfile.TemporaryDirectory(prefix="indextts_concat_") as tmp:
-        listing = os.path.join(tmp, "list.txt")
-        lines = []
-        for i, piece in enumerate(pieces):
-            p = os.path.join(tmp, f"part_{i:04d}.wav")
-            Path(p).write_bytes(piece)
-            lines.append(f"file '{p}'")
-        Path(listing).write_text("\n".join(lines) + "\n", encoding="utf-8")
-        out = os.path.join(tmp, "merged.wav")
-        try:
-            subprocess.run(
-                [
-                    ffmpeg,
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-y",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-i",
-                    listing,
-                    "-c",
-                    "copy",
-                    out,
-                ],
-                capture_output=True,
-                timeout=120,
-                check=True,
-            )
-            merged = Path(out).read_bytes()
-            if len(merged) > 100:
-                return merged
-            log.warning("IndexTTS ffmpeg 拼接产出异常(%dB)，退回字节拼接", len(merged))
-        except FileNotFoundError:
-            log.warning("IndexTTS 未找到 ffmpeg(%s)，退回字节拼接", ffmpeg)
-        except subprocess.SubprocessError as exc:
-            log.warning("IndexTTS ffmpeg 拼接失败(%s)，退回字节拼接", exc)
-
-    # 退化：首段留 WAV 头，其余段只取 data chunk（跳过 44 字节 RIFF 头）
-    head = pieces[0]
-    data = bytearray()
-    for i, piece in enumerate(pieces):
-        if i == 0:
-            data += piece
-            continue
-        idx = piece.find(b"data")
-        if idx == -1:
-            data += piece
-        else:
-            # "data" + 4 字节 size + 载荷
-            data += piece[idx + 8 :]
-    _patch_riff_sizes(head, len(data))
-    return bytes(data)
-
-
-def _patch_riff_sizes(wav_header: bytes, total_len: int) -> bytes:
-    """把 RIFF/data 的大小字段改成拼接后的真实长度。"""
-    buf = bytearray(wav_header)
-    if len(buf) >= 4 and buf[:4] == b"RIFF":
-        buf[4:8] = (total_len - 8).to_bytes(4, "little")
-    idx = buf.find(b"data")
-    if idx != -1 and idx + 8 <= len(buf):
-        buf[idx + 4 : idx + 8] = (total_len - idx - 8).to_bytes(4, "little")
-    return bytes(buf)
+# 切块 / 拼接 / WAV 头修正的实现已抽到共享模块 audio_chunks.py
+# （OpenAI 协议 provider 同样需要，见该模块顶部的说明）。
+# 这里保留同名别名，本模块既有引用与 tests/ai/test_tts_chunk_and_persist.py 都不用改。
+_split_into_chunks = split_into_chunks
+_concat_wav = concat_wav
+_patch_riff_sizes = patch_riff_sizes
 
 
 class IndexTTSClient(TTSClient):
