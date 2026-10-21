@@ -1,0 +1,292 @@
+# Stashbox 后端 —— 生产编排（Aliyun ACK + RDS + ApsaraDB Redis + OSS）
+# ======================================================================
+#
+# 用法（生产）：
+#     cd backend/deploy
+#     cp .env.production.example .env.production   # 然后填真值
+#     ./preflight.sh                                # 先自检，FAIL 就别发
+#     docker compose --env-file .env.production -f docker-compose.production.yml up -d
+#
+# 本文件是**生产**编排：PostgreSQL / Redis 用**外部托管实例**（RDS / ApsaraDB），
+# 不在本文件里起容器。想在本地一键跑通，用叠加文件：
+#     docker compose --env-file .env.production \
+#         -f docker-compose.production.yml \
+#         -f docker-compose.production.local.yml up -d
+#
+# ── 网络拓扑 ───────────────────────────────────────────────────────────
+#   internal  (internal: true) —— 服务之间东西向流量；没有对外路由，
+#                                外部**无法**直连 8101/8102/8103。
+#   egress    (普通 bridge)    —— 出网流量（LLM / TTS / OSS / 厂商推送）。
+#                                4 个服务都要出网，所以每个容器同时挂两张网。
+#   只有 api-gateway 做端口发布（8100:8100）—— 客户端只应该看到一个入口。
+#
+# ── 启动顺序 ───────────────────────────────────────────────────────────
+#   migrate（alembic upgrade head，跑完退出）
+#     └─→ user-service / content-service / ai-service / worker
+#          └─→ api-gateway（等 3 个下游都 healthy 才起）
+#   迁移用 `condition: service_completed_successfully` 卡死：
+#   迁移失败 = 整个栈不起来，绝不出现"服务先起、表还没建"的中间态。
+#
+# ── 数据库连接怎么配（重要）────────────────────────────────────────────
+# ⚠️ 本项目**不读 DATABASE_URL**。common/config.py::Settings.database_url 是
+#    由 POSTGRES_HOST / _PORT / _USER / _PASSWORD / _DB 现场拼出来的：
+#        postgresql+asyncpg://{user}:{pw}@{host}:{port}/{db}
+#    所以托管 RDS 要配的是 **POSTGRES_***，不是 DATABASE_URL
+#    （配了 DATABASE_URL 会被静默忽略 —— 应用会连到 localhost 然后失败）。
+#    同理，应用侧 Redis 读 REDIS_HOST/_PORT/_DB/_PASSWORD；
+#    只有 Arq worker（ai-service/arq_settings.py）**另外**直接读 REDIS_URL。
+#    preflight.sh 会校验 REDIS_URL 与 REDIS_* 指向同一个实例（防漂移）。
+
+name: stashbox
+
+# ── 编排器自己管的接线（覆盖 env_file 里的同名项）──────────────────────
+x-app-env: &app-env
+  # 这个文件就是"生产"文件：环境写死 prod，DEBUG 写死 false。
+  # 其它环境的差异用叠加文件表达，不要在这里开分支。
+  ENVIRONMENT: "prod"
+  DEBUG: "false"
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+  # 网关 → 下游。端口必须跟各服务实际监听端口一致。
+  # common/config.py 的默认值是 8001/8002/8003（开发期旧端口），
+  # 容器里监听的是 8101/8102/8103，不覆盖就是 502。
+  USER_SERVICE_URL: http://user-service:8101
+  CONTENT_SERVICE_URL: http://content-service:8102
+  AI_SERVICE_URL: http://ai-service:8103
+
+  # uvicorn --forwarded-allow-ips：只信这些上游传来的 X-Forwarded-For。
+  # 网关靠它拿到真实客户端 IP（下游登录限流按 IP 计数）。
+  # 生产必须填 SLB / Ingress 的网段；填 "*" = 公网客户端可伪造来源 IP。
+  TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1}
+
+  # ffmpeg 在镜像里是 /usr/bin/ffmpeg（Debian 包路径）。
+  # 代码里 app/services/tts 的默认值是 macOS 的 /opt/homebrew/bin/ffmpeg，必须覆盖。
+  FFMPEG_BIN: /usr/bin/ffmpeg
+
+  # 时区：容器默认 UTC，这里对齐本机（Asia/Shanghai）。
+  # ⚠️ 必须与 RDS 的时区一致，否则应用本地时间与数据库 NOW() 会对不上。
+  TZ: ${TZ:-Asia/Shanghai}
+
+  # ── 硬门禁：这两个在代码里也是"不配就起不来"，这里提前到编排层 ──────
+  # compose 的 `:?` 语法 = 取不到值就直接拒绝启动 compose。
+  # 好处：错配在 `docker compose up` 那一刻就报出来，而不是让 5 个容器
+  # 起来后 crash-loop，日志里只剩一行 pydantic 校验错误。
+  # 值来自 --env-file 指向的文件（或 shell 环境）。
+  # ⚠️ environment 优先级高于 env_file —— 所以这两个以这里的为准。
+  JWT_SECRET: ${JWT_SECRET:?必须设置（生产强密钥，>= 16 字符；不能是 dev 默认值）}
+  STASHBOX_CORS_ALLOW_ORIGINS: ${STASHBOX_CORS_ALLOW_ORIGINS:?必须设置（逗号分隔的 origin 白名单；prod 下网关不配就拒绝启动）}
+  # REDIS_URL 只有 Arq worker 直接读（ai-service/arq_settings.py），应用侧读的是
+  # REDIS_*。缺了它 worker 会静默连 redis://localhost:6379/0 —— worker 起着、
+  # 不报错、但任务永远没人消费。所以在这里硬要求。
+  REDIS_URL: ${REDIS_URL:?必须设置（与 REDIS_HOST/PORT/DB/PASSWORD 指向同一个实例；preflight 会比对一致性）}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-build: &default-build
+  context: ..
+  dockerfile: Dockerfile
+
+services:
+  # ── 迁移：一次性，跑完退出 ───────────────────────────────────────────
+  migrate:
+    build:
+      <<: *default-build
+      target: migrate
+    image: stashbox-backend:migrate
+    env_file:
+      - path: .env.production
+        required: false
+    environment:
+      <<: *app-env
+    # CWD 必须是 backend/（alembic.ini 的 script_location = alembic 相对 CWD）
+    working_dir: /app/stashbox/backend
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    init: true
+    logging: *default-logging
+    networks:
+      - internal
+      - egress
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  # ── api-gateway：唯一对外入口 ────────────────────────────────────────
+  api-gateway:
+    build:
+      <<: *default-build
+      target: api-gateway
+    image: stashbox-backend:api-gateway
+    env_file:
+      - path: .env.production
+        required: false
+    environment:
+      <<: *app-env
+    working_dir: /app/stashbox/backend/api-gateway
+    command: ["sh", "-c", "exec python -m uvicorn main:app --host 0.0.0.0 --port 8100 --proxy-headers --forwarded-allow-ips \"${TRUSTED_PROXY_IPS:-127.0.0.1}\""]
+    init: true
+    ports:
+      # 只发布网关。8101/8102/8103 永远不发布到宿主机。
+      - "${GATEWAY_BIND:-0.0.0.0}:${GATEWAY_PORT:-8100}:8100"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging: *default-logging
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      user-service:
+        condition: service_healthy
+      content-service:
+        condition: service_healthy
+      ai-service:
+        condition: service_healthy
+    networks:
+      - internal
+      - egress
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  # ── user-service ─────────────────────────────────────────────────────
+  user-service:
+    build:
+      <<: *default-build
+      target: user-service
+    image: stashbox-backend:user-service
+    env_file:
+      - path: .env.production
+        required: false
+    environment:
+      <<: *app-env
+    working_dir: /app/stashbox/backend/user-service
+    command: ["sh", "-c", "exec python -m uvicorn main:app --host 0.0.0.0 --port 8101 --proxy-headers --forwarded-allow-ips \"${TRUSTED_PROXY_IPS:-127.0.0.1}\""]
+    init: true
+    expose:
+      - "8101"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    logging: *default-logging
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - internal
+      - egress
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  # ── content-service：带无头浏览器（剪藏 Tier 2 兜底）──────────────────
+  content-service:
+    build:
+      <<: *default-build
+      target: content-service
+    image: stashbox-backend:content-service
+    env_file:
+      - path: .env.production
+        required: false
+    environment:
+      <<: *app-env
+    working_dir: /app/stashbox/backend/content-service
+    command: ["sh", "-c", "exec python -m uvicorn main:app --host 0.0.0.0 --port 8102 --proxy-headers --forwarded-allow-ips \"${TRUSTED_PROXY_IPS:-127.0.0.1}\""]
+    init: true
+    expose:
+      - "8102"
+    restart: unless-stopped
+    stop_grace_period: 60s
+    logging: *default-logging
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - internal
+      - egress
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  # ── ai-service：蒸馏 + 听感运营 + 推送 poller ─────────────────────────
+  ai-service:
+    build:
+      <<: *default-build
+      target: ai-service
+    image: stashbox-backend:ai-service
+    env_file:
+      - path: .env.production
+        required: false
+    environment:
+      <<: *app-env
+    working_dir: /app/stashbox/backend/ai-service
+    command: ["sh", "-c", "exec python -m uvicorn main:app --host 0.0.0.0 --port 8103 --proxy-headers --forwarded-allow-ips \"${TRUSTED_PROXY_IPS:-127.0.0.1}\""]
+    init: true
+    expose:
+      - "8103"
+    restart: unless-stopped
+    stop_grace_period: 60s
+    logging: *default-logging
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - internal
+      - egress
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  # ── worker：Arq 蒸馏队列消费者（无端口）──────────────────────────────
+  # 队列名 stashbox:distill 写死在 ai-service/arq_settings.py。
+  # 没有 HTTP 端口 → 没有 healthcheck；进程挂掉由 restart 策略拉起。
+  worker:
+    build:
+      <<: *default-build
+      target: worker
+    image: stashbox-backend:worker
+    env_file:
+      - path: .env.production
+        required: false
+    environment:
+      <<: *app-env
+    working_dir: /app/stashbox/backend/ai-service
+    command: ["python", "-m", "arq", "worker.WorkerSettings"]
+    init: true
+    restart: unless-stopped
+    # arq 单任务超时 1800s，留够让任务自己收尾的时间，别 SIGKILL 掉半成品音频。
+    stop_grace_period: 120s
+    logging: *default-logging
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - internal
+      - egress
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+networks:
+  # 东西向：服务之间通信，且**没有**对外路由。
+  internal:
+    name: stashbox_internal
+    internal: true
+    driver: bridge
+  # 出网：LLM / TTS / OSS / 厂商推送。
+  egress:
+    name: stashbox_egress
+    driver: bridge

@@ -1,0 +1,156 @@
+# Stashbox 后端 —— 本地一键跑通用的**叠加文件**（override）
+# ==========================================================
+#
+# 生产编排（docker-compose.production.yml）默认用外部托管的 RDS / ApsaraDB Redis。
+# 这个文件把本地用的 PostgreSQL / Redis 容器**叠加**上去，并把 6 个服务
+# 的数据库 / Redis 指向它们 —— 零外部依赖，本地就能 `up`。
+#
+# 用法：
+#     cd backend/deploy
+#     docker compose --env-file .env.production \
+#         -f docker-compose.production.yml \
+#         -f docker-compose.production.local.yml up -d
+#
+# ⚠️ 这个文件**不是**生产配置。生产环境里：
+#     · 不要起这两个容器（RDS / Redis 由阿里云托管）
+#     · POSTGRES_* / REDIS_* 要指向托管实例的真实地址
+#     · 迁移前先跑 deploy/preflight.sh
+
+name: stashbox-local
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: stashbox-postgres-local
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-stashbox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stashbox_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-stashbox}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-stashbox} -d ${POSTGRES_DB:-stashbox}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks:
+      - internal
+
+  redis:
+    image: redis:7-alpine
+    container_name: stashbox-redis-local
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks:
+      - internal
+
+  # 迁移要先等 PG 真的能连上（pg_isready 过了再跑 alembic）
+  migrate:
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-stashbox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stashbox_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-stashbox}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: ${REDIS_DB:-0}
+      REDIS_PASSWORD: ""
+      REDIS_URL: redis://redis:6379/${REDIS_DB:-0}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  api-gateway:
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-stashbox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stashbox_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-stashbox}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: ${REDIS_DB:-0}
+      REDIS_PASSWORD: ""
+      REDIS_URL: redis://redis:6379/${REDIS_DB:-0}
+
+  user-service:
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-stashbox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stashbox_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-stashbox}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: ${REDIS_DB:-0}
+      REDIS_PASSWORD: ""
+      REDIS_URL: redis://redis:6379/${REDIS_DB:-0}
+
+  content-service:
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-stashbox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stashbox_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-stashbox}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: ${REDIS_DB:-0}
+      REDIS_PASSWORD: ""
+      REDIS_URL: redis://redis:6379/${REDIS_DB:-0}
+
+  ai-service:
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-stashbox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stashbox_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-stashbox}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: ${REDIS_DB:-0}
+      REDIS_PASSWORD: ""
+      REDIS_URL: redis://redis:6379/${REDIS_DB:-0}
+
+  worker:
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-stashbox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stashbox_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-stashbox}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: ${REDIS_DB:-0}
+      REDIS_PASSWORD: ""
+      REDIS_URL: redis://redis:6379/${REDIS_DB:-0}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  redis-data:

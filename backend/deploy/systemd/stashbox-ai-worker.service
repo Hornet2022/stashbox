@@ -1,0 +1,85 @@
+[Unit]
+Description=Stashbox ai-worker（Arq 蒸馏队列消费者）
+Documentation=file:///opt/stashbox/stashbox/backend/deploy/README.md
+After=network-online.target stashbox-migrate.service
+Wants=network-online.target
+Requires=stashbox-migrate.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=stashbox
+Group=stashbox
+# ai-service 目录名带连字符（不是合法包名），worker / arq_settings / tasks
+# 都是顶层模块 —— 必须 `python -m arq`（-m 会把 CWD 放进 sys.path），
+# 否则 import 不到 worker。与 run_dev.sh、Dockerfile 的 worker target 一致。
+WorkingDirectory=/opt/stashbox/stashbox/backend/ai-service
+# EnvironmentFile 把 env 文件里的全部变量送进进程环境，包括
+# FORWARDED_ALLOW_IPS（uvicorn 的 ASGI 层）与 TRUSTED_PROXY_IPS（应用层
+# backend/common/ip.py）—— 这两个是同一个信任决定的两个实现，必须完全一致
+# （preflight.sh 会查）。unit 不传 --forwarded-allow-ips，否则命令行会覆盖
+# 环境变量里的 FORWARDED_ALLOW_IPS。
+EnvironmentFile=/etc/stashbox/stashbox.env
+Environment=PYTHONPATH=/opt/stashbox
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONFAULTHANDLER=1
+Environment=MALLOC_ARENA_MAX=2
+Environment=TMPDIR=/var/lib/stashbox/tmp
+ExecStart=/opt/stashbox/venv/bin/python -m arq worker.WorkerSettings
+Restart=always
+RestartSec=5
+TimeoutStartSec=90
+# 蒸馏任务最长 30 分钟（ARQ_JOB_TIMEOUT=1800），停机时别急着砍：
+# SIGTERM 后 arq 会把当前任务做完（或交给下次重试）。给 90s。
+TimeoutStopSec=90
+OOMPolicy=stop
+
+# ── 内存 / CPU 上限 ────────────────────────────────────────────────────
+# 这是 5 个单元里**唯一**会去 fork ffmpeg 的：
+#   ai-service/distill/audio_variant_service.py::transcode_bytes 会真的
+#   fork ffmpeg 做多码率 m4a 转码，子进程被算进**同一个 cgroup**。
+#   实测：4MB WAV → 64kbps AAC 的 ffmpeg 峰值 RSS 只有 18 MB（可忽略），
+#   但 0.35s 的墙钟时间说明 CPU 才是它真正吃的东西。
+#   MemoryHigh=168M —— 音频在解码态的瞬时峰值。
+#   MemoryMax=224M —— 约 2.5× 实测峰值；留出的余量覆盖
+#                      「agent 跑图 + 音频拼接 + ffmpeg 子进程」同时发生。
+#
+# ⚠️ 物理内存实测只有 1613MB（标称 2 GiB），原 224M/288M 是按 2048MB 算的，
+#    五个单元 + PG + Redis + nginx 的硬上限之和必须 ≤ 物理内存，
+#    否则同时顶满会触发 cgroup OOM killer（可能杀掉 PG → 整机掉线）。
+MemoryHigh=168M
+MemoryMax=224M
+# 60%（全场最高）：worker 是唯一做重活（ffmpeg 转码 + agent 推理循环）的单元。
+# 五个单元的 CPUQuota 之和 = 25+40+35+40+60 = 200% = 2 vCPU，
+# 任何时刻没有单元能被饿到 0。
+CPUQuota=60%
+TasksMax=256
+
+# ── 加固 ────────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+# ReadWritePaths（由 tune-host.sh 创建；带 `-` 的目录不存在时忽略）：
+#   /var/lib/stashbox/tmp —— TMPDIR。**这个必须有**：ffmpeg 的中间文件
+#       （tempfile.NamedTemporaryFile / mkstemp）走 TMPDIR。落磁盘而不是
+#       落内存：一次转码的中间产物不该跟 PG / Redis 抢那 2 GiB。
+#   /var/log/stashbox      —— 文件日志。
+#   /opt/stashbox/stashbox/backend/ai-service/data —— INDEXTTS_AUDIO_DIR 默认位置。
+ReadWritePaths=/var/lib/stashbox/tmp
+ReadWritePaths=/var/log/stashbox
+ReadWritePaths=-/opt/stashbox/stashbox/backend/ai-service/data
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stashbox-ai-worker

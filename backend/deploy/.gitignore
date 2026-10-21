@@ -1,0 +1,14 @@
+# 真实的生产环境变量（**含密钥**）不能进版本库。
+#
+# 从 .env.production.example 复制一份，填上真值：
+#     cp .env.production.example .env.production
+#
+# 注意：.env.production.example 里全是占位符，可以提交；
+# .env.production 是真配置，**永远不要提交**。
+.env.production
+.env.production.local
+# 2 GiB 轻量服务器专用模板的**真实**副本（含密钥），同样不能进版本库。
+# 模板本身（.env.production.2g.example）可以提交。
+.env.production.2g
+.env
+*.local

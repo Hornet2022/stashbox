@@ -1,0 +1,634 @@
+# Stashbox 后端 —— 部署产物
+
+容器化 + 生产的编排、环境变量模板、预检脚本。
+
+```
+backend/
+├── Dockerfile                          一个文件，6 个 target（见下）
+├── .dockerignore                       build context 排除表（含 .env）
+└── deploy/
+    ├── docker-compose.production.yml   生产编排（外部 RDS / Redis）
+    ├── docker-compose.production.local.yml  本地叠加文件（自带 PG / Redis）
+    ├── .env.production.example         环境变量模板（无任何真实凭证）
+    ├── .env.production.2g.example      环境变量模板（**2 GiB 轻量服务器**专用，第 9 节）
+    ├── preflight.sh                    部署前预检（FAIL 就别发）
+    ├── deploy.sh                       预检 → 构建 → 迁移 → 启动
+    ├── tune-host.sh                    2 GiB 机器的主机调优（用户/PG/Redis/swap/journald/sysctl）
+    ├── systemd/                        2 GiB 机器的 systemd 部署路径（6 个单元 + nginx.conf）
+    └── README.md                       本文件
+```
+
+开发路径**不受影响**：`backend/run_dev.sh` 和 `backend/scripts/*` 一行没动，
+它们仍然是本机 macOS launchd 的开发入口。
+
+---
+
+## 1. 镜像设计
+
+### 1.1 基础镜像
+
+`python:3.13-slim-bookworm`
+
+- **3.13**：`backend/.venv` 里实际验证过的解释器是 3.13.12，`pyproject.toml`
+  声明 `python = "^3.11"`（3.13 在范围内），CI 用 3.11。
+- **slim**：基础层约 150MB，不是 full 的 1GB+。
+- **bookworm**：Debian 12，ffmpeg / playwright 的系统依赖都有现成包。
+
+> ⚠️ 这是**小版本滚动 tag**，上游每次 patch 重建都会变内容。正式发版请改成
+> 精确 patch 甚至 digest：`python:3.13.12-slim-bookworm@sha256:<digest>`。
+> 本机无法访问 `registry-1.docker.io` / `auth.docker.io`，取不到真实 digest，
+> 所以这里**没有**写一个编造的 digest —— 编造的 digest 比滚动 tag 更危险。
+
+### 1.2 一个 Dockerfile，6 个 target
+
+| target | 内容 | 谁用 |
+|---|---|---|
+| `builder` | 按 `poetry.lock` 装依赖到 `/opt/venv` | 只有构建期 |
+| `runtime` | ffmpeg + 非 root 用户 + 源码 | 基础 |
+| `content` | `runtime` + playwright chromium | content-service |
+| `api-gateway` / `user-service` / `ai-service` | `runtime` + 各自的端口与 CMD | 三个服务 |
+| `content-service` | `content` + 8102 | content-service |
+| `worker` | `runtime` + `python -m arq worker.WorkerSettings` | Arq worker |
+| `migrate` | `runtime` + `alembic upgrade head` | 一次性迁移 |
+
+**为什么一个镜像而不是四个**：4 个服务的依赖集合几乎完全相同
+（fastapi / uvicorn / sqlalchemy / asyncpg / redis / jose / passlib / loguru /
+structlog / prometheus-client），真正的差异只有两处 —— content-service 额外要
+playwright chromium（~150MB），ai-service 额外要 langgraph / langfuse / arq / mcp。
+拆成 4 个镜像的代价是 4× 构建时间、4× 仓库存储、4 份依赖漂移风险，省下的体积
+只有 5% 左右（大头 sqlalchemy / langgraph 大家都装）。所以选"共享 runtime + 1 个
+content 变体"。将来某个服务依赖明显分叉时再单独拆。
+
+**依赖怎么钉**：镜像里跑 `poetry install --only main --no-root`，跟 CI
+（`.github/workflows/test.yml`）同一套解析结果，版本来自 `poetry.lock`。
+因此**没有** `requirements-docker.txt`（项目用 poetry，不用 pip）。
+poetry 版本钉在 `2.5.1`（≥ 2.3.4，修掉了 2.1.x 的 wheel/sdist 路径穿越
+CVE-2026-34591 / CVE-2026-41140，别降级）。
+
+### 1.3 几个容易踩的细节
+
+- **PYTHONPATH=/app**：代码里全是 `stashbox.backend.common.config` 这种绝对导入，
+  `stashbox` 是**仓库根目录**这个包，所以仓库根的**父目录**必须在 sys.path 上
+  （`run_dev.sh` 就是 `export PYTHONPATH="$REPO_PARENT:..."`）。
+  build context 是 `backend/`，根目录的 `__init__.py` 在 context 之外，
+  所以镜像里把布局还原成 `/app/stashbox/backend/...` + 重建 `/app/stashbox/__init__.py`。
+- **各服务的工作目录 = 自己的目录**：`python -m uvicorn main:app` 要从 CWD 找
+  `main.py`，`from config import ...` / `from arq_settings import ...` /
+  `from observability.metrics import ...` 这些顶层模块导入也依赖 CWD 在 sys.path 上。
+  alembic 必须 CWD=`backend/`（`alembic.ini` 里 `script_location = alembic` 是相对 CWD 的）。
+- **ffmpeg 是硬依赖**：`_find_bin` 探测 `PATH` 和 `/usr/bin` 等位置，
+  `transcode_bytes` 真的 fork 它做多码率 m4a 转码。镜像里装 Debian 的 ffmpeg，
+  并把 `FFMPEG_BIN` 指到 `/usr/bin/ffmpeg`（代码默认值是 macOS 的 `/opt/homebrew/bin/ffmpeg`）。
+- **非 root**：uid/gid 固定 10001，`/var/audio` 和 ai-service 的 `data/audio` 可写。
+
+---
+
+## 2. 数据库 / Redis / 对象存储怎么配
+
+### 2.1 ⚠️ 本项目不读 `DATABASE_URL`
+
+这是最容易配错的一点。`common/config.py` 的 `Settings.database_url` 是**现场拼**出来的：
+
+```
+postgresql+asyncpg://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}
+```
+
+配 `DATABASE_URL` 会被**静默忽略** —— 应用转去连 `localhost` 然后失败。
+要接托管 RDS，配的是 `POSTGRES_*` 这一组。
+
+Redis 同理：应用侧读 `REDIS_HOST` / `_PORT` / `_DB` / `_PASSWORD`；
+**只有 Arq worker**（`ai-service/arq_settings.py`）另外直接读 `REDIS_URL`。
+两个必须指向同一个实例，否则 worker 起着、不报错、但任务永远没人消费。
+`preflight.sh` 会逐项比对它们是否一致。
+
+### 2.2 生产用托管实例
+
+| 东西 | 生产 | 本地叠加文件 |
+|---|---|---|
+| PostgreSQL | 阿里云 RDS（填 `POSTGRES_*`） | `postgres:15-alpine` 容器 |
+| Redis | 阿里云 ApsaraDB Redis（填 `REDIS_*` + `REDIS_URL`） | `redis:7-alpine` 容器 |
+| 对象存储 | 阿里云 OSS，走 S3 兼容端点（`OSS_*`） | 同样用 OSS，或 `STORAGE_PROVIDER=local` |
+
+OSS 变量：`OSS_ENDPOINT`（如 `oss-cn-hangzhou.aliyuncs.com`）、`OSS_BUCKET`、
+`OSS_ACCESS_KEY_ID`、`OSS_ACCESS_KEY_SECRET`、`OSS_PUBLIC_BASE_URL`（CDN 域名，可选）、
+`OSS_REGION`（**必须与 bucket 地域一致**，代码默认 `us-east-1` 对阿里云是错的）。
+
+---
+
+## 3. 本地跑通
+
+需要 Docker（含 compose v2 ≥ 2.24 —— `env_file` 的 `required: false` 从这版才有）。
+
+```bash
+cd backend/deploy
+cp .env.production.example .env.production
+# 至少要填：JWT_SECRET / ADMIN_BOOTSTRAP_PASSWORD / STASHBOX_CORS_ALLOW_ORIGINS
+#           / TRUSTED_PROXY_IPS / PUBLIC_GATEWAY_URL
+./preflight.sh          # 先看缺什么
+./deploy.sh --local     # 预检 → 构建 → 迁移 → 启动
+```
+
+`--local` = 生产编排 + 本地叠加文件（自带 PG / Redis 容器与数据卷）：
+
+```bash
+docker compose --env-file .env.production \
+  -f docker-compose.production.yml \
+  -f docker-compose.production.local.yml up -d
+```
+
+起来之后：
+
+```bash
+curl http://localhost:8100/healthz     # 网关存活
+curl http://localhost:8100/readyz      # 网关就绪（探 PG + Redis）
+docker compose ... ps                  # 看健康状态
+```
+
+> 本机（macOS）还有一条老路：`backend/run_dev.sh`（裸 uvicorn + launchd）。
+> 那是开发路径，**没有**容器隔离，也没有本目录里的这些门禁。
+
+---
+
+## 4. 生产部署（自带 Docker 的机器）
+
+```bash
+cd backend/deploy
+cp .env.production.example .env.production   # 填真值
+./preflight.sh                                # 必须 0 FAIL
+./deploy.sh                                   # 预检 → 构建 → 迁移 → 启动
+```
+
+`deploy.sh` 做的事：预检 → `docker compose build`（一次 build，多 target，
+BuildKit 复用公共层缓存）→ 跑一次 `migrate` → `up -d` → 打印状态。
+
+单独执行某一步：
+
+```bash
+./deploy.sh --build-only      # 只构建
+./deploy.sh --migrate-only    # 只跑迁移
+./deploy.sh down              # 停栈（不删数据卷）
+./deploy.sh --skip-preflight  # 跳过预检（不建议）
+```
+
+### 启动顺序
+
+```
+migrate（alembic upgrade head，跑完退出）
+  └─→ user-service / content-service / ai-service / worker
+       └─→ api-gateway（等 3 个下游都 healthy 才起）
+```
+
+迁移用 `condition: service_completed_successfully` 卡死：迁移失败 = 整个栈起不来，
+不会出现"服务先起、表还没建"的中间态。
+
+### 网络
+
+- `internal`（`internal: true`）：服务之间东西向流量，**没有对外路由**，
+  外部无法直连 8101/8102/8103。
+- `egress`（普通 bridge）：出网流量（LLM / TTS / OSS / 厂商推送）。
+  4 个服务都要出网，所以每个容器同时挂两张网。
+- **只有 api-gateway 发布端口**（`8100:8100`）。
+
+---
+
+## 5. 部署到阿里云 ACK
+
+compose 文件不能直接跑在 ACK 上（ACK 是 K8s，不是 compose）。做法：
+
+1. **构建镜像并推到 ACR**（阿里云容器镜像服务）：
+
+   ```bash
+   cd backend
+   docker build -f Dockerfile --target api-gateway -t <registry>/stashbox-backend:2026-10-21 .
+   docker build -f Dockerfile --target content-service -t <registry>/stashbox-backend-content:2026-10-21 .
+   docker build -f Dockerfile --target worker       -t <registry>/stashbox-backend-worker:2026-10-21 .
+   docker build -f Dockerfile --target migrate      -t <registry>/stashbox-backend-migrate:2026-10-21 .
+   docker push <registry>/stashbox-backend:2026-10-21
+   ```
+
+   （4 个服务共用 `runtime` 层，只有 content 多一层浏览器。）
+
+2. **迁移做成一个 Job**（或 Deployment，跑完即退出），在所有服务之前：
+
+   ```yaml
+   # Job 的容器：command: ["alembic", "upgrade", "head"]
+   # workingDir: /app/stashbox/backend
+   ```
+
+   ACK 里用 `helm` / `kubectl apply` 之前，先跑一次：
+   `kubectl create job --from=cronjob/stashbox-migrate stashbox-migrate-<日期>`
+
+3. **4 个服务各一个 Deployment** + 1 个 worker Deployment：
+   - `env` 来自 Secret（`JWT_SECRET`、`POSTGRES_PASSWORD`、`REDIS_PASSWORD`、
+     `OSS_ACCESS_KEY_SECRET`、各 API key）+ ConfigMap（其余）。
+   - `readinessProbe` → `/readyz`；`livenessProbe` → `/healthz`。
+   - `securityContext.runAsUser: 10001`（与镜像里的用户一致）。
+   - `envFrom` 用 `.env.production` 的内容（K8s 没有 env_file 语法，需要转成 Secret/ConfigMap）。
+
+4. **网关做 Service + Ingress**：`Service` type=ClusterIP，Ingress 指向它，
+   只暴露网关的 8100。
+
+5. **`TRUSTED_PROXY_IPS` 填 SLB / Ingress 的网段**（例 `10.0.0.0/8`）。
+   这决定网关采信谁的 `X-Forwarded-For` —— 下游的登录限流按真实客户端 IP 计数。
+   填 `*` 等于让公网客户端伪造来源 IP 绕过限流。
+
+6. **上线前跑一次预检**：把 ACK 里生效的那份环境变量导出成一份 env 文件
+   （K8s Secret → 文件），然后：
+
+   ```bash
+   ./preflight.sh /path/to/rendered-prod.env
+   ```
+
+   这一步能提前抓到"Secret 忘了注入"、"CORS 没配"、"OSS key 是上个月的"这类问题。
+
+---
+
+## 6. 预检脚本
+
+```bash
+./preflight.sh                       # 读同目录的 .env.production
+./preflight.sh /path/to/.env.prod    # 指定文件
+SKIP_NETWORK=1 ./preflight.sh        # 跳过 DB/Redis 连通性（离线校验）
+```
+
+输出是一张 PASS / WARN / FAIL / SKIP 表，**任何一项 FAIL 就 exit 1**。
+`deploy.sh` 会自动先跑它，FAIL 就中止部署。
+
+它检查的东西（括号里是它拦的是什么事故）：
+
+| 检查 | 拦的是什么 |
+|---|---|
+| `ENVIRONMENT=prod`、`DEBUG=false` | 跑在 dev 模式上；SQL 全量进日志 |
+| `JWT_SECRET` 存在 / 非 dev 默认值 / ≥16 字符 | 任何人可伪造 token |
+| `ADMIN_BOOTSTRAP_PASSWORD` 存在且非 dev 默认值 | 迁移 0015 会用**公开的**密码 `admin@stashbox123` 给 admin 账号 |
+| `STASHBOX_ALLOW_DEV_JWT` / `STASHBOX_ALLOW_DEV_TOKEN` **没配** | 两个生产后门开关（连写 `0` 都会生效） |
+| `STASHBOX_CORS_ALLOW_ORIGINS` 存在且不是 `*` | 网关 prod 下拒绝启动 / 后台 cookie 暴露给任意站点 |
+| `TRUSTED_PROXY_IPS` 存在且不是 `*` | 限流可被伪造来源 IP 绕过 |
+| `PUBLIC_GATEWAY_URL` 存在 | 客户端拿到内网 / localhost 地址 |
+| `POSTGRES_HOST/USER/PASSWORD/DB` 存在且非占位符 | 连错库 |
+| PostgreSQL 可连通（有 `psql` 时连认证+查询一起验） | 白名单 / 密码错 |
+| `REDIS_HOST` / `REDIS_PASSWORD` 存在 | Redis 无认证 = VPC 内任意 Pod 可读写 |
+| `REDIS_URL` 与 `REDIS_*` 逐项一致 | worker 和 web 连到不同实例 → 任务没人消费 |
+| Redis 可连通（有 `redis-cli` 时验 PING） | 队列不通 |
+| `STORAGE_PROVIDER=oss` + `OSS_*` 四项齐备 | 音频传不上去 / 多码率转码静默失败 |
+| `STORAGE_PROVIDER=local` 时必须显式确认 | 本地盘当生产存储 |
+| `OSS_REGION` 已设 | 签名 region 与 bucket 地域不符 → 上传失败 |
+| 推送通道已配置（或显式 `STASHBOX_ALLOW_NO_PUSH=1`） | 通知全部标 failed |
+| 应用版本号已设（且 `STASHBOX_APP_DOWNLOAD_URL` 同时有值） | 客户端提示更新却没地方下载 |
+| `LLM_PROVIDER` / `TTS_PROVIDER` 不是 `mock`；`local` 直接 FAIL | 不产内容 / macOS `say` 在 Linux 不可用 |
+| 网关 → 下游 URL 不是旧端口 8001/8002/8003 | 全量 502 |
+| ffmpeg 存在（本机或镜像内） | 音频拼接与转码断掉 |
+| 数据库 `alembic_version` == 仓库 head（`0038`） | 表结构落后于代码 |
+| compose 文件能解析 | 编排本身写错 |
+
+脚本只读，不改任何东西（不改 `.env`、不改数据库、不重启服务）。
+解析 env 文件用 `awk` 而不是 `source` —— env 文件是配置，不是 shell 脚本。
+
+---
+
+## 7. 已知限制 / 需要决策的事
+
+- **镜像 digest 没钉死**：`python:3.13-slim-bookworm` 是滚动 tag。本机连不上
+  Docker Hub，取不到 digest。发版前建议手工换成精确 patch tag。
+- **playwright chromium 只在 `content` target 里**。`content-service` 有无头浏览器
+  通道（剪藏 Tier 2 兜底），其余 3 个服务没有 —— 需要的话自己加 target。
+- **`infra/mlx-audio-tts-service` 是 macOS 专属**，没有进镜像。
+  生产 TTS 用外部 provider（`TTS_PROVIDER=openai` 走火山方舟 ARK / `doubao`），
+  或把 IndexTTS 单独部署一套并改 `INDEXTTS_BASE_URL`。
+  `TTS_PROVIDER=indextts` 在容器里只有在你另外部署了 TTS 端点时才成立。
+- **`ADMIN_BOOTSTRAP_PASSWORD` 只在首次迁移生效**（0015 只在 email/password_hash
+  为 NULL 时写入）。之后改密码要走管理后台，改环境变量不会重新触发。
+- **`INDEXTTS_REF_AUDIO` 没有默认值**：镜像里不带参考音频（`data/` 已被
+  `.dockerignore` 排除，因为那是测试夹具）。用 indextts 的话要自己挂载。
+- **`TZ=Asia/Shanghai` 必须与 RDS 时区一致**，否则应用本地时间与数据库 `NOW()` 对不上。
+- **`.env.production` 已被仓库根 `.gitignore` 排除**，但填完还是自己确认一次
+  `git status` 里没有它。
+- **本机没有 Docker**（`docker: command not found`），所以这些产物**没有**做过
+  真实镜像构建。已做的静态验证见交付报告；构建与端到端启动需要在有 Docker 的机器上跑一遍。
+
+---
+
+## 8. 与既有资产的关系
+
+- `backend/run_dev.sh`、`backend/scripts/*`：**没动**（macOS launchd 开发路径）。
+- `backend/alembic/**`、`backend/**/main.py`：**没动**。
+- `infra/docker/docker-compose.dev.yml`：开发用的 PG/Redis，没动；
+  本目录的 `docker-compose.production.local.yml` 是生产编排的叠加文件，与它互不干扰。
+- `infra/docker/docker-compose.observability.yml`（Prometheus / Grafana / Alertmanager）：
+  没动。生产环境里给网关加 `ServiceMonitor` 抓 `/metrics` 即可（`common/observability.py`
+  已经把 `/metrics` 挂在所有服务上）。
+
+---
+
+## 9. 2 GiB 机器（轻量应用服务器）怎么部
+
+这条路径给的是**固定规格**的阿里云轻量应用服务器：
+
+```
+2 vCPU / 2 GiB RAM / 40 GiB 系统盘 / 200 Mbps 峰值 / 1 IPv4 / Ubuntu 24.04 / 地域 武汉
+```
+
+它和上面第 4 节的 compose 路径是**两条独立的部署路径**：
+compose 路径适合有 Docker 的大机器；这条路径**不用 Docker**，
+5 个 Python 进程直接跑在 systemd 下。
+
+### 9.1 这条路径长什么样
+
+```
+                    公网（只放行 22/80/443）
+                              │
+                    nginx :443  ← TLS 终止（安卓 release 版拒绝明文 HTTP）
+                              │
+        ┌─────────────────────┴──────────────────────┐
+        │  127.0.0.1:8100   api-gateway              │  ← 只有 nginx 能碰
+        │  127.0.0.1:8101   user-service             │
+        │  127.0.0.1:8102   content-service          │
+        │  127.0.0.1:8103   ai-service               │
+        │  （无端口）        ai-worker (arq)          │
+        └────────────────────────────────────────────┘
+        本机：PostgreSQL:5432 / Redis:6379 / journald
+        外部：阿里云 OSS（音频）、LLM API、edge-tts
+```
+
+**8100-8103 必须只监听 127.0.0.1，公网防火墙不得放行。**
+8100 是内网 API 端口：暴露它等于让任何人绕过 TLS 终止直接打 API，
+还能自己伪造 `X-Forwarded-For` 绕过登录限流
+（见 `backend/common/ip.py` 的模块文档）。5432 / 6379 同理。
+
+### 9.2 步骤
+
+```bash
+# ① 机器：Ubuntu 24.04 轻量应用服务器（2 vCPU / 2 GiB / 40 GiB）
+#    控制台防火墙只放行 22 / 80 / 443 —— 8100-8103、5432、6379 一个都别放。
+
+# ② 装依赖 + 调优机器（创建服务用户、PG/Redis 调优、swap、journald 限容、sysctl）
+cd backend/deploy
+sudo bash tune-host.sh --install-deps
+#    想先看它要干什么：sudo bash tune-host.sh --dry-run
+#    ⚠️ tune-host.sh 从 env 文件里读 REDIS_PASSWORD 写进 redis.conf 的
+#       requirepass —— 所以**先填 env 文件再跑它**（或跑两遍）。
+
+# ③ 放代码 + 建 venv
+sudo mkdir -p /opt/stashbox && sudo chown stashbox:stashbox /opt/stashbox
+sudo -u stashbox git clone <repo> /opt/stashbox/stashbox
+sudo -u stashbox python3 -m venv /opt/stashbox/venv
+#
+# ⚠️ **先配阿里云内网源**，否则 pip 会超时：
+#    默认 pypi.org 在这台机器上实测 10s 读超时（装 edge-tts 时直接
+#    ReadTimeoutError 崩掉）；mirrors.cloud.aliyuncs.com 实测 0.086s。
+#    tune-host.sh 已经配好了（跑一次即可），这里只列手工等价命令：
+#     echo '[global]
+#     index-url = https://mirrors.cloud.aliyuncs.com/pypi/simple/
+#     trusted-host = mirrors.cloud.aliyuncs.com
+#     timeout = 60' > /etc/pip.conf
+#
+sudo -u stashbox /opt/stashbox/venv/bin/pip install -U pip
+cd /opt/stashbox/stashbox/backend
+#
+# ⚠️ **用 pip + 冻结清单装**（服务器上实测唯一可靠的路径）：
+#     sudo -u stashbox /opt/stashbox/venv/bin/pip install --no-cache-dir --no-deps \
+#          -r /opt/stashbox/requirements-deploy.txt
+#
+#    ⚠️ **--no-deps 是必须的**，别去掉：
+#       清单里已经包含了**全部传递依赖**（pip freeze 的产物），
+#       不需要 pip 重新求解。而一旦让 pip 求解，它会因为清单里
+#       「看起来矛盾」的 opentelemetry 组合而报 ResolutionImpossible：
+#         mcp 2.3.0              → opentelemetry-api >=1.28.0
+#         opentelemetry-sdk 1.44.0 → opentelemetry-api ==1.44.0
+#         清单里的 opentelemetry-api 是 1.45.1
+#       这不是清单错了 —— 开发机的 .venv 里就是这个组合
+#       （pip freeze 如实记录了实际安装状态），只是 pip 的求解器
+#       比 pip freeze 更挑剔。--no-deps 直接按清单落盘，正是我们要的。
+#
+#    清单从开发机导出，与本机 .venv / poetry.lock 完全一致：
+#     cd backend && .venv/bin/pip list --format=freeze \
+#       | grep -viE "^-e|^#" | grep -v "^pkg-resources|^setuptools" \
+#       | sort > requirements-deploy.txt
+#
+#    ❌ **不要**用 `pip install -r requirements.txt`：
+#       顶层 requirements.txt 只装了 OpenAPI schema 校验器（dev-tools），
+#       **不含**运行时依赖 —— 尤其缺 edge-tts（TTS）和 boto3（OSS 存储），
+#       这两个是 app/services/tts/edge.py 和 app/services/storage/oss.py 直接 import 的。
+#       按它装完，服务起来会在第一次 TTS / 第一次上传 OSS 时才炸。
+#       （各服务目录下的 <service>/requirements.txt 同样不含这两个，别用。）
+#
+#    ❌ **不要**在这台机器上用 `poetry install`：
+#       poetry 的 source 优先级由 pyproject.toml 里的 [[tool.poetry.source]]
+#       决定，光写 ~/.config/pypoetry/config.toml 不生效 —— 实测它照样去
+#       files.pythonhosted.org 拉包，然后超时。pip + /etc/pip.conf 没这个问题。
+#
+#    装完自检（三个必须都能 import，否则别往下走）：
+#    sudo -u stashbox /opt/stashbox/venv/bin/python -c \
+#      "import edge_tts, boto3, arq, fastapi, sqlalchemy, redis; print('deps OK')"
+
+# ④ 环境变量（**2 GiB 专用模板**，不是 .env.production.example）
+#
+# ⚠️ **从模板复制，不要手写**。手写过一次，漏了 39 项配置，
+#    其中 `STASHBOX_FETCH_BROWSER_TIER=0` 漏掉的后果是：
+#    每次剪藏都在「浏览器通道不可用」上白等 30 秒抓取预算，
+#    45 秒超时且文章不入库 —— 而模板里明明写着这一行。
+#    其它漏掉的还有 ARQ_MAX_JOBS=2（2G 机器的并发上限）、
+#    ENABLE_MCP_TOOLS=0 等 —— 漏一个都可能表现成「服务看起来正常但很慢」。
+sudo install -m 0640 -o root -g stashbox \
+     backend/deploy/.env.production.2g.example /etc/stashbox/stashbox.env
+sudo vi /etc/stashbox/stashbox.env    # 填 JWT_SECRET / 密码 / OSS key
+sudo bash backend/deploy/tune-host.sh   # 再跑一次：把 REDIS_PASSWORD 写进 redis.conf
+#
+# ⚠️ **改完 env 必须重启受影响的进程** —— systemd 的 EnvironmentFile
+#    是**启动时**读一次的，改文件不会热更新：
+#      sudo systemctl restart stashbox-user-service.service   # 改 app/version 等
+#    （LLM / TTS 的 key 例外：它们走 DB，后台改完立即生效，不用重启。）
+
+# ⑤ 建库建号（本机 PostgreSQL）
+sudo -u postgres psql -c "CREATE ROLE stashbox LOGIN PASSWORD '<你填进 env 的密码>'"
+sudo -u postgres createdb -O stashbox stashbox
+
+# ⑥ systemd 单元
+sudo cp backend/deploy/systemd/stashbox-*.service /etc/systemd/system/
+sudo cp backend/deploy/systemd/run-service.sh \
+     /opt/stashbox/stashbox/backend/deploy/systemd/run-service.sh
+sudo chmod 0755 /opt/stashbox/stashbox/backend/deploy/systemd/run-service.sh
+sudo systemctl daemon-reload
+
+# ⑦ 迁移（**先迁移，后起服务** —— 迁移失败就别往下走）
+sudo systemctl start stashbox-migrate.service
+sudo systemctl status stashbox-migrate.service
+
+# ⑧ 起 5 个服务
+sudo systemctl enable --now stashbox-api-gateway.service \
+     stashbox-user-service.service stashbox-content-service.service \
+     stashbox-ai-service.service stashbox-ai-worker.service
+
+# ⑨ nginx + 证书（certbot 会改这个文件）
+sudo cp backend/deploy/systemd/nginx.conf /etc/nginx/sites-available/stashbox
+sudo ln -sf /etc/nginx/sites-available/stashbox /etc/nginx/sites-enabled/stashbox
+#    ⚠️ **两个域名一起签**（一次搞定，续签也只有一份）：
+sudo certbot --nginx -d api.stashbox.cn -d admin.stashbox.cn
+sudo nginx -t && sudo systemctl reload nginx
+
+# ⑨-b 管理后台（静态 SPA，内测必需：推推送 / 看用户 / 管配额）
+#    构建（**在开发机上做**，API 地址编译期写死进 bundle）：
+cd stashbox-admin-web
+VITE_API_BASE_URL=https://api.stashbox.cn pnpm build
+#    传到服务器：
+ssh root@8.148.9.151 'mkdir -p /var/www/stashbox-admin'
+rsync -a --delete dist/ root@8.148.9.151:/var/www/stashbox-admin/
+#    ⚠️ 不传 VITE_API_BASE_URL 的话，bundle 里会写死 http://localhost:8100
+#       （src/api/client.ts:27 的默认值）—— 浏览器里必然连不上。
+
+# ⑩ 预检（必须 0 FAIL）
+cd backend/deploy && ./preflight.sh /etc/stashbox/stashbox.env
+```
+
+细节（服务用户、`ReadWritePaths` 逐条说明、日志、卸载）见
+[`deploy/systemd/README`](systemd/README)。
+
+### 9.3 内存预算（实测数字 → 这台机器的分配账）
+
+实测来源：本机（开发机）跑 5 个服务的空闲 / 80 并发内存，以及 ffmpeg 转码峰值。
+
+> ⚠️ **这台机器的物理内存不是 2048MB，是 1613MB。**
+>
+> 轻量应用服务器标称 2 GiB，但 guest 实测 `free -m` → `Mem: total 1613`。
+> 云厂商把一部分内存划给了 hypervisor / 缓存，guest 看到的是 1613。
+> 原预算表按 2048M 算，硬上限合计 1920M > 1613M —— 五个单元同时顶满会
+> 触发 cgroup 内的 OOM killer，被杀的可能是 PostgreSQL，整机数据面掉线。
+> 下面的表已按 1613M 重新分配。
+
+| 组件 | 空闲实测 | 80 并发实测 | 本方案上限 | 依据 |
+|---|---|---|---|---|
+| api-gateway | 17–40 MB | 60–90 MB | High 96M / **Max 128M** | 只做转发 + JWT 校验；上限 ≈1.4× 实测峰值 |
+| user-service | 17–40 MB | 60–90 MB | High 96M / **Max 128M** | bcrypt + PG 连接池 |
+| content-service | 17–40 MB | 60–90 MB | High 128M / **Max 176M** | 整页 HTML 与解析结果同时在内存里 |
+| ai-service | 17–40 MB | 60–90 MB | High 144M / **Max 200M** | LLM 响应 JSON + 音频缓冲 |
+| ai-worker | 17–40 MB | 60–90 MB | High 168M / **Max 224M** | 唯一会 fork ffmpeg 的（子进程同 cgroup） |
+| **五个常驻进程合计** | **~90 MB** | **~400 MB** | **856M** | MemoryMax 之和 |
+| PostgreSQL | 200–300 MB | — | cgroup **320M** | shared_buffers 64MB + ≤30 连接 × ~6MB |
+| Redis | ~50 MB | — | cgroup **128M** | maxmemory 64mb + 开销 |
+| nginx | ~10 MB | — | cgroup **48M** | TLS + 反代 |
+| OS + systemd + journald | ~150 MB | — | journald `SystemMaxUse=200M` | 实测 |
+| ffmpeg 峰值（转码中） | 18 MB | 18 MB | 计入 ai-worker 的 cgroup | 实测 4MB WAV→64kbps AAC，墙钟 0.35s |
+| **合计（硬上限）** | **~550 MB** | **~860 MB** | **1352M / 1613M** | **余量 261M** + 2 GiB swap 兜底 |
+
+要点：
+
+- **所有硬上限加起来是 1352M ≤ 1613M × 0.85**。所以不会出现"5 个单元同时顶到
+  上限 → 内核 OOM 屠机"——最坏情况也是先撞 swap。
+- **生产机实测**（5 个服务全部起来后）：
+  | 服务 | 实际 RSS | MemoryMax |
+  |---|---|---|
+  | api-gateway | 75 MB | 128 MB |
+  | user-service | 79 MB | 128 MB |
+  | content-service | 83 MB | 176 MB |
+  | ai-service | 72 MB | 200 MB |
+  | ai-worker | 89 MB | 224 MB |
+  | **合计** | **398 MB** | **856 MB** |
+
+  整机 `free -m`：used 832 / available 781（含 PG + Redis + nginx + OS）。
+  内存吃紧的其实是 **PG + Redis + OS**（约 430MB），不是 Python 服务。
+- `MemoryHigh`（软限）触发的是回收压力，不是杀进程；正常流量不会碰到。
+- **真不够用时的正确顺序**：先降 PG 的 `max_connections`（30→20）和
+  `shared_buffers`（64→48MB），再降 Redis `maxmemory`（64→48mb），
+  **最后**才动 Python 单元的 MemoryMax —— PG 被 OOM kill 的代价
+  （数据面全断）远大于单个 Python 单元重启。
+- `CPUQuota` 之和 = 25+40+35+40+60 = **200%** = 这台机器的 2 vCPU。
+  任何单元都不会被饿到 0，也不会独占两个核。
+- swap 是**尖峰保险**，不是常规内存：swappiness 压到 10，
+  只有真没内存时才换页（`vm.swappiness` 由 tune-host.sh 设置）。
+
+### 9.4 故意**没有**放到这台机器上的东西
+
+| 没放的东西 | 为什么 | 用什么代替 |
+|---|---|---|
+| Docker / dockerd | 空载就吃 150–200 MB；overlay2 还会把每层再存一份，40 GB 系统盘紧张 | systemd 单元（`deploy/systemd/`） |
+| Prometheus + Grafana + Alertmanager + blackbox_exporter + redis_exporter | 合计约 400–500 MB = 2 GiB 的四分之一，而唯一的消费者是"一天看一次图"的人 | **阿里云云监控**（轻量服务器自带 agent，CPU/内存/磁盘指标免费）+ **SLS**（收 journal、查日志、配告警） |
+| 本机 IndexTTS | `infra/mlx-audio-tts-service` 是 **macOS/mlx 专属**，而且要加载模型（几个 GB RAM） | `TTS_PROVIDER=edge`（不加载模型，0 RAM）；`indextts` 仍然可用 —— 把 `INDEXTTS_BASE_URL` 指向**另一台**远程 IndexTTS 主机 |
+| playwright chromium（无头浏览器抓取通道） | chromium RSS 300 MB+，且是 content-service 的**子进程**（同 cgroup），会直接顶爆它的 MemoryMax | `STASHBOX_FETCH_BROWSER_TIER=0`（代价见下） |
+| Langfuse | 第二套埋点后端，2 GiB 机器不需要 | 云监控 / SLS |
+| 模型权重（torch / transformers / onnx） | 依赖集里本来就没有 | `edge` TTS + 外部 LLM API |
+
+`infra/docker/docker-compose.observability.yml` **保持原样**（本地开发用），
+只是**不要**在这台机器上起它。
+
+### 9.4-b 音频存哪：OSS 还是本地磁盘？（**内测期推荐本地磁盘**）
+
+先纠正一个此前的错误说法：**「武汉没有 OSS 地域」是错的**。
+云元数据实测 `region-id = cn-wuhan-lr`（华中1 武汉 · 本地地域），
+对应 OSS 端点 `oss-cn-wuhan-lr` / `oss-cn-wuhan-lr-internal`，都存在。
+
+（另：查公网 IP 归属地会得到「杭州」，那是错的 —— 阿里云公网 IP 段按
+**注册地**分配。唯一可靠的判据是云元数据：
+`curl http://100.100.100.200/latest/meta-data/region-id`。）
+
+**两个方案的实际成本**（内测规模：30 人 × 每天 2 篇 × 30 天 = 1800 篇，
+每篇 84 秒的 64k m4a ≈ 0.69 MB）：
+
+| | 方案 A：OSS | 方案 B：本地磁盘 + nginx |
+|---|---|---|
+| 存储费 | 1.2 GB × 0.12 元 = **0.15 元/月** | 0 元（用系统盘剩余 32 GB） |
+| 下行流量 | 1.8 GB × 0.5 元 = **0.91 元/月** ← 大头 | 0 元（轻量 200Mbps **不限月流量**） |
+| 请求费 | 5400 次 × 0.01元/万 = **0.01 元/月** | 0 |
+| **合计** | **≈ 1.06 元/月** | **0 元/月** |
+| 磁盘占用 | — | 1.2 GB / 32 GB（**4%**） |
+
+带宽上也远够：30 人同时听 = 2.0 Mbps，峰值预算是 200 Mbps。
+
+**内测期选方案 B 的理由**：一个月省 1 块钱不重要，但**多一个要开通、
+要配 AccessKey、还要盯流量账单的外部依赖就重要** —— 内测期最该少踩依赖。
+等有付费用户、或音频量超过 30 GB 时再迁 OSS（代码不用改，只改 env 的
+`STORAGE_PROVIDER`）。
+
+**方案 B 的代价（必须知道）**：
+
+1. **音频 URL 是公开直链，没有签名和过期时间**（OSS 默认返回 presigned URL，
+   有效期 24h）。缓解：音频 key 是 `audio/{art_<24位随机hex>}.m4a`，
+   24 位 hex ≈ 96 bit 熵，**无法枚举**，泄露一条也不会被猜到别的。
+2. **单机存储**：磁盘坏了音频就没了。内测期可接受（文章元数据在 PG 里，
+   音频可以重新蒸馏）。
+3. **需要清理策略**：磁盘会满。加一条 cron 按 mtime 清掉 N 天前的文件
+   （或用 logrotate 风格的老文件清理）。
+
+**方案 B 的配置**：
+
+```bash
+# env 文件（/etc/stashbox/stashbox.env）
+STORAGE_PROVIDER=local
+STASHBOX_ALLOW_LOCAL_STORAGE=1     # 不写这个，preflight 会 FAIL
+LOCAL_AUDIO_DIR=/var/lib/stashbox/data/audio
+LOCAL_STORAGE_PUBLIC_URL=https://api.stashbox.cn/audio
+```
+
+网关会自动挂 `/audio` 静态路由（`api-gateway/main.py:163`：
+`STORAGE_PROVIDER=local` 或 `ENABLE_LOCAL_AUDIO_MOUNT=1` 时挂载）。
+
+> ⚠️ 走 nginx 对外时，`nginx.conf` 里要**额外**加一段把 `/audio/` 转给网关
+> （网关的静态路由在 8100，不在 nginx 的 root 下）：
+> ```nginx
+> location /audio/ {
+>     proxy_pass http://stashbox_gateway;
+> }
+> ```
+> 不加的话客户端拿到 404（nginx 默认 root 下没有这个目录）。
+
+### 9.5 这条路径的已知代价（都是主动换来的）
+
+- **JS 渲染的页面抓不到**：浏览器通道关掉了，纯 HTTP 通道对这类页面
+  实测只能抽出 7 个字。要开的话得把 `content-service` 的 MemoryMax 提到 640M，
+  2 GiB 的机器上这笔账不成立。
+  **但失败是"快速且明确"的**（实测 <1s 返回
+  `没能提取出文章正文，页面可能需要登录后才能查看`）——
+  因为 `STASHBOX_FETCH_BROWSER_TIER=0` 会让 pipeline 不再升级到浏览器通道。
+  ⚠️ 反面：如果这个变量**漏配**（默认是开），playwright 二进制没装 →
+     每次剪藏都白等 30 秒抓取预算 → 45 秒超时 + 文章不入库，
+     错误信息还含糊（"抓取耗时较长"）。preflight 现在会检查这一项。
+  → 内测用户若反馈"某些文章剪藏不了"，就是这个原因，不是服务挂了。
+- **本机 PG / Redis 扛不住并发**：这是内测量级的规格。要放量先迁托管 RDS /
+  ApsaraDB（改 `POSTGRES_*` / `REDIS_*` 即可，其余不变）。
+- **OSS 地域要跟机器对齐**：机器在 `cn-wuhan-lr`（本地地域），OSS 端点可用
+  `oss-cn-wuhan-lr`（公网）/ `oss-cn-wuhan-lr-internal`（内网）。
+  **实测跨地域的 `-internal` 端点连不上**（武汉机器上 curl
+  `oss-cn-hangzhou-internal:443` 直接超时 —— 解析得到 100.118.x.x，
+  但流量出不去）。所以 bucket 地域必须选武汉；选不了就退回杭州 bucket +
+  杭州**公网**端点（产生出方向流量费，内测量级约 1 元/月）。
+  内测期用本地磁盘（9.4-b）则完全绕开这个问题。
+

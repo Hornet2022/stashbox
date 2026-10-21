@@ -1,0 +1,104 @@
+[Unit]
+Description=Stashbox api-gateway（对外统一入口，127.0.0.1:8100）
+Documentation=file:///opt/stashbox/stashbox/backend/deploy/README.md
+After=network-online.target stashbox-migrate.service
+Wants=network-online.target
+# Require=migrate：迁移不过，服务不起来（fail-closed）。
+# After=migrate：保证迁移先跑完再起服务（顺序，不是成败）。
+Requires=stashbox-migrate.service
+# 5 分钟内重启超过 5 次 → 判定为起不来，停止重试，避免重启风暴把 2 GiB 的机器打满。
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=stashbox
+Group=stashbox
+# CWD 必须是服务自己的目录：`python -m uvicorn main:app` 从 CWD 找 main.py，
+# `from config import ...` 这类顶层模块导入也依赖 CWD 在 sys.path 上。
+WorkingDirectory=/opt/stashbox/stashbox/backend/api-gateway
+# EnvironmentFile 会把 env 文件里的**全部**变量送进进程环境，包括：
+#   FORWARDED_ALLOW_IPS —— uvicorn 的 ProxyHeadersMiddleware 采信谁的
+#       X-Forwarded-For。它在 **ASGI 层**就把 scope["client"] 改写掉 ——
+#       应用代码看到请求之前就已经改了。
+#   TRUSTED_PROXY_IPS  —— 应用层 backend/common/ip.py 用的可信代理列表
+#       （peer 不在列表里就忽略 XFF，只认真 peer）。
+#   这两个是**同一个决定的两个实现**，必须**完全一致**：不一致 → 网关和下游
+#   对"这个 IP 是谁"的理解不同，登录限流和审计永远对不上；代理在另一台机器上
+#   时，所有人算一个 IP，一个人就能把其他人全锁在门外。
+#   preflight.sh 会检查这一对（不一致 = FAIL）。
+#   → unit **不传** --forwarded-allow-ips：命令行传的值会覆盖环境变量，
+#     那 env 文件里的 FORWARDED_ALLOW_IPS 就形同虚设了。
+EnvironmentFile=/etc/stashbox/stashbox.env
+# PYTHONPATH = 仓库根目录的**父目录**（stashbox 是包名，代码里写的是
+# `stashbox.backend.common.config` 这种绝对导入）。与 run_dev.sh 一致。
+Environment=PYTHONPATH=/opt/stashbox
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONFAULTHANDLER=1
+# glibc 的 per-thread arena 上限（经典 2 GiB 机器陷阱）：
+# 每个线程都可能 malloc 出一个独立的 64MB arena，几十个线程就能凭空吃掉
+# 几百 MB RSS。压到 2 个 arena 后，多线程的 RSS 基本贴着实际用量走。
+Environment=MALLOC_ARENA_MAX=2
+# 临时文件落磁盘，不落 RAM（ffmpeg 中间文件、浏览器 state 文件）。
+Environment=TMPDIR=/var/lib/stashbox/tmp
+# 只监听回环：公网入口只有 nginx（:443）。这样即使安全组配错，
+# 8100-8103 也不会直接暴露到公网。
+ExecStart=/opt/stashbox/stashbox/backend/deploy/systemd/run-service.sh api-gateway 8100
+Restart=always
+RestartSec=5
+TimeoutStartSec=90
+TimeoutStopSec=30
+# 内存上限触顶被 OOM kill 时，先停后按 Restart=always 拉起来，
+# 而不是让单元停在一个半死不活的状态。
+OOMPolicy=stop
+
+# ── 内存 / CPU 上限（2 GiB 机器的分配账，见 deploy/README.md 的内存预算表）──
+# 实测：网关空闲 17-40 MB，80 并发下 60-90 MB（它只做转发 + JWT 校验，
+# 不做重活）。所以：
+#   MemoryHigh=96M  —— 比实测峰值（90MB）略高，正常流量不会触发回收压力；
+#   MemoryMax=128M  —— 约 1.4× 实测峰值。真的顶到 128MB，说明有连接或
+#                      缓冲在泄漏；被 OOM kill 后自动重启，比悄悄吃掉整台机器好。
+#
+#   ⚠️ 这台机器**物理内存只有 1613MB**（轻量标称 2 GiB，但 guest 实测
+#      1613MB —— 云厂商划走了一部分给 hypervisor / 缓存）。
+#      原值 128M/160M 是按 2048MB 算的；五个单元 + PG + Redis + nginx
+#      的硬上限之和必须 ≤ 物理内存，否则五个单元同时顶满会触发
+#      cgroup 内的 OOM killer —— 被杀的可能是 PostgreSQL，整机数据面掉线。
+#      新的五单元 MemoryMax 合计 856M，与 PG 320M + Redis 128M +
+#      nginx 48M = 1352M ≤ 1613M × 0.85 ✓
+MemoryHigh=96M
+MemoryMax=128M
+# CPUQuota 之和 = 25+40+35+40+60 = 200% = 这台机器的 2 vCPU。
+# 网关只做转发与 HMAC 校验，25% 足够，且不会跟别的服务抢核。
+CPUQuota=25%
+# 线程上限：防止某个服务自己开线程把 PID 耗光（默认 unlimited）。
+TasksMax=256
+
+# ── 加固 ────────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+# ReadWritePaths（每一项都要存在，否则单元起不来；由 tune-host.sh 创建）：
+#   /var/lib/stashbox/tmp —— TMPDIR 指向这里。python 的 tempfile.gettempdir()
+#       会优先读 TMPDIR，所以 ffmpeg 的中间文件落在这里（磁盘，不是内存）。
+#   /var/log/stashbox      —— 应用自己的文件日志（journal 之外的补充）。
+#   /opt/stashbox/stashbox/backend/ai-service/data —— 只在 INDEXTTS_AUDIO_DIR
+#       指向仓库内目录时才需要；本机 TTS_PROVIDER=edge，用不到。
+#       带 `-` 前缀 = 目录不存在时忽略（不因为一个用不到的路径起不来）。
+ReadWritePaths=/var/lib/stashbox/tmp
+ReadWritePaths=/var/log/stashbox
+ReadWritePaths=-/opt/stashbox/stashbox/backend/ai-service/data
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stashbox-api-gateway

@@ -1,0 +1,72 @@
+[Unit]
+Description=Stashbox user-service（登录 / 配额 / 订阅，127.0.0.1:8101）
+Documentation=file:///opt/stashbox/stashbox/backend/deploy/README.md
+After=network-online.target stashbox-migrate.service
+Wants=network-online.target
+Requires=stashbox-migrate.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=stashbox
+Group=stashbox
+WorkingDirectory=/opt/stashbox/stashbox/backend/user-service
+# EnvironmentFile 把 env 文件里的全部变量送进进程环境，包括
+# FORWARDED_ALLOW_IPS（uvicorn 的 ASGI 层）与 TRUSTED_PROXY_IPS（应用层
+# backend/common/ip.py）—— 这两个是同一个信任决定的两个实现，必须完全一致
+# （preflight.sh 会查）。unit 不传 --forwarded-allow-ips，否则命令行会覆盖
+# 环境变量里的 FORWARDED_ALLOW_IPS。
+EnvironmentFile=/etc/stashbox/stashbox.env
+Environment=PYTHONPATH=/opt/stashbox
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONFAULTHANDLER=1
+Environment=MALLOC_ARENA_MAX=2
+Environment=TMPDIR=/var/lib/stashbox/tmp
+ExecStart=/opt/stashbox/stashbox/backend/deploy/systemd/run-service.sh user-service 8101
+Restart=always
+RestartSec=5
+TimeoutStartSec=90
+TimeoutStopSec=30
+OOMPolicy=stop
+
+# ── 内存 / CPU 上限 ────────────────────────────────────────────────────
+# 实测：空闲 17-40 MB，80 并发下 60-90 MB（它是 5 个服务里连接池最大的之一：
+# POSTGRES_POOL_SIZE 条常驻连接 + JWT 签发缓冲）。
+#   MemoryHigh=96M  —— 正常峰值（90MB）之上，正常流量不会误触发回收。
+#   MemoryMax=128M  —— 约 1.4× 实测峰值。超额即视为异常，被 OOM kill 后自动重启。
+#
+# ⚠️ 物理内存实测只有 1613MB（标称 2 GiB），原 128M/160M 是按 2048MB 算的，
+#    五个单元 + PG + Redis + nginx 的硬上限之和必须 ≤ 物理内存，
+#    否则同时顶满会触发 cgroup OOM killer（可能杀掉 PG → 整机掉线）。
+MemoryHigh=96M
+MemoryMax=128M
+# 40%（高于网关）：登录要算 bcrypt（cost 12 约 200-300ms CPU），
+# 给低了登录接口会明显变慢。40% ≈ 0.4 核 ≈ 每秒 1.6 次 bcrypt，
+# 对内测量级绰绰有余。
+CPUQuota=40%
+TasksMax=256
+
+# ── 加固 ────────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+# ReadWritePaths（由 tune-host.sh 创建；带 `-` 的目录不存在时忽略）：
+#   /var/lib/stashbox/tmp —— TMPDIR（tempfile）。
+#   /var/log/stashbox      —— 文件日志。
+ReadWritePaths=/var/lib/stashbox/tmp
+ReadWritePaths=/var/log/stashbox
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stashbox-user-service

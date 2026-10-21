@@ -1,0 +1,67 @@
+[Unit]
+Description=Stashbox 数据库迁移（alembic upgrade head，一次性）
+Documentation=file:///opt/stashbox/stashbox/backend/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# RemainAfterExit=yes 的作用（**别删**）：
+#   没有它，这个 oneshot 跑完就回到 inactive；之后任何依赖它的服务再次启动时，
+#   systemd 会**重跑一遍**迁移。alembic upgrade head 本身幂等，但在 5 个服务
+#   各自重启的机器上，多跑 5 次迁移没有任何好处，只会在数据库上多拿几次锁。
+#   有了它，迁移单元成功后停在 active (exited)，不会再被触发。
+#   代价：迁移失败后单元停在 failed 状态，必须
+#     systemctl reset-failed stashbox-migrate.service
+#     systemctl restart stashbox-migrate.service
+#   才能重试 —— 这是有意的 fail-closed：迁移没过就不该起服务。
+RemainAfterExit=yes
+User=stashbox
+Group=stashbox
+# alembic.ini 里 script_location = alembic 是**相对 CWD** 的，
+# 所以 CWD 必须是 backend/（与 Dockerfile 的 migrate target 一致）。
+WorkingDirectory=/opt/stashbox/stashbox/backend
+EnvironmentFile=/etc/stashbox/stashbox.env
+Environment=PYTHONPATH=/opt/stashbox
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=MALLOC_ARENA_MAX=2
+Environment=TMPDIR=/var/lib/stashbox/tmp
+ExecStart=/opt/stashbox/venv/bin/alembic upgrade head
+TimeoutStartSec=300
+# 迁移本身很轻（alembic + 几条 DB 连接，实测几十 MB），128M 足够。
+# 真正的上限是"超额 = 迁移失败"—— 迁移失败就该拦住服务启动，不该让它
+# 带着半套 schema 跑起来。
+# ⚠️ 这个单元是**一次性**的：正常路径下它在 5 个服务启动**之前**跑完，
+#    所以峰值账按"只有服务在跑"算（1942M）。在服务运行时重跑迁移会额外
+#    占用 128M —— 迁移请在服务停着的时候跑。
+MemoryHigh=64M
+MemoryMax=128M
+# 迁移是 I/O 密集（等数据库锁），CPU 不紧张，给 40% 足够。
+CPUQuota=40%
+# OOM 被杀 = 迁移失败 = 单元停在 failed，依赖它的服务不会起来（fail-closed）。
+OOMPolicy=stop
+
+# ── 加固 ────────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+# ReadWritePaths 里**只有** tmp 一个目录是迁移真需要的：
+#   /var/lib/stashbox/tmp —— alembic 自己不写文件，但 python 的 tempfile
+#   （以及驱动层的临时文件）会用 TMPDIR。指向磁盘而不是 RAM：迁移期间
+#   临时文件不该跟 PG 抢内存。
+#   其它路径全部由 ProtectSystem=strict 变成只读 —— 迁移不该写任何地方。
+ReadWritePaths=/var/lib/stashbox/tmp
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stashbox-migrate

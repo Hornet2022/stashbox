@@ -1,0 +1,83 @@
+[Unit]
+Description=Stashbox content-service（文章 / 待听 / 收藏，127.0.0.1:8102）
+Documentation=file:///opt/stashbox/stashbox/backend/deploy/README.md
+After=network-online.target stashbox-migrate.service
+Wants=network-online.target
+Requires=stashbox-migrate.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=stashbox
+Group=stashbox
+WorkingDirectory=/opt/stashbox/stashbox/backend/content-service
+# EnvironmentFile 把 env 文件里的全部变量送进进程环境，包括
+# FORWARDED_ALLOW_IPS（uvicorn 的 ASGI 层）与 TRUSTED_PROXY_IPS（应用层
+# backend/common/ip.py）—— 这两个是同一个信任决定的两个实现，必须完全一致
+# （preflight.sh 会查）。unit 不传 --forwarded-allow-ips，否则命令行会覆盖
+# 环境变量里的 FORWARDED_ALLOW_IPS。
+EnvironmentFile=/etc/stashbox/stashbox.env
+Environment=PYTHONPATH=/opt/stashbox
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONFAULTHANDLER=1
+Environment=MALLOC_ARENA_MAX=2
+Environment=TMPDIR=/var/lib/stashbox/tmp
+ExecStart=/opt/stashbox/stashbox/backend/deploy/systemd/run-service.sh content-service 8102
+Restart=always
+RestartSec=5
+TimeoutStartSec=90
+TimeoutStopSec=30
+OOMPolicy=stop
+
+# ── 内存 / CPU 上限 ────────────────────────────────────────────────────
+# 实测：空闲 17-40 MB，80 并发下 60-90 MB。它比别的服务多一样东西：
+# 整页 HTML + 解析出来的正文**同时**在内存里（几 MB 的页面会变成几十 MB 的
+# Python 对象），所以上限给得比网关/用户服务宽一点。
+#   MemoryHigh=160M
+#   MemoryMax=224M（约 2.5× 实测峰值）
+#
+# ⚠️ 这里的 224M 之所以够用，是因为**浏览器通道关掉了**
+#   （2 GiB 模板里 STASHBOX_FETCH_BROWSER_TIER=0）。
+#   playwright 的 chromium 是 content-service 的子进程，会被算进同一个 cgroup，
+#   实测 RSS 300 MB+ —— 开着浏览器通道的话，这个单元必然被 OOM kill，
+#   而且它会连带把整个剪藏链路拖垮。
+#   要开浏览器通道：先把 STASHBOX_FETCH_BROWSER_TIER 改回 1、
+#   再把 MemoryMax 提到 640M，同时从别处（见 deploy/README.md 内存预算表）
+#   腾出 400 MB —— 这台机器（物理内存实测 1613MB）上这笔账不成立。
+#
+# ⚠️ 物理内存实测只有 1613MB（标称 2 GiB），原 160M/224M 是按 2048MB 算的，
+#    五个单元 + PG + Redis + nginx 的硬上限之和必须 ≤ 物理内存，
+#    否则同时顶满会触发 cgroup OOM killer（可能杀掉 PG → 整机掉线）。
+MemoryHigh=128M
+MemoryMax=176M
+# 35%：抓取 + HTML 解析是纯 CPU 的，但实测剪藏最坏 ~40.6s 里大头是网络等待，
+# 不是解析。35% 足够，也保证不跟蒸馏任务抢核。
+CPUQuota=35%
+TasksMax=256
+
+# ── 加固 ────────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+# ReadWritePaths（由 tune-host.sh 创建；带 `-` 的目录不存在时忽略）：
+#   /var/lib/stashbox/tmp —— TMPDIR（tempfile）。浏览器通道若开启，
+#       STASHBOX_FETCH_BROWSER_STATE 默认落在 tempfile.gettempdir() 下，
+#       所以指向这里（而不是被 ProtectSystem 变成只读的 /tmp）。
+#   /var/log/stashbox      —— 文件日志。
+ReadWritePaths=/var/lib/stashbox/tmp
+ReadWritePaths=/var/log/stashbox
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stashbox-content-service

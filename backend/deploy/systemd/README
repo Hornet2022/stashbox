@@ -1,0 +1,168 @@
+# systemd 部署（2 GiB 轻量应用服务器生产路径）
+# ==============================================
+#
+# 这套 unit 是**不用 Docker** 的生产路径：5 个 Python 进程直接跑在 systemd 下。
+#
+# 为什么不用 Docker（2 GiB 机器上的硬约束）：
+#   · dockerd 自己空载就吃 150-200 MB（2 GiB 的 10%）；
+#   · overlay2 会把每一层再存一份（镜像 + 容器可写层），40 GB 系统盘会紧张；
+#   · 一次 docker compose pull/build 的 IO 峰值会跟 PG 的 checkpoint 撞车。
+#   仓库里的 Dockerfile / docker-compose.*.yml 是给 CI 和其它环境用的，
+#   **不要**用它们部署这台机器。
+#
+# 为什么不要本地可观测性栈（Prometheus / Grafana / Alertmanager /
+# blackbox_exporter / redis_exporter）：
+#   这五个组件加起来约 400-500 MB —— 2 GiB 机器的四分之一，为了给一个
+#   "一天看一次图"的人看仪表盘。生产监控走**阿里云云监控 / SLS**：
+#   轻量服务器自带云监控 agent（内存/磁盘/CPU 指标免费），
+#   应用侧用 SLS 收日志、告警走钉钉/飞书。
+#   `infra/docker/docker-compose.observability.yml` 是**本地开发**用的，
+#   原样保留，不在这台机器上跑。
+#
+# ── 拓扑 ──────────────────────────────────────────────────────────────
+#
+#   stashbox-migrate.service   (oneshot, RemainAfterExit=yes)
+#          │  alembic upgrade head
+#          ├──▶ stashbox-user-service.service     :8101  127.0.0.1
+#          ├──▶ stashbox-content-service.service   :8102  127.0.0.1
+#          ├──▶ stashbox-ai-service.service        :8103  127.0.0.1
+#          └──▶ stashbox-ai-worker.service         (无端口)
+#                     │
+#                     ▼
+#              nginx :443 (TLS) ──▶ api-gateway :8100  127.0.0.1
+#                     ▲
+#                     └── 阿里云 SLB（可选）
+#
+#   Requires=stashbox-migrate.service：迁移不过，服务不起来（fail-closed）。
+#   After=：顺序保证（迁移先跑完）。
+#
+# ── 安装位置（所有 unit 里的路径都按这个布局）─────────────────────────
+#
+#   /opt/stashbox/stashbox              仓库（包名 stashbox，所以父目录进 PYTHONPATH）
+#   /opt/stashbox/stashbox/backend      backend/（alembic.ini 在这里）
+#   /opt/stashbox/venv                  Python venv（poetry.lock 装出来的依赖）
+#   /etc/stashbox/stashbox.env          环境变量（EnvironmentFile，0640 root:stashbox）
+#   /var/lib/stashbox/tmp               运行时临时目录（TMPDIR，磁盘不是内存）
+#   /var/log/stashbox                   文件日志
+#
+#   PYTHONPATH=/opt/stashbox —— 仓库根目录的**父目录**。
+#   代码里是 `from stashbox.backend.common.config import settings` 这种绝对导入，
+#   `stashbox` 是包名（仓库根有 __init__.py），所以它的**父目录**必须在 sys.path 上。
+#   与 backend/run_dev.sh 里的 `export PYTHONPATH="${REPO_PARENT}:..."` 同一个道理。
+#
+# ── 服务用户 ──────────────────────────────────────────────────────────
+#
+#   # 方式 A（sysusers，幂等）：
+#   install -m 0644 stashbox-user.conf /etc/sysusers.d/stashbox.conf
+#   systemd-sysusers
+#
+#   # 方式 B（useradd，手工）：
+#   useradd --system --user-group --home-dir /opt/stashbox \
+#           --shell /usr/sbin/nologin stashbox
+#
+#   单元里以它运行（User=stashbox / Group=stashbox）：
+#   应用代码永远拿不到 root；shell 是 nologin，UID 在 100 段，不可登录。
+#
+# ── 安装步骤 ──────────────────────────────────────────────────────────
+#
+#   1) 装依赖 + 调优机器：
+#        sudo bash backend/deploy/tune-host.sh --install-deps
+#   2) 放代码、建 venv：
+#        sudo mkdir -p /opt/stashbox && sudo chown stashbox:stashbox /opt/stashbox
+#        sudo -u stashbox git clone <repo> /opt/stashbox/stashbox
+#        sudo -u stashbox python3 -m venv /opt/stashbox/venv
+#        sudo -u stashbox /opt/stashbox/venv/bin/pip install -U pip
+#        cd /opt/stashbox/stashbox/backend
+#        sudo -u stashbox /opt/stashbox/venv/bin/pip install --no-cache-dir -r requirements.txt
+#        # 或者按 lock 文件装（与镜像/CI 一致）：
+#        sudo -u stashbox /opt/stashbox/venv/bin/pip install --no-cache-dir \
+#             poetry==2.5.1 && sudo -u stashbox poetry install --only main --no-root
+#   3) 环境变量：
+#        sudo install -m 0640 -o root -g stashbox \
+#             backend/deploy/.env.production.2g.example /etc/stashbox/stashbox.env
+#        sudo vi /etc/stashbox/stashbox.env      # 填 JWT_SECRET / 密码 / OSS key
+#   4) 装 unit：
+#        sudo cp backend/deploy/systemd/stashbox-*.service /etc/systemd/system/
+#        sudo cp backend/deploy/systemd/run-service.sh \
+#             /opt/stashbox/stashbox/backend/deploy/systemd/run-service.sh
+#        sudo chmod 0755 /opt/stashbox/stashbox/backend/deploy/systemd/run-service.sh
+#        sudo systemctl daemon-reload
+#   5) 先跑迁移（失败就别往下走）：
+#        sudo systemctl start stashbox-migrate.service
+#        sudo systemctl status stashbox-migrate.service
+#   6) 起服务：
+#        sudo systemctl enable --now stashbox-api-gateway.service \
+#             stashbox-user-service.service stashbox-content-service.service \
+#             stashbox-ai-service.service stashbox-ai-worker.service
+#   7) nginx：
+#        sudo cp backend/deploy/systemd/nginx.conf /etc/nginx/sites-available/stashbox
+#        sudo ln -sf /etc/nginx/sites-available/stashbox /etc/nginx/sites-enabled/stashbox
+#        sudo nginx -t && sudo systemctl reload nginx
+#   8) 预检：
+#        cd backend/deploy && ./preflight.sh /etc/stashbox/stashbox.env
+#
+# ── 内存 / CPU 上限（2 GiB 机器的分配账）──────────────────────────────
+#
+#   单元                    MemoryHigh  MemoryMax  CPUQuota
+#   api-gateway              128M        160M       25%
+#   user-service             128M        160M       40%
+#   content-service          160M        224M       35%
+#   ai-service               192M        256M       40%
+#   ai-worker                224M        288M       60%
+#   ── 合计                   812M       1088M      200%
+#
+#   · MemoryHigh 之和 812M：超过它才进入回收压力（软限，不杀进程）。
+#     实测峰值 60-90 MB/进程，正常流量不会碰到。
+#   · MemoryMax 之和 1088M：硬上限，触顶被 OOM kill，Restart=always 拉起。
+#     1088M + PG 448M + Redis 192M + nginx 64M + OS/journald ~150M
+#     ≈ 1942M < 2048M —— **所有硬上限加起来也在 2 GiB 以内**，
+#     所以不会出现"五个单元同时顶到上限 → 内核 OOM 屠机"。
+#   · CPUQuota 之和 200% = 2 vCPU：任何单元都不会被饿到 0，
+#     也不会出现一个单元独占两个核。
+#
+# ── ReadWritePaths 逐条说明 ──────────────────────────────────────────
+#
+#   ProtectSystem=strict 会把整个文件系统变成只读（除了 /dev /proc /sys 的
+#   必要部分和下面列的目录）。**列进去的路径必须存在**，否则单元起不来
+#   （systemd 报 "Failed to set up mount namespacing"）。带 `-` 前缀的
+#   表示"不存在就忽略"。
+#
+#   /var/lib/stashbox/tmp     必须存在。TMPDIR 指向这里，python 的
+#                              tempfile.gettempdir() 会读 TMPDIR。
+#                              ffmpeg 的中间文件、浏览器 state 文件落这儿。
+#                              放磁盘不放内存：一次转码的中间产物不该
+#                              跟 PG / Redis 抢那 2 GiB。
+#   /var/log/stashbox         必须存在（如果开文件日志）。journal 之外
+#                              的补充日志目录。
+#   .../ai-service/data       可选（`-` 前缀）。只有 INDEXTTS_AUDIO_DIR
+#                              指向仓库内目录时才需要写；本机
+#                              TTS_PROVIDER=edge，用不到。
+#
+#   由 tune-host.sh 创建（它会 mkdir -p + chown stashbox）。
+#
+# ── 日志 ──────────────────────────────────────────────────────────────
+#
+#   所有单元 StandardOutput=journal / StandardError=journal：
+#   日志进 journald，**不在应用目录里堆文件**。
+#   → 所以 journald 必须限容，否则 40 GB 盘会被日志吃光：
+#       SystemMaxUse=200M（tune-host.sh 已配）
+#   查日志：
+#       journalctl -u stashbox-api-gateway -f
+#       journalctl -u stashbox-ai-worker --since "1 hour ago"
+#
+# ── 排障 ──────────────────────────────────────────────────────────────
+#
+#   systemctl status stashbox-api-gateway
+#   journalctl -u stashbox-api-gateway -n 200 --no-pager
+#   # 迁移失败后所有服务都起不来（fail-closed）：
+#   systemctl reset-failed stashbox-migrate.service
+#   systemctl restart stashbox-migrate.service
+#   # 看某个单元的内存实际用量：
+#   systemctl show stashbox-ai-worker -p MemoryCurrent
+#   cat /sys/fs/cgroup/system.slice/stashbox-ai-worker.service/memory.current
+#
+# ── 卸载 ──────────────────────────────────────────────────────────────
+#
+#   sudo systemctl disable --now stashbox-*.service
+#   sudo rm /etc/systemd/system/stashbox-*.service
+#   sudo systemctl daemon-reload
