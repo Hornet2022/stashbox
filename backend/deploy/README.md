@@ -462,7 +462,24 @@ sudo systemctl enable --now stashbox-api-gateway.service \
 # ⑨ nginx + 证书（certbot 会改这个文件）
 sudo cp backend/deploy/systemd/nginx.conf /etc/nginx/sites-available/stashbox
 sudo ln -sf /etc/nginx/sites-available/stashbox /etc/nginx/sites-enabled/stashbox
-#    ⚠️ **两个域名一起签**（一次搞定，续签也只有一份）：
+#    ⚠️ **证书用 tls-cert.sh 选，不要手改 nginx.conf 里的路径**
+#
+#    为什么需要这个脚本（2026-10-21 实测踩出来的）：
+#    备案期间域名解析会被阿里云监测系统阻断，而安卓 release 包
+#    **只信任系统 CA**（network_security_config 的 trust-anchors=system），
+#    自签证书一律被拒 —— 也就是说：
+#      · 用域名 → 备案通过前，App 连不上
+#      · 用自签证书 → 任何时候都连不上
+#    解法：Let's Encrypt 自 2025-12 起支持**签发 IP 证书**（http-01 验证，
+#    6 天有效期，自动续签）。所以备案期间用 IP 证书，备案通过后换域名证书，
+#    同一份 nginx 配置，两种证书。
+#
+#    备案期间（IP 证书）：
+#      bash deploy/tls-cert.sh ip
+#    备案通过后（域名证书）：
+#      bash deploy/tls-cert.sh domain api.stashbox.cn
+#    看当前用的哪张：
+#      bash deploy/tls-cert.sh status
 sudo certbot --nginx -d api.stashbox.cn -d admin.stashbox.cn
 sudo nginx -t && sudo systemctl reload nginx
 
@@ -472,9 +489,11 @@ cd stashbox-admin-web
 VITE_API_BASE_URL=https://api.stashbox.cn pnpm build
 #    传到服务器：
 ssh root@8.148.9.151 'mkdir -p /var/www/stashbox-admin'
-rsync -a --delete dist/ root@8.148.9.151:/var/www/stashbox-admin/
+rsync -a dist/ root@8.148.9.151:/var/www/stashbox-admin/
 #    ⚠️ 不传 VITE_API_BASE_URL 的话，bundle 里会写死 http://localhost:8100
 #       （src/api/client.ts:27 的默认值）—— 浏览器里必然连不上。
+#    ⚠️ 备案期间想用 IP 直连，就传 VITE_API_BASE_URL=https://8.148.9.151/
+#       （后台的 API 请求是相对路径 /api/v1/admin，同源即可，不用管）
 
 # ⑩ 预检（必须 0 FAIL）
 cd backend/deploy && ./preflight.sh /etc/stashbox/stashbox.env
