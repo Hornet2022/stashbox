@@ -18,6 +18,7 @@ from .user_listening_pattern import UserListeningPattern  # CP3.7.1 §2.1.B
 from .article_audio_variant import ArticleAudioVariant  # CP3.7.1 §2.1.C
 from .few_shot_example import FewShotExample  # CP3.7.1 §2.1.D
 from .consent import ConsentRecord  # CP5.6.0 §3.1
+from .device_token import DeviceToken  # 2026-10-21 推送投递落点
 from .tts_voice import (  # CP-TTS-VOICE 音色库 + 用户偏好
     DEFAULT_PLAYBACK_SPEEDS,
     MAX_PLAYBACK_SPEED,
@@ -49,6 +50,8 @@ __all__ = [
     "FewShotExample",
     # CP5.6.0 个性化 + 隐私政策 v2
     "ConsentRecord",
+    # 2026-10-21 推送投递落点
+    "DeviceToken",
     # CP-TTS-VOICE 音色库 + 用户音色/语速偏好
     "TTSVoice",
     "UserTTSPreference",
