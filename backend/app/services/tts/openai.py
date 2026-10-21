@@ -46,6 +46,14 @@ IndexTTS provider 早就因为同类问题做了分段，这套实现现在共�
 
 串行则每段 17s 完成，对 60s 超时有 3.5 倍余量，总耗时不变。
 
+⚠️ **上游会抖动，单块超时 + 单块重试**（同一天实测）：
+
+    段1 16s ✅   段2 60s 超时 ❌   段3 16s ✅   ← 同一篇稿子的三段
+
+所以超时从 60s 放宽到 120s（正常段 13~20s，6 倍余量），
+并且单块失败时**只重试这一块**（OPENAI_TTS_CHUNK_RETRIES，默认 2，
+退避 3s/6s）—— 不必让 Arq 把整篇（LLM 改写 + 全部分块）重来一遍。
+
 火山引擎方舟 TTS 模型示例（2026-09-21 官方文档）：
 - 模型：doubao-seed-tts（或按控制台开通的实际模型名）
 - 音色 ID：BV001_streaming 等（控制台 → 音色库 → 复制 speaker）
@@ -90,9 +98,10 @@ class OpenAITTSClient(TTSClient):
         model: str | None = None,
         voice: str | None = None,
         base_url: str | None = None,
-        timeout: float = 60.0,
+        timeout: float | None = None,
         chunk_chars: int | None = None,
         chunk_concurrency: int | None = None,
+        chunk_retries: int | None = None,
     ):
         # 优先入参；入参缺省时从环境变量读（pydantic Settings 不会接管 .env 加载到这里）
         self.api_key = api_key if api_key is not None else os.getenv("OPENAI_TTS_API_KEY", "")
@@ -101,8 +110,21 @@ class OpenAITTSClient(TTSClient):
         self.base_url = (
             base_url if base_url is not None else os.getenv("OPENAI_BASE_URL", _DEFAULT_BASE_URL)
         ).rstrip("/")
-        self.timeout = timeout
-        # 单次请求的最大字数。超时 60s 时，~280 字是实测安全线（17.4s），
+        self.timeout = (
+            timeout if timeout is not None else float(os.getenv("OPENAI_TTS_TIMEOUT", "120"))
+        )
+        # 单块失败时的重试次数（只重试**这一块**，不是整篇重来）。
+        #
+        # 实测（2026-10-21）：上游会**抖动** —— 同一篇稿子的 3 段里，
+        # 段1 16s ✅、段2 60s 超时 ❌、段3 16s ✅，Arq 重试后整篇三段全通。
+        # 单块重试能把「某段抖动」消化在本地，不必让 Arq 把整篇
+        # （LLM 改写 + 全部分块）重来一遍 —— 那是双倍的钱和双倍的时间。
+        self.chunk_retries = (
+            chunk_retries
+            if chunk_retries is not None
+            else int(os.getenv("OPENAI_TTS_CHUNK_RETRIES", "2"))
+        )
+        # 单次请求的最大字数。~280 字是实测安全线（13~20s），
         # 1047 字必然超时 —— 取 300 留足余量（见文件头的实测记录）。
         self.chunk_chars = (
             chunk_chars
@@ -132,7 +154,7 @@ class OpenAITTSClient(TTSClient):
             else int(os.getenv("OPENAI_TTS_CONCURRENCY", "1"))
         )
         self._client = httpx.AsyncClient(
-            timeout=timeout,
+            timeout=self.timeout,
             trust_env=False,  # 忽略沙箱/系统代理
             headers={
                 "Authorization": f"Bearer {self.api_key}",
@@ -205,7 +227,28 @@ class OpenAITTSClient(TTSClient):
 
         async def _one(chunk: str) -> bytes:
             async with sem:
-                return await self._synthesize_once(chunk, voice, output_format)
+                last_exc: Exception | None = None
+                for attempt in range(1, self.chunk_retries + 2):
+                    try:
+                        return await self._synthesize_once(chunk, voice, output_format)
+                    except Exception as exc:
+                        last_exc = exc
+                        if attempt > self.chunk_retries:
+                            break
+                        # 上游抖动是**间歇性**的：实测同一篇稿子的 3 段里，
+                        # 有一段 60s 超时而另外两段 16s 就好了。
+                        # 重试前先等一下，别在同一个坏窗口里连打。
+                        wait = 3.0 * attempt
+                        log.warning(
+                            "OpenAITTS 分块失败，重试: attempt=%s/%s wait=%ss err=%s",
+                            attempt,
+                            self.chunk_retries,
+                            wait,
+                            exc,
+                        )
+                        await asyncio.sleep(wait)
+                assert last_exc is not None
+                raise last_exc
 
         # gather 保序（返回顺序 = 输入顺序），拼接顺序才不会乱
         pieces = await asyncio.gather(*[_one(c) for c in chunks])

@@ -109,16 +109,54 @@ def concat_wav(pieces: list[bytes]) -> bytes:
     if len(pieces) == 1:
         return pieces[0]
 
+    merged = _concat_via_ffmpeg(pieces, "wav")
+    if merged is not None:
+        return merged
+
+    # 退化：首段留 WAV 头，其余段只取 data chunk（跳过 44 字节 RIFF 头）
+    head = pieces[0]
+    data = bytearray()
+    for i, piece in enumerate(pieces):
+        if i == 0:
+            data += piece
+            continue
+        idx = piece.find(b"data")
+        if idx == -1:
+            data += piece
+        else:
+            # "data" + 4 字节 size + 载荷
+            data += piece[idx + 8 :]
+    return patch_riff_sizes(head, len(data))
+
+
+def _concat_via_ffmpeg(pieces: list[bytes], ext: str) -> bytes | None:
+    """用 ffmpeg concat demuxer 拼接同格式音频片段（`-c copy`，不重编码）。
+
+    返回合并后的字节；ffmpeg 不可用或失败时返回 None（调用方决定退化路径）。
+
+    ⚠️ 为什么 MP3 也必须走 ffmpeg，而不是直接字节拼接：
+    裸拼出来的 MP3 没有统一的帧头索引，ffmpeg 会报
+
+        invalid concatenated file detected - using bitrate for duration
+        Estimating duration from bitrate, this may be inaccurate
+
+    —— 时长变成**估算值**而不是解析值。对一个播客产品来说这是硬伤：
+    客户端展示的时长、进度条、剩余时间都会不准（实测分段拼接的两篇
+    都触发了这个警告，而未分段的单文件没有）。
+
+    concat demuxer 会重新扫描全部帧并写出正确的时长表，`-c copy` 不重编码，
+    耗时与文件大小同阶、几乎零 CPU。
+    """
     ffmpeg = os.getenv("FFMPEG_BIN", "ffmpeg")
     with tempfile.TemporaryDirectory(prefix="tts_concat_") as tmp:
         listing = os.path.join(tmp, "list.txt")
         lines = []
         for i, piece in enumerate(pieces):
-            p = os.path.join(tmp, f"part_{i:04d}.wav")
+            p = os.path.join(tmp, f"part_{i:04d}.{ext}")
             Path(p).write_bytes(piece)
             lines.append(f"file '{p}'")
         Path(listing).write_text("\n".join(lines) + "\n", encoding="utf-8")
-        out = os.path.join(tmp, "merged.wav")
+        out = os.path.join(tmp, f"merged.{ext}")
         try:
             subprocess.run(
                 [
@@ -149,33 +187,34 @@ def concat_wav(pieces: list[bytes]) -> bytes:
             log.warning("TTS 未找到 ffmpeg(%s)，退回字节拼接", ffmpeg)
         except subprocess.SubprocessError as exc:
             log.warning("TTS ffmpeg 拼接失败(%s)，退回字节拼接", exc)
+    return None
 
-    # 退化：首段留 WAV 头，其余段只取 data chunk（跳过 44 字节 RIFF 头）
-    head = pieces[0]
-    data = bytearray()
-    for i, piece in enumerate(pieces):
-        if i == 0:
-            data += piece
-            continue
-        idx = piece.find(b"data")
-        if idx == -1:
-            data += piece
-        else:
-            # "data" + 4 字节 size + 载荷
-            data += piece[idx + 8 :]
-    return patch_riff_sizes(head, len(data))
+
+def concat_mp3(pieces: list[bytes]) -> bytes:
+    """把多段 MP3 字节拼成一段。
+
+    优先走 ffmpeg concat demuxer（重算时长表，避免「invalid concatenated
+    file detected」导致的时长估算不准）；ffmpeg 不可用时退化为字节拼接
+    —— 播放器仍能按帧顺序播，但时长会变成估算值。
+    """
+    if not pieces:
+        raise ValueError("没有可拼接的音频分段")
+    if len(pieces) == 1:
+        return pieces[0]
+
+    merged = _concat_via_ffmpeg(pieces, "mp3")
+    if merged is not None:
+        return merged
+    # 退化：MP3 每帧自包含，直接字节拼接播放器也能按帧顺序解码
+    return b"".join(pieces)
 
 
 def concat_audio(pieces: list[bytes]) -> bytes:
-    """按音频格式分派拼接：WAV 走 ffmpeg/退化路径，其余（mp3 等）直接字节拼接。
-
-    MP3 每帧自包含，字节拼接后播放器按帧顺序解码，不需要重编码 ——
-    这是零开销的选择，也是生产 OpenAI provider 的实际格式。
-    """
+    """按音频格式分派拼接：WAV / MP3 各走自己的路径。"""
     if not pieces:
         raise ValueError("没有可拼接的音频分段")
     if len(pieces) == 1:
         return pieces[0]
     if pieces[0][:4] == b"RIFF":
         return concat_wav(pieces)
-    return b"".join(pieces)
+    return concat_mp3(pieces)

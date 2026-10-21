@@ -24,6 +24,7 @@ arq 0.28 的 worker 只对 `arq.Retry` / `CancelledError` / `RetryJob`
 （那边的用例直接跑 distill_task 的失败路径）。
 """
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -124,13 +125,72 @@ async def test_empty_text_still_rejected(openai_mod):
         await client.synthesize("   ")
 
 
-def test_mp3_concat_is_plain_byte_concat():
-    """mp3 每帧自包含 → 直接字节拼接，不该走 ffmpeg。"""
-    from app.services.tts.audio_chunks import concat_audio
+def test_mp3_concat_goes_through_ffmpeg_for_accurate_duration():
+    """MP3 拼接必须走 ffmpeg —— 裸字节拼出来的时长是**估算值**。
+
+    ffmpeg 对裸拼接的 mp3 会报：
+        invalid concatenated file detected - using bitrate for duration
+        Estimating duration from bitrate, this may be inaccurate
+
+    客户端展示的时长、进度条、剩余时间都依赖它不准的值。
+    concat demuxer 会重新扫描帧并写出正确的时长表（-c copy，不重编码）。
+    """
+    import shutil
+    import subprocess
+
+    from app.services.tts.audio_chunks import concat_mp3
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("环境没有 ffmpeg，跳过")
+
+    # 造两段真实 mp3（1 秒静音 + 1 秒静音）
+    made = []
+    for i in range(2):
+        out = f"/tmp/_tts_concat_probe_{i}.mp3"
+        subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=44100:cl=mono",
+                "-t",
+                "1",
+                out,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        made.append(out)
+
+    merged = concat_mp3([open(p, "rb").read() for p in made])
+
+    # 合并后应能被 ffprobe 精确解析出 2 秒（而不是「按码率估算」）
+    probe = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", "-", "-f", "null", "-"],
+        input=merged,
+        capture_output=True,
+    )
+    stderr = probe.stderr.decode("utf-8", "replace")
+    assert "invalid concatenated file" not in stderr, (
+        "拼接后的 mp3 被判定为非法拼接文件（时长会退化成估算值）:\n" + stderr[-500:]
+    )
+
+
+def test_mp3_concat_falls_back_to_byte_concat_without_ffmpeg(monkeypatch):
+    """ffmpeg 不可用时退化到字节拼接（播放器仍能按帧顺序解码）。"""
+    from app.services.tts import audio_chunks
+
+    monkeypatch.setenv("FFMPEG_BIN", "/nonexistent/ffmpeg")
 
     a = b"\xff\xfb\x90\x00" + b"aaaa"
     b = b"\xff\xfb\x90\x00" + b"bbbb"
-    assert concat_audio([a, b]) == a + b
+    assert audio_chunks.concat_mp3([a, b]) == a + b
 
 
 def test_default_concurrency_is_serial(openai_mod):
@@ -148,6 +208,78 @@ def test_default_concurrency_is_serial(openai_mod):
     client = openai_mod.OpenAITTSClient(api_key="k", base_url="http://x", model="m")
     assert client.chunk_concurrency == 1, "默认必须是串行（上游实测串行，并发只会让末段超时）"
     assert client.chunk_chars == 300
+
+
+def test_default_timeout_leaves_room_for_upstream_jitter(openai_mod):
+    """默认超时必须是 120s，不是 60s。
+
+    实测：同一篇稿子的 3 段里，段1 16s ✅、**段2 60s 超时** ❌、段3 16s ✅
+    —— 上游是**间歇性**抖的，不是稳定慢。
+
+    超时卡 60s 时，偶发的那一段必炸；而炸掉的后果是整篇蒸馏失败
+    （LLM 改写 + 全部分块都要重来）。放宽到 120s（正常段 13~20s，6 倍余量）
+    把这类抖动消化在本地。
+    """
+    client = openai_mod.OpenAITTSClient(api_key="k", base_url="http://x", model="m")
+    assert client.timeout == 120.0
+    assert client.chunk_retries == 2
+
+
+@pytest.mark.asyncio
+async def test_flaky_chunk_is_retried_without_redoing_other_chunks(openai_mod):
+    """某一段失败 → 只重试这一段，不重跑整篇。
+
+    实测上游会间歇性抖：同一篇的 3 段里有一段超时、另外两段正常。
+    整篇重来 = LLM 改写 + 全部分块都白花；单段重试只要几秒。
+    """
+    recorder = _make_recorder(openai_mod, chunk_chars=50, chunk_concurrency=1)
+    state = {"calls": 0}
+    seen: list[str] = []
+
+    async def _flaky(text, voice=None, output_format="mp3"):
+        state["calls"] += 1
+        seen.append(text)
+        if state["calls"] == 1:
+            raise RuntimeError("OpenAITTS 超时: 模拟上游抖动")
+        return b"OK" + text.encode()[:4]
+
+    recorder._synthesize_once = _flaky  # type: ignore[assignment]
+    # 退避 3s 会拖慢测试，这里把它压到 0
+    monkey = pytest.MonkeyPatch()
+    # ⚠️ 必须先存下原始 sleep：替换后的 lambda 里若再调 asyncio.sleep(0)
+    #    就会调到它自己 → 无限递归（maximum recursion depth exceeded）。
+    _real_sleep = asyncio.sleep
+    monkey.setattr("asyncio.sleep", lambda *_: _real_sleep(0))
+    try:
+        out = await recorder.synthesize("第一句话。第二句话。" * 10)
+    finally:
+        monkey.undo()
+
+    assert out.startswith(b"OK")
+    # 2 段：第 1 段失败后重试一次，第 2 段一次过 → 共 3 次调用
+    assert state["calls"] == 3, f"应只重试失败的那段，实际调用 {state['calls']} 次"
+    assert seen[0] == seen[1], "重试的应该是同一段"
+
+
+@pytest.mark.asyncio
+async def test_chunk_retry_exhausted_raises(openai_mod):
+    """重试用尽 → 照常抛错（不能静默吞掉，任务必须判失败）。"""
+    recorder = _make_recorder(openai_mod, chunk_chars=50, chunk_concurrency=1)
+
+    async def _always_fail(text, voice=None, output_format="mp3"):
+        raise RuntimeError("一直失败")
+
+    recorder._synthesize_once = _always_fail  # type: ignore[assignment]
+    monkey = pytest.MonkeyPatch()
+    # ⚠️ 必须先存下原始 sleep：替换后的 lambda 里若再调 asyncio.sleep(0)
+    #    就会调到它自己 → 无限递归（maximum recursion depth exceeded）。
+    _real_sleep = asyncio.sleep
+    monkey.setattr("asyncio.sleep", lambda *_: _real_sleep(0))
+    try:
+        with pytest.raises(RuntimeError, match="一直失败"):
+            await recorder.synthesize("第一句话。第二句话。" * 10)
+    finally:
+        monkey.undo()
 
 
 def test_env_can_override_chunk_settings(openai_mod, monkeypatch):
