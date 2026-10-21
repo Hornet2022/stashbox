@@ -84,6 +84,36 @@ async def lifespan(app: FastAPI):
         log.info("distill queue poller 已启动")
     except Exception as exc:
         log.error("distill queue poller 启动失败（忽略）: %s", exc)
+
+    # ---- startup: 推送投递 poller（2026-10-21）----
+    #
+    # 之前**没有任何进程**负责把 push_notifications 发到设备上：
+    # 通知只落库，客户端拉 GET /api/v1/notifications 能在应用内看到，
+    # 但手机上不会响。管理后台的"重发"更是假重发（直接改 status='sent'）。
+    #
+    # 这个 poller 认领 status='pending' 的行、真的去投、再按**真实结果**写状态。
+    # 没配通道 / 用户没注册设备 / 网关报错 → 如实写 failed + 原因。
+    push_task = None
+    try:
+        from stashbox.backend.common import push_service
+
+        async def _push_loop():
+            while True:
+                try:
+                    async with AsyncSessionLocal() as session:
+                        claimed = await push_service.claim_pending(session, limit=50)
+                        for notif in claimed:
+                            await push_service.deliver_notification(session, notif)
+                        if claimed:
+                            await session.commit()
+                except Exception as exc:
+                    log.warning("push poller 失败（忽略）: %s", exc)
+                await asyncio.sleep(30)
+
+        push_task = asyncio.create_task(_push_loop())
+        log.info("push delivery poller 已启动")
+    except Exception as exc:
+        log.error("push delivery poller 启动失败（忽略）: %s", exc)
     # CP6.2.2.2b 埋点：SERVICE_START
     try:
         async with AsyncSessionLocal() as session:
@@ -99,6 +129,12 @@ async def lifespan(app: FastAPI):
         poll_task.cancel()
         try:
             await poll_task
+        except asyncio.CancelledError:
+            pass
+    if push_task:
+        push_task.cancel()
+        try:
+            await push_task
         except asyncio.CancelledError:
             pass
     await shutdown_dispatcher()
@@ -225,6 +261,9 @@ async def _run_pipeline(task_id: str, simulate_failure: bool = False) -> None:
 
         if simulate_failure:
             da.status = "failed"
+            # 失败即无产出：清掉音频字段，别让这一行 status='failed' 却挂着旧音频地址
+            da.audio_url = None
+            da.duration_sec = None
             await session.commit()
             # 蒸馏失败 → 退还配额（quota_used-1, quota_version+1）+ 缓存失效
             result = await session.execute(select(Article).where(Article.id == da.article_id))

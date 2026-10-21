@@ -49,7 +49,12 @@ class PushNotification(Base):
     )
     # CP5.4a-ADMIN：推送状态机三件套。默认 'sent' 与历史行回填保持一致，
     # 不引入 status=NULL 这种"未初始化"语义——业务侧没有这种状态。
-    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="sent")
+    # 2026-10-21：默认值从 'sent' 改成 'pending'。
+    # 原来默认 'sent'（注释写着"历史行已发出,无失败回执"）——
+    # 但当时**根本没有投递**，"sent" 是凭空来的。
+    # 现在 status 严格表示投递状态：pending(待投) / sending(投递中) /
+    # sent(真的送达了) / failed(失败，带原因)。
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="pending")
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     sent_at: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP, nullable=True)
 

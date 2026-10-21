@@ -10,12 +10,13 @@ import asyncio
 import bcrypt
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from stashbox.backend.common.auth import (
@@ -37,13 +38,19 @@ from stashbox.backend.common.logging import setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
 from stashbox.backend.common.auth_admin import require_admin, require_admin_or_operator
 from stashbox.backend.common.models import User
+from stashbox.backend.common.models.article import Article
 from stashbox.backend.common.models.admin_operation_log import AdminOperationLog
 from stashbox.backend.common.models.push_notification import PushNotification
+from stashbox.backend.common.models.consent import ConsentRecord
+from stashbox.backend.common.models.device_token import DeviceToken
 from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common import quota_service
 from stashbox.backend.common.analytics import track_simple
 from stashbox.backend.common.events import EventName
 from stashbox.backend.common import quota_metrics
+from stashbox.backend.common import rate_limit
+from stashbox.backend.common import revocation
+from stashbox.backend.common.policies import load_privacy_policy, privacy_policy_version
 
 log = logging.getLogger(__name__)
 
@@ -321,10 +328,61 @@ async def health():
     return {"status": "ok", "service": "user-service"}
 
 
+# ── 登录限流（2026-10-21）──────────────────────────────────────────────────
+#
+# wechat-login 是未鉴权端点，且当前是"任意 code 都能建号"。
+# 内测把网关暴露到公网后，一次简单的循环就能建出海量 users，
+# 每个号还自带一份免费配额 —— 蒸馏要真花 LLM + TTS 的钱。
+#
+# 阈值取值：内测是"几十个人手工点登录"的使用强度，20 次/分钟/IP
+# 远高于真人操作，同时能挡住脚本。生产接上真微信 OAuth 后可以收紧。
+_LOGIN_RATE_LIMIT = int(os.getenv("STASHBOX_LOGIN_RATE_LIMIT", "20"))
+_LOGIN_RATE_WINDOW = int(os.getenv("STASHBOX_LOGIN_RATE_WINDOW", "60"))
+
+
+def _client_ip(request: Request) -> str:
+    """取真实客户端 IP（限流按它计数）。
+
+    这里**直接信任** X-Forwarded-For 是安全的，因为：
+    - 生产环境只有网关对外，用户连不到 user-service；
+    - 网关转发前会**用自己解析出的真实 IP 覆盖** XFF
+      （见 api-gateway/main.py 的 _client_ip 与 common/ip.py），
+      所以这个头里的值不是客户端能随便伪造的。
+
+    为什么不直接用 common/ip.py 的那套"只信可信代理"的逻辑：
+    那个函数是为**对外的入口**写的（要防伪造）；而这里的对端是网关
+    自己 —— 它已经把 XFF 净化过了，再套一层"不可信就忽略"会把
+    所有用户算成同一个 IP，限流就废了。
+    """
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        first = fwd.split(",")[0].strip()
+        if first:
+            return first
+    return request.client.host if request.client else "unknown"
+
+
 @app.post("/api/v1/auth/wechat-login", response_model=WechatLoginResponse)
-async def wechat_login(req: WechatLoginRequest, db: AsyncSession = Depends(get_db)):
+async def wechat_login(
+    req: WechatLoginRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     """微信登录（mock：code 派生 open_id，按 open_id 查/插 users 表）。"""
     # 本期不调真实微信 code2session，用 code 派生一个稳定 open_id
+    #
+    # 正因为"任意 code 都能建号"，这个未鉴权端点必须限流（见上方注释）。
+    allowed, _remaining = await rate_limit.check(
+        f"ratelimit:login:{_client_ip(request)}",
+        limit=_LOGIN_RATE_LIMIT,
+        window_sec=_LOGIN_RATE_WINDOW,
+    )
+    if not allowed:
+        raise BizException(
+            code=42901,
+            message="登录尝试过于频繁，请稍后再试",
+            http_status=429,
+        )
     open_id = "wx_" + (req.code or "unknown")[:56]
     result = await db.execute(select(User).where(User.open_id == open_id))
     user = result.scalar_one_or_none()
@@ -390,6 +448,14 @@ async def refresh_token(req: RefreshTokenRequest, db: AsyncSession = Depends(get
     user = result.scalar_one_or_none()
     if user is None:
         raise Unauthorized(message="user not found")
+    # 2026-10-21：已注销的账号不能换出新 token。
+    #
+    # 注销时做了两件事：数据库软删（users.deleted_at）+ 吊销已签发的 token
+    # （common/revocation.py）。前者是**事实**，后者是**热路径上的快速判定**。
+    # 这个端点本来就查库，所以顺手把事实也看一眼 —— Redis 标记万一丢了
+    # （Redis 重启），这里仍然是最后一道闸。
+    if user.deleted_at is not None:
+        raise Unauthorized(message="account has been deleted")
     new_access = create_access_token(str(user.id))
     new_refresh = create_refresh_token(str(user.id))
     return RefreshTokenResponse(
@@ -569,12 +635,494 @@ async def onboarding_complete(
     return {"onboarding_done": True, "onboarding_done_at": u.onboarding_done_at.isoformat()}
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 账号合规组（2026-10-21）
+#
+# 补齐内测前必须有的三件事：隐私政策同意、注销账号、设备注册（推送投递的前提）。
+#
+# 这一组端点全是**用户自己**对自己数据的操作，不是管理端 ——
+# 所以走 require_user，不走 require_admin。
+# ══════════════════════════════════════════════════════════════════════
+
+
+# ── 隐私政策正文（公开端点，不需要登录）──────────────────────────────
+@app.get("/api/v1/policies/privacy")
+async def get_privacy_policy():
+    """当前隐私政策正文。
+
+    **公开端点**：用户还没登录时也要能读政策（首次启动的同意页就在登录之前）。
+    """
+    try:
+        policy = load_privacy_policy()
+    except Exception as exc:  # noqa: BLE001
+        # 政策读不出来必须让客户端知道 —— 客户端要靠它显示"你同意的是哪一版"
+        log.error("privacy_policy_load_failed: %s", exc)
+        raise HTTPException(status_code=503, detail="privacy policy unavailable")
+    return policy
+
+
+# ── 同意记录 ─────────────────────────────────────────────────────────
+class ConsentStateResponse(BaseModel):
+    #: **用户已同意的**版本号；从来没同意过 = ""。
+    #: 客户端拿它跟 current_privacy_policy_version 比：不等 → 要弹同意页。
+    privacy_policy_version: str
+    #: 服务端当前政策版本。
+    current_privacy_policy_version: str
+    privacy_policy_accepted: bool
+    privacy_policy_accepted_at: str | None
+    personalization_enabled: bool
+    cross_user_share_enabled: bool
+
+
+class ConsentUpdateRequest(BaseModel):
+    privacy_policy_version: str
+    accepted: bool
+    personalization_enabled: bool | None = None
+    cross_user_share_enabled: bool | None = None
+
+
+async def _get_or_create_consent(db: AsyncSession, uid: int) -> ConsentRecord:
+    """取同意记录；没有就建一行。
+
+    默认值都是"没同意"（privacy_policy_accepted=False）——
+    合规上必须是**显式同意**，不能因为"没记录"就当成"同意了"。
+    """
+    rec = await db.get(ConsentRecord, uid)
+    if rec is None:
+        rec = ConsentRecord(user_id=uid)
+        db.add(rec)
+        await db.flush()
+    return rec
+
+
+@app.get("/api/v1/users/me/consent", response_model=ConsentStateResponse)
+async def get_my_consent(
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """我当前的同意状态。
+
+    客户端用它决定"要不要弹同意页"：当前政策版本 != 已同意的版本 → 弹。
+    """
+    uid = int(user["sub"])
+    rec = await db.get(ConsentRecord, uid)
+    current_version = privacy_policy_version()
+    if rec is None:
+        return ConsentStateResponse(
+            privacy_policy_version="",
+            current_privacy_policy_version=current_version,
+            privacy_policy_accepted=False,
+            privacy_policy_accepted_at=None,
+            personalization_enabled=False,
+            cross_user_share_enabled=False,
+        )
+    return ConsentStateResponse(
+        privacy_policy_version=rec.privacy_policy_version or "",
+        current_privacy_policy_version=current_version,
+        privacy_policy_accepted=rec.privacy_policy_accepted,
+        privacy_policy_accepted_at=(
+            rec.privacy_policy_accepted_at.isoformat() if rec.privacy_policy_accepted_at else None
+        ),
+        personalization_enabled=rec.personalization_enabled,
+        cross_user_share_enabled=rec.cross_user_share_enabled,
+    )
+
+
+@app.put("/api/v1/users/me/consent", response_model=ConsentStateResponse)
+async def update_my_consent(
+    req: ConsentUpdateRequest,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """记录 / 撤回同意。
+
+    允许**撤回**：accepted=false 是合法操作（合规要求"撤回同意不影响撤回前已进行的处理"）。
+
+    版本号必须与服务端当前版本一致 —— 客户端不能拿着旧版本号来"同意"，
+    那等于同意了一份用户没看过的政策。
+    """
+    uid = int(user["sub"])
+    current_version = privacy_policy_version()
+    if req.privacy_policy_version != current_version:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"policy version mismatch: client sent {req.privacy_policy_version!r}, "
+                f"current is {current_version!r}"
+            ),
+        )
+
+    rec = await _get_or_create_consent(db, uid)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    rec.privacy_policy_accepted = req.accepted
+    rec.privacy_policy_version = current_version if req.accepted else None
+    rec.privacy_policy_accepted_at = now if req.accepted else None
+    if req.personalization_enabled is not None:
+        rec.personalization_enabled = req.personalization_enabled
+    if req.cross_user_share_enabled is not None:
+        rec.cross_user_share_enabled = req.cross_user_share_enabled
+
+    try:
+        await track_simple(db, EventName.USER_CONSENT_UPDATED, uid, "n/a")
+    except Exception as exc:
+        log.warning(f"USER_CONSENT_UPDATED 埋点异常（忽略）: user={uid} err={exc}")
+
+    try:
+        await db.commit()
+        await db.refresh(rec)
+    except Exception:
+        await db.rollback()
+        raise
+
+    return ConsentStateResponse(
+        privacy_policy_version=rec.privacy_policy_version or "",
+        current_privacy_policy_version=current_version,
+        privacy_policy_accepted=rec.privacy_policy_accepted,
+        privacy_policy_accepted_at=(
+            rec.privacy_policy_accepted_at.isoformat() if rec.privacy_policy_accepted_at else None
+        ),
+        personalization_enabled=rec.personalization_enabled,
+        cross_user_share_enabled=rec.cross_user_share_enabled,
+    )
+
+
+# ── 注销账号 ─────────────────────────────────────────────────────────
+class AccountDeleteRequest(BaseModel):
+    """注销请求。
+
+    confirm_text 必须精确等于 :data:`ACCOUNT_DELETE_CONFIRM_TEXT`。
+    为什么要"打字确认"：注销是**不可逆**的终局操作，一个误触就永久丢数据。
+    这不是 UX 洁癖 —— 是让用户有机会意识到自己在做什么。
+    """
+
+    confirm_text: str
+    reason: str | None = None
+
+
+class AccountDeleteResponse(BaseModel):
+    deleted: bool
+    already_deleted: bool
+    anonymized_fields: list[str]
+    articles_soft_deleted: int
+
+
+#: 注销确认短语。客户端要显示出来让用户照着输入。
+ACCOUNT_DELETE_CONFIRM_TEXT = "注销听匣"
+
+
+@app.post("/api/v1/users/me/account/delete", response_model=AccountDeleteResponse)
+async def delete_my_account(
+    req: AccountDeleteRequest,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """注销账号（删除我的账号）。
+
+    ## 做什么
+
+    1. **匿名化**（立即，不可逆）：open_id / union_id / phone / apple_id / email /
+       avatar_url / password_hash 清空，nickname 改成"已注销用户"，open_id 换成
+       一个**不可逆**的随机串（保留原值没有意义，但也得满足 unique 约束）。
+    2. **软删**该用户的全部文章（articles.deleted_at）—— 音频文件在 OSS 上，
+       由运营按 30 天期限批量清理（不在这个请求里做）。
+    3. **停用**该用户的全部设备推送令牌。
+    4. **删掉**同意记录（那是关于"这个人"的个人信息）。
+    5. **吊销**该用户已签发的所有 token（见 common/revocation.py）——
+       这一步是"注销后立即停止提供服务"的兑现点。
+    6. 软删用户行本身（users.deleted_at）。
+
+    ## 幂等
+
+    重复调用返回 200 + already_deleted=true，不报错 ——
+    客户端重试（网络抖动）不该让用户看到"注销失败"。
+
+    ## 为什么是软删而不是硬删
+
+    - articles 挂着外键到 users，硬删会连带删掉别人的评论/标签关联
+    - 审计与计费口径需要保留"曾经有过这个人"的痕迹（但不含个人内容）
+    - 真要物理删除，是运营侧的批量清理任务（30 天期限），不在用户请求里做
+    """
+    if (req.confirm_text or "").strip() != ACCOUNT_DELETE_CONFIRM_TEXT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"confirm_text must be exactly {ACCOUNT_DELETE_CONFIRM_TEXT!r}",
+        )
+
+    uid = int(user["sub"])
+    u = await db.get(User, uid)
+    if u is None:
+        raise HTTPException(status_code=404, detail="user not found")
+
+    if u.deleted_at is not None:
+        # 已经注销过了 —— 幂等返回，不做任何写入
+        return AccountDeleteResponse(
+            deleted=True,
+            already_deleted=True,
+            anonymized_fields=[],
+            articles_soft_deleted=0,
+        )
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    # 1) 匿名化
+    anonymized: list[str] = []
+    if u.open_id:
+        # 换成随机串：原值是微信 OpenID，属于个人信息，不能留。
+        # 保留 id 前缀只为了运维能看出"这是被注销的那个号"，不泄露任何身份。
+        u.open_id = f"del_{uid}_{secrets.token_hex(8)}"
+        anonymized.append("open_id")
+    for field in ("union_id", "phone", "apple_id", "email", "avatar_url", "password_hash"):
+        if getattr(u, field, None):
+            setattr(u, field, None)
+            anonymized.append(field)
+    if u.nickname:
+        u.nickname = "已注销用户"
+        anonymized.append("nickname")
+
+    # 2) 软删文章
+    res = await db.execute(
+        update(Article)
+        .where(Article.user_id == uid, Article.deleted_at.is_(None))
+        .values(deleted_at=now, updated_at=now)
+    )
+    articles_soft_deleted = int(res.rowcount or 0)
+
+    # 3) 停用设备推送令牌
+    await db.execute(
+        update(DeviceToken)
+        .where(DeviceToken.user_id == uid, DeviceToken.deleted_at.is_(None))
+        .values(is_active=False, deleted_at=now, updated_at=now)
+    )
+
+    # 4) 删同意记录
+    await db.execute(delete(ConsentRecord).where(ConsentRecord.user_id == uid))
+
+    # 5) 软删用户行
+    u.deleted_at = now
+    u.quota_used = 0
+    u.monthly_quota = 0
+
+    try:
+        await track_simple(db, EventName.USER_ACCOUNT_DELETED, uid, "n/a")
+    except Exception as exc:
+        log.warning(f"USER_ACCOUNT_DELETED 埋点异常（忽略）: user={uid} err={exc}")
+
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    # 6) 吊销 token —— 放在 commit **之后**。
+    #    顺序很关键：先落库（数据确实没了），再吊销（服务确实停了）。
+    #    反过来的话，中间崩了会出现"数据还在但 token 已废"——用户重登就能看到
+    #    自己已注销的账号，比反过来更糟。
+    #
+    #    ⚠️ 时间戳必须是 **UTC**。上面算的 `now` 是 naive 的（为了写 DB 的
+    #    TIMESTAMP WITHOUT TIME ZONE 列），直接 `.timestamp()` 会被 Python
+    #    按**本地时区**解释 —— 东八区就比真实 UTC 早 8 小时，
+    #    于是"吊销时刻"落在 token 签发时刻**之前**，判据 `iat < revoked_after`
+    #    恒为假，token 根本没被吊销。
+    #    这条 bug 是被 test_delete_revokes_token_immediately 抓出来的。
+    await revocation.revoke(uid, at=now.replace(tzinfo=timezone.utc).timestamp())
+
+    return AccountDeleteResponse(
+        deleted=True,
+        already_deleted=False,
+        anonymized_fields=anonymized,
+        articles_soft_deleted=articles_soft_deleted,
+    )
+
+
+# ── 设备注册（推送投递的前提）─────────────────────────────────────────
+class DeviceRegisterRequest(BaseModel):
+    token: str
+    platform: str = "android"
+    provider: str = "none"
+    app_version: str | None = None
+    device_model: str | None = None
+
+
+class DeviceResponse(BaseModel):
+    id: int
+    token: str
+    platform: str
+    provider: str
+    app_version: str | None
+    device_model: str | None
+    is_active: bool
+
+
+@app.get("/api/v1/users/me/devices", response_model=list[DeviceResponse])
+async def list_my_devices(
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """我注册过的设备。"""
+    uid = int(user["sub"])
+    res = await db.execute(
+        select(DeviceToken)
+        .where(DeviceToken.user_id == uid, DeviceToken.deleted_at.is_(None))
+        .order_by(DeviceToken.updated_at.desc())
+    )
+    rows = res.scalars().all()
+    return [
+        DeviceResponse(
+            id=r.id,
+            token=r.token,
+            platform=r.platform,
+            provider=r.provider,
+            app_version=r.app_version,
+            device_model=r.device_model,
+            is_active=r.is_active,
+        )
+        for r in rows
+    ]
+
+
+@app.post("/api/v1/users/me/devices", response_model=DeviceResponse)
+async def register_my_device(
+    req: DeviceRegisterRequest,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """注册（或更新）一台设备的推送令牌。
+
+    **幂等**：同一个 (token, provider) 再次注册 = 更新归属 + 重新激活。
+    换账号登录时，客户端会用新账号的 token 调一次这里，把这台设备转过去 ——
+    否则会出现"登出后旧账号还在往这台手机推"的情况。
+    """
+    uid = int(user["sub"])
+    token = (req.token or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="token is required")
+    provider = (req.provider or "none").strip()[:32]
+
+    res = await db.execute(
+        select(DeviceToken).where(DeviceToken.token == token, DeviceToken.provider == provider)
+    )
+    row = res.scalar_one_or_none()
+    if row is None:
+        row = DeviceToken(
+            user_id=uid,
+            token=token,
+            platform=(req.platform or "android")[:16],
+            provider=provider,
+            app_version=req.app_version,
+            device_model=req.device_model,
+        )
+        db.add(row)
+    else:
+        # 归属转移 + 重新激活
+        row.user_id = uid
+        row.platform = (req.platform or row.platform)[:16]
+        row.app_version = req.app_version
+        row.device_model = req.device_model
+        row.is_active = True
+        row.deleted_at = None
+
+    try:
+        await db.commit()
+        await db.refresh(row)
+    except Exception:
+        await db.rollback()
+        raise
+
+    return DeviceResponse(
+        id=row.id,
+        token=row.token,
+        platform=row.platform,
+        provider=row.provider,
+        app_version=row.app_version,
+        device_model=row.device_model,
+        is_active=row.is_active,
+    )
+
+
+@app.delete("/api/v1/users/me/devices/{device_id}", response_model=AccountDeleteResponse)
+async def unregister_my_device(
+    device_id: int,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """解绑一台设备（停用，不硬删 —— 留着才知道"这台设备曾经推过"）。"""
+    uid = int(user["sub"])
+    row = await db.get(DeviceToken, device_id)
+    if row is None or row.user_id != uid:
+        raise HTTPException(status_code=404, detail="device not found")
+    row.is_active = False
+    row.deleted_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+    return AccountDeleteResponse(
+        deleted=True, already_deleted=False, anonymized_fields=[], articles_soft_deleted=0
+    )
+
+
+# ── 应用版本（公开端点，驱动应用内更新）─────────────────────────────
+class AppVersionResponse(BaseModel):
+    latest_version_code: int
+    latest_version_name: str
+    min_supported_version_code: int
+    download_url: str
+    release_notes: str
+    published_at: str | None
+    mandatory: bool
+
+
+@app.get("/api/v1/app/version", response_model=AppVersionResponse)
+async def get_app_version():
+    """当前发布的 App 版本信息（应用内更新用）。
+
+    **公开端点**：更新检查发生在"用户还没登录"和"App 刚启动"的时候。
+
+    值从环境变量读（见 .env.example）：
+      STASHBOX_APP_LATEST_VERSION_CODE / _NAME / _DOWNLOAD_URL
+      STASHBOX_APP_MIN_SUPPORTED_VERSION_CODE / _NOTES
+
+    为什么用环境变量而不是 DB：内测阶段每次发版都要改一次，
+    而"改一个环境变量 + 重启 user-service"比"加一个管理页面"轻得多。
+    真要运营自助，改成 SystemConfig 即可（表已存在）。
+    """
+
+    def _int_env(name: str, default: int) -> int:
+        try:
+            return int(os.getenv(name, "") or default)
+        except ValueError:
+            return default
+
+    latest_code = _int_env("STASHBOX_APP_LATEST_VERSION_CODE", 0)
+    min_code = _int_env("STASHBOX_APP_MIN_SUPPORTED_VERSION_CODE", 0)
+    return AppVersionResponse(
+        latest_version_code=latest_code,
+        latest_version_name=os.getenv("STASHBOX_APP_LATEST_VERSION_NAME", ""),
+        min_supported_version_code=min_code,
+        download_url=os.getenv("STASHBOX_APP_DOWNLOAD_URL", ""),
+        release_notes=os.getenv("STASHBOX_APP_RELEASE_NOTES", ""),
+        published_at=os.getenv("STASHBOX_APP_PUBLISHED_AT", "") or None,
+        mandatory=latest_code > 0 and min_code > 0 and min_code >= latest_code,
+    )
+
+
 @app.get("/api/v1/subscription/plans")
 async def get_plans(user: dict = Depends(require_user)):
     plans = [
-        Plan(id="free", name="免费", price_cny=0, monthly_quota=5),
-        Plan(id="student", name="学生", price_cny=9, monthly_quota=30),
-        Plan(id="member", name="会员", price_cny=29, monthly_quota=50),
+        # 免费档配额跟配置走（STASHBOX_FREE_TIER_QUOTA，默认 50）——
+        # 付费墙显示的"免费档 N 篇"必须和实际发到的配额一致，
+        # 否则用户看到的数字和撞到的墙对不上。
+        Plan(
+            id="free",
+            name="免费",
+            price_cny=0,
+            monthly_quota=settings.free_tier_monthly_quota,
+        ),
+        # 档位必须**单调递增**：免费档提到 50 之后，学生档还是 30 就成了
+        # "学生花 9 块只有 30 篇，比免费用户还少" —— 定价逻辑自相矛盾。
+        Plan(id="student", name="学生", price_cny=9, monthly_quota=150),
+        Plan(id="member", name="会员", price_cny=29, monthly_quota=500),
         Plan(id="pro", name="专业", price_cny=69, monthly_quota=-1),
     ]
     return {"plans": [p.model_dump() for p in plans]}
@@ -742,16 +1290,23 @@ async def admin_retry_push_notification(
     """v1 §端点需求_admin推送队列_v1 §2.3：失败推送重推。
 
     鉴权：require_admin_or_operator（admin / operator 通过；free/viewer 403）。
-    仅 `status=failed` 可重推（pending 还在队列、sent 已成功，重推无意义）。
     reason 必填且 5..200 字符（与 quota-adjust 同口径）。
 
-    副作用（与目标更新同事务）：
-      1. 重置 push_notifications.status='sent' / error=NULL / sent_at=now
-         （重置为「已重发」便于 admin 视角立即看效果；真推送 CP4.6 上线后
-          可改为 status='pending' 让 worker 重投,改动只需这一行）
-      2. 写 admin_operation_logs(action='retry_push_notification',target_id=str(id))
-         reason 与请求体一致——便于运营复盘「为什么重推」
-    失败整体回滚：reason 校验失败 / status 非 failed / id 不存在 都不会落库。
+    ## 2026-10-21：它现在**真的会推**
+
+    原来这个端点的副作用是：
+
+        notif.status = "sent"; notif.error = None; notif.sent_at = now
+
+    —— 直接把状态改成"已发送"，**一个网络请求都不发**。
+    运营在后台看到"已发送"，用户手机上什么都没收到。
+    那是整条推送链路上最坏的一种状态：**看起来是绿的，实际上没做**。
+
+    现在走真的投递：取该用户的设备令牌 → 调 provider → 按真实结果写状态。
+    没配通道、用户没注册设备、网关报错，都会如实写 failed + 原因。
+
+    允许重推的状态：failed / pending / sending（sent 不给重推，
+    因为那会真的给用户再发一遍）。
     """
     # 1) reason 校验（commit 前,失败不落库）
     if not req.reason or not req.reason.strip():
@@ -772,20 +1327,33 @@ async def admin_retry_push_notification(
     notif = await db.get(PushNotification, notification_id)
     if notif is None:
         raise HTTPException(status_code=404, detail=f"notification {notification_id} 不存在")
-    if notif.status != "failed":
-        # 仅 failed 可重推：pending 还在待发队列（不需重投）、sent 已成功（重投无意义）
+    if notif.status == "sent":
+        # 已成功投递的不给重推（重推会真的再发一次，用户收到两条）
         raise HTTPException(
             status_code=409,
-            detail=(f"仅 status=failed 可重推,当前 status={notif.status!r}"),
+            detail="该通知已投递成功，不需重推",
         )
 
-    # 3) 副作用：重置状态 + 写 audit（同事务）
-    from datetime import datetime as _dt
+    # 3) 真投递（2026-10-21）
+    #
+    #    原来这里是 `notif.status = "sent"` —— 直接把状态改成已发送，
+    #    **不发起任何投递请求**。运营在后台看到"已发送"，
+    #    用户手机上什么都没收到，而系统里一切正常。
+    #    （那行代码的注释自己都写着"真推送 CP4.6 上线后可改为 status='pending'"）
+    #
+    #    现在走真的投递路径：取设备 → 调 provider → 按**真实结果**写状态。
+    #    没有配置通道 / 用户没注册设备 / 网关报错，都会如实写 failed + 原因。
+    from stashbox.backend.common import push_service
 
-    now = _dt.now()
-    notif.status = "sent"
-    notif.error = None
-    notif.sent_at = now
+    notif.status = push_service.STATUS_PENDING
+    await db.flush()
+    result = await push_service.deliver_notification(db, notif)
+    log.info(
+        "admin_retry_push: notif=%s provider=%s -> %s",
+        notification_id,
+        result.provider,
+        result.summary(),
+    )
 
     log_row = AdminOperationLog(
         admin_id=await _resolve_audit_admin_id(db, user.get("sub")),
@@ -796,7 +1364,15 @@ async def admin_retry_push_notification(
         reason=reason,
         method="POST",
         path=f"/api/v1/admin/push-notifications/{notification_id}/retry",
-        request_body={"reason": reason},
+        # 把真实投递结果也记进审计 —— 运营复盘"为什么这条推不出去"时用得上
+        request_body={
+            "reason": reason,
+            "provider": result.provider,
+            "attempted": result.attempted,
+            "delivered": result.delivered,
+            "failed": result.failed,
+            "detail": result.detail,
+        },
         response_status=200,
         ip=None,
         user_agent=None,
@@ -816,7 +1392,7 @@ async def admin_retry_push_notification(
         status=notif.status,
         error=notif.error,
         sent_at=notif.sent_at.isoformat() if notif.sent_at else None,
-        retried_at=now.isoformat(),
+        retried_at=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
     )
 
 

@@ -515,16 +515,83 @@ def test_gateway_routes_include_admin_push_notifications_retry():
 # ===== CP5.4a-ADMIN-RETRY：失败推送重推（v1 §端点需求_admin推送队列_v1 §2.3） =====
 
 
+class _FakeProvider:
+    """可编程的假 provider。
+
+    2026-10-21：重推端点**真的投递**了，所以测试要能控制"投递结果"，
+    否则只能测到"没配通道"这一种情况。
+    """
+
+    name = "fake"
+
+    def __init__(self, *, ok: bool = True, delivered: int = 1) -> None:
+        self.ok = ok
+        self.delivered = delivered
+        self.calls: list[list] = []
+
+    async def send(self, targets, *, title, body, deeplink=None):
+        from stashbox.backend.common.push import PushResult
+
+        self.calls.append(list(targets))
+        n = len(targets)
+        return PushResult(
+            ok=self.ok,
+            provider=self.name,
+            detail="fake provider",
+            attempted=n,
+            delivered=self.delivered if self.ok else 0,
+            failed=0 if self.ok else n,
+        )
+
+
+async def _make_device(user_id: int, *, provider: str = "fake") -> int:
+    """给用户造一条设备推送令牌，返回 device id。
+
+    没有设备就没有"往哪投"——投递路径会如实报"该用户没有已注册的设备"。
+    所以要测"投递成功"这条路径，必须先有设备。
+    """
+    from stashbox.backend.common.models import DeviceToken
+
+    async with AsyncSessionLocal() as s:
+        row = DeviceToken(
+            user_id=user_id,
+            token=f"tok_{uuid.uuid4().hex}",
+            platform="android",
+            provider=provider,
+            is_active=True,
+        )
+        s.add(row)
+        await s.commit()
+        await s.refresh(row)
+        return row.id
+
+
+@pytest.fixture
+def fake_provider(monkeypatch):
+    """把 provider 换成假实现，返回它以便断言调用情况。"""
+    from stashbox.backend.common import push_service
+
+    p = _FakeProvider()
+    monkeypatch.setattr(push_service, "get_push_provider", lambda: p)
+    return p
+
+
 async def _make_failed_notification(user_id: int, *, error: str = "推送通道 503") -> int:
     """造一条 status=failed 的推送,返回 id。"""
     return await _make_notification(user_id, status="failed", error=error, sent_at=None)
 
 
 @pytest.mark.asyncio
-async def test_retry_failed_notification_success():
-    """status=failed 重推成功：status=sent、error=NULL、sent_at 更新、audit 落库。"""
+async def test_retry_really_delivers_and_marks_sent(fake_provider):
+    """重推**真的投递**，成功才写 status=sent。
+
+    2026-10-21 之前这个端点只是把 status 改成 'sent'，一个请求都不发 ——
+    运营看到"已发送"，用户手机上什么都没有。现在必须真的调 provider，
+    而且 provider 报成功才写 sent。
+    """
     admin = await _make_user(tier="admin")
     u = await _make_user()
+    await _make_device(u)
     nid = await _make_failed_notification(u, error="推送通道 503")
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=user_app), base_url="http://test"
@@ -553,6 +620,59 @@ async def test_retry_failed_notification_success():
             {"i": nid},
         )
         assert row == "sent|NULL|SET"
+    # 关键：provider **真的被调了**（不是只改了个状态字段）
+    assert len(fake_provider.calls) == 1, "重推必须真的调 provider"
+
+
+@pytest.mark.asyncio
+async def test_retry_without_channel_reports_failure_not_fake_success():
+    """**没有配置推送通道**时，重推必须如实报 failed + 原因，不能报 sent。
+
+    这是本次修复的核心：以前"没投出去"会被写成"已发送"。
+    没有通道 = 推送没做，状态就该是 failed。
+    """
+    from stashbox.backend.common import push_service
+
+    admin = await _make_user(tier="admin")
+    u = await _make_user()
+    nid = await _make_failed_notification(u, error="推送通道 503")
+    # 刻意不装 fake_provider → 走真实的 NullPushProvider（未配置通道）
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=user_app), base_url="http://test"
+    ) as client:
+        resp = await client.post(
+            f"/api/v1/admin/push-notifications/{nid}/retry",
+            headers={"Authorization": f"Bearer {_token(admin)}"},
+            json={"reason": "没配通道时重推也该如实报失败"},
+        )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "failed", f"没通道却报成功：{data}"
+    assert data["error"], "失败必须写明原因"
+    assert data["sent_at"] is None
+    # provider 名对得上
+    assert push_service.STATUS_FAILED == "failed"
+
+
+@pytest.mark.asyncio
+async def test_retry_provider_failure_is_reported(fake_provider):
+    """provider 报失败 → 如实 failed + 原因，不许写 sent。"""
+    fake_provider.ok = False
+    admin = await _make_user(tier="admin")
+    u = await _make_user()
+    nid = await _make_failed_notification(u)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=user_app), base_url="http://test"
+    ) as client:
+        resp = await client.post(
+            f"/api/v1/admin/push-notifications/{nid}/retry",
+            headers={"Authorization": f"Bearer {_token(admin)}"},
+            json={"reason": "provider 报失败时如实记录"},
+        )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "failed", data
+    assert data["error"]
 
 
 @pytest.mark.asyncio
@@ -664,10 +784,16 @@ async def test_retry_sent_status_409():
 
 
 @pytest.mark.asyncio
-async def test_retry_pending_status_409():
-    """status=pending 不可重推 → 409（还在队列里,不需重投）。"""
+async def test_retry_pending_is_allowed_and_delivers(fake_provider):
+    """status=pending **可以**重推（2026-10-21 起）。
+
+    以前 pending 是 409（"还在队列里,不需重投"）—— 但那个"队列"根本没人消费，
+    pending 只会一直挂着。现在 pending/sending/failed 都允许重推，
+    只有 sent 不给重推（那会真的给用户再发一遍）。
+    """
     admin = await _make_user(tier="admin")
     u = await _make_user()
+    await _make_device(u)
     nid = await _make_notification(u, status="pending", sent_at=None)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=user_app), base_url="http://test"
@@ -675,7 +801,28 @@ async def test_retry_pending_status_409():
         resp = await client.post(
             f"/api/v1/admin/push-notifications/{nid}/retry",
             headers={"Authorization": f"Bearer {_token(admin)}"},
-            json={"reason": "pending 状态不应被重推"},
+            json={"reason": "pending 也允许手动重推"},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "sent"
+    assert len(fake_provider.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_sent_is_409():
+    """已投递成功的不给重推 —— 重推会真的给用户再发一遍。"""
+    admin = await _make_user(tier="admin")
+    u = await _make_user()
+    nid = await _make_notification(
+        u, status="sent", sent_at=datetime.now(timezone.utc).replace(tzinfo=None)
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=user_app), base_url="http://test"
+    ) as client:
+        resp = await client.post(
+            f"/api/v1/admin/push-notifications/{nid}/retry",
+            headers={"Authorization": f"Bearer {_token(admin)}"},
+            json={"reason": "已成功的不能再推"},
         )
     assert resp.status_code == 409
 
@@ -746,10 +893,11 @@ async def test_retry_reason_too_long_400():
 
 
 @pytest.mark.asyncio
-async def test_retry_already_retried_is_idempotent_blocked():
+async def test_retry_already_retried_is_idempotent_blocked(fake_provider):
     """同一行重推第二次会被 409 挡住：第一次成功后 status=sent,第二次不再允许。"""
     admin = await _make_user(tier="admin")
     u = await _make_user()
+    await _make_device(u)
     nid = await _make_failed_notification(u)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=user_app), base_url="http://test"
@@ -769,10 +917,11 @@ async def test_retry_already_retried_is_idempotent_blocked():
 
 
 @pytest.mark.asyncio
-async def test_retry_operator_allowed():
+async def test_retry_operator_allowed(fake_provider):
     """operator 角色亦可通过 require_admin_or_operator。"""
     operator = await _make_user(tier="operator")
     u = await _make_user()
+    await _make_device(u)
     nid = await _make_failed_notification(u)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=user_app), base_url="http://test"
