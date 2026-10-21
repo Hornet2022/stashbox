@@ -745,16 +745,39 @@ async def admin_llm_test_with_config(
         )
 
     # app/services/llm 用 provider 前缀式键名，这里从请求体映射过去
+    #
+    # ⚠️ **空值要沿用已存的那把 key**（前端约定）：
+    #    前端在用户**没有重新输入** key 时传 api_key: ''（不是不传），
+    #    意图是"用我已保存的那把"。但这里原来直接把 req.api_key 塞进 cfg，
+    #    空串 → build_adhoc_client 抛 "api_key required for OpenAIClient"
+    #    → 端点 4ms 就返回 ok:false。
+    #    症状：运营明明在后台配好了 key，点「测试调用」却报
+    #    "服务端处理异常"，而 GET 版（用已存配置）却是绿的 ——
+    #    同一个页面两个按钮，一个通一个不通。
+    #
+    #    合并语义与 PUT 保存端一致：**空/不传 = 不动已存的值**。
+    effective_key = req.api_key
+    if not effective_key:
+        stored_cfg = await system_config.get_config(system_config.KEY_LLM) or {}
+        effective_key = str(stored_cfg.get("api_key") or "").strip()
+        # 仍为空 → 回落 env（可能配在 env 里）
+        if not effective_key:
+            effective_key = (
+                os.getenv("OPENAI_LLM_API_KEY", "")
+                if provider == "openai"
+                else os.getenv("DASHSCOPE_API_KEY", "") or os.getenv("QWEN_VL_API_KEY", "")
+            )
+
     cfg: dict[str, Any] = {
         "provider": provider,
         f"{provider}_llm_model": req.model,
-        f"{provider}_llm_api_key": req.api_key,
+        f"{provider}_llm_api_key": effective_key,
         f"{provider}_llm_base_url": req.base_url,
     }
     if provider == "qwen_vl":
         # qwen_vl 的 provider 名带 _vl，键名是 qwen_vl_llm_*（与 build_client 一致）
         cfg["qwen_vl_llm_model"] = req.model
-        cfg["qwen_vl_llm_api_key"] = req.api_key
+        cfg["qwen_vl_llm_api_key"] = effective_key
         cfg["qwen_vl_llm_base_url"] = req.base_url
 
     result: dict[str, Any] = {"provider": provider, "model": req.model}
