@@ -3057,6 +3057,65 @@
         ]
       }
     },
+    "/api/v1/admin/tts/voices/probe": {
+      "post": {
+        "summary": "Admin Tts Probe Voices",
+        "description": "探测该 TTS 模型**支持哪些 voice**。\n\n## 为什么单独一个端点\n\n「测试调用」失败时才带出 supported_voices 是不够的：\n运营的常见场景是「我第一次配这个服务，想知道有哪些音色」，\n那时还没有失败、没有错误信息可解析。\n\n## 怎么探\n\n发一次**故意用错 voice** 的合成请求。绝大多数 OpenAI 兼容的 TTS 服务\n校验 voice 时会把可用列表带在 400 响应里：\n\n    Invalid voice 'x'. Supported: aiden, dylan, ...\n\n于是\"一次失败的请求\"就是\"一次探测\"。比逐个试省事，也不额外烧合成额度。\n\n解析不出来（服务不报这个错 / 报的是别的格式）时返回空列表 ——\n**不猜、不硬编码**。\n\n合并语义与 tts/test 一致：空值 = 沿用已存配置。",
+        "operationId": "admin_tts_probe_voices_api_v1_admin_tts_voices_probe_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TTSConfigUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
     "/api/v1/admin/tts/voices/{voice_id}": {
       "put": {
         "summary": "Admin Update Voice",

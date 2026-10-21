@@ -319,6 +319,14 @@ ROUTES += [
     Route("GET", "/api/v1/admin/tts/test", "content-service", _url("content-service")),
     # 2026-10：同上，POST 版带请求体，测未保存的表单配置
     Route("POST", "/api/v1/admin/tts/test", "content-service", _url("content-service")),
+    # 探测该 TTS 模型支持哪些 voice（运营配音色时最常踩的坑：
+    # 第三方兼容服务的音色名跟 OpenAI 官方完全不一样）
+    Route(
+        "POST",
+        "/api/v1/admin/tts/voices/probe",
+        "content-service",
+        _url("content-service"),
+    ),
     # admin-web 用的 POST /api/v1/tags + GET /api/v1/notifications（CP3.6-A2 + CP5.4a）
     Route("POST", "/api/v1/tags", "content-service", _url("content-service")),
     Route("GET", "/api/v1/notifications", "user-service", _url("user-service")),

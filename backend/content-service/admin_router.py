@@ -1085,12 +1085,134 @@ async def admin_tts_test_with_config(
             hint=cls["hint"],
             detail=cls["detail"],
         )
+        # voice 填错是最常见的配置错误，而服务方的报错里**就带着答案**
+        # （"Invalid voice 'x'. Supported: a, b, c"）。
+        # 把它结构化带出来，前端直接显示成可选列表 ——
+        # 运营不用去翻日志、也不用一个一个试。
+        try:
+            from stashbox.backend.app.services.tts.voice_probe import (
+                extract_supported_voices,
+            )
+
+            supported = extract_supported_voices(
+                f"{exc}\n{cls.get('detail') or ''}\n{cls.get('hint') or ''}"
+            )
+        except Exception:  # noqa: BLE001 —— 解析失败不该覆盖测试结果
+            supported = []
+        if supported:
+            result["supported_voices"] = supported
+            result["hint"] = (
+                f"音色 '{result.get('voice')}' 不被该模型支持；" f"可用音色：{', '.join(supported)}"
+            )
+            result["error"] = result["hint"]
     finally:
         if client is not None:
             try:
                 await client.close()
             except Exception:  # noqa: BLE001 —— 关闭失败不该覆盖测试结果
                 log.warning("adhoc tts client close failed", exc_info=True)
+    return result
+
+
+@router.post("/api/v1/admin/tts/voices/probe")
+async def admin_tts_probe_voices(
+    req: TTSConfigUpdate,
+    user: dict = Depends(require_admin_or_operator),
+):
+    """探测该 TTS 模型**支持哪些 voice**。
+
+    ## 为什么单独一个端点
+
+    「测试调用」失败时才带出 supported_voices 是不够的：
+    运营的常见场景是「我第一次配这个服务，想知道有哪些音色」，
+    那时还没有失败、没有错误信息可解析。
+
+    ## 怎么探
+
+    发一次**故意用错 voice** 的合成请求。绝大多数 OpenAI 兼容的 TTS 服务
+    校验 voice 时会把可用列表带在 400 响应里：
+
+        Invalid voice 'x'. Supported: aiden, dylan, ...
+
+    于是"一次失败的请求"就是"一次探测"。比逐个试省事，也不额外烧合成额度。
+
+    解析不出来（服务不报这个错 / 报的是别的格式）时返回空列表 ——
+    **不猜、不硬编码**。
+
+    合并语义与 tts/test 一致：空值 = 沿用已存配置。
+    """
+    if os.getenv("ENABLE_TTS_TEST_ENDPOINT", "1").lower() in {"0", "false", "no"}:
+        raise NotFound(message="tts voice probe disabled")
+
+    provider = req.provider.strip().lower()
+    if provider not in TTS_SUPPORTED_PROVIDERS:
+        raise InvalidRequest(
+            message=f"provider 必须是 {list(TTS_SUPPORTED_PROVIDERS)} 之一，当前 {provider!r}"
+        )
+
+    from stashbox.backend.app.services.tts import build_client
+    from stashbox.backend.app.services.tts.voice_probe import extract_supported_voices
+
+    stored = dict(await system_config.get_config(system_config.KEY_TTS) or {})
+    stored["provider"] = provider
+    fields = req.model_fields_set
+    for fname in (
+        "openai_base_url",
+        "openai_model",
+        "openai_voice",
+        "doubao_voice",
+        "doubao_resource_id",
+        "edge_voice",
+        "local_voice",
+    ):
+        if fname in fields:
+            v = getattr(req, fname)
+            stored[fname] = (v or "").strip() or None
+    for key, env_name in (
+        ("openai_api_key", "OPENAI_TTS_API_KEY"),
+        ("doubao_api_key", "DOUBAO_TTS_API_KEY"),
+    ):
+        if key in fields and getattr(req, key):
+            stored[key] = getattr(req, key)
+        elif not stored.get(key):
+            # 已存没有 → 回落 env
+            stored[key] = os.getenv(env_name, "") or None
+
+    effective = tts_resolve_config(stored)
+    result: dict[str, Any] = {"provider": provider, "supported_voices": []}
+
+    client = None
+    try:
+        client = build_client(effective)
+        # 故意用一个几乎不可能存在的音色名，逼服务把支持列表说出来
+        probe_voice = "__stashbox_probe_voice__"
+        await client.synthesize("探测。", voice=probe_voice)
+        # 没报错 = 服务**不校验 voice**（那就没法探出来，如实说）
+        result.update(
+            ok=False,
+            hint="该服务接受任意音色名（不校验），无法探测可用列表。"
+            " 可以直接填你知道的音色名试试。",
+            detail=None,
+        )
+    except Exception as exc:  # noqa: BLE001 —— 探测失败也是有效结果
+        supported = extract_supported_voices(str(exc))
+        result.update(
+            ok=bool(supported),
+            supported_voices=supported,
+            hint=(
+                f"该模型支持 {len(supported)} 个音色：{', '.join(supported)}"
+                if supported
+                else "没能从服务响应里解析出音色列表（该服务可能不校验 voice，"
+                "或错误格式未覆盖）。可先填一个音色名试合成。"
+            ),
+            detail=str(exc)[:500],
+        )
+    finally:
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:  # noqa: BLE001
+                log.warning("probe tts client close failed", exc_info=True)
     return result
 
 
