@@ -18,6 +18,36 @@ from .models import Feedback
 log = logging.getLogger(__name__)
 
 
+# feedback.reason 的列宽（common/models/feedback.py 里是 String(64)）。
+#
+# 为什么护栏要放在 SDK 这一层，而不是让每个调用点自己记得截断：
+#
+# 埋点失败是**静默**的 —— track() 用 SAVEPOINT 兜住异常，只留一条 warning，
+# 事件就此消失，业务照常成功。于是只要有一个调用点忘了按列宽截断，
+# 那条埋点就整条没了，外部完全看不出来（数据库里查不到，告警也不会响）。
+#
+# 真实踩过的坑：distill_task 的 agent 路径把完整异常塞进 reason（截断到 200），
+# 200 > 64 → insert 报 StringDataRightTruncationError → **整条 distill_failed
+# 埋点被丢掉**，管理后台看不到任何失败原因（只在 worker 日志里留了一行 warning）。
+#
+# 现在 reason 统一在 SDK 层压到列宽，溢出部分挪进 metadata（JSONB 无长度上限），
+# 既不丢事件，也不丢原文；调用点漏截断也伤不到数据。
+_REASON_MAX_LEN = 64
+
+
+def _fit_reason(reason: str | None, metadata: dict[str, Any]) -> str | None:
+    """把 reason 压进列宽；溢出部分挪进 metadata['reason_full']。
+
+    返回截断后的 reason（None 原样返回）。
+    """
+    if reason is None:
+        return None
+    if len(reason) <= _REASON_MAX_LEN:
+        return reason
+    metadata.setdefault("reason_full", reason)
+    return reason[:_REASON_MAX_LEN]
+
+
 async def track(
     db: AsyncSession,
     event: EventName | str,
@@ -52,6 +82,9 @@ async def track(
     - 若传入的 session 没有活跃事务（单测/特殊场景），退化为独立新 session 写入。
     """
     event_name = event.value if isinstance(event, EventName) else event
+    # 护栏在此生效：reason 压到列宽（超长部分进 metadata），调用点不必自己记得截断。
+    metadata = dict(metadata or {})
+    reason = _fit_reason(reason, metadata)
 
     def _new_record() -> Feedback:
         return Feedback(

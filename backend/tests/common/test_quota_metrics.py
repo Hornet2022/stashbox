@@ -2,6 +2,7 @@
 
 任务包 §4.5 定义 4 测试，验收标准 §6 要求 4 passed。
 """
+
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -67,7 +68,12 @@ async def test_100_concurrent_consume_no_overage():
             # 模拟：前 10 次成功（quota_used 从 0 到 10），之后抛 QuotaExceededError
         if call_count <= 10:
             # 返回模拟扣减结果
-            return {"user_id": user_id, "quota_used": call_count, "monthly_quota": 10, "version": call_count}
+            return {
+                "user_id": user_id,
+                "quota_used": call_count,
+                "monthly_quota": 10,
+                "version": call_count,
+            }
         raise QuotaExceededError(message="quota exceeded")
 
     mock_session = AsyncMock()
@@ -97,6 +103,7 @@ async def test_cache_hit_and_miss_counters_increment():
     # 读取计数初始值
     def _hit_count():
         return quota_metrics.quota_cache_hit_total._value.get()
+
     def _miss_count():
         return quota_metrics.quota_cache_miss_total._value.get()
 
@@ -104,7 +111,9 @@ async def test_cache_hit_and_miss_counters_increment():
     miss_before = _miss_count()
 
     # 第 1 次：mock cache_service.get_quota 返回 None → miss
-    with patch("stashbox.backend.common.quota_service.cache_service.get_quota", new_callable=AsyncMock) as mock_get:
+    with patch(
+        "stashbox.backend.common.quota_service.cache_service.get_quota", new_callable=AsyncMock
+    ) as mock_get:
         mock_get.return_value = None  # cache miss
         mock_session.execute = AsyncMock()
         mock_session.get = AsyncMock()
@@ -114,9 +123,11 @@ async def test_cache_hit_and_miss_counters_increment():
         mock_result = MagicMock()
         mock_result.one_or_none.return_value = mock_row
         mock_session.execute.return_value = mock_result
-        mock_session.get.return_value = MagicMock(plan="free")
+        mock_session.get.return_value = MagicMock(tier="free")
 
-        with patch("stashbox.backend.common.quota_service.cache_service.set_quota", new_callable=AsyncMock):
+        with patch(
+            "stashbox.backend.common.quota_service.cache_service.set_quota", new_callable=AsyncMock
+        ):
             await get_quota(mock_session, 1)
 
     assert _miss_count() == miss_before + 1, "first call should be a cache miss"
@@ -126,7 +137,9 @@ async def test_cache_hit_and_miss_counters_increment():
     hit_before2 = _hit_count()
     miss_before2 = _miss_count()
 
-    with patch("stashbox.backend.common.quota_service.cache_service.get_quota", new_callable=AsyncMock) as mock_get2:
+    with patch(
+        "stashbox.backend.common.quota_service.cache_service.get_quota", new_callable=AsyncMock
+    ) as mock_get2:
         mock_get2.return_value = {"quota_used": 5, "monthly_quota": 10, "version": 1}  # cache hit
 
         result = await get_quota(mock_session, 1)
@@ -142,6 +155,7 @@ async def test_cache_hit_and_miss_counters_increment():
 @pytest.mark.asyncio
 async def test_refund_metric_label():
     """退还 1 次后 quota_refund_total{trigger=distill_failed} = 1。"""
+
     # 读取 refund counter 初始值
     def _refund_count(trigger="distill_failed"):
         # Counter.labels() 返回 ChildCounter，._value.get() 取当前值
@@ -159,3 +173,54 @@ async def test_refund_metric_label():
 
     assert _refund_count() == before + 1, "refund should increment distill_failed counter"
     assert _refund_count(trigger="admin") == 0, "admin trigger should be untouched"
+
+
+# ---------------------------------------------------------------------------
+# test 5：consume 成功后 quota_consume_total 必须递增（2026-10-21 修）
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_consume_metric_increments_with_tier_label():
+    """扣配额成功后，quota_consume_total{tier=...} 必须 +1。
+
+    修前这个计数器**一次都没递增过**：
+    取的是 `user.plan`，而 User 模型里没有 plan 这个字段（是 `tier`），
+    每次都抛 AttributeError，又被 `except Exception: pass` 吞掉 ——
+    指标静默失效，运营侧"扣了多少配额"永远看不到数据。
+    """
+
+    def _consume_count(tier="free"):
+        return quota_metrics.quota_consume_total.labels(tier=tier)._value.get()
+
+    before = _consume_count("free")
+
+    async def mock_apply(session, user_id, delta):
+        return {"user_id": user_id, "quota_used": 1, "monthly_quota": 10, "version": 1}
+
+    mock_session = AsyncMock()
+    mock_session.get = AsyncMock(return_value=MagicMock(tier="free"))
+
+    with patch("stashbox.backend.common.quota_service._apply", new=mock_apply):
+        await consume(mock_session, user_id=1, amount=1)
+
+    assert _consume_count("free") == before + 1, "consume 成功后指标必须递增"
+
+
+@pytest.mark.asyncio
+async def test_consume_metric_failure_does_not_break_consume():
+    """指标挂了**不能**让扣配额失败 —— 主流程优先于可观测性。
+
+    但也不能静默：至少要留下 warn（原来那个 except Exception: pass 把
+    AttributeError 一起吃掉了，正是这个 bug 藏了这么久的原因）。
+    """
+
+    async def mock_apply(session, user_id, delta):
+        return {"user_id": user_id, "quota_used": 1, "monthly_quota": 10, "version": 1}
+
+    mock_session = AsyncMock()
+    # tier 是个不能当 label 的对象 → .labels() 会抛
+    mock_session.get = AsyncMock(return_value=MagicMock(tier=object()))
+
+    with patch("stashbox.backend.common.quota_service._apply", new=mock_apply):
+        result = await consume(mock_session, user_id=1, amount=1)
+
+    assert result["quota_used"] == 1, "指标失败不能影响扣配额本身"

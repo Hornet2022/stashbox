@@ -1,7 +1,7 @@
 """quota 专属 Prometheus metrics（CP3.5）。
 
 7 个 metric：
-  - quota_consume_total         Counter（plan label）
+  - quota_consume_total         Counter（tier label）
   - quota_consume_blocked_total Counter（reason label）
   - quota_consume_duration_seconds Histogram
   - quota_refund_total          Counter（trigger label）
@@ -15,7 +15,12 @@ from prometheus_client import Counter, Histogram
 quota_consume_total = Counter(
     "quota_consume_total",
     "quota 扣减成功次数",
-    ["plan"],  # free/student/member/pro
+    # label 名用 `tier` 而不是 `plan` —— User 模型里没有 plan 这个概念，
+    # 套餐字段就叫 tier（free/student/member/pro）。
+    # 2026-10-21 改：原来这里叫 `plan`，而调用方取的是 `user.plan`
+    # （User 上没这个属性）→ 每次 AttributeError → 计数器零样本。
+    # 改名安全：改之前这个计数器**从来没有样本**，也没有 dashboard 引用它。
+    ["tier"],
 )
 quota_consume_blocked_total = Counter(
     "quota_consume_blocked_total",

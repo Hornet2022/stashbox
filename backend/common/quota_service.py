@@ -136,11 +136,24 @@ async def consume(session: AsyncSession, user_id: int, amount: int = 1) -> dict:
             result = await _apply(session, user_id, amount)
             user = await session.get(User, user_id)
             try:
+                # 2026-10-21 修：原来这里是 `user.plan`。
+                #
+                # User 模型里**没有** plan 这个字段（common/models/user.py 里
+                # 是 `tier`）→ 每次都抛 AttributeError → 被下面的
+                # `except Exception: pass` 吞掉 → quota_consume_total
+                # **从来没有被递增过一次**（实测 /metrics 里这个计数器零样本）。
+                # 而这个计数器正是运营看"扣了多少配额"的唯一来源。
+                #
+                # 顺带用 getattr 兜一层：label 值必须是 str，
+                # 万一 tier 为空或不是字符串，指标失败也不该影响扣配额本身。
+                tier = getattr(user, "tier", None) if user is not None else None
                 quota_metrics.quota_consume_total.labels(
-                    plan=user.plan if user else "unknown"
+                    tier=str(tier) if tier else "unknown"
                 ).inc()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # 不再静默吞掉：指标挂掉是"运营看不到数据"，属于要能发现的问题。
+                # 但**不能**因此让扣配额失败 —— 指标失败不能影响主流程。
+                log.warning("quota_consume_metric_failed: user_id=%s err=%s", user_id, exc)
             return result
         except QuotaExceededError:
             quota_metrics.quota_consume_blocked_total.labels(reason="exceeded").inc()
