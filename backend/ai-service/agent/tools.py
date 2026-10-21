@@ -198,12 +198,35 @@ async def tts_synthesize_tool(state: dict[str, Any], args: dict[str, Any]) -> di
     out_path = out_dir / f"{article_id}.{fmt}"
     out_path.write_bytes(audio)
 
+    # 时长：按格式精确解析。
+    #
+    # ⚠️ 原来这里是 `_wav_duration_sec(audio) or len(audio) // 32000` ——
+    #    那个 32000 是**假设音频是 32 kbps CBR**，而生产上的 OpenAI 协议
+    #    TTS（Qwen3-TTS-12Hz-1.7B-Base）实际码率是 **55 kbps** →
+    #    时长被低估 1.7 倍。实测一篇 223.4s 的音频被记成 **48 秒**。
+    #
+    #    影响不止显示：安卓端 durationSec 还用于「听感评分 ≥ 90% 触发」的
+    #    判定（会提前 3.6 倍触发）、推送通知里的分钟数（48s 报「1 分钟」，
+    #    实际 4 分钟）、离线下载记录。
+    #
+    #    解析不出来时**不写**（None）比写个错的诚实 —— 详情页会显示「未知」，
+    #    而不是骗用户说这篇只有 48 秒。
+    #
+    # ⚠️ 导入放在函数内：本模块顶层若 import `app.services.tts.xxx`，会连带
+    #    执行那个包的 __init__（里面有 Redis/限流相关的初始化），
+    #    改变测试与生产的导入副作用顺序 —— 实测会让
+    #    tests/user/test_login_rate_limit.py 里的限流计数被提前初始化而失败。
+    #    本模块其他 TTS 导入（reload 等）也都在函数内，保持一致。
+    from stashbox.backend.app.services.tts.audio_duration import audio_duration_sec
+
+    duration_sec = audio_duration_sec(audio)
+
     audio_url = await _try_save_audio(article_id, audio, fmt)
     return {
         "audio_path": str(out_path),
         "audio_url": audio_url,
         "voice": voice or getattr(client, "voice", None),
-        "duration_sec": _wav_duration_sec(audio) or len(audio) // 32000,
+        "duration_sec": duration_sec,
         "bytes_len": len(audio),
         # CP-TTS-VOICE：把本次用的音色带回 state，节点据此回写
         # distilled_articles.tts_voice_id。两种情况记 None，都表示「来源不可溯源」：
@@ -236,19 +259,6 @@ async def _try_save_audio(article_id: str, audio: bytes, fmt: str) -> str | None
         return await storage.save(f"audio/{article_id}.{fmt}", audio)
     except Exception as exc:
         log.info("agent_tts_storage_unavailable article_id=%s err=%s", article_id, exc)
-        return None
-
-
-def _wav_duration_sec(audio: bytes) -> int | None:
-    """从 RIFF/WAV 头读时长（秒）；非 WAV 返回 None。"""
-    try:
-        import io
-        import wave
-
-        with wave.open(io.BytesIO(audio), "rb") as w:
-            rate = w.getframerate()
-            return int(w.getnframes() / rate) if rate else None
-    except Exception:
         return None
 
 
