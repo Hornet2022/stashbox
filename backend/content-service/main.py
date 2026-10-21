@@ -894,6 +894,12 @@ async def get_article(
     uid = _uid(user)
     cached = await cache_service.get_article(article_id, user_id=uid)
     if cached:
+        # ⚠️ **stage 不能从缓存里返回** —— 它是**易变**的（蒸馏进行中每十几秒
+        # 变一次），而详情缓存有 300s TTL。缓存里的 stage 最多会滞后 5 分钟，
+        # 用户看到「蒸馏中」却没有任何阶段信息，正是这个 bug 的表现。
+        #
+        # 所以 stage 每次现读 Redis（~0.1ms），不参与缓存。
+        cached["stage"] = await get_stage(article_id)
         return cached
 
     art, task = await _get_owned_with_task(article_id, uid, db)
@@ -903,9 +909,10 @@ async def get_article(
         task,
         full_script=True,
         tts_voice=await _tts_voice_brief(task),
-        stage=await get_stage(article_id),
     ).model_dump()
     await cache_service.set_article(article_id, payload, owner_id=art.user_id)  # ttl 300s
+    # stage 现读、不入缓存（与上面缓存命中分支同一口径）
+    payload["stage"] = await get_stage(article_id)
     return payload
 
 
