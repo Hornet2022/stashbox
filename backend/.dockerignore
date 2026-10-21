@@ -1,0 +1,55 @@
+# Docker build context 排除表
+# =========================
+#
+# build context 是 backend/（docker build 的上下文根 = .dockerignore 所在目录）。
+# 目标：镜像里只有"跑起来需要的东西"，没有本机开发残留、没有密钥、没有测试产物。
+#
+# ⚠️ 特别重要：backend/.env 是**真实凭证**（JWT_SECRET / OSS key / LLM key），
+#    绝不能进镜像 —— 它只在 build context 里被排除，运行时用环境变量注入。
+
+# ── 虚拟环境 / 构建缓存 ──────────────────────────────────────────────
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*.so
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# ── 密钥：本机 .env / .env.bak 一律不进镜像 ───────────────────────────
+.env
+.env.*
+!.env.production.example
+
+# ── 本机开发脚本与产物（容器里用不上）─────────────────────────────────
+scripts/
+bin/
+docs/
+*.log
+
+# ── 测试与测试数据 ───────────────────────────────────────────────────
+tests/
+**/tests/
+data/
+**/data/
+
+# ── 部署产物本身（镜像里不需要）──────────────────────────────────────
+deploy/
+Dockerfile*
+.dockerignore
+
+# ── 杂项 ─────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/

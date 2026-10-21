@@ -10,6 +10,10 @@
 # user-service 是叶子服务（不调下游），但仍需 DATABASE_URL / REDIS_URL / JWT_SECRET。
 set -e
 
+# 共享的启停逻辑（2026-10-21 抽出：只杀 LISTEN 的进程 + launchd 托管时用 kickstart）
+# shellcheck source=scripts/_service_ctl.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_service_ctl.sh"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="$REPO_ROOT/.venv/bin/python"
 if [[ ! -x "$PYTHON_BIN" ]]; then
@@ -18,16 +22,10 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
-EXISTING_PID="$(lsof -ti :8101 2>/dev/null || true)"
-if [[ -n "$EXISTING_PID" ]]; then
-  echo "▶ 杀掉现存 user-service (pid $EXISTING_PID)"
-  kill "$EXISTING_PID" 2>/dev/null || true
-  sleep 1
-fi
-
 export PYTHONPATH="$(dirname "$(dirname "$REPO_ROOT")"):${PYTHONPATH:-}"  # stashbox 包根在仓库父目录（run_dev.sh 同款）
 # dev 环境放行默认 JWT secret；生产必须用真 JWT_SECRET 注入（见 config.py 校验）
 export STASHBOX_ALLOW_DEV_JWT="${STASHBOX_ALLOW_DEV_JWT:-1}"
 
 cd "$REPO_ROOT"
-exec "$PYTHON_BIN" -m uvicorn user-service.main:app --host 0.0.0.0 --port 8101 --log-level info
+restart_service "com.stashbox.user-service" 8101 "user-service" \
+  "$PYTHON_BIN" -m uvicorn user-service.main:app --host 0.0.0.0 --port 8101 --log-level info

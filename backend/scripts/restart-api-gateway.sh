@@ -15,20 +15,16 @@
 #   期望看到:USER_SERVICE_URL / CONTENT_SERVICE_URL / AI_SERVICE_URL 都是 http://localhost:810x
 set -e
 
+# 共享的启停逻辑（2026-10-21 抽出：只杀 LISTEN 的进程 + launchd 托管时用 kickstart）
+# shellcheck source=scripts/_service_ctl.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_service_ctl.sh"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="$REPO_ROOT/.venv/bin/python"
 if [[ ! -x "$PYTHON_BIN" ]]; then
   echo "✗ venv 不存在：$PYTHON_BIN" >&2
   echo "  建议运行: cd backend && ./run_dev.sh" >&2
   exit 1
-fi
-
-# 杀掉现存 api-gateway 进程（端口 8100）
-EXISTING_PID="$(lsof -ti :8100 2>/dev/null || true)"
-if [[ -n "$EXISTING_PID" ]]; then
-  echo "▶ 杀掉现存 api-gateway (pid $EXISTING_PID)"
-  kill "$EXISTING_PID" 2>/dev/null || true
-  sleep 1
 fi
 
 # 显式 export 下游 URL（关键：pydantic-settings 在模块 import 时锁住）
@@ -41,4 +37,5 @@ export STASHBOX_ALLOW_DEV_JWT="${STASHBOX_ALLOW_DEV_JWT:-1}"
 
 # 启动（cwd 必须是 backend 根，不是 api-gateway 子目录——sys.path[0]=cwd 才能 import api-gateway）
 cd "$REPO_ROOT"
-exec "$PYTHON_BIN" -m uvicorn api-gateway.main:app --host 0.0.0.0 --port 8100 --log-level info
+restart_service "com.stashbox.api-gateway" 8100 "api-gateway" \
+  "$PYTHON_BIN" -m uvicorn api-gateway.main:app --host 0.0.0.0 --port 8100 --log-level info
