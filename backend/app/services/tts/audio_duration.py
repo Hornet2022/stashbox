@@ -102,13 +102,19 @@ def wav_duration_sec(audio: bytes) -> int | None:
         return None
 
 
-def mp3_duration_sec(audio: bytes) -> int | None:
-    """逐帧解析 MP3 帧头，累加得到时长（秒）；不是合法 MP3 返回 None。"""
+def mp3_info(audio: bytes) -> tuple[int, int, int] | None:
+    """解析 MP3 → (时长秒, 采样率, 声道数)；不是合法 MP3 返回 None。
+
+    声道数从**第一帧**的声道模式读（00=单声道, 01=双声道, 10/11=单声道）。
+
+    为什么需要声道数：拼接时要插入一段**参数完全一致**的静音 mp3
+    （段间停顿），ffmpeg 的 concat demuxer 要求各输入的编码参数一致，
+    否则会重采样/重编码（`-c copy` 就不成立了）。
+    """
     if len(audio) < 4:
         return None
 
     pos = 0
-    # 跳过 ID3v2 tag（大小是 4 个 syncsafe 字节）
     if audio[:3] == b"ID3":
         if len(audio) < 10:
             return None
@@ -122,6 +128,8 @@ def mp3_duration_sec(audio: bytes) -> int | None:
     total_sec = 0.0
     frames = 0
     size = len(audio)
+    sample_rate = 0
+    channels = 1
 
     while pos + 4 <= size:
         # 帧同步：11 bit 全 1
@@ -140,26 +148,40 @@ def mp3_duration_sec(audio: bytes) -> int | None:
             continue
 
         rates = _SAMPLE_RATES[version]
-        sample_rate = rates[sr_idx]
+        rate = rates[sr_idx]
         bitrate = (_BITRATES_V1 if version == 3 else _BITRATES_V2)[bitrate_idx]
-        if not bitrate or not sample_rate:
+        if not bitrate or not rate:
             pos += 1
             continue
 
+        if not sample_rate:
+            sample_rate = rate
+            # 声道模式（第 4 字节的高 2 位）：01 = 双声道，其余 = 单声道
+            mode = (audio[pos + 3] >> 6) & 0x03
+            channels = 2 if mode == 1 else 1
+
         # 每帧时长：MPEG1 = 1152/采样率，MPEG2/2.5 = 576/采样率
         samples = 1152 if version == 3 else 576
-        total_sec += samples / sample_rate
+        total_sec += samples / rate
         frames += 1
 
         # 跳到下一帧：帧长（字节）
         coeff = 144 if version == 3 else 72
-        frame_len = (coeff * bitrate * 1000) // sample_rate + padding
+        frame_len = (coeff * bitrate * 1000) // rate + padding
         if frame_len <= 4:
             pos += 4
             continue
         pos += frame_len
 
-    return int(total_sec) if frames else None
+    if not frames:
+        return None
+    return int(total_sec), sample_rate, channels
+
+
+def mp3_duration_sec(audio: bytes) -> int | None:
+    """逐帧解析 MP3 帧头，累加得到时长（秒）；不是合法 MP3 返回 None。"""
+    info = mp3_info(audio)
+    return info[0] if info else None
 
 
 def audio_duration_sec(audio: bytes) -> int | None:

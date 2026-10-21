@@ -207,7 +207,76 @@ def test_default_concurrency_is_serial(openai_mod):
     """
     client = openai_mod.OpenAITTSClient(api_key="k", base_url="http://x", model="m")
     assert client.chunk_concurrency == 1, "默认必须是串行（上游实测串行，并发只会让末段超时）"
-    assert client.chunk_chars == 300
+
+
+def test_default_chunk_chars_is_the_measured_safe_size(openai_mod):
+    """默认段长必须是 200 字 —— 实测出来的安全值，不是拍脑袋。
+
+    实测（2026-10-21，tertu.cn 的 Qwen3-TTS-12Hz-1.7B-Base）：
+        100 字 → 25.2s  语速 3.97  ✅
+        150 字 → 32.5s  语速 4.61  ✅
+        200 字 → 46.5s  语速 4.30  ✅  ← 取这个
+        250 字 → 64.5s  语速 3.88  ✅ 但已越过上游 60s 线
+        300 字 → 504 上游语音合成超时(60s)
+        400 字 → 94.5s  语速 4.23  ✅（能过但 46s 时长没保障）
+
+    上游**自己**也有 60s 墙钟（504 backend_timeout「上游语音合成超时」），
+    且是波动的（250 字成功、300 字 504、400 字又成功）。200 字实测 46.5s，
+    离那条线有 23% 余量。
+
+    另外 290 字那次语速 7.14（真截断），所以 300 字同时也踩了「静默截断」，
+    丢约 40% 内容 —— 内测反馈的「中间一大段没音频」就是这个。
+    """
+    client = openai_mod.OpenAITTSClient(api_key="k", base_url="http://x", model="m")
+    assert client.chunk_chars == 200, "默认段长必须是实测安全值 200 字"
+
+
+def test_truncation_threshold_is_tight_enough(openai_mod):
+    """截断阈值必须 5.5 —— 正常上界 4.61，真截断 7.14。
+
+    阈值太松（比如 7.0）会让真截断漏判，内容缺失照样写进库；
+    太紧（比如 4.0）会把正常段误判成截断，白白多合成一次。
+    """
+    assert openai_mod._TRUNCATION_CHARS_PER_SEC == 5.5
+
+
+@pytest.mark.asyncio
+async def test_truncated_chunk_is_detected_and_split(openai_mod):
+    """被静默截断的块 → 自动二分重来，而不是把缺内容的音频当成功。
+
+    构造一个「每次调用都只产出开头」的假端点：返回的音频时长远小于
+    文本应有的时长 → 语速超阈值 → 触发二分。
+    """
+    client = openai_mod.OpenAITTSClient(
+        api_key="k", base_url="http://x", model="m", chunk_chars=200, min_chunk_chars=40
+    )
+    calls: list[str] = []
+
+    async def _truncating(text, voice=None, output_format="mp3"):
+        calls.append(text)
+        # 造一段「时长固定 1 秒」的假音频 → 文本越长语速越高
+        return _fake_mp3_of_seconds(1)
+
+    client._synthesize_once = _truncating  # type: ignore[assignment]
+
+    # 60 字的块：1 秒音频 → 60 字/秒 → 远超阈值 → 触发二分
+    with pytest.raises(Exception):
+        await client._synthesize_chunk("这" * 60)
+
+    assert len(calls) > 1, "应该被二分重试，而不是一次就放弃"
+
+
+def _fake_mp3_of_seconds(seconds: int) -> bytes:
+    """造一段指定时长的假 mp3（够解析出帧数即可）。"""
+    from app.services.tts.audio_duration import _SAMPLE_RATES
+
+    # MPEG2 Layer III / 24kHz / 64kbps
+    header = bytes([0xFF, 0xF3, 0x40, 0xC0])
+    frame_len = (72 * 64000) // 24000  # = 192
+    rate = _SAMPLE_RATES[2][1]  # 24000
+    samples = 576
+    frames = int(seconds * rate / samples)
+    return (header + b"\x00" * (frame_len - 4)) * frames
 
 
 def test_default_timeout_leaves_room_for_upstream_jitter(openai_mod):

@@ -209,6 +209,67 @@ def concat_mp3(pieces: list[bytes]) -> bytes:
     return b"".join(pieces)
 
 
+def silence_mp3(
+    duration_sec: float,
+    sample_rate: int = 24000,
+    channels: int = 1,
+    ffmpeg_bin: str | None = None,
+) -> bytes | None:
+    """生成一段静音 mp3（参数需与内容一致，才能 `-c copy` 拼接）。
+
+    ## 为什么要段间静音
+
+    分段合成是**多次独立请求** —— 每段的韵律/语调各自采样，段与段之间
+    会有突变，听感上「一段一段」（内测反馈：音色感觉是一段一段的）。
+
+    在段与段之间插一小段静音，人耳会把每段当成独立的句子/换气，
+    而不是「一段连续语音被切开」。旧 pipeline（distill/steps.py 的
+    `gap_after_ms=350`）就是这么做的。
+
+    静音的**采样率与声道数必须和内容一致**，否则 ffmpeg concat demuxer
+    会重采样 → `-c copy` 不成立（要么报错，要么悄悄重编码）。
+    调用方应从内容里探测（audio_duration.mp3_info）后传进来。
+
+    ffmpeg 不可用时返回 None —— 调用方跳过插入，不破主流程。
+    """
+    if duration_sec <= 0:
+        return None
+    ffmpeg = ffmpeg_bin or os.getenv("FFMPEG_BIN", "ffmpeg")
+    try:
+        with tempfile.TemporaryDirectory(prefix="tts_silence_") as tmp:
+            out = os.path.join(tmp, "silence.mp3")
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    f"anullsrc=r={sample_rate}:cl={'mono' if channels == 1 else 'stereo'}",
+                    "-t",
+                    f"{duration_sec:.3f}",
+                    "-c:a",
+                    "libmp3lame",
+                    "-q:a",
+                    "9",
+                    out,
+                ],
+                capture_output=True,
+                timeout=30,
+                check=True,
+            )
+            data = Path(out).read_bytes()
+            return data if len(data) > 100 else None
+    except FileNotFoundError:
+        log.warning("TTS 生成段间静音失败（无 ffmpeg）")
+    except subprocess.SubprocessError as exc:
+        log.warning("TTS 生成段间静音失败：%s", exc)
+    return None
+
+
 def concat_audio(pieces: list[bytes]) -> bytes:
     """按音频格式分派拼接：WAV / MP3 各走自己的路径。"""
     if not pieces:
