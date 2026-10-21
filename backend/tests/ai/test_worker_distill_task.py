@@ -409,3 +409,47 @@ async def test_agent_failed_status_triggers_failure_path(fake_agent, monkeypatch
 
     # 失败路径应退还配额
     assert refund_calls == [7]
+
+
+# ---------------------------------------------------------------------------
+# CP-ARQ-RETRY：失败必须抛 arq.Retry，普通异常在 arq 0.28 下不会被重试
+# ---------------------------------------------------------------------------
+async def test_failure_raises_arq_retry_so_queue_actually_retries(fake_agent):
+    """失败路径必须抛 arq.Retry。
+
+    arq 0.28 的 worker 只对 `arq.Retry` / `CancelledError` / `RetryJob` 重试，
+    普通异常一律落进 else 分支判 failed（finish=True，不再入队）。
+    旧实现抛的是裸 RuntimeError —— 于是 `ARQ_RETRY_MAX=2` 这套配置
+    **一次都没生效过**（实测长稿 TTS 超时，job 只执行了 1 次）。
+
+    实测（2026-10-21）：一篇 1047 字的稿子因 TTS 超时失败，
+    队列里没有第二次 arq_distill_started，用户只能自己点重试。
+    """
+    from arq import Retry as ArqRetry
+
+    AgentCallRecorder.raise_exc = RuntimeError("step2 boom")
+
+    with pytest.raises(ArqRetry) as ei:
+        await dt_module.distill_task(CTX, "dst_1", "art_1", 7, "https://x.com/a")
+
+    # 原始失败原因必须留在 str() 里 —— arq 的结构化日志只打 str(exc)，
+    # 原因丢了就只能去翻 __cause__，排障时等于没有线索。
+    assert "step2 boom" in str(ei.value)
+    # defer=15s：上游（vLLM）的问题有时间聚集性，立刻重试多半还在坏窗口里
+    assert ei.value.defer_score == 15000
+
+
+async def test_distill_retry_keeps_original_message():
+    """DistillRetry 是 arq.Retry 的子类，但 str() 给回原始原因。
+
+    arq 0.28 的 `Retry.__init__` 不接受 message、`__str__` 固定返回
+    '<Retry defer 15.00s>' —— 直接抛它，真实失败原因会在 arq 日志里消失。
+    """
+    from arq import Retry as ArqRetry
+
+    from tasks.distill_task import DistillRetry
+
+    r = DistillRetry("tts_synthesize 失败: OpenAITTS 超时", defer=15)
+    assert isinstance(r, ArqRetry)
+    assert isinstance(r, RuntimeError)
+    assert str(r) == "tts_synthesize 失败: OpenAITTS 超时"

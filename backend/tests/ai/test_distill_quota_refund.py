@@ -327,7 +327,12 @@ def test_蒸馏失败路径调用了退款():
     src = (Path(AI_SERVICE_DIR) / "tasks" / "distill_task.py").read_text()
 
     assert "_refund_quota_once(task_id=task_id, user_id=user_id)" in src
-    # 必须在 `raise`（让 Arq 走 retry）之前调用
+    # 必须在抛异常（让 Arq 走 retry）之前调用。
+    #
+    # 2026-10-21：这里原来定位的是 `raise  # 让 Arq 走 retry 逻辑` 这行注释。
+    # 失败路径改成抛 `arq.Retry`（普通异常在 arq 0.28 下不会被重试），
+    # 那行注释连同裸 raise 一起没了 → 断言 substring not found。
+    # 现在定位实际抛出点，且**不依赖注释文本**（注释会被随手改，代码不会）。
     refund_pos = src.index("_refund_quota_once(task_id=task_id")
-    raise_pos = src.index("raise  # 让 Arq 走 retry 逻辑")
-    assert refund_pos < raise_pos, "必须在 raise 之前退款，否则这条路径根本走不到"
+    raise_pos = src.index("raise DistillRetry(")
+    assert refund_pos < raise_pos, "必须在抛异常之前退款，否则这条路径根本走不到"

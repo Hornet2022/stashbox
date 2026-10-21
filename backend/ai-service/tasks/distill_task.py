@@ -14,6 +14,7 @@ CP3.5-pre-3 说明：
 import os
 
 import structlog
+from arq import Retry as ArqRetry
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,6 +36,33 @@ from agent.runner import agent_app as _agent_app
 from agent.state import AgentState
 
 log = structlog.get_logger("ai-worker")
+
+
+class DistillRetry(ArqRetry):
+    """带原始失败原因的 arq.Retry。
+
+    为什么不能直接抛 `arq.Retry`：
+
+    arq 0.28 的 `Retry.__init__(self, defer=None)` **不接受 message**，
+    且 `__str__` 固定返回 `'<Retry defer 15.00s>'`。直接抛它的话，
+    arq worker 打出来的失败日志就是
+
+        73.82s ! xxx:distill_task failed, RuntimeError: <Retry defer 15.00s>
+
+    **真实失败原因（"tts_synthesize 失败: OpenAITTS 超时" 之类）整个消失** ——
+    排障时只能去翻异常的 __cause__，而 arq 的结构化日志并不带 __cause__。
+
+    这里把原因留在 str() 里：既是 RuntimeError 的子类（现有调用方的
+    `except RuntimeError` / `pytest.raises(RuntimeError)` 都不受影响），
+    又满足 arq 的 `isinstance(e, Retry)` 判定 → 照样触发重试。
+    """
+
+    def __init__(self, message: str, defer: int = 15):
+        super().__init__(defer=defer)
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
 
 
 async def _trigger_subscription_pushes(
@@ -485,7 +513,33 @@ async def distill_task(
                 user_id=user_id,
                 reason="auto_retry_never_charged",
             )
-        raise  # 让 Arq 走 retry 逻辑
+
+        # ── 抛 arq.Retry，让重试**真的**发生 ────────────────────────────
+        #
+        # ⚠️ 这里以前是裸 `raise`（把原始异常抛出去），在 **arq 0.28 下
+        #    等于完全不重试** —— 整个自动兜底是空转的。
+        #
+        # arq 0.28 worker.py 的异常分支只认三种：
+        #     if   retry_jobs and isinstance(e, Retry):              → 重试
+        #     elif retry_jobs and isinstance(e, (CancelledError, RetryJob)): → 重试
+        #     else: logger.exception(... failed ...) ; finish = True → **不重试**
+        #
+        # 普通异常（RuntimeError / TimeoutError / httpx 异常）全落进 else 分支，
+        # 直接判 failed。而 max_tries / retry_jobs 配置是对的
+        # （worker.py: retry_jobs = _cfg.retry_max > 0; max_tries = _cfg.retry_max + 1），
+        # 注释里「抛异常给 Arq retry」、退款处的 SETNX 幂等锁
+        # （"避免首跑 + 重试多次退双倍"）全都假设它会重试 —— 实际一次都没重试过。
+        #
+        # 实测（2026-10-21）：一篇长稿因 TTS 超时失败，Arq 只执行了 1 次，
+        # 队列里没有第二次 arq_distill_started。
+        #
+        # 所以这里必须抛 arq 专用的 Retry 异常。
+        #
+        # defer=15s：实测上游（tertu.cn 的 vLLM）的问题有**时间聚集性** ——
+        # 同一时刻连着几次请求连续返回空 content（实测 4 次连续全空），
+        # 紧接着又完全正常。立刻重试大概率落在同一个坏窗口里，
+        # 等 15s 再试才是有效的恢复策略。
+        raise DistillRetry(str(e), defer=15) from e
     finally:
         # CP-AGENT-RUNNER-INTEGRATION：agent 路径下 LLM client 由 agent.runner 内部
         # 通过 _llm_module.get_llm_client() 获取（单例），这里拿同一个实例关闭。
