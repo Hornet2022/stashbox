@@ -174,25 +174,35 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
         # 不能 await —— 之前多写 await 导致生产报 "can't be used in 'await' expression"。
         llm = _llm_module.get_llm_client()
 
-        # ── 两阶段改写（2026-10-21）────────────────────────────────────
+        prompt = _rewrite_prompt(fetched_content)
+
+        # Phase 2：memory 注入（如果有 store + profile）
+        if user_profile or few_shot_examples:
+            # Note: MemoryStore 实例化依赖 session_factory；这里用延迟注入模式
+            # —— runner 调用方注入（避免 agent 模块依赖 DB 配置）。
+            prompt = _maybe_inject_memory(state, prompt)
+
+        # ⚠️ 2026-10-21：这里曾经改成「两阶段」（分段抽素材 → 基于素材写稿），
+        #    动机是「长 prompt 会触发上游丢 content」。那个动机**已被证伪** ——
+        #    真正的根因是上游**非流式**路径上「增量解码 → 累积进 content」
+        #    有缺陷（同一个 2925 字 prompt：非流式 4/4 空，流式 0/4 空），
+        #    改成流式即可，长文一次就能改写（见 llm/openai.py:_post_stream）。
         #
-        # ① 读取：原文按段切开，每段独立抽取素材（每段 prompt 短 → 不触发
-        #    上游「随机丢 content」）
-        # ② 写稿：输入是**全部素材**（短）→ 基于素材做全局再创作
+        #    所以这里恢复**单次长文改写**：
+        #      · 模型看到全文 → 「基于原文的关联思考/延伸判断」才有依据
+        #        （分段抽素材会把稿子降级成各段摘要的拼接）
+        #      · 成本 1 次调用（不是 N+1 次）
+        #      · 细节不丢（不用经过「要点」这个有损中间层）
         #
-        # 为什么不能「一次长 prompt」：实测 user 1465 字 → 100% 空，
-        # 2925 字 → 100% 空；2920 字那篇文章连续 4 次尝试全空。
-        # 为什么不能「分段独立改写」：每块只看局部原文，产生不了跨段的
-        # 关联思考与拓展方向，稿子会退化成各段摘要的拼接。
-        #
-        # 短文（≤阈值）也走两阶段：稿子的产出形态统一（都带延展要素），
-        # 而且阶段 ② 还能额外拿到原文全文，细节不丢。
-        raw = await _rewrite_two_stage(
+        #    但**保留**了 system prompt 里新增的第 9 条（关联思考 / 延伸判断 /
+        #    值得关联的关键点 / 可拓展关注的方向）—— 那是产品定位的要求，
+        #    与怎么绕开上游 bug 无关。
+        raw = await _chat_text(
             llm,
-            fetched_content,
-            state=state,
-            user_profile=user_profile,
-            few_shot_examples=few_shot_examples,
+            prompt,
+            system_prompt=_REWRITE_SYSTEM,
+            step="agent_rewrite",
+            task_id=state.get("trace_id", ""),
         )
         # 结构化解析（CP-AGENT-REWRITE-STRUCTURED）：LLM 必须回 JSON
         # {hook, sections, outro}，这样 script_text 的段落边界才是可靠的。
@@ -668,7 +678,10 @@ _REWRITE_SYSTEM = """你是一个中文播客主理人。任务：把原文改�
 【输出格式 — 严格 JSON，不要 Markdown 代码块】
 {
   "hook": "开场钩子，≤ 80 字，15 秒左右能读完",
-  "sections": ["正文节拍，一节一个字符串，80-180 字，共 3-6 节"],
+  "sections": ["正文节拍，一节一个字符串，80-160 字，共 3-5 节"],
+  "insights": ["基于原文的关联思考或延伸判断，1-3 条，每条 ≤ 90 字"],
+  "related": ["值得关联的关键点（其他公司/概念/趋势/事件），0-3 条，每条 ≤ 50 字"],
+  "follow_ups": ["听众接下来可以拓展关注的方向，1-3 条，每条 ≤ 60 字"],
   "outro": "收束，≤ 80 字，呼应 hook 的开头句式或意象"
 }
 
@@ -682,243 +695,20 @@ _REWRITE_SYSTEM = """你是一个中文播客主理人。任务：把原文改�
 7. **不要输出音效标注**：不要出现"（轻松开场音乐淡出）""【片头音乐】"这类
    舞台提示或音效描述。它们会被当成正文混进稿子污染下游。
 8. **不要 markdown、不要 bullet、不要 emoji、不要"听众朋友们"这种播音腔**
-9. **长度自适应**：原文 < 500 字 → 600-800 字；500-2000 字 → 800-1100 字；> 2000 字 → 1000-1400 字
-10. **这是再创作，不是摘要**：除了讲清原文，还要给听众**原文之外的价值** ——
-    关联思考（这件事和什么相关/矛盾）、延伸判断（往后看会怎样）、
-    值得关联的关键点、可以拓展关注的方向。这些要**融进 sections 里**，
-    用"有意思的是""你可能没想到"这类口语承接，**不要写成列表或小标题**。
-    素材包里给了这些线索就用上；没给就不要硬编。
+9. **这是再创作，不是摘要**：播客稿的价值不止于"讲清原文"，还在于给听众
+   **原文之外的东西**（对应上面 JSON 的三个额外字段）：
+     · insights —— 关联思考与延伸判断（这件事和什么相关/矛盾？往后看会怎样？
+       原文没写、但能从原文推出的）
+     · related —— 值得关联的关键点（听众可能想知道的其他公司/概念/趋势）
+     · follow_ups —— 听众可以拓展关注的方向
+   这三类是**稿子的组成部分，会被念给听众听**，所以：
+     · 写成**能念的口语段落**（像 sections 一样），不要写成"关联："这种标签
+     · 事实必须能追回原文依据；推不出就少写，**不要硬编**
+     · 没有值得关联的就给空数组，不要凑数
+10. **长度自适应**：原文 < 500 字 → 600-800 字；500-2000 字 → 800-1100 字；> 2000 字 → 1000-1400 字
+    （sections + insights + related + follow_ups 合计）
 
 输出纯 JSON。"""
-
-
-def _rewrite_prompt(fetched_content: str) -> str:
-    """构造改写 prompt（user 侧）。
-
-    system 契约放在 `_chat_text(system_prompt=...)`，这里只拼原文。
-    """
-    return f"# 原文\n{fetched_content}"
-
-
-# ---------------------------------------------------------------------------
-# 阶段 ①：读取 / 抽取素材
-# ---------------------------------------------------------------------------
-#
-# 为什么要这一步（2026-10-21 实测踩出来的）：
-#
-#   上游 vLLM 会**随机**把生成内容整个丢掉（HTTP 200、content 为空、
-#   completion_tokens > 0）。实测（tertu.cn 的 Qwen3.8-27B）：
-#       user 735 字  → 50% 空
-#       user 1465 字 → 100% 空
-#       user 2925 字 → 100% 空
-#   库里 2920 字那篇文章连续 4 次尝试全空，800 字那篇一次就过。
-#
-#   所以「把长文一次塞进 prompt」这条路对长文**根本不可用**。
-#   而单纯「分段独立改写」也不够 —— 每块只看局部原文，**产生不了全局性的
-#   关联思考与拓展方向**，稿子会退化成各段独立摘要的拼接。
-#
-#   所以拆成两步：
-#       ① 读取：原文按段切开（每段短 → 不触发丢内容），每段产出结构化素材
-#       ② 写稿：输入是**全部素材**（短）→ 基于素材做全局再创作
-#   阶段 ② 看到的是全文的骨架，因此能产出跨段的关联思考与拓展方向。
-#
-# 阶段 ① 的 prompt 契约（严格 JSON）：
-_EXTRACT_SYSTEM = """你是中文播客节目的素材编辑。给你一段原文，请抽出结构化素材。
-
-【输出格式 — 严格 JSON，不要 Markdown 代码块】
-{
-  "key_points": ["核心事实/观点，3-6 条，每条 ≤ 60 字"],
-  "insights": ["基于这段内容的关联思考或延伸判断，1-3 条，每条 ≤ 80 字"],
-  "related": ["值得关联的关键点（其他公司/概念/趋势/事件），0-3 条，每条 ≤ 40 字"],
-  "follow_ups": ["读者接下来值得关注、可以拓展关注的方向，1-3 条，每条 ≤ 50 字"]
-}
-
-【要求】
-1. **只用原文里出现的信息**做事实陈述，不编造数据、人名、机构
-2. insights / related / follow_ups 可以有推理和延伸，但必须能追回原文依据
-3. **不要复读原文措辞**，要重述 + 加判断
-4. 原文没有值得延伸的地方时，related 就给空数组，不要硬凑
-5. 不要输出 markdown、bullet 符号、emoji
-6. 输出纯 JSON。"""
-
-
-@dataclass
-class _ExtractedMaterial:
-    """阶段 ① 的产物：一份素材。
-
-    key_points  核心事实/观点
-    insights    基于内容的关联思考/延伸判断
-    related     值得关联的关键点
-    follow_ups  值得拓展关注的方向
-    """
-
-    key_points: list[str] = field(default_factory=list)
-    insights: list[str] = field(default_factory=list)
-    related: list[str] = field(default_factory=list)
-    follow_ups: list[str] = field(default_factory=list)
-    degraded: bool = False
-
-    def is_empty(self) -> bool:
-        return not (self.key_points or self.insights or self.related or self.follow_ups)
-
-    def render(self) -> str:
-        """渲染成给阶段 ② 的素材包（中文，按目标分节）。"""
-        lines: list[str] = []
-        if self.key_points:
-            lines.append("## 核心要点\n" + "\n".join(f"- {p}" for p in self.key_points))
-        if self.insights:
-            lines.append("## 关联思考与延伸判断\n" + "\n".join(f"- {p}" for p in self.insights))
-        if self.related:
-            lines.append("## 值得关联的关键点\n" + "\n".join(f"- {p}" for p in self.related))
-        if self.follow_ups:
-            lines.append("## 可拓展关注的方向\n" + "\n".join(f"- {p}" for p in self.follow_ups))
-        return "\n\n".join(lines)
-
-
-def _parse_extract(raw: str) -> _ExtractedMaterial:
-    """解析阶段 ① 的输出（降级但不崩）。
-
-    降级（degraded=True）：把整段当 key_points —— 素材比没有强，
-    阶段 ② 照样能写稿。
-    """
-    obj = _extract_json_object(raw)
-    if obj is not None:
-        mat = _ExtractedMaterial(
-            key_points=_str_list(obj.get("key_points")),
-            insights=_str_list(obj.get("insights")),
-            related=_str_list(obj.get("related")),
-            follow_ups=_str_list(obj.get("follow_ups")),
-        )
-        if not mat.is_empty():
-            return mat
-    # 降级：整段当要点
-    text = (raw or "").strip()
-    if not text:
-        return _ExtractedMaterial(degraded=True)
-    return _ExtractedMaterial(key_points=[text], degraded=True)
-
-
-def _str_list(value: Any) -> list[str]:
-    """把 LLM 给的「可能是数组/可能是字符串/可能是 None」统一成字符串列表。"""
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [_flatten_para(value)] if value.strip() else []
-    if isinstance(value, (list, tuple)):
-        out = []
-        for item in value:
-            s = str(item).strip()
-            if s:
-                out.append(_flatten_para(s))
-        return out
-    return []
-
-
-#: 阶段 ② 除了素材包，还能带上原文全文的原文长度上限。
-#:
-#: 带上原文是为了**不丢细节**（素材是压缩过的）；但带上原文就等于回到
-#: 「长 prompt」的老问题 —— 所以只在原文确实短时才带。
-#: 实测 user 735 字 → 50% 空，所以这个上限取 600（留一半余量）。
-_REWRITE_WITH_SOURCE_MAX = 600
-
-
-async def _rewrite_two_stage(
-    llm: Any,
-    fetched_content: str,
-    *,
-    state: dict[str, Any] | None = None,
-    user_profile: Any = None,
-    few_shot_examples: Any = None,
-) -> str:
-    """两阶段改写：读取素材 → 写稿。返回阶段 ② 的原始输出（待解析）。
-
-    阶段 ① 把原文按段切开，逐段抽取结构化素材（要点/关联思考/关联关键点/
-    拓展方向）。阶段 ② 拿到**全部素材**（加上短原文全文）写出一篇稿。
-
-    为什么分段读取能解决「随机丢 content」：上游丢内容与 prompt 长度强相关
-    （实测 1465 字起 100% 空），每段控制在 REWRITE_CHUNK_CHARS 以内就绕开了。
-    为什么仍要两阶段而不是分段直接改写：分段直接改写只能看到局部原文，
-    产不出跨段的关联思考与拓展方向 —— 而那正是播客稿的价值所在。
-    """
-    from agent.rewrite_chunking import (
-        REWRITE_CHUNK_CHARS,
-        split_for_rewrite,
-        target_chars_for,
-    )
-
-    chunks = split_for_rewrite(fetched_content, REWRITE_CHUNK_CHARS)
-    log.info(
-        "agent_rewrite_plan total_chars=%d chunks=%d chunk_limit=%d",
-        len(fetched_content),
-        len(chunks),
-        REWRITE_CHUNK_CHARS,
-    )
-
-    # ── 阶段 ①：逐段抽取素材 ────────────────────────────────────────
-    mats: list[_ExtractedMaterial] = []
-    for idx, chunk in enumerate(chunks):
-        raw_chunk = await _chat_text(
-            llm,
-            f"# 原文片段（第 {idx + 1}/{len(chunks)} 段）\n{chunk}",
-            system_prompt=_EXTRACT_SYSTEM,
-            step="agent_extract",
-            task_id=(state or {}).get("trace_id", ""),
-        )
-        mat = _parse_extract(raw_chunk)
-        mats.append(mat)
-        log.info(
-            "agent_extract_parsed chunk=%d/%d points=%d insights=%d related=%d follow_ups=%d fallback=%s",
-            idx + 1,
-            len(chunks),
-            len(mat.key_points),
-            len(mat.insights),
-            len(mat.related),
-            len(mat.follow_ups),
-            mat.degraded,
-        )
-
-    material = _ExtractedMaterial(
-        key_points=[p for m in mats for p in m.key_points],
-        insights=[p for m in mats for p in m.insights],
-        related=[p for m in mats for p in m.related],
-        follow_ups=[p for m in mats for p in m.follow_ups],
-    )
-
-    # 素材全空（上游把每段都丢了）→ 抛错，让上层走重试/失败路径。
-    # 绝不能拿空素材去写稿 —— 那会产出一篇没有内容的稿子。
-    if material.is_empty():
-        raise LLMError("LLM 素材抽取返回空内容（原文切了 %d 段，每段都没抽到内容）" % len(chunks))
-
-    # ── 阶段 ②：基于素材写稿 ─────────────────────────────────────────
-    lo, hi = target_chars_for(len(fetched_content))
-    total_chunks = max(1, len(chunks))
-    per_chunk_lo = max(120, lo // total_chunks)
-    per_chunk_hi = max(200, hi // total_chunks)
-
-    lines = ["# 素材包（来自原文逐段抽取）", material.render()]
-    # 短文带上原文全文 → 细节不丢
-    if len(fetched_content) <= _REWRITE_WITH_SOURCE_MAX:
-        lines.append("# 原文全文\n" + fetched_content)
-    prompt = "\n\n".join(lines)
-
-    prompt = (
-        f"# 写作目标\n整篇 {lo}-{hi} 字（当前素材来自 {total_chunks} 段原文，"
-        f"每段素材展开约 {per_chunk_lo}-{per_chunk_hi} 字）\n\n" + prompt
-    )
-
-    # Phase 2：memory 注入（如果有 store + profile）
-    if state is not None and (user_profile or few_shot_examples):
-        # Note: MemoryStore 实例化依赖 session_factory；这里用延迟注入模式
-        # —— runner 调用方注入（避免 agent 模块依赖 DB 配置）。
-        prompt = _maybe_inject_memory(state, prompt)
-
-    return await _chat_text(
-        llm,
-        prompt,
-        system_prompt=_REWRITE_SYSTEM,
-        step="agent_rewrite",
-        task_id=(state or {}).get("trace_id", ""),
-    )
 
 
 @dataclass
@@ -947,6 +737,38 @@ class _RewriteParts:
 
 # 音效/舞台提示：整段就是括号或方括号包着的一小段，且不含句号
 _SFX_RE = re.compile(r"^[\(（\[【][^\n]{0,24}[\)）\]】]\s*$")
+
+
+def _rewrite_prompt(fetched_content: str) -> str:
+    """构造改写 prompt（user 侧）。
+
+    system 契约放在 `_chat_text(system_prompt=...)`，这里只拼原文。
+    """
+    return f"# 原文\n{fetched_content}"
+
+
+def _str_list(value: Any) -> list[str]:
+    """把 LLM 给的「可能是数组/可能是字符串/可能是 None」统一成字符串列表。"""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [_flatten_para(value)] if value.strip() else []
+    if isinstance(value, (list, tuple)):
+        out = []
+        for item in value:
+            s = str(item).strip()
+            if s:
+                out.append(_flatten_para(s))
+        return out
+    return []
+
+
+#: 阶段 ② 除了素材包，还能带上原文全文的原文长度上限。
+#:
+#: 带上原文是为了**不丢细节**（素材是压缩过的）；但带上原文就等于回到
+#: 「长 prompt」的老问题 —— 所以只在原文确实短时才带。
+#: 实测 user 735 字 → 50% 空，所以这个上限取 600（留一半余量）。
+_REWRITE_WITH_SOURCE_MAX = 600
 
 
 def _flatten_para(text: str) -> str:
@@ -996,6 +818,10 @@ def _parse_rewrite(raw: str) -> _RewriteParts:
     降级路径（`degraded=True`）：整段当正文，并**主动跳过开头的音效段** ——
     这正是 2026-10-02 那条污染样本的形态，宁可 hook 为空也不能让
     「（轻松开场音乐淡出）」进池子。
+
+    ⚠️ 额外字段（insights / related / follow_ups）会被**合进 sections**，
+    不是丢掉 —— 播客稿是「基于原文的再创作」，这三类内容（关联思考/延伸判断、
+    值得关联的关键点、可拓展关注的方向）是稿子的组成部分，要被念出来。
     """
     obj = _extract_json_object(raw)
     if obj is not None:
@@ -1005,6 +831,30 @@ def _parse_rewrite(raw: str) -> _RewriteParts:
             raw_sections = [raw_sections]
         sections = [_flatten_para(str(s)) for s in raw_sections if str(s).strip()]
         outro = _flatten_para(str(obj.get("outro") or ""))
+
+        # 额外字段 → 合进 sections（顺序：正文 → 关联思考 → 关联关键点 → 拓展方向）
+        n_insights = len(_str_list(obj.get("insights")))
+        n_related = len(_str_list(obj.get("related")))
+        n_follow = len(_str_list(obj.get("follow_ups")))
+        extra = (
+            _str_list(obj.get("insights"))
+            + _str_list(obj.get("related"))
+            + _str_list(obj.get("follow_ups"))
+        )
+        extra = [_flatten_para(s) for s in extra if s.strip()]
+        if extra:
+            sections = sections + extra
+        # 结构化计数（比关键词匹配准 —— 关键词会低估：LLM 写的是
+        # 「这条和XX行业很像」而不是「有意思的是」）
+        log.info(
+            "agent_rewrite_recreation insights=%d related=%d follow_ups=%d merged=%d sections=%d",
+            n_insights,
+            n_related,
+            n_follow,
+            len(extra),
+            len(sections),
+        )
+
         # hook 缺失但有正文 → 拿第一节顶上，别让整稿没有钩子
         if not hook and sections:
             hook, sections = sections[0], sections[1:]
