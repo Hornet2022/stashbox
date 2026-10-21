@@ -212,23 +212,24 @@ def test_default_concurrency_is_serial(openai_mod):
 def test_default_chunk_chars_is_the_measured_safe_size(openai_mod):
     """默认段长必须是 200 字 —— 实测出来的安全值，不是拍脑袋。
 
-    实测（2026-10-21，tertu.cn 的 Qwen3-TTS-12Hz-1.7B-Base）：
-        100 字 → 25.2s  语速 3.97  ✅
-        150 字 → 32.5s  语速 4.61  ✅
-        200 字 → 46.5s  语速 4.30  ✅  ← 取这个
-        250 字 → 64.5s  语速 3.88  ✅ 但已越过上游 60s 线
-        300 字 → 504 上游语音合成超时(60s)
-        400 字 → 94.5s  语速 4.23  ✅（能过但 46s 时长没保障）
+    实测（2026-10-21，tertu.cn 的 Qwen3-TTS-12Hz-1.7B-Base，每档试 2 次）：
+        400 字 → 语速 4.64 / 4.78  wall 23s  ✅
+        500 字 → 语速 4.31 / 3.79  wall 48s  ✅  ← 取这个
+        600 字 → 语速 4.34 / 4.28  wall 49s  ✅
+        700 字 → 语速 4.46 / 4.85  wall 52~59s ✅
 
-    上游**自己**也有 60s 墙钟（504 backend_timeout「上游语音合成超时」），
-    且是波动的（250 字成功、300 字 504、400 字又成功）。200 字实测 46.5s，
-    离那条线有 23% 余量。
+    **为什么不是更小的段长**：段数直接决定「音色一段一段」的严重程度 ——
+    每段是一次独立请求，段间韵律各自采样，接缝就是突变点。
+    段长 200 → 900 字稿 6 段（5 个接缝）；段长 500 → 2 段（1 个接缝）。
 
-    另外 290 字那次语速 7.14（真截断），所以 300 字同时也踩了「静默截断」，
-    丢约 40% 内容 —— 内测反馈的「中间一大段没音频」就是这个。
+    **为什么不能整篇不切**：上游自己也有 60s 墙钟（504 backend_timeout
+    「上游语音合成超时」），而 700 字的 wall 已经 52~59s —— 顶到那条线了。
+
+    另外 290 字那次语速 7.14（真截断，丢了约 40%）证明端点会**静默**截断，
+    所以仍需保留截断检测 + 二分自愈兜底。
     """
     client = openai_mod.OpenAITTSClient(api_key="k", base_url="http://x", model="m")
-    assert client.chunk_chars == 200, "默认段长必须是实测安全值 200 字"
+    assert client.chunk_chars == 500, "默认段长必须是实测安全值 500 字"
 
 
 def test_truncation_threshold_is_tight_enough(openai_mod):
@@ -280,17 +281,14 @@ def _fake_mp3_of_seconds(seconds: int) -> bytes:
 
 
 def test_default_timeout_leaves_room_for_upstream_jitter(openai_mod):
-    """默认超时必须是 120s，不是 60s。
+    """默认超时必须是 300s。
 
-    实测：同一篇稿子的 3 段里，段1 16s ✅、**段2 60s 超时** ❌、段3 16s ✅
-    —— 上游是**间歇性**抖的，不是稳定慢。
-
-    超时卡 60s 时，偶发的那一段必炸；而炸掉的后果是整篇蒸馏失败
-    （LLM 改写 + 全部分块都要重来）。放宽到 120s（正常段 13~20s，6 倍余量）
-    把这类抖动消化在本地。
+    段长 500 字时实测 wall 48~50s（700 字 52~59s），上游自己还有 60s 墙钟。
+    我们的 timeout 必须比它宽松 —— 上游 504 是它自己的限制、httpx 给大也没用，
+    但**上游返回 200 之后**的传输/读取不能被我们自己掐断。
     """
     client = openai_mod.OpenAITTSClient(api_key="k", base_url="http://x", model="m")
-    assert client.timeout == 120.0
+    assert client.timeout == 300.0
     assert client.chunk_retries == 2
 
 

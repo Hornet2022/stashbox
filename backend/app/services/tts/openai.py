@@ -134,7 +134,7 @@ class OpenAITTSClient(TTSClient):
             base_url if base_url is not None else os.getenv("OPENAI_BASE_URL", _DEFAULT_BASE_URL)
         ).rstrip("/")
         self.timeout = (
-            timeout if timeout is not None else float(os.getenv("OPENAI_TTS_TIMEOUT", "120"))
+            timeout if timeout is not None else float(os.getenv("OPENAI_TTS_TIMEOUT", "300"))
         )
         # 单块失败时的重试次数（只重试**这一块**，不是整篇重来）。
         #
@@ -157,24 +157,29 @@ class OpenAITTSClient(TTSClient):
         self.gap_sec = float(os.getenv("OPENAI_TTS_GAP_SEC", "0.3"))
         # 单次请求的最大字数。
         #
-        # 取 200 的依据（2026-10-21 实测，tertu.cn 的 Qwen3-TTS-12Hz-1.7B-Base）：
-        #     100 字 → 25.2s  语速 3.97  ✅
-        #     150 字 → 32.5s  语速 4.61  ✅
-        #     200 字 → 46.5s  语速 4.30  ✅  ← 取这个
-        #     250 字 → 64.5s  语速 3.88  ✅ 但已越过上游 60s 线
-        #     300 字 → 504 上游语音合成超时(60s)
-        #     400 字 → 94.5s  语速 4.23  ✅（能过但 46s 时长没保障）
+        # 取 500 的依据（2026-10-21 实测，tertu.cn 的 Qwen3-TTS-12Hz-1.7B-Base，
+        # 每档试 2 次）：
+        #     400 字 → 语速 4.64 / 4.78  wall 23s  ✅
+        #     500 字 → 语速 4.31 / 3.79  wall 48s  ✅  ← 取这个
+        #     600 字 → 语速 4.34 / 4.28  wall 49s  ✅
+        #     700 字 → 语速 4.46 / 4.85  wall 52~59s ✅
         #
-        # 上游**自己**也有 60s 墙钟（返回 504 backend_timeout「上游语音合成超时」），
-        # 且是波动的（250 字成功、300 字 504、400 字又成功）。200 字实测 46.5s，
-        # 离那条线有 23% 余量。
+        # **为什么取 500 而不是更小**：段数直接决定「音色一段一段」的严重程度 ——
+        # 每段是一次独立请求，段间韵律各自采样，段与段的接缝就是突变点。
+        # 段长 200 → 900 字稿要 6 段（5 个接缝）；段长 500 → 只要 2 段（1 个接缝）。
+        # 段数减到最少，割裂感就基本消失。
         #
-        # 之前用 300 字 → 撞上两个问题：① 上游 504 ② 端点静默截断
-        # （290 字只念了 60%，见 _TRUNCATION_CHARS_PER_SEC）。
+        # **为什么不整篇不切**：900+ 字整篇合成会撞上上游自己的 60s 墙钟
+        # （返回 504 backend_timeout「上游语音合成超时 (60s)」），
+        # 而 700 字的 wall 已经 52~59s —— 顶到那条线了。
+        # 我们的 httpx timeout 给到 300s（上游 504 是它自己的限制，给大也没用）。
+        #
+        # 500 字 × 2 段 = ~96s 墙钟，稳稳在 Arq job_timeout(1800s) 之内，
+        # App 那边有阶段显示（正在合成语音…），用户等得住。
         self.chunk_chars = (
             chunk_chars
             if chunk_chars is not None
-            else int(os.getenv("OPENAI_TTS_CHUNK_CHARS", "200"))
+            else int(os.getenv("OPENAI_TTS_CHUNK_CHARS", "500"))
         )
         # 分段并行度。**默认 1（串行）** —— 不是为了性能，是为了让每一段的
         # 计时器从「真正开始被上游处理」起算。

@@ -55,6 +55,24 @@ log = logging.getLogger("agent.runner")
 # ---------------------------------------------------------------------------
 
 
+async def _report_stage(article_id: str, stage: str) -> None:
+    """上报蒸馏当前阶段（供客户端展示「正在合成语音…」）。
+
+    阶段值就是 agent 自己的 `current_step`，不另造一套枚举 ——
+    客户端看到的和 agent 内部走的是同一个判据。
+
+    写失败静默忽略：阶段只是展示增强，不能因为 Redis 抖动让整条蒸馏失败。
+    """
+    if not article_id:
+        return
+    try:
+        from stashbox.backend.common.distill_stage import set_stage
+
+        await set_stage(article_id, stage)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("distill stage 上报失败 article=%s stage=%s err=%s", article_id, stage, exc)
+
+
 def _observe_step(step_name: str) -> Callable[[Any], Any]:
     """给 agent 节点补 CP3.6 埋点：耗时 histogram + 成功/失败 counter。
 
@@ -105,6 +123,7 @@ async def fetch_node(state: AgentState) -> dict[str, Any]:
     这也是生产主路径：抓取在 CP-CREATE-ARTICLE 阶段已完成并落库。
     """
     article_id = state.get("article_id", "")
+    await _report_stage(article_id, "fetch")
     prefetched = state.get("fetched_content") or ""
     if prefetched.strip():
         log.info(f"agent_node_fetch_prefetched article_id={article_id} len={len(prefetched)}")
@@ -133,6 +152,7 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
     Phase 3：用 LangGraph 的 ToolNode 让 LLM 选 tool 决定改写风格。
     """
     log.info("agent_node_rewrite article_id=%s", state.get("article_id"))
+    await _report_stage(state.get("article_id", ""), "rewrite")
     state = {**state, "current_step": "rewrite"}
 
     # Phase 2：从 MemoryStore 读 profile + few-shot
@@ -275,6 +295,9 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
 async def tts_node(state: AgentState) -> dict[str, Any]:
     """CP-AGENT-NODE-TTS：调 tts_synthesize tool。"""
     log.info("agent_node_tts article_id=%s", state.get("article_id"))
+    # TTS 是整条蒸馏里最慢的一步（上游 RTF≈0.3，1000 字稿要合成 4 分钟音频）。
+    # 上报阶段，客户端就能显示「正在合成语音…」而不是干等「蒸馏中」。
+    await _report_stage(state.get("article_id", ""), "tts")
     state = {**state, "current_step": "tts"}
     script = state.get("rewritten_script")
     if not script:
@@ -343,6 +366,7 @@ async def concat_node(state: AgentState) -> dict[str, Any]:
     Phase 1 先把骨架跑通，TODO：迁移 step4_concat 到这里。
     """
     log.info("agent_node_concat article_id=%s", state.get("article_id"))
+    await _report_stage(state.get("article_id", ""), "concat")
     state = {**state, "current_step": "concat"}
     # Phase 1 占位：tts_audio_url 直接当 final_audio_url
     return {

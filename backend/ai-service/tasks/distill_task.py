@@ -745,6 +745,16 @@ async def _run_distill_via_agent(
     )
     final = await _agent_app.ainvoke(initial_state)
 
+    # 蒸馏到此结束（成功或失败）—— 清掉阶段标记。
+    # 终态由 articles.status 表达，阶段只描述「进行中」，留着会让客户端
+    # 在终态下还显示「正在合成语音…」。
+    try:
+        from stashbox.backend.common.distill_stage import clear_stage
+
+        await clear_stage(article_id)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("distill stage 清除失败 article=%s err=%s", article_id, exc)
+
     # A/B 分组要在落库时写进 distilled_agents（方案 §2.7-D：user_id % 100 < 30
     # → personalized 组，其余 general，intention-to-treat 口径）。
     # 之前只有死代码 pipeline.py 会写这两个字段，生产 8 条记录实测全是 NULL，

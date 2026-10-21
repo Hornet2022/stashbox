@@ -8788,6 +8788,17 @@
             "type": "string",
             "title": "Status"
           },
+          "stage": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage"
+          },
           "favorite": {
             "type": "boolean",
             "title": "Favorite"
@@ -8913,6 +8924,17 @@
           "status": {
             "type": "string",
             "title": "Status"
+          },
+          "stage": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage"
           },
           "task_id": {
             "anyOf": [

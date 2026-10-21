@@ -71,6 +71,7 @@ from schemas import (  # noqa: E402
 )
 
 from stashbox.backend.common import cache_service, quota_service
+from stashbox.backend.common.distill_stage import get_stage
 from stashbox.backend.common.config import settings
 from stashbox.backend.common.tts_voice_service import get_voice_briefs
 from stashbox.backend.common.auth import create_access_token, require_user, require_user_optional
@@ -213,6 +214,7 @@ def _to_response(
     *,
     full_script: bool = False,
     tts_voice: TTSVoiceBrief | None = None,
+    stage: str | None = None,
 ) -> ArticleResponse:
     """CP9.x dev 兜底：本地模式（STORAGE_PROVIDER=local）下 audio_url 用
     PUBLIC_GATEWAY_URL 拼，避免真机客户端连到 localhost（设备本机）。
@@ -237,6 +239,7 @@ def _to_response(
         status=_derive_status(a, task),
         favorite=a.favorite,
         skip=a.skip,
+        stage=stage,
         created_at=a.created_at.isoformat() if a.created_at else "",
         audio_url=audio_url,
         task_id=task.id if task else None,
@@ -896,7 +899,11 @@ async def get_article(
     art, task = await _get_owned_with_task(article_id, uid, db)
     # CP-DISTILL-TEXT：详情页返回蒸馏稿全文（列表页只要 120 字摘要）
     payload = _to_response(
-        art, task, full_script=True, tts_voice=await _tts_voice_brief(task)
+        art,
+        task,
+        full_script=True,
+        tts_voice=await _tts_voice_brief(task),
+        stage=await get_stage(article_id),
     ).model_dump()
     await cache_service.set_article(article_id, payload, owner_id=art.user_id)  # ttl 300s
     return payload
@@ -1818,6 +1825,11 @@ async def article_status(
     return ArticleStatusResponse(
         article_id=art.id,
         status=_derive_status(art, task),
+        # 蒸馏当前阶段（fetch/rewrite/tts/concat）—— App 轮询这个端点时
+        # 拿它显示「正在合成语音…」，而不是干等笼统的「蒸馏中」。
+        # TTS 是最慢的一步（上游 RTF≈0.3，1000 字稿要合成 4 分钟音频），
+        # 没有阶段信息用户会以为卡死。
+        stage=await get_stage(article_id),
         task_id=task.id if task else None,
         task_status=task.status if task else None,
         error=art.error,

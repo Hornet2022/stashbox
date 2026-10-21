@@ -37,6 +37,16 @@ class ArticleResponse(BaseModel):
     title: str | None = None
     owner_id: str
     status: str  # pending | distilling | ready | listened | failed
+    # 蒸馏当前阶段（fetch/rewrite/tts/concat），仅 distilling 时非空。
+    #
+    # 为什么需要：蒸馏是异步长任务，TTS 合成占了总时延的大头
+    # （上游 RTF≈0.3，1000 字稿要合成 4 分钟音频）。
+    # 客户端只看到 status=distilling（「蒸馏中」）时无从判断是在正常干活
+    # 还是卡死 —— 这个字段让 App 能显示「正在合成语音…」。
+    #
+    # 阶段值直接取自 agent 的 current_step（common/distill_stage.py），
+    # 不另造一套枚举；蒸馏结束/失败即清除（终态由 status 表达）。
+    stage: str | None = None
     favorite: bool
     skip: bool
     created_at: str
@@ -85,6 +95,10 @@ class ArticleStatusResponse(BaseModel):
 
     article_id: str
     status: str  # pending | distilling | ready | failed | listened
+    # 蒸馏当前阶段（fetch/rewrite/tts/concat），仅 distilling 时非空。
+    # App 轮询这个端点等 ready，靠它显示「正在合成语音…」而不是干等
+    # 笼统的「蒸馏中」（TTS 是最慢的一步，1000 字稿要合成 4 分钟音频）。
+    stage: str | None = None
     task_id: str | None = None
     task_status: str | None = None  # queued | running | done | failed
     error: str | None = None
