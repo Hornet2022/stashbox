@@ -63,7 +63,7 @@ async def isolated_article(test_user):
     from sqlalchemy import delete
 
     from stashbox.backend.common.database import AsyncSessionLocal
-    from stashbox.backend.common.models import Article, DistilledArticle
+    from stashbox.backend.common.models import Article, DistilledArticle, Feedback
 
     # id 列是 VARCHAR(32)，前缀 + 18 位 hex 必须留出余量
     article_id = f"art_tstp_{uuid.uuid4().hex[:18]}"
@@ -93,6 +93,9 @@ async def isolated_article(test_user):
             await db.execute(
                 delete(DistilledArticle).where(DistilledArticle.article_id == article_id)
             )
+            # 埋点行也要清：_persist_agent_final 失败路径会写 feedback（无 FK，
+            # 不会被上面的删除连带清掉），留着就是在生产表里攒垃圾。
+            await db.execute(delete(Feedback).where(Feedback.article_id == article_id))
             await db.execute(delete(Article).where(Article.id == article_id))
             await db.commit()
 
@@ -487,7 +490,9 @@ async def test_persist_failure_does_not_rollback_data_writes(isolated_article):
         1,
         {
             "status": "failed",
-            "error": "x" * 500,  # reason 被截断到 200，写入正常
+            # 500 字异常：以前这里截断到 200 仍然超列宽(64) → insert 报错 →
+            # 整条埋点被 track() 静默吞掉。现在由 SDK 统一压到列宽。
+            "error": "x" * 500,
             "rewritten_script": marker,
             "error_kind": "internal",
             "error_step": "tts",
@@ -500,6 +505,137 @@ async def test_persist_failure_does_not_rollback_data_writes(isolated_article):
         rows = result.scalars().all()
         assert len(rows) == 1
         assert rows[0].script_text == marker
+        await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_persist_failure_lands_feedback_event(isolated_article):
+    """超长错误也必须**真的落下埋点行**（回归：以前整条事件被静默丢掉）。
+
+    feedback.reason 是 varchar(64)，而 track() 用 SAVEPOINT 兜异常、只留 warning，
+    所以「reason 超长 → insert 失败 → 事件消失」在日志之外完全无感。
+    """
+    from sqlalchemy import select
+
+    from stashbox.backend.common.database import AsyncSessionLocal
+    from stashbox.backend.common.models import Feedback
+    from tasks.distill_task import _persist_agent_final
+
+    article_id = isolated_article
+    long_error = "tts_synthesize 未捕获异常: OpenAITTS 错误 401: " + "y" * 400
+
+    await _persist_agent_final(
+        "cp_persist_feedback",
+        article_id,
+        1,
+        {
+            "status": "failed",
+            "error": long_error,
+            "rewritten_script": "稿子",
+            "error_kind": "internal",
+            "error_step": "tts",
+        },
+    )
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Feedback).where(
+                Feedback.article_id == article_id,
+                Feedback.type == "distill_failed",
+            )
+        )
+        rows = result.scalars().all()
+        assert len(rows) == 1, f"distill_failed 埋点没落库（{len(rows)} 行）"
+        assert len(rows[0].reason) <= 64
+        assert rows[0].metadata_["reason_full"] == long_error, "完整错误必须在 metadata 里"
+        await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_persist_failure_clears_stale_audio_fields(isolated_article):
+    """失败必须清掉上一轮残留的 audio_url / duration_sec（状态与产出同源）。
+
+    `_persist_agent_final` 按 article_id **复用同一行**，所以「换音色重生成」或
+    「失败重试」时行里还留着上一次成功的音频地址：status='failed' 却带着
+    146s 的旧音频 —— 任何按「有 audio_url 就算有产物」判断的调用方都会拿到过期音频。
+    """
+    from sqlalchemy import select
+
+    from stashbox.backend.common.database import AsyncSessionLocal
+    from stashbox.backend.common.models import DistilledArticle
+    from tasks.distill_task import _persist_agent_final
+
+    article_id = isolated_article
+
+    # 预置「上一轮成功」的残留产物
+    async with AsyncSessionLocal() as db:
+        row = (
+            await db.execute(
+                select(DistilledArticle).where(DistilledArticle.article_id == article_id)
+            )
+        ).scalar_one()
+        row.status = "done"
+        row.audio_url = "https://oss.example.com/stale-old-audio.m4a"
+        row.duration_sec = 146
+        await db.commit()
+
+    await _persist_agent_final(
+        "cp_persist_stale",
+        article_id,
+        1,
+        {
+            "status": "failed",
+            "error": "IndexTTS 合成失败",
+            "rewritten_script": "新稿",
+            "error_kind": "internal",
+            "error_step": "tts",
+        },
+    )
+
+    async with AsyncSessionLocal() as db:
+        row = (
+            await db.execute(
+                select(DistilledArticle).where(DistilledArticle.article_id == article_id)
+            )
+        ).scalar_one()
+        assert row.status == "failed"
+        assert row.audio_url is None, "失败后仍残留上一轮的音频地址"
+        assert row.duration_sec is None, "失败后仍残留上一轮的时长"
+        await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_persist_success_keeps_new_audio_fields(isolated_article):
+    """成功路径不受影响：新产出的 audio_url / duration_sec 必须留存。"""
+    from sqlalchemy import select
+
+    from stashbox.backend.common.database import AsyncSessionLocal
+    from stashbox.backend.common.models import DistilledArticle
+    from tasks.distill_task import _persist_agent_final
+
+    article_id = isolated_article
+
+    await _persist_agent_final(
+        "cp_persist_ok",
+        article_id,
+        1,
+        {
+            "status": "done",
+            "rewritten_script": "成稿",
+            "tts_audio_url": "https://oss.example.com/new-audio.wav",
+            "tts_duration_sec": 146,
+        },
+    )
+
+    async with AsyncSessionLocal() as db:
+        row = (
+            await db.execute(
+                select(DistilledArticle).where(DistilledArticle.article_id == article_id)
+            )
+        ).scalar_one()
+        assert row.status == "done"
+        assert row.audio_url == "https://oss.example.com/new-audio.wav"
+        assert row.duration_sec == 146
         await db.rollback()
 
 

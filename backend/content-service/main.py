@@ -988,6 +988,10 @@ async def push_retry_message(user_id: int, article_id: str) -> None:
             article_id=article_id,
             title="换个来源重试？",
             body="这篇原文被拒收，要不要换一个源？",
+            # 2026-10-21：status 严格表示**投递状态**，新建一律 pending，
+            # 由投递 worker 真的去发之后再改。默认值 'sent' 等于
+            # "创建即宣称已送达"，而当时没有任何投递动作。
+            status="pending",
         )
         session.add(notif)
         try:

@@ -27,9 +27,11 @@ from stashbox.backend.common.exceptions import InvalidRequest, NotFound
 from stashbox.backend.common.models import (
     ArticleAudioVariant,
     ConsentRecord,
+    DeviceToken,
     DistillationEvaluation,
     DistilledArticle,
     FewShotExample,
+    PushNotification,
 )
 
 from distill.ab_report import compute_ab_report
@@ -172,6 +174,75 @@ async def admin_evaluations_list(
             }
             for r in rows
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 推送通道自检（2026-10-21）
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/v1/admin/push/health")
+async def admin_push_health(
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """推送通道是否真的接好了 + 当前注册了多少设备。
+
+    ## 为什么要有这个端点
+
+    推送这件事的失败模式特别隐蔽：**没配通道时，通知会如实写成
+    "failed: 未配置推送通道"，但系统里一切正常** —— 没有异常、没有堆栈、
+    没有 5xx。管理后台的列表里全是失败行，但没人知道根因是"压根没接通道"。
+
+    更早的时候更糟：那个「重推」端点直接把 status 改成 'sent'，
+    运营看到"已发送"，用户手机上什么都没有。
+
+    所以这个端点把"接没接"这件事变成一个**可以被查、被部署脚本检查**的答案。
+    `deploy/preflight.sh` 也会读同样的信息。
+
+    查不到通道 → `configured: false` + 明确的原因，别让人猜。
+    """
+    from stashbox.backend.common.push import get_push_provider
+
+    provider = get_push_provider()
+    configured = provider.name != "none"
+
+    device_rows = await db.execute(
+        select(
+            DeviceToken.provider,
+            func.count(),
+            func.count(func.distinct(DeviceToken.user_id)),
+        )
+        .where(DeviceToken.deleted_at.is_(None), DeviceToken.is_active.is_(True))
+        .group_by(DeviceToken.provider)
+    )
+    by_provider = [
+        {"provider": r[0], "devices": int(r[1]), "users": int(r[2])} for r in device_rows.all()
+    ]
+    total_devices = sum(d["devices"] for d in by_provider)
+
+    notif_rows = await db.execute(
+        select(PushNotification.status, func.count()).group_by(PushNotification.status)
+    )
+    by_status = {r[0]: int(r[1]) for r in notif_rows.all()}
+
+    reason = None
+    if not configured:
+        reason = (
+            "未配置推送通道：设 STASHBOX_PUSH_WEBHOOK_URL 指向你的推送网关，"
+            "并让客户端以同一个 provider 上报设备令牌。"
+        )
+    elif total_devices == 0:
+        reason = "通道已配置，但还没有任何设备注册令牌（客户端登录后会自动注册）。"
+
+    return {
+        "configured": configured,
+        "provider": provider.name,
+        "reason": reason,
+        "devices": total_devices,
+        "devices_by_provider": by_provider,
+        "notifications_by_status": by_status,
     }
 
 

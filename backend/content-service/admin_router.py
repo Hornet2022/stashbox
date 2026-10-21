@@ -545,19 +545,49 @@ async def admin_llm_config_put(
         stored["base_url"] = (req.base_url or "").strip() or None
 
     row = await system_config.set_config(system_config.KEY_LLM, stored, updated_by=_uid(user))
-    client = await reload()  # 改完即生效，不用重启进程
+    # 改完即生效，不用重启进程。
+    #
+    # ⚠️ 这里**不能**让 reload() 的异常冒出去：
+    #    reload() 内部会构造 client，而 OpenAIClient 在**没有 api_key** 时
+    #    抛 ValueError("api_key required for OpenAIClient")。
+    #    后果：用户在后台「只改模型名」（没顺手填 key）→ 保存其实成功了，
+    #    但接口返回 500 → 前端弹一个看不懂的错误 → 运营以为没保存，
+    #    于是反复重试，DB 里被写进一堆半截配置。
+    #    （实测：带 api_key 时 200，不带时 500。）
+    #
+    #    正确行为：**保存照做**，缺 key 只是「配置还差一步」，
+    #    用 warning 告知（返回体的 api_key_set 会是 false，前端据此提示）。
+    reload_warning: str | None = None
+    try:
+        client = await reload()
+        client_name = client.provider_name
+    except Exception as exc:  # noqa: BLE001 —— 缺 key / provider 未实现等
+        reload_warning = f"配置已保存，但立即生效失败：{exc}"
+        log.warning(
+            "admin_llm_config_saved_not_applied",
+            admin_id=_uid(user),
+            provider=provider,
+            error=str(exc),
+        )
+        client_name = provider
+
     log.info(
         "admin_llm_config_updated",
         admin_id=_uid(user),
         provider=provider,
         model=stored.get("model"),
-        client=client.provider_name,
+        client=client_name,
     )
-    return _masked_llm_config(
+    masked = _masked_llm_config(
         resolve_config(row["value"]),
         "db",
         row["updated_at"].isoformat() if row["updated_at"] else None,
     )
+    if reload_warning:
+        # 用 warning 字段带出去，不改 HTTP 状态码 —— 状态码仍是 200，
+        # 因为「保存」这个动作确实成功了。
+        masked["warning"] = reload_warning
+    return masked
 
 
 # ---------------------------------------------------------------------------

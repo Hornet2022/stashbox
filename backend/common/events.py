@@ -18,6 +18,7 @@ CP6.2.2 续单时把所有 50 个接入埋点。
 
 总计 50 ✅
 """
+
 from enum import Enum
 
 
@@ -30,6 +31,11 @@ class EventName(str, Enum):
     USER_REGISTER = "user_register"  # CP6.2.2
     QUOTA_RESET = "quota_reset"  # CP6.2.1
     PLAN_UPGRADE = "plan_upgrade"  # CP6.2.2
+    # 2026-10-21：用户主动注销账号（合规要求可追溯"发生过注销"这件事，
+    # 但不能留下个人内容 —— 埋点只带 user_id，不带任何个人信息）
+    USER_ACCOUNT_DELETED = "user_account_deleted"
+    # 2026-10-21：用户同意 / 撤回隐私政策
+    USER_CONSENT_UPDATED = "user_consent_updated"
 
     # === 内容收集（CP6.2.1 覆盖 3）===
     ARTICLE_SUBMIT = "article_submit"  # CP6.2.1

@@ -252,8 +252,40 @@ async def test_failure_does_not_write_final_result(ctx, fake_llm_cls, fake_tts_c
     with pytest.raises(RuntimeError):
         await pipeline.run(ctx)
 
-    assert all("audio_url" not in row for row in factory.values)
+    # 失败不得写出音频结果：audio_url / duration_sec 要么不出现，要么是 None。
+    #
+    # 2026-10-21 起，FAILED 转换会**显式**写 audio_url=None / duration_sec=None
+    # （用来清掉上一轮成功残留的指针，见 _update_status），所以这里不能再要求
+    # 「键不存在」——但仍然要求「绝不写出非空的音频结果」。
+    assert all(not row.get("audio_url") for row in factory.values)
+    assert all(not row.get("duration_sec") for row in factory.values)
     assert ctx.final is None
+
+
+async def test_failed_status_clears_stale_audio_fields(
+    ctx, fake_llm_cls, fake_tts_cls, monkeypatch
+):
+    """FAILED 转换必须显式清掉 audio_url / duration_sec。
+
+    同一行会被复用（换音色重生成 / 失败重试），失败时若留着上一轮成功的
+    audio_url，就是 status='failed' 却带着旧音频 —— 状态与产出不同源。
+    """
+    pipeline, factory, _ = _make_pipeline(
+        monkeypatch, fake_llm_cls("改写稿正文"), fake_tts_cls=fake_tts_cls
+    )
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(pipeline_module, "step4_concat", _boom)
+
+    with pytest.raises(RuntimeError):
+        await pipeline.run(ctx)
+
+    failed_rows = [row for row in factory.values if row.get("status") == "failed"]
+    assert failed_rows, "没有写出 FAILED 状态更新"
+    assert failed_rows[-1]["audio_url"] is None, "FAILED 必须清掉 audio_url"
+    assert failed_rows[-1]["duration_sec"] is None, "FAILED 必须清掉 duration_sec"
 
 
 async def test_failure_without_session_factory_still_raises(

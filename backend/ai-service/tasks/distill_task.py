@@ -119,6 +119,11 @@ async def _trigger_subscription_pushes(
                 title=f"新文章：{article_title[:50]}",
                 body=f"你订阅的 {primary_tag_slug} 标签有新文章蒸馏完成",
                 deeplink=f"/articles/{article_id}",
+                # 2026-10-21：status 严格表示**投递状态**。
+                # 默认值原是 'sent'（"历史行已发出,无失败回执"），
+                # 那等于**创建即宣称已送达**——而当时根本没有投递。
+                # 现在新行一律 pending，等投递 worker 真的去发。
+                status="pending",
             )
             for sub_id in subscriber_ids
         ]
@@ -318,7 +323,9 @@ async def distill_task(
                 )
                 await track_simple(db, EventName.DISTILL_QUOTA_REFUND, user_id, article_id)
                 await db.execute(
-                    update(Article).where(Article.id == article_id).values(status="failed")
+                    update(Article)
+                    .where(Article.id == article_id)
+                    .values(status="failed", audio_url=None)
                 )
                 await db.commit()
         except Exception as track_exc:
@@ -450,10 +457,16 @@ async def distill_task(
         # failed，否则与 distilled_articles.status='failed' 不一致，UI 永远「处理中」。
         # 若 Arq 还会 retry，该任务下次进入时会把状态重新置回 distilling，
         # 因此这里不区分「是否最后一次尝试」也能收敛到正确终态。
+        #
+        # 2026-10-21：同时清掉 articles.audio_url —— 它是成功路径写回产物时
+        # 镜像 distilled_articles.audio_url 的（见上面的 art.audio_url = da.audio_url）。
+        # 失败时留着它，文章就是 status='failed' 却还挂着一个「可播」的旧地址。
         try:
             async with AsyncSessionLocal() as db:
                 await db.execute(
-                    update(Article).where(Article.id == article_id).values(status="failed")
+                    update(Article)
+                    .where(Article.id == article_id)
+                    .values(status="failed", audio_url=None)
                 )
                 await db.commit()
         except Exception as exc:
@@ -764,9 +777,26 @@ async def _persist_agent_final(
             if final.get("rewritten_script"):
                 da.script_text = final["rewritten_script"]
             if final.get("tts_audio_url"):
+                # 音频字段**整体**来自本次尝试（有 URL 才有时长，不留上一轮的）
                 da.audio_url = final["tts_audio_url"]
-            if final.get("tts_duration_sec") is not None:
-                da.duration_sec = int(final["tts_duration_sec"])
+                da.duration_sec = (
+                    int(final["tts_duration_sec"])
+                    if final.get("tts_duration_sec") is not None
+                    else None
+                )
+            else:
+                # **失败/无产出必须清掉上一轮留下的音频指针**（2026-10-21 修）。
+                #
+                # 这一行是按 article_id 复用同一行的（换音色重生成 / 失败重试都走这里），
+                # 所以本次没出音频时行里还留着**上一次成功**的 audio_url 和 duration_sec：
+                # status='failed' 却带着 146s 的旧音频地址 —— 状态与产出不同源，
+                # 任何按「有 audio_url 就算有产物」判断的调用方都会拿到过期音频。
+                #
+                # 安卓端不受影响（播放器只在 status==READY && audioUrl!=null 时渲染），
+                # 但 API 载荷、admin 列表、音频统计全是错的。
+                # 旧音频文件本身仍在 SeaweedFS 里，不删，只是这一行不再指向它。
+                da.audio_url = None
+                da.duration_sec = None
             # CP-TTS-VOICE：溯源「这段音频是谁念的」。
             # None = 回落全局 indextts_ref_audio，来源不可溯源 —— 保持 NULL，
             # 不要回填一个「看起来对」的音色 ID，那会让统计口径失真。
@@ -821,6 +851,10 @@ async def _persist_agent_final(
     # 失败 → 带 reason，让 admin dashboard 看到"为什么失败"。
     # 注意：DistilledArticle 没有 metadata 列（见模型定义），错误详情
     # 通过 feedback（DISTILL_FAILED.reason）持久化，不写在该行上。
+    #
+    # reason **不再手工截断**：feedback.reason 只有 varchar(64)，原先这里截到 200
+    # 反而超长 → insert 报错 → 整条埋点被 track() 静默吞掉（只留一行 warning）。
+    # 现在由 analytics.track() 统一压到列宽，原文自动进 metadata['reason_full']。
     if status == "failed" and final.get("error"):
         async with AsyncSessionLocal() as fb_db:
             try:
@@ -829,7 +863,7 @@ async def _persist_agent_final(
                     EventName.DISTILL_FAILED,
                     user_id=user_id,
                     article_id=article_id,
-                    reason=str(final["error"])[:200],
+                    reason=str(final["error"]),
                 )
                 await fb_db.commit()
             except Exception as exc:

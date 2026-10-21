@@ -371,10 +371,19 @@ class DistillPipeline:
         from stashbox.backend.common.models import DistilledArticle
 
         async with self.session_factory() as session:
+            values: dict[str, object] = {"status": status.value, "updated_at": func.now()}
+            if status == DistillStatus.FAILED:
+                # **失败必须清掉音频字段**（2026-10-21 修）。
+                #
+                # 这一行是按 task_id 复用同一行的，重跑/重试时行里可能还留着
+                # 上一次成功的 audio_url 和 duration_sec → status='failed' 却带着
+                # 旧音频地址，状态与产出不同源。
+                # 成功路径不受影响：DONE 转换在 _write_final_to_db 之后发生，
+                # 这里只清 FAILED。
+                values["audio_url"] = None
+                values["duration_sec"] = None
             await session.execute(
-                update(DistilledArticle)
-                .where(DistilledArticle.id == ctx.task_id)
-                .values(status=status.value, updated_at=func.now())
+                update(DistilledArticle).where(DistilledArticle.id == ctx.task_id).values(**values)
             )
             await session.commit()
 
