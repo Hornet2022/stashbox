@@ -36,6 +36,12 @@ log = structlog.get_logger(__name__)
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
 
+# 「有 completion_tokens 但 content 为空」时的重试次数。
+# 见 _openai_chat 里那段注释 —— 某些 OpenAI 兼容后端（实测 vLLM 0.22.0）
+# 会偶发把生成内容丢出 content 字段，重发一次通常就好了。
+# 3 次是实测里够用的量（实测 3 次里第 3 次就正常），再多就是浪费配额。
+_EMPTY_CONTENT_RETRIES = 3
+
 
 class OpenAIClient(LLMClient):
     """OpenAI 兼容 LLM 客户端（HTTP POST /chat/completions，Bearer auth）。
@@ -129,6 +135,48 @@ class OpenAIClient(LLMClient):
         tool_calls_raw = message.get("tool_calls")  # 可能 None / [] / [list]
         usage_data = data.get("usage", {})
         finish_reason = data.get("choices", [{}])[0].get("finish_reason", "stop")
+
+        # ── 空 content 但确实生成了 token → 重试 ──────────────────────
+        #
+        # 实测（2026-10-21，tertu.cn 的 vLLM 0.22.0 后端）：
+        # 同一个请求连发 3 次，前 2 次返回 content='' 但 usage.completion_tokens
+        # 是 300~450 —— 模型**明明生成了内容**，只是没落到 content 字段里
+        # （vLLM 偶发 detokenize 丢失）。第 3 次就正常返回 834 字的完整 JSON。
+        #
+        # 不做重试的后果（实测踩过）：content 空 → agent/runner.py 的
+        # `getattr(resp, "content", None) or str(resp)` 回落到 str(resp) →
+        # **把整个响应对象的 repr 当成了播客稿**，
+        # 于是「听感整理稿」里出现
+        #   content='' model='Qwen3.8-27B' usage=Usage(...) latency_ms=...
+        # 这种天书，而文章状态还是「已就绪」、音频照常合成 —— 静默到没法发现。
+        #
+        # 判据用 completion_tokens > 0 而不是「content 为空」：
+        # 真正合法的空回复（模型拒答/被截断）completion_tokens 也是 0，
+        # 那种情况重试也没用，应该直接返回空让上层报错。
+        if not content and usage_data.get("completion_tokens", 0) > 0:
+            for attempt in range(1, _EMPTY_CONTENT_RETRIES + 1):
+                log.warning(
+                    "llm_empty_content_retry attempt=%s/%s model=%s completion_tokens=%s",
+                    attempt,
+                    _EMPTY_CONTENT_RETRIES,
+                    model,
+                    usage_data.get("completion_tokens"),
+                )
+                data = await self._post(body)
+                message = data.get("choices", [{}])[0].get("message", {})
+                content = message.get("content", "")
+                tool_calls_raw = message.get("tool_calls")
+                usage_data = data.get("usage", {})
+                finish_reason = data.get("choices", [{}])[0].get("finish_reason", "stop")
+                if content:
+                    break
+            if not content:
+                # 重试完还是空 —— 明确记一条，别让上层把 repr 当内容用
+                log.error(
+                    "llm_empty_content_after_retries model=%s completion_tokens=%s",
+                    model,
+                    usage_data.get("completion_tokens"),
+                )
 
         # 解析 tool_calls → ChatResponse.tool_calls (list[ToolCall])
         from .types import ToolCall

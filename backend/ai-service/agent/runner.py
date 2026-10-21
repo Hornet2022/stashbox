@@ -44,6 +44,7 @@ from .tools import ToolError, get_default_registry
 # 让测试 monkeypatch `llm.get_llm_client` 时真正生效（`from X import Y` 会绑死
 # 模块级引用，monkeypatch 改不到）。
 import llm as _llm_module
+from llm.exceptions import LLMError
 from llm.types import ChatMessage, ChatRequest
 
 log = logging.getLogger("agent.runner")
@@ -837,7 +838,21 @@ async def _chat_text(
     req = ChatRequest(messages=messages, **kwargs)
     resp = await llm.chat(req)
     # ChatResponse.content 是 str；防御：万一测试 mock 直接返回 str
-    return getattr(resp, "content", None) or str(resp)
+    #
+    # ⚠️ 这里**不能**写成 `getattr(resp, "content", None) or str(resp)`：
+    #    content 为空串时，str(resp) 会把**整个响应对象的 repr** 当成正文返回
+    #    （"content='' model='Qwen3.8-27B' usage=Usage(...) latency_ms=..."），
+    #    于是「听感整理稿」里出现这种天书，而文章状态还是"已就绪"、
+    #    音频照常合成 —— 静默到没法从界面上发现（2026-10-21 实测踩过）。
+    #
+    #    正确做法：只接受真正的文本；content 为空就抛错，让上层走
+    #    "LLM 返回空内容"的错误路径，而不是把调试信息当稿子念出去。
+    if isinstance(resp, str):
+        return resp
+    content = getattr(resp, "content", None)
+    if isinstance(content, str) and content.strip():
+        return content
+    raise LLMError("LLM 返回空内容（content 为空，重试后仍为空）")
 
 
 # ---------------------------------------------------------------------------
