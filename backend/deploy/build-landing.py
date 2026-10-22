@@ -82,16 +82,20 @@ def main() -> int:
         '<p class="cta-note">Android 内测版（' + APK_VER + "）· iOS 规划中</p>\n"
         f'      <a class="btn" href="{APK_PATH}" download>下载内测版</a>\n'
         '      <p class="cta-note" style="margin-top:10px">'
-        '下载中断或很慢？<a href="' + APK_FALLBACK_URL + '" download>点这里直连下载</a>'
-        "（走 IP，不经过域名）</p>",
+        "下载中断或很慢？可能是浏览器自带下载器的问题 —— "
+        "试试<strong>用系统下载器打开</strong>（长按链接 → 复制到下载工具），"
+        '或<a href="' + APK_FALLBACK_URL + '" download>走 IP 直连下载</a>'
+        "（不经过域名）。</p>",
     )
     src = src.replace(
         "<p>内测中 · Android 优先</p>\n" '        <button class="btn">加入内测名单</button>',
         f"<p>Android 内测版（{APK_VER}）· iOS 规划中</p>\n"
         f'        <a class="btn" href="{APK_PATH}" download>下载内测版</a>\n'
         '        <p class="cta-note" style="margin-top:10px">'
-        '下载中断或很慢？<a href="' + APK_FALLBACK_URL + '" download>点这里直连下载</a>'
-        "（走 IP，不经过域名）</p>",
+        "下载中断或很慢？可能是浏览器自带下载器的问题 —— "
+        "试试<strong>用系统下载器打开</strong>（长按链接 → 复制到下载工具），"
+        '或<a href="' + APK_FALLBACK_URL + '" download>走 IP 直连下载</a>'
+        "（不经过域名）。</p>",
     )
     if "加入内测名单" in src:
         raise SystemExit("还有没换掉的「加入内测名单」")
