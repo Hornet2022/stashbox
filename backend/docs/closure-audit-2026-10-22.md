@@ -97,3 +97,156 @@ python3 scripts/extract_client_endpoints.py     # 重新生成
 # 真链路冒烟（需要在能访问域名的网络里跑，例如生产机）
 python3 scripts/endpoint_smoke.py
 ```
+
+---
+
+# 第二轮：三路并行审计（2026-10-22 晚）
+
+第一轮走查是「端点有没有」的横向扫。第二轮换三个角度并行再审一遍，
+每个角度看不同的东西：
+
+| 审计 | 角度 | 发现 |
+|---|---|---|
+| admin-web | 前端每个功能点：UI → ViewModel → API → 状态 → 反馈 | 2 个真断链 |
+| 后端与部署 | 路由表 ↔ 实现 ↔ 契约 ↔ 鉴权 ↔ 状态机 ↔ 副作用 | 4 个真断链 |
+| 安卓 | 端点 + 异常处理 + 死按钮 | 0 个新断链（第一轮已修完） |
+
+**结论：第二轮又挖出 6 个真断链，全部已修 + 部署 + 实测。**
+
+## 一、admin-web 的 2 个真断链
+
+### 1. 「失效音频」按钮对**所有**文章永久禁用 🔴
+
+admin-web 用 `article.audio_id` 判断「这篇文章有没有关联音频」，
+失效端点 `POST /api/v1/admin/audio/{audio_id}/invalidate` 做的是
+`db.get(DistilledArticle, audio_id)` —— 要的是**蒸馏结果的主键**（`dst_xxx`）。
+
+而列表端点 `GET /api/v1/admin/articles` 只下发 `audio_url`（OSS URL 字符串）。
+两者不是一回事 → `hasAudio` 恒为 false → **每一行的「失效音频」按钮都是灰的**，
+这条功能从头到尾没被用过。
+
+**修**：列表端点把蒸馏结果的主键一起下发（顺带把 `tags` / `quality_score`
+也带上 —— 后台文章表有这两列、按数据决定显隐，而列表端点从来没下发过，
+两列永远不出现，契约是一句空话）。
+
+**实测**：列表现在返回 `audio_id='dst_ea754418f6a74af5964a4db8'`。
+
+### 2. 6 处写操作在「网关不可达」时完全无提示 🔴
+
+响应拦截器只在**有 HTTP 状态码**时才 toast。网关不可达 / 跨域失败 /
+axios 超时，axios 交给拦截器的 error 里**没有 response** → `status` 是
+`undefined` → 三个分支全不命中 → **一个字都不弹**。
+
+于是这 8 处 catch 里的注释「拦截器已 toast」是**假的**：
+发起盲测 / 提交评分 / 提交标注 / 重推 / 保存 tier / 池清理 / 抽查回写。
+用户视角：网关一挂，点「发起盲测」→ 按钮转一圈恢复原状，界面毫无变化。
+
+**修**：在拦截器里统一补 `status === undefined` 分支（一次改，所有写操作受益）。
+同时把「无法连接 api-gateway（localhost:8100）」里的硬编码地址去掉 ——
+生产构建的 baseURL 是同源，写死 localhost 会让运维去查一台根本不存在的机器。
+
+## 二、后端与部署的 4 个真断链
+
+### 3. 登出只杀了 access token，refresh 那条腿还活着 🔴
+
+**这是本轮最要紧的一条，而且是我自己上一个 commit 引入的假闭环。**
+
+logout 端点刚补上时，我实测过：登出后 access token 立刻 401
+「Token has been revoked」。但拿**同一个 refresh token** 去换新 token
+依然返回 **200** —— refresh 端点只查 `users.deleted_at`，**从不看吊销标记**。
+
+后果：设备丢了、用户以为登出了，旧 refresh token 最长 30 天内能无限换出
+新 access token —— 等于给用户发了一张「已登出」的假凭证。
+
+**修**：
+- refresh 端点补吊销检查（与 `require_user` 同一套判据）；
+- 吊销判据从秒级提到**毫秒级**：JWT 的 `iat` 只有秒精度
+  （python-jose 3.5.0 编码时按 `utctimetuple()` 截断），拿它去比一个带
+  小数秒的边界就分不出同一秒内的先后 —— 严了会误杀「登出后立刻重新登录」
+  的新 token，宽了会让旧 token 活满 7 天。token 里多带一个 `iat_ms`
+  毫秒戳，两个错都不用犯；
+- 吊销边界按 `ms:` 前缀存 —— 值自己说明刻度，不靠数值大小猜
+  （这个改法是被测试逼出来的：第一版靠「小于 1e11 当秒」猜刻度，
+  测试一换非当代时刻就判错，边界差 1000 倍）。
+
+**实测**（生产机）：
+
+    登出后 access token:  HTTP 401  Token has been revoked
+    登出后 refresh token: HTTP 401  Token has been revoked
+    登出后重新登录可用:   HTTP 200
+
+### 4. `POST /api/v1/users/me/quota/reset-monthly` 在网关是 404 🔴
+
+实现一直在 user-service 里，也进了 OpenAPI 契约，但**没进路由表** →
+走兜底时首段 `users`（复数）不在白名单 → 网关直接 404「接口不存在」。
+
+**实测（修复前）**：网关 404，直连 user-service 才是 401。
+
+`api-gateway/config.py` 的注释里记着**同款事故的三次**
+（`notifications/{id}/mark-read`、`admin/export/tags.csv`、`admin/llm/*`），
+这次是**第四例**。
+
+**修**：
+- 补路由；兜底白名单补 `users`（显式路由表先匹配，命中不了的才走兜底，
+  猜不到就是 404。宁可通到下游让它自己答 404/401，也不要网关替下游撒谎）；
+- 剪藏与重试这两个**最核心的写端点**从兜底提到显式注册 ——
+  原来靠前缀猜下游，猜对了，但兜底路径不注入 `X-Request-ID`，
+  两边日志串不上号，而「剪藏失败要回溯扣费与蒸馏派发」恰恰最需要串号；
+- 兜底路径也补 `X-Request-ID`：同一个网关不该有两套链路串联口径；
+- **新增路由一致性守卫**（`tests/gateway/test_route_coverage.py`）：
+  路由表每条都要有下游实现，且下游每个端点网关都要路由得到。
+  这条测试能挡住下一例（已用「模拟修复前」验证过它确实会失败）。
+
+**实测（修复后）**：网关返回 `HTTP 200 {"reset_users":4,"scope":"all_users"}`。
+
+### 5. 换机时 nginx 起不来：两个片段没有任何安装步骤 🔴
+
+站点模板 include 了两个共享片段，但仓库里只有
+`patch-nginx-downloads-redirect.py` 会拷其中一个，另一个**没有任何脚本会拷**。
+而 nginx 对 include 一个不存在的文件是 **emerg**（不是 warning）→
+`nginx -t` 直接挂 → 站点起不来。严格照 README 部署一台新机器，第 ⑨ 步就死。
+
+**修**：新增 `deploy/install-nginx-assets.sh`（站点 + 片段一次装齐，
+装完 `nginx -t` 过了才 reload，失败停原地并留备份；主配置默认不装，
+要装得显式 `--main`），README 第 ⑨ 步改用它。
+
+### 6. 注销账号后仍能登进 admin 后台 🔴
+
+wechat 登录和 refresh 都查了 `users.deleted_at`，**只有 admin 登录漏了** ——
+注销过的 admin/operator 照样拿密码登进管理后台。三处登录口径必须一致。
+
+**修**：admin 登录补 `deleted_at` 检查。
+
+**实测**（临时软删账号，验证后已清理，残留 0）：
+`HTTP 401 {"code":40100,"message":"account has been deleted"}`
+
+## 三、顺手修掉的（审计顺带牵出来的）
+
+| 问题 | 修法 |
+|---|---|
+| 收藏 / 稍后听 / 收听进度只查「文章存在」，不查属主 | 改用 `_get_owned`，与兄弟端点一致。`update_progress` 的注释原本写着「（归属校验）」，**注释声称的校验并不存在** |
+| admin-web 拿不到真实 role 时静默兜底成 `'admin'` | 兜底改成最小权限 `operator`（另见下方待办） |
+| 冒烟脚本自己制造假断链 | admin 密码写死成 `"wrong"` + 打印「跳过」却**没真的跳过** → 所有 admin 端点报 502「连不上后端」，看起来像服务挂了。改成从 env 只读取密码、拿不到就真的跳过；分类也改诚实（属主校验的 403 / 会话态端点的 404 / 参数不足，都不是断链） |
+
+## 四、最终冒烟结果（生产机）
+
+    通            37/50
+    真断链(404)   0
+    属主校验(403) 7   ← 校验生效，不是断链
+    鉴权失败      0
+    参数不足      5   ← 脚本没填 body/query，不是断链
+    会话不存在    1   ← 会话态端点（盲测会话只在内存里，24h TTL），404 是预期
+    其它异常      0
+    ✅ 没有真断链
+
+## 五、本轮**没有**修的（已知、有意留下）
+
+| 项 | 为什么不修 |
+|---|---|
+| admin 登录无限流 | 公开的 `wechat-login` 有 Redis 限流，admin 登录没有。bcrypt cost 12 把单次尝试拉到 ~200-300ms。**内测阶段规模够用**，上线前必须补（按 email+IP 维度） |
+| clawbot 回调不扣配额、不派蒸馏 | mock 性质的端点，与 `submit_article` 口径不一致。要么接上配额，要么从网关暴露面摘掉 |
+| 真实 agent 路径退款后没清 Redis「已扣费」标记 | 当下无害（重试不会重复扣），但两套状态长期不一致，后续任何依赖该标记做计费判断的改动都会踩坑 |
+| 配额标记 24h TTL → 超时后手动蒸馏会二次扣费 | 需要把扣费事实落库，改动大。要在配额策略定型后一起做 |
+| Docker 部署下蒸馏 P95 面板恒为空 | `AI_WORKER_METRICS_URL` 在 compose 里没有、8104 绑在容器回环。当前是 **systemd 部署**，不受影响 |
+| admin-web `AdminRole` 里的 `super_admin` / `viewer` 后端不存在 | 前端类型与后端角色集合不一致。后端真实只有 `admin` / `operator` 两档，前端闸门实际形同虚设。收窄类型是**破坏性**改动，等真要分权时一起做 |
+| 14 个端点零测试（其中 10 个客户端在调） | 音色 CRUD 与 admin/tags 至少要补「鉴权 + 归属 + 幂等」三层用例。内测阶段先补最热的 |
