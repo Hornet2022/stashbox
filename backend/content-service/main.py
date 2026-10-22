@@ -826,7 +826,7 @@ async def list_articles(
         .outerjoin(DistilledArticle, DistilledArticle.article_id == Article.id)
         .options(_LISTING_DEFER)  # 见 _LISTING_DEFER：_to_response 不读 raw_content
         .where(*base_filter)
-        .order_by(Article.created_at.desc())
+        .order_by(Article.created_at.desc(), Article.id.desc())
         .limit(limit)
         .offset(offset)
     )

@@ -96,20 +96,60 @@ async def test_list_users_default():
 
 @pytest.mark.asyncio
 async def test_list_users_pagination():
-    """分页：两页不重叠。"""
-    u1 = await _make_user(nickname="page_one_user")
-    await _make_user(nickname="page_two_user")
+    """分页：两页不重叠，**且 created_at 相同也能分页**。
+
+    2026-10-22 修的 bug：列表排序只按 `created_at DESC`，**没有唯一 tiebreaker**
+    → 同一时刻创建的多个用户并列时，PostgreSQL 对并列元素的排序**不稳定**
+    → 同一个用户会同时出现在第 1 页和第 2 页，另一个人两页都看不到
+    （实测撞过：`assert not (set(ids1) & set(ids2))` → `{46762} & {46762}`）。
+
+    这个测试**故意**造出并列：三个用户 created_at 完全相同。
+    修好后排序是全序（created_at DESC, id DESC）→ 翻页结果稳定可复现。
+    """
+    tied: list[int] = []
+    async with AsyncSessionLocal() as s:
+        for i in range(3):
+            u = User(
+                open_id=f"page_tie_{uuid.uuid4().hex[:24]}",
+                nickname=f"page_tie_user_{i}",
+                tier="free",
+            )
+            s.add(u)
+            await s.flush()
+            tied.append(int(u.id))
+        await s.commit()
+
+    # 把三行的 created_at 改成**完全相同**的值（且等于全表最大值 → 它们排在最前）。
+    #
+    # ⚠️ 不要在 Python 侧算「将来 1 小时」再塞进去：created_at 是
+    # timestamp with time zone，naive 值会按**数据库会话时区**（本机 UTC+8）
+    # 解释 → 「+1 小时」实际变成「-7 小时」→ 反而排到最后（实测踩过）。
+    # 让 DB 自己算 now() 最稳。
+    async with AsyncSessionLocal() as s:
+        await s.execute(
+            text(
+                "UPDATE users SET created_at = (SELECT max(created_at) FROM users) "
+                "WHERE id = ANY(:ids)"
+            ),
+            {"ids": tied},
+        )
+        await s.commit()
+
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=user_app), base_url="http://test"
     ) as client:
-        h = {"Authorization": f"Bearer {_token(u1)}"}
-        p1 = await client.get("/api/v1/admin/users?page=1&size=1", headers=h)
-        p2 = await client.get("/api/v1/admin/users?page=2&size=1", headers=h)
-    assert p1.status_code == 200 and p2.status_code == 200
-    ids1 = [it["id"] for it in p1.json()["items"]]
-    ids2 = [it["id"] for it in p2.json()["items"]]
-    assert len(ids1) == 1
-    assert not (set(ids1) & set(ids2))
+        h = {"Authorization": f"Bearer {_token(tied[0])}"}
+        pages = []
+        for page in (1, 2, 3):
+            resp = await client.get(f"/api/v1/admin/users?page={page}&size=1", headers=h)
+            assert resp.status_code == 200, resp.text
+            pages.append([it["id"] for it in resp.json()["items"]])
+
+    ids = [i for p in pages for i in p]
+    # ① 三个用户一个都不重（修复前这里会撞上重复 id）
+    assert len(ids) == len(set(ids)), f"分页出现重复用户：{ids}"
+    # ② 三个并列的用户**一个都不能漏**（修复前可能有一个人两页都看不到）
+    assert set(tied).issubset(set(ids)), f"并列的用户没被完整翻出来：缺 {set(tied) - set(ids)}"
 
 
 @pytest.mark.asyncio

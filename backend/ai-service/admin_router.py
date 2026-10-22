@@ -84,7 +84,7 @@ async def admin_few_shot_list(
     if active is not None:
         conds.append(FewShotExample.active == active)
 
-    q = select(FewShotExample).order_by(FewShotExample.score_avg.desc())
+    q = select(FewShotExample).order_by(FewShotExample.score_avg.desc(), FewShotExample.id.desc())
     cq = select(func.count()).select_from(FewShotExample)
     for c in conds:
         q = q.where(c)
@@ -145,7 +145,9 @@ async def admin_evaluations_list(
     if max_score is not None:
         conds.append(DistillationEvaluation.overall_score <= max_score)
 
-    q = select(DistillationEvaluation).order_by(DistillationEvaluation.created_at.desc())
+    q = select(DistillationEvaluation).order_by(
+        DistillationEvaluation.created_at.desc(), DistillationEvaluation.id.desc()
+    )
     cq = select(func.count()).select_from(DistillationEvaluation)
     for c in conds:
         q = q.where(c)
@@ -334,7 +336,9 @@ async def admin_consents_list(
     if personalization_enabled is not None:
         conds.append(ConsentRecord.personalization_enabled == personalization_enabled)
 
-    q = select(ConsentRecord).order_by(ConsentRecord.user_id)
+    # ConsentRecord 的主键就是 user_id（一对一），**本身就是唯一的** →
+    # 排序键已经是全序，不需要再加 tiebreaker（这表没有 id 列，加了会 AttributeError）。
+    q = select(ConsentRecord).order_by(ConsentRecord.user_id.desc())
     cq = select(func.count()).select_from(ConsentRecord)
     for c in conds:
         q = q.where(c)

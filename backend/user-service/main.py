@@ -1260,7 +1260,11 @@ async def admin_list_push_notifications(
         list_stmt = list_stmt.where(f)
 
     total = await db.scalar(count_stmt) or 0
-    list_stmt = list_stmt.order_by(PushNotification.created_at.desc()).offset(offset).limit(limit)
+    list_stmt = (
+        list_stmt.order_by(PushNotification.created_at.desc(), PushNotification.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
     result = await db.execute(list_stmt)
     rows = result.scalars().all()
 
@@ -1459,7 +1463,23 @@ async def admin_list_users(
         list_stmt = list_stmt.where(f)
 
     total = await db.scalar(count_stmt) or 0
-    list_stmt = list_stmt.order_by(User.created_at.desc()).offset((page - 1) * size).limit(size)
+    # 排序必须带**唯一 tiebreaker**（id）。
+    #
+    # 为什么：只按 created_at DESC 排时，同一时刻创建的多个用户（批量导入、
+    # 测试连建几个账号、并发注册）created_at 完全相同 → PostgreSQL 对并列
+    # 元素的排序**不稳定** → 两次查询的并列部分顺序可能不同 →
+    # **同一个用户会同时出现在第 1 页和第 2 页，另一个人两页都看不到**。
+    #
+    # 实测（2026-10-22）：后台用户列表翻页，断言「两页 id 不重叠」时
+    # 撞上重复 id（{46762} & {46762}）。运营看到的现象是「翻页有重复、
+    # 人数对不上」—— 典型到会被当成「数据脏了」，而根因只是少一个排序键。
+    #
+    # id 是主键，天然唯一 → 加它之后排序是**全序**，翻页结果稳定可复现。
+    list_stmt = (
+        list_stmt.order_by(User.created_at.desc(), User.id.desc())
+        .offset((page - 1) * size)
+        .limit(size)
+    )
     result = await db.execute(list_stmt)
     users = result.scalars().all()
 
