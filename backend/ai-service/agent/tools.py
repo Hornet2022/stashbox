@@ -115,7 +115,8 @@ async def tts_synthesize_tool(state: dict[str, Any], args: dict[str, Any]) -> di
           → 回到 tts_node 再合成一次
           → 无限循环，每轮白合成一遍（实测一次任务合成了 3 遍、8MB+ 音频）
 
-    现在改为**真实落盘**：音频写到 `INDEXTTS_AUDIO_DIR/{article_id}.{fmt}`，
+    现在改为**真实落盘**：音频写到 `INDEXTTS_AUDIO_DIR/{article_id}.{hash8}.{fmt}`
+    （内容寻址命名，见下面「本地落盘用内容寻址的文件名」那段），
     audio_path 一定有值；audio_url 取自当前环境配置的 storage（`_try_save_audio`
     失败时为 None，distill_task 会记 `audio_url_not_http` 且不标 ready —— 这是
     既有约定，不要为了让它变绿而伪造 URL）。

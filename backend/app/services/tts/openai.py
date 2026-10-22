@@ -20,6 +20,33 @@
 
 响应：raw audio bytes（Content-Type: audio/mpeg）。
 
+⚠️ **本 provider 不透传 ref_audio —— 但这不代表端点不支持克隆**（2026-10-22 实测）：
+
+    生产的 openai provider（tertu.cn / Qwen3-TTS-12Hz-1.7B-Base）走的是
+    固定音色（voice=uncle_fu），音色库里的「克隆音色」用不上 ——
+    worker 日志里是 `tts_voice_resolved ... applied=False`。
+
+    但实测**端点本身是支持零样本克隆的**（在生产服务器上直接打端点验证）：
+        ① 不带 ref_audio          → 200，音频正常
+        ② 带 ref_audio(裸 base64)  → 504（上游 60s 超时）
+        ③ 带 ref_audio 不带 ref_text → 400，且报错里明写
+            "ref_audio must be a URL (http/https), base64 data URL (data:...),
+             or file URI (file://...)"
+        ④ 带 ref_audio = **data:audio/wav;base64,...** + ref_text
+                                 → 200，音频正常（9.6s），两次都稳定
+        ⑤ 克隆是否真的生效 —— 基频三点对齐：
+            参考音频（婷婷，克隆源）  225.4 Hz
+            输出（带 ref_audio）      224.3 Hz   ← 与参考音频一致
+            输出（不带，uncle_fu）    191.2 Hz   ← 固定音色
+
+    → 结论：**要支持音色库克隆，不需要换模型**，需要的是
+      ① 本 provider 支持并透传 ref_audio / ref_text；
+      ② base64 必须用 **data: URL** 形式（裸 base64 上游不认）；
+      ③ 配置里要有克隆音源（音色库的 ref_audio URL 或本地 wav）。
+
+    在这三件事做完之前，**不要**在别处下结论说「这个模型不能克隆」——
+    那是把「我们没传」说成了「端点不支持」。
+
 ⚠️ **长稿必须分段合成**（2026-10-21 生产实测踩过）：
 
     1503B / ~500 字  → 40s  ✅
