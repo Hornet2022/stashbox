@@ -42,6 +42,12 @@ from pathlib import Path
 
 SNAPSHOT = Path(__file__).resolve().parent / "client_endpoints.json"
 
+# 会话态端点：数据只存在**内存**里，没有 id 可从库里取。
+# 没有活跃会话时 404 是**正确**行为，不该算进「断链」。
+# 盲测会话存在 ai-service 的 _blind_test_sessions（24h TTL），
+# 库里查不到 → 冒烟只能拿占位符去撞 → 404 是预期的。
+SESSION_SCOPED = {("GET", "/api/v1/admin/tts/blind-test/{p}/results")}
+
 
 def load_endpoints() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """返回 (安卓端端点, admin-web 端点)。"""
@@ -118,7 +124,25 @@ def fetch_params(base: str) -> dict[str, str]:
     return out
 
 
-def login(base: str, code: str) -> tuple[str, str]:
+def read_admin_password(env_path: str) -> str:
+    """从 env 文件里读管理员密码。
+
+    ⚠️ **只读**，且**不打印**。
+    env 文件是服务器上的 /etc/stashbox/stashbox.env（0640 root:stashbox）。
+    本地没有就返回空字符串（脚本会把 admin 段跳过，而不是假装测过）。
+    """
+    try:
+        text = Path(env_path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("ADMIN_BOOTSTRAP_PASSWORD="):
+            return line.split("=", 1)[1].strip().strip("\"'")
+    return ""
+
+
+def login(base: str, code: str, admin_password: str = "") -> tuple[str, str]:
     """返回 (user_token, admin_token)。"""
     r = sh(
         [
@@ -138,6 +162,14 @@ def login(base: str, code: str) -> tuple[str, str]:
     except json.JSONDecodeError:
         user_tok = ""
 
+    if not admin_password:
+        # 没有密码就**不去试**。原实现拿写死的 "wrong" 去试 ——
+        # 必然 401 → token 空 → 所有 admin 请求都是「无鉴权」→
+        # 网关把它兜底成 502「暂时连不上后端服务」→
+        # **看起来像 admin 路由全挂**，实际只是没登录。
+        # 这个误判在 2026-10-22 真的发生过一次。
+        return user_tok, ""
+
     r2 = sh(
         [
             "curl",
@@ -147,7 +179,7 @@ def login(base: str, code: str) -> tuple[str, str]:
             "-H",
             "Content-Type: application/json",
             "-d",
-            json.dumps({"email": "admin@stashbox.local", "password": "wrong"}),
+            json.dumps({"email": "admin@stashbox.local", "password": admin_password}),
             f"{base}/api/v1/admin/auth/login",
         ]
     )
@@ -224,6 +256,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="https://api.stashbox.cn")
     ap.add_argument("--admin", action="store_true", help="只跑 admin 端点")
+    ap.add_argument(
+        "--admin-env",
+        default="/etc/stashbox/stashbox.env",
+        help="含 ADMIN_BOOTSTRAP_PASSWORD 的 env 文件（只读，不打印内容）",
+    )
     args = ap.parse_args()
 
     params = fetch_params(args.base)
@@ -231,7 +268,7 @@ def main() -> int:
     if missing:
         print(f"⚠️ 取不到路径参数：{missing} → 相关端点会带字面量占位符", file=sys.stderr)
 
-    user_tok, admin_tok = login(args.base, "smoke_probe_audit")
+    user_tok, admin_tok = login(args.base, "smoke_probe_audit", read_admin_password(args.admin_env))
     if not user_tok:
         print("✗ 拿不到用户 token，冒烟无法进行", file=sys.stderr)
         return 2
@@ -262,29 +299,94 @@ def main() -> int:
 
     print("\n=== admin-web GET（需要 admin token）===")
     if not admin_tok:
-        print("  ⚠️ 没拿到 admin token → 跳过（拿不到就是测不准，不是端点坏了）")
-    for m, p in adm_ep:
-        if m != "GET":
-            continue
-        path = fill_path(p, params)
-        st, code, body = call(args.base, m, path, admin_tok)
-        results.append((m, path, st, code, body))
-        print(f"  {st:3d} code={code:<6} {m:6s} {path}")
+        # ⚠️ 这里原来只 print 一句「跳过」，**却没真的跳过** ——
+        # 循环照样跑，于是所有 admin 端点都报 502「连不上后端服务」，
+        # 而真实原因只是没登录。工具自己制造了一个假断链。
+        print("  ⚠️ 没拿到 admin token → **真的跳过**（拿不到就是测不准，不是端点坏了）")
+        print("     提示：--admin-env 指向含 ADMIN_BOOTSTRAP_PASSWORD 的 env 文件")
+    else:
+        for m, p in adm_ep:
+            if m != "GET":
+                continue
+            path = fill_path(p, params)
+            st, code, body = call(args.base, m, path, admin_tok)
+            results.append((m, path, st, code, body))
+            print(f"  {st:3d} code={code:<6} {m:6s} {path}")
 
     print("\n=== 汇总 ===")
+
+    # 分类要**诚实**：把「端点坏了」和「脚本没条件」分开。
+    #
+    # 之前只有三档（通 / 404 断链 / 其它），于是两类假警报混在里面：
+    #   · 盲测结果端点：盲测会话只存在**内存**里（_blind_test_sessions，24h TTL），
+    #     库里没有 id 可取 → 冒烟只能拿占位符去撞 → 404 是**预期**行为；
+    #   · 属主校验：冒烟用 probe 用户登录，却拿库里**别人的**真实 id 去调
+    #     → 403「not the owner」是**校验生效**，不是断链。
+    # 这两类混进「404 断链」，会让人以为服务坏了。
+    def _is_session_scoped(m: str, p: str) -> bool:
+        """p 是**填完参数**的路径，SESSION_SCOPED 里是**模板**。
+
+        所以不能直接比字符串 —— 得把模板拆成「前缀 / 后缀」，
+        中间那段（填进去的参数）不参与比较。
+        """
+        for tm, tpl in SESSION_SCOPED:
+            if tm != m:
+                continue
+            head, _, tail = tpl.partition("{")
+            tail = tail.rpartition("}")[2]
+            if p.startswith(head) and p.endswith(tail) and len(p) >= len(head) + len(tail):
+                return True
+        return False
+
+    def _is_owner_guard(body: str) -> bool:
+        return "not the owner" in body
+
     ok = [r for r in results if 200 <= r[2] < 300 and r[3] in (0, 200)]
-    missing = [r for r in results if r[2] == 404]
-    auth = [r for r in results if r[2] in (401, 403)]
-    other = [r for r in results if r not in ok and r[2] != 404 and r[2] not in (401, 403)]
-    print(f"  通          {len(ok)}/{len(results)}")
-    print(f"  404 断链    {len(missing)}")
-    print(f"  401/403     {len(auth)}")
-    print(f"  其它异常    {len(other)}")
-    for label, group in (("404", missing), ("401/403", auth), ("其它", other)):
+    session_absent = [r for r in results if r[2] == 404 and _is_session_scoped(r[0], r[1])]
+    missing = [r for r in results if r[2] == 404 and not _is_session_scoped(r[0], r[1])]
+    owner_guard = [r for r in results if r[2] == 403 and _is_owner_guard(r[4])]
+    auth_fail = [
+        r
+        for r in results
+        if r[2] in (401, 403)
+        and r not in owner_guard
+        and r not in missing
+        and r not in session_absent
+    ]
+    param = [
+        r
+        for r in results
+        if r[2] in (400, 422) and r not in ok and r not in missing and r not in session_absent
+    ]
+    other = [
+        r
+        for r in results
+        if r not in ok
+        and r not in missing
+        and r not in session_absent
+        and r not in owner_guard
+        and r not in auth_fail
+        and r not in param
+    ]
+    print(f"  通            {len(ok)}/{len(results)}")
+    print(f"  真断链(404)   {len(missing)}")
+    print(f"  属主校验(403) {len(owner_guard)}  ← 校验生效，不是断链")
+    print(f"  鉴权失败      {len(auth_fail)}")
+    print(f"  参数不足      {len(param)}  ← 脚本没填 body/query，不是断链")
+    print(f"  会话不存在    {len(session_absent)}  ← 会话态端点，404 是预期")
+    print(f"  其它异常      {len(other)}")
+    for label, group in (
+        ("真断链", missing),
+        ("鉴权失败", auth_fail),
+        ("参数不足", param),
+        ("其它", other),
+    ):
         if group:
             print(f"\n  ── {label} ──")
             for m, p, st, code, body in group:
                 print(f"    {m:6s} {p}\n           {body[:100]}")
+    if not missing and not auth_fail and not other:
+        print("\n  ✅ 没有真断链")
     Path("/tmp/smoke_results.json").write_text(
         json.dumps(
             [
