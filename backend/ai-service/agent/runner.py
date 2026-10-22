@@ -37,6 +37,7 @@ from observability.metrics import (
     DISTILL_SUCCESS_TOTAL,
 )
 
+from . import recreation_quality
 from .state import AgentState
 from .tools import ToolError, get_default_registry
 
@@ -672,16 +673,6 @@ def _error_update(state: AgentState, step: str, err: ToolError) -> dict[str, Any
 #   这里把它捡回来，并保留容错：LLM 不听话时降级成「整段当正文」，
 #   宁可 hook 语义不完美，也不能让音效标注被当成范例。
 
-#: 再创要素（insights/related/follow_ups）单条的最小字数。
-#:
-#: 这些内容**会被念给听众听**（读者只听声音、看不到列表），
-#: 太短就会是「标签」而不是「能独立站住的话」——
-#: 「《无人深空》的转型对比」念出来读者不知道为什么提它。
-#:
-#: 低于这个长度的条目**只记日志不丢弃**（丢内容比不流畅更糟），
-#: 但要能持续盯住 prompt 强化的实际效果。
-_RECREATION_MIN_ITEM_CHARS = 30
-
 
 _REWRITE_SYSTEM = """你是一个中文播客主理人。任务：把原文改写成适合通勤收听的播客稿
 （目标听众：上下班通勤、希望快速吃透一篇文章要点的人）。
@@ -690,9 +681,9 @@ _REWRITE_SYSTEM = """你是一个中文播客主理人。任务：把原文改�
 {
   "hook": "开场钩子，≤ 80 字，15 秒左右能读完",
   "sections": ["正文节拍，一节一个字符串，80-160 字，共 3-5 节"],
-  "insights": ["基于原文的关联思考或延伸判断，1-3 条，每条 ≤ 90 字"],
-  "related": ["值得关联的关键点（其他公司/概念/趋势/事件），0-3 条，每条 ≤ 50 字"],
-  "follow_ups": ["听众接下来可以拓展关注的方向，1-3 条，每条 ≤ 60 字"],
+  "insights": ["关联思考/延伸判断，2-3 条，每条 50-100 字"],
+  "related": ["值得关联的关键点，1-2 条，每条 45-80 字"],
+  "follow_ups": ["可拓展关注的方向，1-2 条，每条 45-80 字"],
   "outro": "收束，≤ 80 字，呼应 hook 的开头句式或意象"
 }
 
@@ -707,29 +698,58 @@ _REWRITE_SYSTEM = """你是一个中文播客主理人。任务：把原文改�
    舞台提示或音效描述。它们会被当成正文混进稿子污染下游。
 8. **不要 markdown、不要 bullet、不要 emoji、不要"听众朋友们"这种播音腔**
 9. **这是再创作，不是摘要**：播客稿的价值不止于"讲清原文"，还在于给听众
-   **原文之外的东西**（对应上面 JSON 的三个额外字段）：
-     · insights —— 关联思考与延伸判断（这件事和什么相关/矛盾？往后看会怎样？
-       原文没写、但能从原文推出的）
-     · related —— 值得关联的关键点（听众可能想知道的其他公司/概念/趋势）
-     · follow_ups —— 听众可以拓展关注的方向
-   这三类是**稿子的组成部分，会被念给听众听**，所以每一句都必须
-   **能独立站住的完整句子** —— 读者只听声音、看不到列表：
+   **原文之外的东西**（对应上面 JSON 的三个额外字段）。这三个字段是稿子的
+   组成部分，会被念给听众听，所以每一条都要满足下面三条硬要求：
 
-     ✗ 错：「《无人深空》从"永远在修复"到"内容持续更新"的转型对比」
-            （列表项，念出来突兀，读者不知道为什么提它）
-     ✓ 对：「《无人深空》从"永远在修复"走到"内容持续更新"这条路值得看，
-            它证明长线项目可以靠内容节奏而不是大版本续命。」
+   ① **有推论**：必须写出"因为/所以/但/反而/这意味着/前提是…"这类推理，
+      让人知道你**为什么**这么判断。只给定义、只给标签、只复述原文主旨，
+      一律不合格。
+   ② **有依据**：推论要能追回原文的某个事实、矛盾或数字。追不回就少写，
+      不要硬编（宁缺毋滥）。
+   ③ **是给听众的一句话判断**，不是标签、不是选题清单、不是短语。
+      听众只听声音、看不到列表，所以每条都要能独立站住。
 
-     ✗ 错：「关注Squadron 42的封闭测试时间线与反馈」
-            （指令句，不是给听众的话）
-     ✓ 对：「接下来真正值得盯的是封闭测试的时间线与反馈，
-            它是判断这次"功能完成"能不能兑现的第一道验钞机。」
+   **浅 vs 深的对照**（左边是生产上真实产出的不合格样本，右边是合格写法）：
 
-     硬要求：
-     · 每条 ≥ 30 字，必须是**带主语和判断的完整句子**
-     · 不写标签、不写短语、不用"关注/研究/对比"这种祈使句开头
-     · 事实必须能追回原文依据；推不出就少写，**不要硬编**
-     · 没有值得关联的就给空数组，不要凑数
+   ✗ 错：「模型能力与执行基建的脱节是散户最大痛点，
+          未来竞争焦点将从'谁模型强'转向'谁数据管道更干净'」
+          （原文已经说过这句 = 复述，不是延伸；而且只是换个说法）
+   ✓ 对：「散户真正被卡住的地方不是模型选得对不对，
+          而是有没有一套能每天跑回测的环境——
+          这意味着模型换代对散户几乎没有帮助，除非你先把基建补上。」
+
+   ✗ 错：「Bloomberg终端年费近3万美元，QuantGPT本质是AI时代的Bloomberg接口」
+          （只说"是什么"，不说"所以呢"；这是定义，不是关联思考）
+   ✓ 对：「Bloomberg靠三万美元年费把数据、终端和分析师锁在一起，
+          QuantGPT想复制的是这套组合，但价格压到个人能接受——
+          如果它真能做到，散户第一次能摸到机构级的研究管线。」
+
+   ✗ 错：「Alpaca作为券商API层，是AI交易从研究到执行的关键信任锚点」
+          （定义式标签，念出来只是名词解释）
+   ✓ 对：「Alpaca在这套架构里承担的是"钱不离开券商"这条底线，
+          这比策略准不准更要紧——因为前者是合规问题，后者只是收益率问题。」
+
+   ✗ 错：「MCP协议在交易场景下的安全边界设计，如何防止AI被提示注入后误操作」
+          （名词短语 = 选题标签，不是给听众的话）
+   ✓ 对：「MCP接进交易场景后最该盯的是提示注入：
+          外部内容一旦能改写策略参数，AI的'聪明'就变成了风险，
+          所以权限必须收回人能确认的那一环。」
+
+   ✗ 错：「幸存者偏差对量化策略回测的量化影响，
+          以及公开数据源中退市公司覆盖率的差异」
+          （两个名词短语拼在一起，仍然是标签）
+   ✓ 对：「很多回测漂亮得不真实，根子常在数据里没有退市公司：
+          幸存者偏差会把"买对的股票"算成"选股能力强"，
+          所以判断一个策略，先看它吃没吃过退市的账。」
+
+   **分字段的额外要求**：
+     · insights —— 必须是**原文没有明说**的判断。写之前自问：
+       听众读完原文能不能直接得出这句话？能，就换一条。
+     · related —— 不只要说清"是什么"，还要说清它和原文论点**的关系**
+       （印证？矛盾？提供反例？还是提供一条不同的路径？）。
+     · follow_ups —— 必须是**给听众的判断句**：值得关注什么、为什么值得
+       现在看。不许写成"关注X""研究Y"这种选题清单。
+     · 没有值得写的就给空数组，不要凑数
 10. **长度自适应**：原文 < 500 字 → 600-800 字；500-2000 字 → 800-1100 字；> 2000 字 → 1000-1400 字
     （sections + insights + related + follow_ups 合计）
 
@@ -858,15 +878,13 @@ def _parse_rewrite(raw: str) -> _RewriteParts:
         outro = _flatten_para(str(obj.get("outro") or ""))
 
         # 额外字段 → 合进 sections（顺序：正文 → 关联思考 → 关联关键点 → 拓展方向）
-        n_insights = len(_str_list(obj.get("insights")))
-        n_related = len(_str_list(obj.get("related")))
-        n_follow = len(_str_list(obj.get("follow_ups")))
-        extra = (
-            _str_list(obj.get("insights"))
-            + _str_list(obj.get("related"))
-            + _str_list(obj.get("follow_ups"))
-        )
-        extra = [_flatten_para(s) for s in extra if s.strip()]
+        insights = [_flatten_para(s) for s in _str_list(obj.get("insights")) if s.strip()]
+        related = [_flatten_para(s) for s in _str_list(obj.get("related")) if s.strip()]
+        follow_ups = [_flatten_para(s) for s in _str_list(obj.get("follow_ups")) if s.strip()]
+        n_insights = len(insights)
+        n_related = len(related)
+        n_follow = len(follow_ups)
+        extra = insights + related + follow_ups
         if extra:
             sections = sections + extra
         # 结构化计数（比关键词匹配准 —— 关键词会低估：LLM 写的是
@@ -879,16 +897,36 @@ def _parse_rewrite(raw: str) -> _RewriteParts:
             len(extra),
             len(sections),
         )
-        # 不合格条目（太短 / 祈使句开头）**只记不丢** ——
-        # 丢掉会让「再创作」内容缺失（更糟），但要能持续盯住 prompt 强化的效果。
-        # 这些条目作为书面稿没问题，念出来会突兀。
-        weak = [x for x in extra if len(x) < _RECREATION_MIN_ITEM_CHARS]
-        if weak:
-            log.warning(
-                "agent_rewrite_recreation_weak_items count=%d sample=%r",
-                len(weak),
-                weak[0][:60],
+
+        # ── 再创作内容的质量画像 ────────────────────────────────────
+        #
+        # 「关联思考/延伸判断/拓展方向」最容易写成**标签**（选题短语、定义、
+        # 或者把原文主旨换个说法复述一遍）—— 内测反馈「不够专业、深度」。
+        #
+        # 这里按可机械判定的契约出画像（见 agent/recreation_quality.py）：
+        # 无句末标点 / 祈使句开头 / 名词化选题 / 复述正文。
+        # **只记不丢** —— 丢掉会让「再创作」内容缺失（比浅更糟）。
+        body_text = "\n".join([hook] + sections)
+        quality = recreation_quality.summarize(
+            {"insights": insights, "related": related, "follow_ups": follow_ups},
+            body_text,
+        )
+        for name, q in quality.items():
+            if not q["total"]:
+                continue
+            log.info(
+                "agent_rewrite_recreation_quality group=%s total=%d ok=%d issues=%s",
+                name,
+                q["total"],
+                q["ok"],
+                q["issues"] or "{}",
             )
+            for bad in q["offenders"]:
+                log.warning(
+                    "agent_rewrite_recreation_weak_item group=%s item=%r",
+                    name,
+                    bad[:80],
+                )
 
         # hook 缺失但有正文 → 拿第一节顶上，别让整稿没有钩子
         if not hook and sections:
