@@ -517,8 +517,21 @@ sudo systemctl enable --now stashbox-api-gateway.service \
      stashbox-ai-service.service stashbox-ai-worker.service
 
 # ⑨ nginx + 证书
-sudo cp backend/deploy/systemd/nginx.conf /etc/nginx/sites-available/stashbox
-sudo ln -sf /etc/nginx/sites-available/stashbox /etc/nginx/sites-enabled/stashbox
+#
+#    ⚠️ 用 install-nginx-assets.sh，**不要**只 cp nginx.conf。
+#    站点配置 include 了两个共享片段（stashbox-downloads.conf /
+#    stashbox-downloads-redirect.conf），nginx 对 include 一个不存在的
+#    文件是 **emerg**（不是 warning）→ `nginx -t` 直接挂 →
+#    站点起不来。2026-10-22 走查发现：仓库里没有任何脚本会拷
+#    stashbox-downloads.conf（只有 patch-nginx-downloads-redirect.py
+#    拷了另一个）→ 严格照步骤部署的新机器在第 ⑨ 步就死。
+sudo bash backend/deploy/install-nginx-assets.sh
+#    想顺便覆盖主配置（谨慎）：服务器上的 /etc/nginx/nginx.conf 现由
+#    patch-nginx-logformat.py 就地打补丁维护，覆盖前会自动备份。
+# sudo bash backend/deploy/install-nginx-assets.sh --main
+#    只看装没装、差在哪：
+# sudo bash backend/deploy/install-nginx-assets.sh --check
+#
 #    ⚠️ **证书用 tls-cert.sh 选，不要手改 nginx.conf 里的路径**
 #
 #    为什么需要这个脚本（2026-10-21 实测踩出来的）：
