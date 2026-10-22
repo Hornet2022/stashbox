@@ -1352,10 +1352,13 @@ async def add_favorite(
     folder = body.get("folder", "default")
     note = body.get("note")
 
-    # 文章必须存在
-    art = await db.get(Article, article_id)
-    if not art:
-        raise NotFound(message=f"article 不存在: {article_id}")
+    # 文章必须存在**且属于当前用户**
+    #
+    # 2026-10-22：原来只查存在性。别人文章的 id 不可猜（art_ + uuid4 前 24 位），
+    # 所以这不是越权读 —— 写进去的行挂在**调用者**名下。但结果是调用者的收藏列表里
+    # 会出现**打不开（403）**的条目：写的时候说"存在"，读的时候被属主校验拦掉。
+    # 同仓库的兄弟端点（mark-listened 等）都用 _get_owned，口径要一致。
+    await _get_owned(article_id, uid, db)
 
     # 检查是否已存在
     existing = await db.scalar(
@@ -1494,9 +1497,9 @@ async def snooze_article(
 ):
     """标记稍后听。"""
     uid = _uid(user)
-    art = await db.get(Article, article_id)
-    if not art:
-        raise NotFound(message=f"article 不存在: {article_id}")
+    # 同加收藏：校验存在**且属于当前用户**（原来只查存在性，
+    # 会让别人的文章出现在自己的「稍后听」里，点进去又是 403）。
+    await _get_owned(article_id, uid, db)
 
     snooze_until = body.get("snooze_until")
     if snooze_until:
@@ -2036,10 +2039,11 @@ async def update_progress(
     """上报/更新收听进度（断点续听）。"""
     uid = _uid(user)
 
-    # 检查 article 是否存在（归属校验）
-    art = await db.get(Article, article_id)
-    if not art:
-        raise NotFound(message=f"article {article_id} not found")
+    # 检查 article 是否存在**且属于当前用户**
+    #
+    # 2026-10-22：这里原来只查存在性，注释却写着「（归属校验）」——
+    # 注释声称的归属校验并不存在。已改成真的 _get_owned。
+    await _get_owned(article_id, uid, db)
 
     # upsert
     existing = await db.scalar(
