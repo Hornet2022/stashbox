@@ -30,6 +30,19 @@ SAMPLE_PATH = "/audio/audio/art_881ed5393d9d47248ed48271.b7416ab1.mp3"
 APK_PATH = "/downloads/tingxia-0.3.1.apk"
 APK_VER = "v0.3.1"
 
+# 备用下载入口（IP 直连）。
+#
+# 为什么需要（2026-10-22 实测）：有内测用户反馈「App 下载不了」，生产日志显示
+#   GET /downloads/tingxia-0.3.1.apk  →  200 但只传了 96KB / 884736 就断了
+#   （APK 是 3.8MB；nginx 无任何错误、curl 能下完、Range 206 正常）
+# → **服务器侧完全正常**，是那个用户的网络在**大流量**上把连接切了
+#   （落地页 9.6KB 正常、小请求正常、大流量断）。
+#
+# App 里的 API 与音频都有「域名失败 → 切 IP」的兜底，**唯独浏览器下载这条
+# 路径没有** —— 浏览器不会自己换地址。于是给一个手动兜底：直连 IP 下载。
+# 顺带它还能一次性区分两种病因：IP 能下完 = 域名线路问题；IP 也断 = 大流量 QoS。
+APK_FALLBACK_URL = "https://8.148.9.151/downloads/tingxia-0.3.1.apk"
+
 
 def extract_template(src: str, func_name: str) -> str:
     """从 `function f() { return `...`; }` 里取出模板字符串的内容。"""
@@ -67,12 +80,18 @@ def main() -> int:
         '<p class="cta-note">当前处于内测阶段，Android 优先，iOS 规划中。</p>\n'
         '      <button class="btn">加入内测名单</button>',
         '<p class="cta-note">Android 内测版（' + APK_VER + "）· iOS 规划中</p>\n"
-        f'      <a class="btn" href="{APK_PATH}" download>下载内测版</a>',
+        f'      <a class="btn" href="{APK_PATH}" download>下载内测版</a>\n'
+        '      <p class="cta-note" style="margin-top:10px">'
+        '下载中断或很慢？<a href="' + APK_FALLBACK_URL + '" download>点这里直连下载</a>'
+        "（走 IP，不经过域名）</p>",
     )
     src = src.replace(
         "<p>内测中 · Android 优先</p>\n" '        <button class="btn">加入内测名单</button>',
         f"<p>Android 内测版（{APK_VER}）· iOS 规划中</p>\n"
-        f'        <a class="btn" href="{APK_PATH}" download>下载内测版</a>',
+        f'        <a class="btn" href="{APK_PATH}" download>下载内测版</a>\n'
+        '        <p class="cta-note" style="margin-top:10px">'
+        '下载中断或很慢？<a href="' + APK_FALLBACK_URL + '" download>点这里直连下载</a>'
+        "（走 IP，不经过域名）</p>",
     )
     if "加入内测名单" in src:
         raise SystemExit("还有没换掉的「加入内测名单」")
