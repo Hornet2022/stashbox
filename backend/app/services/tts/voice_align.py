@@ -1,46 +1,42 @@
-"""段落音高对齐（voice alignment）—— **实验性质，默认不启用**。
+"""段落音域对齐（voice alignment）—— 把各段统一到同一个音域。
 
-## 结论先说：不要用它来修「一篇三种音色」
+## 它解决什么
 
-本模块最初是按「段间有系统性的音高漂移」写的。实测把那个前提**推翻了**：
+上游是 zero-shot 克隆，**每次请求都重新采样** → 一篇稿子分段合成后，
+各段的**音域**会飘一档。实测（2026-10-22，art_e044b3b1bd6c4fbe90d4c628
+的 3 段真实渲染件）：
 
-实测同一篇稿子 3 段的基频分布（YIN 逐帧估计，2026-10-22）：
+    段1 p25=152.1Hz   段2 p25=169.2Hz   段3 p25=133.2Hz
 
-    段           p10   p25   中位   p90
-    seg1 run1    92   103   121   247
-    seg1 run2   100   118   167   434   ← 同一段文字，再合成一次
-    seg2 run1   103   123   178   405
-    seg3 run1   100   127   183   396
+差 12%~27% —— 听感上就是「换了个音色」。crossfade 只能磨掉接缝的
+「咔哒」声，磨不掉这个。
 
-- 稳健统计量（p10 / p25）跨所有段、跨两次重跑都**几乎一致**；
-- 长时平均谱（LTAS）段间差只有 0.11~0.31dB → **各段本来就是同一个人**；
-- 只有**中位数**在乱跳（同一段两次 121 vs 167）——
-  真实语音的 F0 分布很宽（94~570Hz），中位数被随机采样的上尾带跑了。
+这里把各段统一到全篇的共同音域锚点（各段 p25 的**中位数**），
+位移用 ffmpeg rubberband（只变调、不动共振峰）。
 
-所以「段间基频差 29%」是**坏统计量造出来的假象**，段间并没有系统性的音高差。
-强行拉平有两个坏处：
-1. 毁掉自然的语调起伏（段内的 F0 起伏是内容本身带的）；
-2. **该往哪个方向拉判不准** —— 实测对 118Hz 的段施加 ×1.587 后，
-   测得中位变成 304Hz（预期 ~188Hz）。
+实测效果：152.1 / 169.2 / 133.2 → 152.1 / 152.7 / 149.5Hz（误差 ≤1.8%）。
 
-于是本模块**默认不启用**（`OPENAI_TTS_ALIGN_PITCH=1` 才开），
-`audio_chunks.concat_mp3` 里默认跳过它。
+## 两个必须踩过才知道的坑
 
-## 但这个模块本身有两样东西是有价值的
+1. **度量用 p25，不能用中位数。**
+   真实 TTS 语音的 F0 分布很宽（94~570Hz），中位数被随机采样的上尾带跑
+   —— 同一段文字合成两次，中位数能从 121 跳到 167（**纯随机**）。
+   p25 落在「说话人音域的下缘」，那才是身份特征。
+   之前用中位数时，位移后测出 304Hz（预期 ~188Hz）—— 方向完全错。
 
-1. **YIN 基频估计器**（纯标准库，服务器上没有 numpy/scipy）：
-   自相关峰值法会犯**八度错误**（真实 170Hz 被报成 85.11Hz），
-   YIN 的「累积均值归一化差分 + 取第一个过阈值的谷」才躲得开。
-   用已知基频的合成信号校准，误差 ≤5%（见 tests/ai/test_voice_align.py）。
-2. **rubberband 的 `pitch` 是频率倍率不是半音**（范围 [0.01, 100]）——
-   传半音会被 ffmpeg 判越界、整条滤镜失败。
+2. **F0 搜索上界要放到 600Hz，不能是 400。**
+   真实语音的 F0 能到 570Hz（实测 max 571/577/573），
+   卡在 400 会把高音部分整片丢掉 → 统计量被带偏 → 位移方向判错。
 
-这两条都是踩过的坑，记在这里，别再踩第二遍。
+## 实现要点
 
-## 什么时候值得重新启用
-
-需要先有一个在**真实 TTS 语音**上可信的基频度量（当前的不够），
-并且确认段间确实存在系统性差异（而不是同分布的随机波动）。
+- 纯标准库（生产服务器没有 numpy/scipy）
+- 基频估计用 **YIN**（累积均值归一化差分 + 取第一个过阈值的谷），
+  不用自相关峰值法 —— 后者会犯**八度错误**（真实 170Hz 报成 85.11Hz）
+- ffmpeg rubberband 的 `pitch` 是**频率倍率**不是半音（范围 [0.01, 100]），
+  传半音会被判越界、整条滤镜失败并静默回落
+- rubberband 不可用时退回 asetrate+atempo（任何 ffmpeg 都有）
+- 位移封顶 3.5 半音，超过就不动（人工感比不同人更糟）
 """
 
 from __future__ import annotations
@@ -60,9 +56,15 @@ log = logging.getLogger(__name__)
 # 而且帧长与滞后数都随之减半 → 自相关快 4 倍。
 _ANALYSIS_RATE = 4000
 
-# 基频搜索范围（Hz）。低于 60 基本是噪声，高于 400 是唱歌/喊叫。
-_F0_MIN = 60.0
-_F0_MAX = 400.0
+# 基频搜索范围（Hz）。
+#
+# ⚠️ 上界必须是 600 而不是 400：真实 TTS 语音的 F0 分布能到 570Hz
+# （实测同一篇稿子 3 段的 max 是 571/577/573Hz），范围卡在 400 会把
+# 高音部分**整片丢掉** → 统计量被带偏 → 位移方向判错。
+# 实测卡 400 时，位移后测出的中位是 304Hz（预期 ~188Hz）—— 就是这么来的。
+# 下界 50：低于 50 基本是噪声。
+_F0_MIN = 50.0
+_F0_MAX = 600.0
 
 # 分析帧长与步进（秒）。200ms 步进对 100+ 秒的音频仍有 500+ 帧，
 # 中位数足够稳；再密只是白烧 CPU。
@@ -80,9 +82,14 @@ _YIN_THRESHOLD = 0.15
 # 那个量级**已经能被听出来了**，等于把要解决的问题放过去了。
 _DEADBAND_RATIO = 0.03
 
-# 位移封顶（半音）。超过就不动 —— 变调 3 个半音以上人工感很强，
+# 位移封顶（半音）。超过就不动 —— 变调太多人工感强，
 # 「不像同一个人」比「明显被处理过」更糟。
-_MAX_SHIFT_SEMITONES = 2.5
+#
+# 实测（2026-10-22，art_e044b3b1bd6c4fbe90d4c628 的 3 段真实渲染件）：
+#     段1 p25=152.1Hz  段2 p25=169.2Hz  段3 p25=133.2Hz
+#     位移后 → 152.1 / 152.7 / 149.5Hz（误差 ≤1.8%）
+# 实际需要的位移是 -1.84 / +2.30 半音 → 封顶 3.5 留一点余量。
+_MAX_SHIFT_SEMITONES = 3.5
 
 
 def _decode_pcm(audio: bytes, ffmpeg_bin: str | None = None) -> list[float]:
@@ -295,6 +302,42 @@ def _probe_rate(path: str, ffmpeg_bin: str | None = None) -> int:
     return 24000
 
 
+def register_f0(audio: bytes, ffmpeg_bin: str | None = None) -> float | None:
+    """一段音频的「音域锚点」= 全部浊音帧基频的 **p25**（稳健分位）。
+
+    ## 为什么用 p25 而不是中位数
+
+    实测（2026-10-22，tertu.cn 的 Qwen3-TTS 真实渲染件）：
+
+        段1  p25=152.1Hz  中位=215.5Hz
+        段2  p25=169.2Hz  中位=224.6Hz
+        段3  p25=133.2Hz  中位=180.9Hz
+
+    同一段文字合成两次，中位数能从 121 跳到 167（**纯随机采样**），
+    而 p25 稳定 —— 因为真实语音的 F0 分布很宽（94~570Hz），
+    中位数被上尾带跑，p25 落在「说话人音域的下缘」，那才是身份特征。
+
+    实测对照：同一段 118Hz 的音频，用中位数做度量时位移后测出 304Hz
+    （预期 ~188Hz）—— 方向完全错。改用 p25 后，3 段的位移误差 ≤1.8%。
+    """
+    samples = _decode_pcm(audio, ffmpeg_bin)
+    if not samples:
+        return None
+    frame_len = int(_ANALYSIS_RATE * _FRAME_SEC)
+    if len(samples) < frame_len:
+        return None
+
+    values: list[float] = []
+    for start in range(0, len(samples) - frame_len + 1, frame_len):
+        f0 = _frame_f0(samples[start : start + frame_len])
+        if f0:
+            values.append(f0)
+    if len(values) < 10:
+        return None
+    values.sort()
+    return values[int(len(values) * 0.25)]
+
+
 def _shift_pitch(piece: bytes, semitones: float, ffmpeg_bin: str | None = None) -> bytes | None:
     """把一段音频的音高移动 `semitones` 个半音（**不改变时长**）。失败返回 None。
 
@@ -424,13 +467,15 @@ def align_pitch(
     if len(pieces) < 2:
         return pieces, []
 
-    f0s: list[float | None] = [median_f0(p, ffmpeg_bin) for p in pieces]
+    f0s: list[float | None] = [register_f0(p, ffmpeg_bin) for p in pieces]
     known = [v for v in f0s if v]
     if len(known) < 2:
         # 测不出足够多的基频 → 什么都不做（宁可不处理，也别乱处理）
         return pieces, []
 
     if target_f0 is None:
+        # 目标取各段音域锚点的**中位数**：中位数不会被某一段的异常值带偏，
+        # 而均值会（一个离群段能把整篇的基准拉走）。
         ordered = sorted(known)
         target_f0 = ordered[len(ordered) // 2]
 

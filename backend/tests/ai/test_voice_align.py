@@ -106,6 +106,53 @@ def test_median_f0_is_repeatable(voice_align):
     assert abs(a - b) / a < 0.01, f"两次测量不一致：{a} vs {b}"
 
 
+def test_register_f0_uses_p25_and_is_stable(voice_align):
+    """`register_f0` 是**音域锚点**，用 p25 而不是中位数。
+
+    为什么：中位数会被真实语音 F0 分布的上尾带跑（同一段文字两次
+    合成，中位数能从 121 跳到 167 —— 纯随机采样）。p25 落在说话人
+    音域的下缘，才是身份特征。
+
+    这里的断言就是锁住「用 p25」这个选择：合成一段基频 150Hz、
+    但叠了强高次谐波（把中位数往上拉）的信号，
+    `register_f0` 应该仍报 ~150Hz。
+    """
+    import shutil
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("环境没有 ffmpeg，跳过")
+
+    def _synth_with_strong_harmonics(f0: float, seconds: float = 2.0, rate: int = 16000) -> bytes:
+        import io
+        import struct
+        import wave
+
+        n = int(rate * seconds)
+        samples = []
+        for i in range(n):
+            t = i / rate
+            # 第 3、5、7 次谐波压过基波 → 中位数会被拉高
+            v = (
+                0.6 * math.sin(2 * math.pi * f0 * t)
+                + 1.0 * math.sin(2 * math.pi * f0 * 3 * t)
+                + 0.8 * math.sin(2 * math.pi * f0 * 5 * t)
+            )
+            samples.append(int(max(-1.0, min(1.0, v / 3.0)) * 32767))
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(struct.pack(f"<{n}h", *samples))
+        return buf.getvalue()
+
+    audio = _synth_with_strong_harmonics(150.0)
+    measured = voice_align.register_f0(audio)
+    assert measured is not None
+    error = abs(measured - 150.0) / 150.0
+    assert error <= 0.05, f"音域锚点实测 {measured:.1f}Hz vs 真值 150Hz，误差 {error:.1%}"
+
+
 def test_align_pitch_moves_segment_towards_target(voice_align, tmp_path):
     """对齐后，各段的基频应该**真的**靠近目标（不是越对齐越离谱）。
 
