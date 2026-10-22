@@ -67,24 +67,32 @@ def patch(path: pathlib.Path) -> int:
     text = path.read_text()
     changed = 0
 
-    # ── api 块：补 /api/ 与健康检查 ──────────────────────────────
-    span = server_block(text, "api.stashbox.cn")
-    if span is None:
-        print(f"  ✗ {path}: 找不到 server_name api.stashbox.cn 的块", file=sys.stderr)
-    else:
+    # ── api 块 + admin 块：补 /api/ 与健康检查 ───────────────────
+    # ⚠️ admin 块**同样**必须有 location /api/：后台登录是
+    #    POST /api/v1/auth/token，而后台块里只有
+    #    `location / { try_files $uri $uri/ /index.html; }` ——
+    #    try_files 不支持 POST，会直接返回 **405 Not Allowed**，
+    #    表现就是「登录报请求失败（405）」。
+    for host in ("api.stashbox.cn", "admin.stashbox.cn"):
+        span = server_block(text, host)
+        if span is None:
+            print(f"  ✗ {path}: 找不到 server_name {host} 的 443 块", file=sys.stderr)
+            continue
         s, e = span
         block = text[s:e]
         if "location /api/" in block:
-            print(f"  · {path}: api 块已有 location /api/，跳过")
-        else:
-            anchor = "    location /audio/ {"
-            if anchor not in block:
-                print(f"  ✗ {path}: api 块里找不到锚点 {anchor!r}", file=sys.stderr)
-            else:
+            print(f"  · {path}: {host} 块已有 location /api/，跳过")
+            continue
+        # 插到 location /audio/ 之前（没有就插到 location / 之前）
+        for anchor in ("    location /audio/ {", "    location / {"):
+            if anchor in block:
                 block = block.replace(anchor, API_ROUTES + anchor, 1)
                 text = text[:s] + block + text[e:]
                 changed += 1
-                print(f"  ✓ {path}: api 块补上 location /api/ + 健康检查")
+                print(f"  ✓ {path}: {host} 块补上 location /api/ + 健康检查")
+                break
+        else:
+            print(f"  ✗ {path}: {host} 块里找不到插入锚点", file=sys.stderr)
 
     # ── IP 兜底块：补健康检查 ───────────────────────────────────
     span = server_block(text, "8.148.9.151")
