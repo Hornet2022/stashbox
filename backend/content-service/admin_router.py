@@ -143,8 +143,40 @@ async def admin_list_articles(
     else:
         total = await db.scalar(select(func.count()).select_from(Article))
     rows = (await db.execute(q.limit(limit).offset(offset))).scalars().all()
+
+    # 2026-10-22：把蒸馏结果的**主键**一起下发。
+    #
+    # admin-web 的「失效音频」按钮判的是 `article.audio_id`，
+    # 而失效端点 POST /api/v1/admin/audio/{audio_id}/invalidate 做的是
+    # `db.get(DistilledArticle, audio_id)` —— 要的是 DistilledArticle 的主键
+    # （dst_xxx）。列表端点原来只下发 audio_url（OSS URL 字符串），
+    # 两者不是一回事 → 前端 hasAudio 恒为 false →
+    # **每一行的「失效音频」按钮都是灰的**，这条功能从头到尾没被用过。
+    #
+    # 顺带把 tags / quality_score 也带上：admin-web 的文章表有「标签」「质量分」
+    # 两列，按数据决定显隐（constants.ts::visibleColumns），而列表端点从来没
+    # 下发过这两个字段 → 两列**永远**不出现，契约是一句空话。
+    # 正好同一次查询，不多花钱。
+    distilled_by_article: dict[str, Any] = {}
+    if rows:
+        distilled_rows = (
+            await db.execute(
+                select(
+                    DistilledArticle.article_id,
+                    DistilledArticle.id,
+                    DistilledArticle.tags,
+                    DistilledArticle.quality_score,
+                ).where(DistilledArticle.article_id.in_([r.id for r in rows]))
+            )
+        ).all()
+        distilled_by_article = {
+            article_id: {"audio_id": did, "tags": tags, "quality_score": score}
+            for article_id, did, tags, score in distilled_rows
+        }
+
     items = []
     for r in rows:
+        distilled = distilled_by_article.get(r.id) or {}
         items.append(
             {
                 "id": r.id,
@@ -154,6 +186,11 @@ async def admin_list_articles(
                 "title": r.title,
                 "status": r.status,
                 "audio_url": r.audio_url,
+                # 蒸馏结果主键（失效端点要的就是它）。没有蒸馏结果时为 None，
+                # 前端据此禁用「失效音频」按钮 —— 那才是按钮该灰的真实原因。
+                "audio_id": distilled.get("audio_id"),
+                "tags": distilled.get("tags"),
+                "quality_score": distilled.get("quality_score"),
                 "favorite": r.favorite,
                 "skip": r.skip,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
