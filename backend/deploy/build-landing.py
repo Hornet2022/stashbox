@@ -140,6 +140,23 @@ a.btn { text-decoration: none; }
     src = src.replace("</style>", css_add + "</style>")
 
     # ── 7) JS：?picker=1 显示切换器；方向 2 播真音频 ─────────────
+    #
+    # ⚠️ 原型的 setActive() 会把当前方向写进地址栏（history.replaceState）
+    #    → 生产页每次打开都变成 /?v=1，**分享出去的链接带着这个噪音**。
+    #    改成：只有在「探索模式」（?picker=1）下才写 URL。
+    src = src.replace(
+        """  const url = new URL(location);
+  url.searchParams.set('v', i + 1);
+  history.replaceState(null, '', url);
+  mount(i);""",
+        """  // 只在探索模式下写地址栏 —— 生产页的分享链接不该带 ?v=1
+  if (document.body.classList.contains('show-picker')) {
+    const url = new URL(location);
+    url.searchParams.set('v', i + 1);
+    history.replaceState(null, '', url);
+  }
+  mount(i);""",
+    )
     src = src.replace(
         "setActive((parseInt(new URLSearchParams(location.search).get('v'), 10) || 1) - 1);",
         "if (new URLSearchParams(location.search).get('picker') === '1') "

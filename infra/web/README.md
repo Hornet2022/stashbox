@@ -18,6 +18,7 @@
 | CTA「加入内测名单」→「**下载内测版**」 | 现在真的有可安装的 release APK 了；原型 README 里「CTA 还没定」这个阻塞已解除 |
 | 方向 2 的样例音频换成**真实成品** | 原型里「《注意力经济下的深度阅读》· 样例」是占位，没有音频源 |
 | 加 `og:` / `description` meta | 分享卡片的标题与描述 |
+| **不再往地址栏写 `?v=1`** | 原型的 `setActive()` 会 `history.replaceState` 把当前方向写进 URL → 生产页每次打开都变成 `/?v=1`，**分享出去的链接带着这个噪音**。改成只在探索模式（`?picker=1`）下才写 |
 | `<a class="btn">` 补 `text-decoration: none` | CTA 从 button 换成真链接 |
 
 ### 为什么默认选「纸面」

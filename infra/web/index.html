@@ -607,9 +607,12 @@ function setActive(i) {
     else el.removeAttribute('aria-current');
   });
   moveHighlight();
-  const url = new URL(location);
-  url.searchParams.set('v', i + 1);
-  history.replaceState(null, '', url);
+  // 只在探索模式下写地址栏 —— 生产页的分享链接不该带 ?v=1
+  if (document.body.classList.contains('show-picker')) {
+    const url = new URL(location);
+    url.searchParams.set('v', i + 1);
+    history.replaceState(null, '', url);
+  }
   mount(i);
 }
 
