@@ -811,3 +811,15 @@ nginx 访问日志（域名块）里已有 13 个不同来源 IP 正常取到内
 ⚠️ 备案通过后 80 端口会解封，那时可以把域名证书切回 HTTP-01
 （`issue-domain-cert.sh --webroot`），续期就不用停 nginx 了。
 ALPN 继续用也没问题，只是每次续期有 ~40 秒中断。
+
+⚠️ **但切回 HTTP-01 之前先逐个 host 验一遍**：备案拦截是**按域名**判的，
+主域名 `stashbox.cn` 解封**不等于**子域名 `admin.` / `api.` 也解封 ——
+子域名可能需要在备案系统里单独申报。测法（响应里没有 Beaver 才算通）：
+
+```bash
+curl -sI http://admin.stashbox.cn/.well-known/acme-challenge/x | grep -i server
+# 出现 "Server: Beaver" → 还在被拦，别切
+```
+
+反过来说：**保持 ALPN 就完全不受这件事影响** —— ALPN 走 443，
+443 从来没被拦过。
