@@ -1963,17 +1963,26 @@ async def article_audio_url(
 
 
 def _resolve_actual_audio_extension(base_url: str, audio_dir: str) -> str:
-    """扫描 LOCAL_AUDIO_DIR 下 /audio/{article_id}.{ext} 实际存在的扩展名。
+    """扫描 LOCAL_AUDIO_DIR 下 /audio/{article_id}.* 实际存在的音频文件。
 
     CP9.x：服务端 audio_url 后缀与磁盘文件后缀不一致时（例如 task_url 是
     .mp3 但本地只存了 .wav —— placeholder 文件是 wav 因为 Python wave 模块），客户端
     ExoPlayer 按后缀选 decoder 会失败。改用磁盘扫描兜底。
 
-    注意 LocalStorage 落盘用 key=f"audio/{article_id}.{ext}"，所以文件路径是
-    audio_dir/audio/{article_id}.{ext} —— 扫描两个候选位置（直接 + audio 子目录）。
+    注意 LocalStorage 落盘用 key=f"audio/{article_id}.{hash8}.{ext}"
+    （内容寻址，见 app/services/storage/base.py:versioned_audio_key），
+    所以文件路径是 audio_dir/audio/{article_id}.{hash8}.{ext} ——
+    扫描两个候选位置（直接 + audio 子目录）。
 
     优先级：.m4a > .mp3 > .wav（m4a 优先因为生产 OSS 通常返 m4a）
+    同后缀有多个版本时取**最新**（mtime 最大）—— 内容寻址意味着重新生成会
+    留下旧文件名的版本，「最新」才是当前该播的那份。
+
+    ⚠️ 只认**主档**（`{article_id}.{hash8}.{ext}`），不认多码率变体
+    （`{article_id}.{bitrate}k.{hash8}.{ext}`）—— 变体是给客户端按网速选的
+    备选，兜底 URL 不该指向它。
     """
+    import re
     from urllib.parse import urlparse
     from pathlib import Path
 
@@ -1987,10 +1996,24 @@ def _resolve_actual_audio_extension(base_url: str, audio_dir: str) -> str:
     candidates_root = [audio_dir_path / stem, audio_dir_path / "audio" / stem]
     for ext in (".m4a", ".mp3", ".wav", ".ogg", ".aac"):
         for root in candidates_root:
+            # ① 历史命名（无 hash）：{article_id}.{ext}
             candidate = root.with_suffix(ext)
             if candidate.exists():
                 # 替换 base_url 的后缀为真实存在的后缀
                 new_path = parent / f"{stem}{ext}"
+                new_parsed = parsed._replace(path=str(new_path))
+                return new_parsed.geturl()
+            # ② 内容寻址命名（当前生产形态）：{article_id}.{hash8}.{ext}
+            #    正则排除多码率变体（{article_id}.{bitrate}k.{hash8}.{ext}）
+            pattern = re.compile(rf"^{re.escape(root.name)}\.[0-9a-f]{{8}}{re.escape(ext)}$")
+            found = [
+                f
+                for f in root.parent.glob(f"{root.name}.*{ext}")
+                if f.is_file() and pattern.match(f.name)
+            ]
+            if found:
+                newest = max(found, key=lambda f: f.stat().st_mtime)
+                new_path = parent / newest.name
                 new_parsed = parsed._replace(path=str(new_path))
                 return new_parsed.geturl()
     # 没找到实际文件：保持原 URL（让客户端 404，便于调试）

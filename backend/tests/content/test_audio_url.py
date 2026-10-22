@@ -132,3 +132,60 @@ async def test_audio_url_presigned_returns_expires_at():
     expires_at = datetime.fromisoformat(body["expires_at"]).timestamp()
     assert expires_at > before + 3600 - 5  # 容忍 5s 误差
     assert expires_at <= before + 3600 + 5
+
+
+# ---------------------------------------------------------------------------
+# 6. 本地模式的兜底 URL 解析：认得内容寻址的文件名（2026-10-22 修）
+#
+# 本地模式（STORAGE_PROVIDER=local）下，兜底 URL 是按 `{article_id}.{ext}`
+# 拼出来的，而磁盘上真实存在的文件是**内容寻址**命名
+# `audio/{article_id}.{hash8}.{ext}`（见 app/services/storage/base.py）。
+# 旧实现只认无 hash 的旧命名 → 兜底永远解析不到真实产物（返回的 URL 指向
+# 一个不存在的文件）；而当时之所以"能用"，是因为 TTS 工具还往同一个目录
+# 里写了一份无 hash 的重复副本 —— 那份重复副本正是 2026-10-22 发现并修掉的
+# 「同一份音频存两遍」问题。修掉重复之后，兜底解析必须跟着认新命名。
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_actual_extension_finds_versioned_file(tmp_path):
+    """兜底解析要认内容寻址的文件名、取**最新**的那个、且不认多码率变体。"""
+    import os
+    import time
+
+    from helpers import content_main
+
+    audio_dir = tmp_path / "data"
+    art_dir = audio_dir / "audio"
+    art_dir.mkdir(parents=True)
+
+    old = art_dir / "art_x.11111111.mp3"
+    new = art_dir / "art_x.22222222.mp3"
+    variant = art_dir / "art_x.64k.33333333.m4a"
+    for f in (old, new, variant):
+        f.write_bytes(b"x" * 10)
+    now = time.time()
+    os.utime(old, (now - 3600, now - 3600))
+    os.utime(new, (now, now))
+    os.utime(variant, (now + 10, now + 10))  # 变体比主档还新，也不能被选中
+
+    base = "https://api.example.com/audio/audio/art_x.mp3"
+    resolved = content_main._resolve_actual_audio_extension(base, str(audio_dir))
+
+    assert resolved.endswith(
+        "/audio/audio/art_x.22222222.mp3"
+    ), f"解析到了 {resolved}，应是最新主档 art_x.22222222.mp3"
+    assert "64k" not in resolved, "不该指向多码率变体"
+
+
+def test_resolve_actual_extension_prefers_plain_when_only_plain_exists(tmp_path):
+    """历史命名（无 hash）仍然要认（老数据没有内容寻址版本）。"""
+    from helpers import content_main
+
+    audio_dir = tmp_path / "data"
+    (audio_dir / "audio").mkdir(parents=True)
+    (audio_dir / "audio" / "art_y.mp3").write_bytes(b"x" * 10)
+
+    base = "https://api.example.com/audio/audio/art_y.mp3"
+    assert content_main._resolve_actual_audio_extension(base, str(audio_dir)).endswith(
+        "/audio/audio/art_y.mp3"
+    )

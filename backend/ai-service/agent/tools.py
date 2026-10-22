@@ -207,7 +207,23 @@ async def tts_synthesize_tool(state: dict[str, Any], args: dict[str, Any]) -> di
     out_dir = Path(os.getenv("INDEXTTS_AUDIO_DIR", "data/audio")).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
     fmt = "wav" if audio[:4] == b"RIFF" else "mp3"
-    out_path = out_dir / f"{article_id}.{fmt}"
+    # ⚠️ **本地落盘用内容寻址的文件名**（与 storage 的 key 同一套命名）。
+    #
+    # 原来这里写的是 `{article_id}.{fmt}`（无 hash），而 storage 那边写的是
+    # `{article_id}.{hash8}.{fmt}`（见 base.py:versioned_audio_key）。生产上
+    # INDEXTTS_AUDIO_DIR 与 LOCAL_AUDIO_DIR **是同一个目录**
+    # （/var/lib/stashbox/data/audio）→ **同一份音频落盘两次**：
+    #   · 带 hash 的那份 = storage 产物，DB 引用它
+    #   · 不带 hash 的那份 = 本地调试落盘，**没人引用、也没人删**
+    # 实测 2026-10-22：音频目录 35 个文件里 21 个是孤儿（46.9MB，占 58%），
+    # 其中 15 个是**与产物逐字节相同**的重复副本 —— 磁盘整整多占一倍，
+    # 且这个增长是每次蒸馏都发生、无回收的。
+    #
+    # 改成同一套内容寻址命名后，两次写**落在同一个文件**（内容相同 → 幂等），
+    # 磁盘上只剩一份。既保住「audio_path 一定有值」的契约，也不再产生孤儿。
+    from stashbox.backend.app.services.storage.base import content_hash
+
+    out_path = out_dir / f"{article_id}.{content_hash(audio)}.{fmt}"
     out_path.write_bytes(audio)
 
     # 时长：按格式精确解析。
