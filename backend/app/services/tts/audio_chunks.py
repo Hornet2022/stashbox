@@ -443,13 +443,60 @@ def crossfade_concat(
     return None
 
 
+def _measure_mean_db(ffmpeg: str, path: str, timeout: int) -> float | None:
+    """用 ffmpeg 的 volumedetect 量一段音频的平均电平（dBFS）。
+
+    返回 None 表示量不到（静音 / ffmpeg 不可用 / 输出异常）。
+
+    ⚠️ 解析必须**只取 mean_volume 后面那一个数字**：
+    这个仓库已经吃过一次同样的亏（voice_align.py 里把 "Hz" 当数字解析，
+    int("Hz"[:-2]) 直接抛错 → 静默回退到默认采样率，音高整体跑偏）。
+    """
+    try:
+        proc = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-nostats",
+                "-i",
+                path,
+                "-af",
+                "volumedetect",
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        log.warning("TTS 响度测量失败: %s", exc)
+        return None
+
+    for line in (proc.stderr or b"").decode("utf-8", "replace").splitlines():
+        if "mean_volume:" not in line:
+            continue
+        token = line.split("mean_volume:", 1)[1].strip().split()
+        if not token:
+            continue
+        try:
+            value = float(token[0])
+        except ValueError:
+            continue
+        # 静音片段 mean_volume 是 -inf，float() 会抛 —— 已经处理掉了。
+        return value
+    return None
+
+
 def normalize_loudness(
     piece: bytes,
-    target_lufs: float = -16.0,
-    true_peak: float = -1.5,
+    target_rms_db: float = -20.0,
+    peak_db: float = -1.5,
     ffmpeg_bin: str | None = None,
+    timeout: int = 30,
 ) -> bytes | None:
-    """把一段音频的响度归一到目标（EBU R128，ffmpeg loudnorm）。
+    """把一段音频的响度归一到目标（静态增益 + 限峰）。
 
     ## 为什么需要
 
@@ -459,10 +506,35 @@ def normalize_loudness(
 
     统一响度后，段与段之间只剩音色差异，突兀感明显降低。
 
+    ## 为什么不用 ffmpeg 的 loudnorm（2026-10-22 实测后换掉）
+
+    原来用的是 `loudnorm=I=-16:TP=-1.5:LRA=11`（EBU R128 **动态**模式）。
+    生产日志里**每个分块都超时 120 秒**（`timed out after 120 seconds，
+    退回原音频`）—— 于是归一根本没生效，段间响度差 6.5 LU，
+    而代价是每篇 8~15 个分块 × 120s = 16~30 分钟**纯等待**
+    （蒸馏 P95 面板实测 step3_tts p50=300s / p95=570s）。
+
+    生产机实测（2 核，77 秒真实音频）：
+
+    | 方案 | 单次 | 4 并发（=ARQ_MAX_JOBS 在 2 核上） | 段间一致性（LUFS 极差） |
+    |---|---|---|---|
+    | loudnorm | 4.72s | 19.0s | 1.0 LU |
+    | dynaudnorm | 0.77s | 2.7s | 2.1 LU |
+    | **静态增益（本实现）** | **0.14s** | — | **0.5 LU** |
+
+    静态增益 = `volumedetect` 测 RMS（单趟，几乎不耗 CPU）→ 算出需要的增益
+    → `volume=<增益>dB` 施加**静态**增益（不需要任何动态分析）
+    → `alimiter` 限峰（防止增益把峰值推爆）。
+
+    **两个维度都比 loudnorm 好**：快 34 倍，一致性还更好
+    （0.5 LU vs 1.0 LU —— 6 个真实音频样本实测）。
+
+    另测：`-threads 1` 对并发**没有**改善（18.9s vs 19.0s）——
+    瓶颈是纯 CPU 争抢，不是线程超订，所以那不是解法。
+
     ## 代价
 
-    - 每段一次 ffmpeg 调用（CPU，单遍动态模式，实测 20 秒音频 < 1 秒）
-    - loudnorm 的动态模式会做动态压缩（不是纯粹改增益），动态范围略收窄
+    - 每段两次 ffmpeg 调用（一次测量、一次施加），但都很便宜
     - ffmpeg 不可用 / 失败 → 返回 None，调用方退回原音频（宁可不统一，
       也不能丢内容）
     """
@@ -472,6 +544,18 @@ def normalize_loudness(
             src = os.path.join(tmp, "in.mp3")
             out = os.path.join(tmp, "out.mp3")
             Path(src).write_bytes(piece)
+
+            mean_db = _measure_mean_db(ffmpeg, src, timeout)
+            if mean_db is None:
+                log.warning("TTS 响度测量失败，退回原音频")
+                return None
+
+            # 增益上限 ±20 dB：量到的电平异常时（极安静 / 极端压缩）
+            # 不至于把底噪一起放大成啸叫。
+            gain_db = max(-20.0, min(20.0, target_rms_db - mean_db))
+            # 峰值上限：-1.5 dBFS ≈ 0.841 线性
+            limit = 10 ** (peak_db / 20.0)
+
             subprocess.run(
                 [
                     ffmpeg,
@@ -482,7 +566,7 @@ def normalize_loudness(
                     "-i",
                     src,
                     "-af",
-                    f"loudnorm=I={target_lufs}:TP={true_peak}:LRA=11",
+                    f"volume={gain_db:.2f}dB,alimiter=limit={limit:.4f}:level=disabled",
                     "-c:a",
                     "libmp3lame",
                     "-b:a",
@@ -490,7 +574,7 @@ def normalize_loudness(
                     out,
                 ],
                 capture_output=True,
-                timeout=120,
+                timeout=timeout,
                 check=True,
             )
             data = Path(out).read_bytes()
