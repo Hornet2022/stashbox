@@ -135,7 +135,7 @@ async def admin_list_articles(
                 )
             )
         )
-    q = select(Article).order_by(Article.created_at.desc())
+    q = select(Article).order_by(Article.created_at.desc(), Article.id.desc())
     if base_filter:
         q = q.where(*base_filter)
     if base_filter:
@@ -440,7 +440,9 @@ async def admin_audit_log(
     rows = (
         (
             await db.execute(
-                query.order_by(AdminOperationLog.created_at.desc()).offset(offset).limit(size)
+                query.order_by(AdminOperationLog.created_at.desc(), AdminOperationLog.id.desc())
+                .offset(offset)
+                .limit(size)
             )
         )
         .scalars()
@@ -911,9 +913,89 @@ class TTSConfigUpdate(BaseModel):
     indextts_ref_text: str | None = None
 
 
+#: 普通字段：传了就动（null / "" 都归一成 None = 清空回 env）。
+_TTS_PLAIN_FIELDS = (
+    "edge_voice",
+    "openai_base_url",
+    "openai_model",
+    "openai_voice",
+    "doubao_voice",
+    "doubao_resource_id",
+    "doubao_app_id",
+    "local_voice",
+    "ffmpeg_bin",
+    "indextts_base_url",
+    "indextts_model",
+    "indextts_ref_audio",
+    "indextts_ref_text",
+)
+
+#: 密钥字段：语义与普通字段**不同**，是三态。
+#:
+#: 为什么：前端在用户**没有重新输入** key 时发的是**空串**（不是不传），
+#: 意图是「沿用我已存的那把」。若把空串当清空，用户点一次「保存」就把 key 抹了。
+#: 但那样一来 key 就**永远清不掉** —— 实测那把早已失效的 `hlk_` key 一直躺在
+#: system_config 里，admin 页照样显示「API Key 已设置」，**纯属误导**
+#: （当前 provider 根本不用它）。
+#:
+#: 所以定成三态：
+#:   · 不传（字段缺省）   → 不动
+#:   · `""`（空串）        → 不动（保留前端「没重新输入」的约定）
+#:   · `null`（显式 null） → **清除**（从已存配置里删掉，回落到 env）
+#:   · 非空              → 覆盖
+_TTS_SECRET_FIELDS = ("openai_api_key", "doubao_api_key", "doubao_token")
+
+
+def _merge_tts_config(stored: dict, req: TTSConfigUpdate) -> dict:
+    """把请求体合并进已存配置 —— **PUT / test / voices-probe 三处共用这一份**。
+
+    ⚠️ 原来这三处各抄了一份合并逻辑（PUT、POST /test、POST /voices/probe），
+    而且抄得并不一样：probe 那份少了 `indextts_*` / `ffmpeg_bin` / `doubao_app_id`，
+    还多了一套「已存没有就回落 env」的规则。
+    规则一多份就必然漂移 —— 这次修「key 清不掉」时发现的正是这种漂移：
+    三份拷贝里只有 PUT 那份被真正用到，probe 那份的回落 env 规则
+    会让「显式清除」在 probe 路径上表现不一致。
+
+    所以：**规则只留这一份，三个端点都调它**。
+    """
+    merged = dict(stored)
+    merged["provider"] = req.provider.strip().lower()
+    fields = req.model_fields_set
+
+    for fname in _TTS_PLAIN_FIELDS:
+        if fname in fields:
+            v = getattr(req, fname)
+            merged[fname] = (v or "").strip() or None
+
+    for fname in _TTS_SECRET_FIELDS:
+        if fname not in fields:
+            continue
+        v = getattr(req, fname)
+        if v is None:
+            merged.pop(fname, None)  # 显式 null = 清除
+        elif v != "":
+            merged[fname] = v
+        # "" = 不动（前端「没重新输入」的约定）
+
+    return merged
+
+
 def _masked_tts_config(config: dict, source: str, updated_at: str | None) -> dict:
-    """把完整配置（含明文 api_key）转成可出网的响应体。"""
-    api_key = config.get("openai_api_key") or config.get("doubao_api_key") or ""
+    """把完整配置（含明文 api_key）转成可出网的响应体。
+
+    ⚠️ `api_key_set` 是「**任意一把**密钥存在」（历史字段，前端兼容用）。
+    但配置页里 openai / 豆包两段各自有自己的 key 输入框，
+    共用一个标志就会出现这种「说谎」：
+    生效 provider 是 indextts、豆包 env 里配了 key 时，`api_key_set` 是 true →
+    openai 那一栏显示「已保存，留空则不变」→ **其实没保存**。
+    运营于是以为「这栏有值、不用管」，而真正该清的那把 key 就在这一栏。
+
+    所以额外给出**分 provider** 的标志（`openai_api_key_set` / `doubao_api_key_set`），
+    前端按当前 provider 取对应那个。
+    """
+    openai_key = config.get("openai_api_key") or ""
+    doubao_key = config.get("doubao_api_key") or ""
+    api_key = openai_key or doubao_key
     return {
         "provider": config.get("provider") or "mock",
         "edge_voice": config.get("edge_voice"),
@@ -930,6 +1012,11 @@ def _masked_tts_config(config: dict, source: str, updated_at: str | None) -> dic
         "indextts_ref_text": config.get("indextts_ref_text"),
         "api_key_set": bool(api_key),
         "api_key_last4": api_key[-4:] if api_key else None,
+        # 分 provider 的「这把 key 有没有」—— 前端按当前 provider 取用。
+        "openai_api_key_set": bool(openai_key),
+        "openai_api_key_last4": openai_key[-4:] if openai_key else None,
+        "doubao_api_key_set": bool(doubao_key),
+        "doubao_api_key_last4": doubao_key[-4:] if doubao_key else None,
         "source": source,
         "updated_at": updated_at,
     }
@@ -955,50 +1042,77 @@ async def admin_tts_config_put(
             message=(f"provider 必须是 {list(TTS_SUPPORTED_PROVIDERS)} 之一，当前 {provider!r}")
         )
 
-    stored = dict(await system_config.get_config(system_config.KEY_TTS) or {})
-    stored["provider"] = provider
-    # 用 model_fields_set 判断「显式传了」：null/""=清空回 env；不传=不动
-    fields = req.model_fields_set
-    for fname in (
-        "edge_voice",
-        "openai_base_url",
-        "openai_model",
-        "openai_voice",
-        "doubao_voice",
-        "doubao_resource_id",
-        "local_voice",
-        "ffmpeg_bin",
-        "indextts_base_url",
-        "indextts_model",
-        "indextts_ref_audio",
-        "indextts_ref_text",
-    ):
-        if fname in fields:
-            v = getattr(req, fname)
-            stored[fname] = (v or "").strip() or None
-    # api_key/token 不传=不动；显式传空串=不动（避免误清空已有 key）
-    if "openai_api_key" in fields and req.openai_api_key:
-        stored["openai_api_key"] = req.openai_api_key
-    if "doubao_api_key" in fields and req.doubao_api_key:
-        stored["doubao_api_key"] = req.doubao_api_key
-    if "doubao_token" in fields and req.doubao_token:
-        stored["doubao_token"] = req.doubao_token
-    if "doubao_app_id" in fields:
-        stored["doubao_app_id"] = (req.doubao_app_id or "").strip() or None
+    stored = _merge_tts_config(
+        dict(await system_config.get_config(system_config.KEY_TTS) or {}), req
+    )
 
     row = await system_config.set_config(system_config.KEY_TTS, stored, updated_by=_uid(user))
-    client = await tts_reload()  # 改完即生效，不用重启进程
+
+    # 改完即生效，不用重启进程。
+    #
+    # ⚠️ 这里**不能**让 reload() 的异常冒出去 —— 与 /admin/llm/config 同一个理由：
+    #   reload() 会构造 client，而 OpenAITTS 在**没有 api_key** 时抛
+    #   ValueError("api_key required ...")。
+    #   「显式清除密钥」这个动作**必然**触发它（清掉的往往就是当前 provider
+    #   唯一的那把 key）→ 若把异常冒出去，接口 500，而 DB 其实**已经写好了**。
+    #   运营看到红色报错 → 以为没保存 → 再点一次 → 又 500 → 反复重试，
+    #   最后把「清除」当成「保存不了」的功能缺失。
+    #
+    # 正确行为同 LLM：保存照做，reload 失败用 warning 告知（状态码仍 200，
+    # 因为「保存」这个动作确实成功了）；api_key_set 会是 false，前端据此提示。
+    reload_warning: str | None = None
+    try:
+        client = await tts_reload()
+        client_name = client.provider_name
+    except Exception as exc:  # noqa: BLE001 —— 缺 key / provider 未实现等
+        reload_warning = f"配置已保存，但立即生效失败：{exc}"
+        log.warning(
+            "admin_tts_config_saved_not_applied",
+            admin_id=_uid(user),
+            provider=provider,
+            error=str(exc),
+        )
+        client_name = provider
+
     log.info(
         "admin_tts_config_updated",
         admin_id=_uid(user),
         provider=provider,
-        client=client.provider_name,
+        client=client_name,
     )
-    return _masked_tts_config(
+    masked = _masked_tts_config(
         tts_resolve_config(row["value"]),
         "db",
         row["updated_at"].isoformat() if row["updated_at"] else None,
     )
+
+    # 主动提醒「当前 provider 手上没有任何 key」。
+    #
+    # 为什么要有这条：清掉一把 key **不会**让 reload() 报错 ——
+    # build_client() 对空 api_key 不抛（缺 key 要等到**合成时**才 401），
+    # 所以「存下来了 + 200 + 前端弹『保存成功』」会让人以为万事大吉，
+    # 而下一次蒸馏直接 401。
+    #
+    # 这条提示的价值就在**闭环**：让「清除」这个动作的后果是可见的，
+    # 而不是把雷留给下一次蒸馏。
+    warnings: list[str] = []
+    if reload_warning:
+        warnings.append(reload_warning)
+    effective = tts_resolve_config(row["value"])
+    if provider == "openai":
+        has_key = bool(effective.get("openai_api_key"))
+    elif provider == "doubao":
+        has_key = bool(effective.get("doubao_api_key") or effective.get("doubao_token"))
+    else:
+        has_key = True  # edge / local / indextts 不靠 key
+    if not has_key:
+        warnings.append(
+            f"当前 provider={provider} 手上没有任何 API Key —— 配置已保存，"
+            f"但下一次合成会失败（401）。换 provider 或补一把 key。"
+        )
+    if warnings:
+        masked["warning"] = "；".join(warnings)
+    return masked
 
 
 @router.post("/api/v1/admin/tts/test")
@@ -1027,34 +1141,9 @@ async def admin_tts_test_with_config(
 
     from stashbox.backend.app.services.tts import build_client
 
-    stored = dict(await system_config.get_config(system_config.KEY_TTS) or {})
-    stored["provider"] = provider
-    fields = req.model_fields_set
-    for fname in (
-        "edge_voice",
-        "openai_base_url",
-        "openai_model",
-        "openai_voice",
-        "doubao_voice",
-        "doubao_resource_id",
-        "local_voice",
-        "ffmpeg_bin",
-        "indextts_base_url",
-        "indextts_model",
-        "indextts_ref_audio",
-        "indextts_ref_text",
-    ):
-        if fname in fields:
-            v = getattr(req, fname)
-            stored[fname] = (v or "").strip() or None
-    if "openai_api_key" in fields and req.openai_api_key:
-        stored["openai_api_key"] = req.openai_api_key
-    if "doubao_api_key" in fields and req.doubao_api_key:
-        stored["doubao_api_key"] = req.doubao_api_key
-    if "doubao_token" in fields and req.doubao_token:
-        stored["doubao_token"] = req.doubao_token
-    if "doubao_app_id" in fields:
-        stored["doubao_app_id"] = (req.doubao_app_id or "").strip() or None
+    stored = _merge_tts_config(
+        dict(await system_config.get_config(system_config.KEY_TTS) or {}), req
+    )
 
     effective = tts_resolve_config(stored)
     result: dict[str, Any] = {
@@ -1154,29 +1243,18 @@ async def admin_tts_probe_voices(
     from stashbox.backend.app.services.tts import build_client
     from stashbox.backend.app.services.tts.voice_probe import extract_supported_voices
 
-    stored = dict(await system_config.get_config(system_config.KEY_TTS) or {})
-    stored["provider"] = provider
-    fields = req.model_fields_set
-    for fname in (
-        "openai_base_url",
-        "openai_model",
-        "openai_voice",
-        "doubao_voice",
-        "doubao_resource_id",
-        "edge_voice",
-        "local_voice",
-    ):
-        if fname in fields:
-            v = getattr(req, fname)
-            stored[fname] = (v or "").strip() or None
+    stored = _merge_tts_config(
+        dict(await system_config.get_config(system_config.KEY_TTS) or {}), req
+    )
+    # probe 要**真发一次请求**，所以必须有一把能用的 key：
+    # 已存没有（从没配过 / 刚被显式清除）→ 回落 env。
+    #
+    # 注意这里回落的是**内存态**，不落库 —— probe 端点本来就不写库。
     for key, env_name in (
         ("openai_api_key", "OPENAI_TTS_API_KEY"),
         ("doubao_api_key", "DOUBAO_TTS_API_KEY"),
     ):
-        if key in fields and getattr(req, key):
-            stored[key] = getattr(req, key)
-        elif not stored.get(key):
-            # 已存没有 → 回落 env
+        if not stored.get(key):
             stored[key] = os.getenv(env_name, "") or None
 
     effective = tts_resolve_config(stored)
