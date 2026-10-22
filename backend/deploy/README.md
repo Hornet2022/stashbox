@@ -459,28 +459,27 @@ sudo systemctl enable --now stashbox-api-gateway.service \
      stashbox-user-service.service stashbox-content-service.service \
      stashbox-ai-service.service stashbox-ai-worker.service
 
-# ⑨ nginx + 证书（certbot 会改这个文件）
+# ⑨ nginx + 证书
 sudo cp backend/deploy/systemd/nginx.conf /etc/nginx/sites-available/stashbox
 sudo ln -sf /etc/nginx/sites-available/stashbox /etc/nginx/sites-enabled/stashbox
 #    ⚠️ **证书用 tls-cert.sh 选，不要手改 nginx.conf 里的路径**
 #
 #    为什么需要这个脚本（2026-10-21 实测踩出来的）：
-#    备案期间域名解析会被阿里云监测系统阻断，而安卓 release 包
-#    **只信任系统 CA**（network_security_config 的 trust-anchors=system），
-#    自签证书一律被拒 —— 也就是说：
-#      · 用域名 → 备案通过前，App 连不上
+#    安卓 release 包**只信任系统 CA**（network_security_config 的
+#    trust-anchors=system），自签证书一律被拒 —— 也就是说：
+#      · 用域名 → 证书必须是公网受信的
 #      · 用自签证书 → 任何时候都连不上
 #    解法：Let's Encrypt 自 2025-12 起支持**签发 IP 证书**（http-01 验证，
-#    6 天有效期，自动续签）。所以备案期间用 IP 证书，备案通过后换域名证书，
-#    同一份 nginx 配置，两种证书。
+#    6 天有效期，自动续签）。IP 没有备案概念 → 不受备案拦截影响，
+#    备案期间用 IP 证书，备案通过后换域名证书，同一份 nginx 配置两种证书。
 #
-#    备案期间（IP 证书）：
+#    签发域名证书（acme.sh，**不要用 certbot** —— 这台机器的 certbot
+#    续期目录是坏的，签出来的证书到期即死）：
+#      bash deploy/issue-domain-cert.sh
+#    IP 兜底块用哪张：
 #      bash deploy/tls-cert.sh ip
-#    备案通过后（域名证书）：
-#      bash deploy/tls-cert.sh domain api.stashbox.cn
 #    看当前用的哪张：
 #      bash deploy/tls-cert.sh status
-sudo certbot --nginx -d api.stashbox.cn -d admin.stashbox.cn
 sudo nginx -t && sudo systemctl reload nginx
 
 # ⑨-b 管理后台（静态 SPA，内测必需：推推送 / 看用户 / 管配额）
@@ -662,9 +661,15 @@ LOCAL_STORAGE_PUBLIC_URL=https://api.stashbox.cn/audio
 
 | server 块 | server_name | 证书 | SAN |
 |---|---|---|---|
-| API | `api.stashbox.cn` `stashbox.cn` | 域名证书 | `stashbox.cn` `www.stashbox.cn` |
-| 后台 | `admin.stashbox.cn` `www.stashbox.cn` | 域名证书 | 同上 |
+| 公开面 | `stashbox.cn` `www.stashbox.cn` | 域名证书 | 四个名字（见下） |
+| API | `api.stashbox.cn` | 域名证书 | 同上 |
+| 后台 | `admin.stashbox.cn` | 域名证书 | 同上 |
 | IP 兜底 | `_`（default_server） | **IP 证书** | IP:8.148.9.151 |
+
+域名证书的 SAN 是**一张证书四个名字**：`stashbox.cn` `www.stashbox.cn`
+`admin.stashbox.cn` `api.stashbox.cn`。四个 host 复用同一个证书文件 →
+这张证书的 SAN 必须同时含四个名字，否则浏览器按 host 校验会直接报
+「证书失配」（比拿不到证书更难排查）。
 
 **为什么不能共用一张**（`tls-cert.sh` 的共用片段 `tls-cert.conf`）：
 两张证书的 SAN **不重叠** —— 域名证书不含 IP，IP 证书不含域名。
@@ -678,21 +683,39 @@ LOCAL_STORAGE_PUBLIC_URL=https://api.stashbox.cn/audio
 
 ### 12.2 签发 / 续期
 
-```bash
-# 签（HTTP-01，需要域名已解析到本机；webroot 模式，nginx 已配好 ACME 路径）
-/root/.acme.sh/acme.sh --issue -d stashbox.cn -d www.stashbox.cn \
-    -w /var/www/html --server letsencrypt --keylength ec-256
+⚠️ **备案期间域名的 80 端口被阿里云拦截**（见 §12.6 实测），HTTP-01
+验证走不通 → 域名证书必须走 **TLS-ALPN-01**（验证走 443，443 不拦）。
 
-# 同步 + reload（acme.sh 的 cron 只负责签发，nginx 还要 reload 才换证书）
+```bash
+# 签发（ALPN）——会临时停掉 nginx（ALPN 要独占 443），签完自动起回来
+bash /opt/stashbox/deploy/issue-domain-cert.sh
+
+# 只看状态，不签发
+bash /opt/stashbox/deploy/issue-domain-cert.sh --check
+
+# 续期 + 同步 + reload（cron 每天跑，脚本自己判断是否进窗口）
 bash /opt/stashbox/deploy/renew-tls.sh
 ```
 
-acme.sh 的 cron（`0 3 */3 * *`）负责签发，`renew-tls.sh`（每 6 小时）
-负责同步到 `/etc/letsencrypt/live/` 并 reload nginx。
+**续期链路的两条岔路**（`renew-tls.sh` 一次跑完）：
+
+| 证书 | 有效期 | 验证方式 | 续期代价 |
+|---|---|---|---|
+| 域名证书（4 个名字） | 90 天 | **TLS-ALPN-01**（443） | 要停 nginx ~40 秒 |
+| IP 证书 | **6 天** | HTTP-01（`8.148.9.151:80`） | 不停 nginx |
+
+两张证书对 nginx 的要求**正好相反**（IP 的验证需要 nginx 跑着，
+ALPN 的验证需要 nginx 停着），所以必须分开、按顺序处理，不能用
+`acme.sh --cron` 一把梭。
+
+⚠️ **IP 证书的节流**：有效期只有 6 天，但 Let's Encrypt 对 IP 证书的
+重复证书配额是**每周 5 张** —— 每天续一张就是 7 张/周，超限。
+`renew-tls.sh` 因此把它卡到 **4 天一次**（留 2 天余量，一周 1~2 张）。
 
 ⚠️ **不要用 certbot 签域名证书**：之前那两张 `api.` / `admin.` 的证书
 是 certbot 签的、**只有 24 小时有效期**，而且 `/etc/letsencrypt/renewal/`
-里**没有 renewal 配置** → 到期即死、永远不会续。域名证书统一走 acme.sh。
+里**没有 renewal 配置** → 到期即死、永远不会续。已归档到
+`/root/retired-certs/`。域名证书统一走 acme.sh。
 
 ### 12.3 一键切换
 
@@ -718,18 +741,18 @@ bash /opt/stashbox/deploy/switch-domain.sh ip       # 切回 https://8.148.9.151
 
    APK 没重打之前，App 仍连旧地址（旧地址仍可用 —— 这是刻意的回退）。
 
-### 12.4 内测期间：App 走 IP，域名只承载营销页
+### 12.4 内测期间：App 走 IP，域名承载营销页 + 后台入口
 
 **为什么 App 继续用 IP**：
 
 - **App 没有多域名容错**：`BaseUrls.gatewayBaseUrl()` 是单一编译期常量，
   域名一断就是**所有内测用户全部连不上**，且 APK 分发后改不了（要重新分发）。
 - IP 入口**与备案无关**（IP 证书不需要备案）→ 它就是回退路径。
-- 域名的价值是「好看的对外链接」（营销页、分享），不是「给 App 用」。
+- 域名的价值是「好看的对外链接」（营销页、分享）+ 后台入口，不是「给 App 用」。
 
-**所以**：域名只承载营销页（打不开只是看不到页面，没有损失）；
-App 和音频继续走 IP。备案通过后一条命令切干净
-（`switch-domain.sh domain` + 重打 APK）。
+**所以**：域名承载**营销页**（`https://stashbox.cn/`）+ **后台登录**
+（`https://admin.stashbox.cn/login`），App 和音频继续走 IP。
+备案通过后一条命令切干净（`switch-domain.sh domain` + 重打 APK）。
 
 ### 12.5 ⚠️ 关于「域名被按 SNI 封堵」—— 那是误判，别照着改
 
@@ -751,3 +774,40 @@ nginx 访问日志（域名块）里已有 13 个不同来源 IP 正常取到内
 
 ⚠️ `tls-cert.sh` 顶部那句「备案期间域名解析会被阿里云监测系统阻断」
 是**当年的观察**，现在没有复现；用之前先按上面这条验一遍。
+
+### 12.6 备案拦截的真实行为（2026-10-22 实测，别凭印象改）
+
+备案审核期间，阿里云**确实**在拦 —— 但**不是**按 SNI 封 443，而是
+**只拦域名的 80 端口**：
+
+| 入口 | 结果 |
+|---|---|
+| `http://stashbox.cn/…` | **403**，`Server: Beaver`，body 是阿里云备案拦截页 |
+| `http://www./admin./api.stashbox.cn/…` | 同上 |
+| `http://8.148.9.151/…`（IP，无域名） | **200**，正常放行 |
+| `https://stashbox.cn/` `https://admin.stashbox.cn/` | **200**，正常放行 |
+
+拦截页原文：
+
+```html
+<title>Non-compliance ICP Filing</title>
+… src= "http://www.aliyun.com/beian/beian-block?id=00000000005986618342"
+```
+
+**三个推论**（每一条都影响怎么做）：
+
+1. **HTTP-01 验证走不通** → 域名证书只能走 TLS-ALPN-01（443）→ ALPN
+   要独占 443 → 续期时必须停 nginx。
+2. **443 正常** → 证书能不能签和访问方不通用。证书是「能不能签」，
+   备案拦截是「能不能访问」——**这是两件事**，别混。
+3. **IP 不受影响** → IP 证书的 HTTP-01 续期照常工作（走
+   `http://8.148.9.151/.well-known/…`）。这也是为什么 App 和音频继续走 IP
+   是个安全选择。
+
+**诊断要点**：被拦的请求**不会出现在 nginx 访问日志里**（拦截在 nginx
+之前）。所以看到 403 就去翻 nginx 日志是找不到证据的 —— 要看响应头
+里的 `Server: Beaver` 和 body 里的 `beian-block` 才认得出是备案拦截。
+
+⚠️ 备案通过后 80 端口会解封，那时可以把域名证书切回 HTTP-01
+（`issue-domain-cert.sh --webroot`），续期就不用停 nginx 了。
+ALPN 继续用也没问题，只是每次续期有 ~40 秒中断。

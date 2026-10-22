@@ -5,22 +5,29 @@
 #
 # ## 为什么需要这个脚本
 #
-# 备案期间域名解析会被阿里云监测系统阻断，而安卓 release 包
-# **只信任系统 CA**（network_security_config.xml 的 base-config
-# cleartextTrafficPermitted=false + trust-anchors=system），
+# 安卓 release 包**只信任系统 CA**（network_security_config.xml 的
+# base-config cleartextTrafficPermitted=false + trust-anchors=system），
 # 自签证书一律被拒 —— 也就是说：
 #
-#   · 用域名 → 备案通过前，App 连不上
+#   · 用域名 → 证书必须是公网受信的
 #   · 用自签证书 → 任何时候都连不上
 #
 # 解法：Let's Encrypt 自 2025-12 起支持**签发 IP 证书**（http-01 验证，
-# 6 天有效期，自动续签）。所以备案期间可以用 IP 证书，
-# 备案通过后换成域名证书 —— 同一个 nginx 配置，两种证书。
+# 6 天有效期，自动续签）。IP 没有备案概念 → 不受备案拦截影响，
+# 所以备案期间可以用 IP 证书，备案通过后换成域名证书 ——
+# 同一个 nginx 配置，两种证书。
+#
+# ⚠️ 关于「备案期间域名解析会被阿里云监测系统阻断」这句话：
+# 2026-10-22 实测，**只拦域名的 80 端口**（返回 `Server: Beaver` 的
+# 备案拦截页），443 正常、IP 的 80 也正常。所以：
+#   · 「域名能不能访问」→ 443 通，**能访问**
+#   · 「域名证书能不能签」→ HTTP-01 走 80 → 通不了，要用 ALPN
+# 这两件事别混。详见 deploy/README.md §12.6。
 #
 # ## 用法
 #
-#     ./tls-cert.sh ip                 # 用 IP 证书（备案期间）
-#     ./tls-cert.sh domain api.stashbox.cn   # 用域名证书（备案通过后）
+#     ./tls-cert.sh ip                 # 用 IP 证书（IP 兜底块）
+#     ./tls-cert.sh domain stashbox.cn # 用域名证书（域名块）
 #     ./tls-cert.sh auto               # 有域名证书就用域名，否则回退 IP
 #     ./tls-cert.sh status             # 只看当前用的哪张
 #
@@ -78,7 +85,7 @@ use_domain() {
   [ -f "$DOMAIN_BASE/$d/fullchain.pem" ] && [ -f "$DOMAIN_BASE/$d/privkey.pem" ] || {
     echo "✗ 没有域名证书：$DOMAIN_BASE/$d" >&2; exit 1; }
   [ -f "$SNIPPET" ] && cp "$SNIPPET" "$SNIPPET.bak"
-  write_snippet "$DOMAIN_BASE/$d/fullchain.pem" "$DOMAIN_BASE/$d/privkey.pem" "域名证书 $d（certbot，90 天自动续签）"
+  write_snippet "$DOMAIN_BASE/$d/fullchain.pem" "$DOMAIN_BASE/$d/privkey.pem" "域名证书 $d（acme.sh，ALPN 续期）"
   apply_and_reload "域名证书（$d）"
 }
 
