@@ -3649,7 +3649,8 @@
           }
         },
         "tags": [
-          "content-service"
+          "content-service",
+          "api-gateway"
         ]
       }
     },
@@ -4550,7 +4551,8 @@
           }
         },
         "tags": [
-          "content-service"
+          "content-service",
+          "api-gateway"
         ]
       }
     },
@@ -7313,7 +7315,8 @@
           }
         },
         "tags": [
-          "user-service"
+          "user-service",
+          "api-gateway"
         ]
       }
     },
