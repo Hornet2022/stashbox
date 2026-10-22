@@ -216,7 +216,12 @@ class OpenAITTSClient(TTSClient):
             if min_chunk_chars is not None
             else int(os.getenv("OPENAI_TTS_MIN_CHUNK_CHARS", "60"))
         )
-        # 段间静音秒数（0 = 不插）。默认 0.3s ≈ 一次自然换气。
+        # 段间静音秒数（0 = 不插）。
+        #
+        # ⚠️ 现在它只是**兜底**：crossfade 走不通时才用（见
+        # audio_chunks.concat_mp3）。主路径不再插静音 ——
+        # 实测带着静音拼出来的音频，用户照样听出「三种音色」：
+        # 静音只让耳朵「重新分句」，两段依然是两个音色。
         self.gap_sec = float(os.getenv("OPENAI_TTS_GAP_SEC", "0.3"))
         # 单次请求的最大字数。
         #
@@ -369,57 +374,8 @@ class OpenAITTSClient(TTSClient):
 
         # gather 保序（返回顺序 = 输入顺序），拼接顺序才不会乱
         pieces = list(await asyncio.gather(*[_one(c) for c in chunks]))
-        merged = self._concat_with_gaps(pieces)
+        merged = concat_audio(pieces, gap_sec=self.gap_sec)
         log.info("OpenAITTS 分段合成完成: chunks=%d bytes=%d", len(pieces), len(merged))
-        return merged
-
-    def _concat_with_gaps(self, pieces: list[bytes]) -> bytes:
-        """拼接各段，段间插入短静音（让听感像换气，而不是被切开的连续语音）。
-
-        静音的采样率/声道从第一段探测 —— 必须与内容一致，否则 concat demuxer
-        会重采样，`-c copy` 就不成立了。
-
-        拼完**自检**总时长：与「各段之和 + 静音时长」差太多就回退到不加静音
-        的版本（拼接出错时宁可少个停顿，也不能丢内容）。
-        """
-        if len(pieces) < 2 or self.gap_sec <= 0:
-            return concat_audio(pieces)
-
-        from stashbox.backend.app.services.tts.audio_chunks import silence_mp3
-        from stashbox.backend.app.services.tts.audio_duration import audio_duration_sec, mp3_info
-
-        info = mp3_info(pieces[0])
-        if not info:
-            return concat_audio(pieces)
-        _, rate, channels = info
-
-        silence = silence_mp3(self.gap_sec, rate, channels)
-        if not silence:
-            return concat_audio(pieces)
-
-        with_gaps: list[bytes] = []
-        for i, piece in enumerate(pieces):
-            if i:
-                with_gaps.append(silence)
-            with_gaps.append(piece)
-
-        merged = concat_audio(with_gaps)
-
-        # 自检：总时长应 ≈ 各段之和 + 静音段数 × gap
-        expected = 0.0
-        for piece in pieces:
-            d = audio_duration_sec(piece)
-            if d:
-                expected += d
-        expected += self.gap_sec * (len(pieces) - 1)
-        actual = audio_duration_sec(merged) or 0
-        if expected > 0 and abs(actual - expected) > 3:
-            log.warning(
-                "OpenAITTS 段间静音拼接异常，回退无静音版本: actual=%.1fs expected=%.1fs",
-                actual,
-                expected,
-            )
-            return concat_audio(pieces)
         return merged
 
     async def _synthesize_chunk(
