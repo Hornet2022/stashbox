@@ -102,8 +102,20 @@ server {
 
     # 音频：nginx 的 root 下没有这个目录，必须显式转给网关，
     # 否则客户端拿到 404（表现为「文章有音频但播不了」）
+    #
+    # ⚠️ **proxy_buffering off 必须有**（2026-10-22 补）：
+    # 少了它，nginx 会把整个音频响应**缓冲到临时文件**再发给客户端
+    # （错误日志里就有 "an upstream response is buffered to a temporary file
+    # /var/lib/nginx/proxy/… while reading upstream"）。
+    # 音频是「边下边播」的长响应，缓冲意味着：客户端要等**整个文件**下完
+    # 才开始播 —— 播放延迟从 0.5s 变成几秒；而且每个并发播放都在这台
+    # 1.6GB 的机器上落一个临时文件（free 只剩 ~95MB）。
+    # api 域和 IP 域这两个 location 一直都有这两行，只有营销域这块漏了。
     location /audio/ {
         proxy_pass http://stashbox_gateway;
+        # 音频是完整文件下载，不要缓冲整个响应到内存
+        proxy_buffering off;
+        proxy_read_timeout 120s;
     }
 
     # APK 下载（共享片段：漏了会返回 index.html 而不是 APK，状态码还是 200）
