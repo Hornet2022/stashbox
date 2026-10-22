@@ -90,3 +90,23 @@ def test_每个错误码都有话术():
 
 def test_未知错误码有兜底话术():
     assert fetch_error_user_message("不存在的码") == "抓取失败，请稍后重试"
+
+
+def test_auth_话术按抓取器分流():
+    """同一个 AUTH，微信文章与别的站点要说得不一样。
+
+    实测踩到的：PDF 返回 403（fetcher.auth）时，用户看到的是
+    「微信文章请在微信里打开后重新复制链接」—— 对一个 PDF 说这句话
+    完全是胡话，而 PDF 是营销页宣传过的能力。
+    """
+    wechat_msg = fetch_error_user_message(FetcherErrorCode.AUTH, "wechat_mp")
+    other_msg = fetch_error_user_message(FetcherErrorCode.AUTH, "pdf")
+    assert "微信" in wechat_msg, "微信文章该告诉用户回微信里重新复制链接"
+    assert "微信" not in other_msg, f"非微信来源不该提微信：{other_msg}"
+    assert wechat_msg != other_msg
+
+
+def test_auth_通用话术不含误导指引():
+    msg = fetch_error_user_message(FetcherErrorCode.AUTH, "generic_url")
+    for bad in ("微信", "换个网站"):
+        assert bad not in msg, f"通用 AUTH 话术不该出现「{bad}」：{msg}"

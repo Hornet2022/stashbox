@@ -62,7 +62,10 @@ _FETCH_ERROR_USER_MESSAGE: dict[FetcherErrorCode, str] = {
     FetcherErrorCode.SSRF_BLOCKED: "这个链接我们暂时读不到内容，换个来源试试",
     FetcherErrorCode.NETWORK: "没能连上这个网站，可能是网络不通或对方站点暂时不可用，请稍后重试",
     FetcherErrorCode.RATE_LIMIT: "对方网站暂时限制了访问，请过几分钟再试",
-    FetcherErrorCode.AUTH: "对方网站限制了非官方客户端访问，微信文章请在微信里打开后重新复制链接",
+    # 通用话术。**微信文章专属的那句在 fetch_error_user_message() 里按 source 分流** ——
+    # 同一个 AUTH，PDF / 普通网页说「微信文章请在微信里打开」是胡话
+    # （实测 adobe.com 的 PDF 返回 403，用户看到的就是这句）。
+    FetcherErrorCode.AUTH: "对方网站限制了非官方客户端访问，换个来源试试",
     FetcherErrorCode.NOT_FOUND: "这篇文章已被删除或链接已失效",
     FetcherErrorCode.PARSE: "没能提取出文章正文，页面可能需要登录后才能查看",
     # 单独成句，不复用 PARSE 的"可能需要登录"：对方要的是人机验证，不是登录。
@@ -73,8 +76,16 @@ _FETCH_ERROR_USER_MESSAGE: dict[FetcherErrorCode, str] = {
 }
 
 
-def fetch_error_user_message(code: FetcherErrorCode) -> str:
-    """FetcherErrorCode → 面向用户的中文提示。"""
+def fetch_error_user_message(code: FetcherErrorCode, source: str = "") -> str:
+    """FetcherErrorCode → 面向用户的中文提示。
+
+    `source` 用来**按抓取器区分措辞**：同一个错误码，不同站点的正确建议
+    完全不同。实测踩到的：PDF 返回 403（fetcher.auth）时，用户看到的
+    是「微信文章请在微信里打开后重新复制链接」—— 对一个 PDF 说这句话
+    完全是胡话，而它当时还印在营销页宣传的能力上。
+    """
+    if code is FetcherErrorCode.AUTH and source.startswith("wechat"):
+        return "对方网站限制了非官方客户端访问，微信文章请在微信里打开后重新复制链接"
     return _FETCH_ERROR_USER_MESSAGE.get(code, "抓取失败，请稍后重试")
 
 
@@ -94,11 +105,11 @@ def map_fetcher_error(exc: FetcherError) -> BizException:
     技术细节由调用方打日志（见 capture 端点的 fetch_fail 日志）。
     """
     if exc.code in (FetcherErrorCode.UNSUPPORTED, FetcherErrorCode.SSRF_BLOCKED):
-        biz = BizException(code=2001, message=fetch_error_user_message(exc.code))
+        biz = BizException(code=2001, message=fetch_error_user_message(exc.code, exc.source))
         biz.detail = f"[{exc.source}/{exc.code.value}] {exc.message}"
         return biz
 
-    biz = BizException(code=2002, message=fetch_error_user_message(exc.code))
+    biz = BizException(code=2002, message=fetch_error_user_message(exc.code, exc.source))
     biz.http_status = 500 if exc.code == FetcherErrorCode.INTERNAL else 502
     # 技术细节留在异常属性里，日志用；不进 message，避免把内部实现泄给客户端。
     biz.detail = f"[{exc.source}/{exc.code.value}] {exc.message}"
