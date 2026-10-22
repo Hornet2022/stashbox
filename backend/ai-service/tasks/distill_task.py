@@ -66,6 +66,27 @@ class DistillRetry(ArqRetry):
         return self.message
 
 
+def _retry_after_seconds(exc: BaseException, default: int = 15) -> int:
+    """从异常链里找 `retry_after`（熔断器告诉调用方「多久后再来」）。
+
+    为什么要沿链找：熔断异常在 TTS client 里抛出，中间会被
+    ToolError / RuntimeError 逐层包起来，只有**链底**那个还带着
+    `retry_after` 属性。找不到就用默认的 15s。
+    """
+    seen = 0
+    cur: BaseException | None = exc
+    while cur is not None and seen < 10:
+        value = getattr(cur, "retry_after", None)
+        if value not in (None, ""):
+            try:
+                return max(1, int(float(value)))
+            except (TypeError, ValueError):
+                break
+        cur = cur.__cause__ or cur.__context__
+        seen += 1
+    return default
+
+
 async def _trigger_subscription_pushes(
     db: AsyncSession,
     article_id: str,
@@ -393,7 +414,18 @@ async def distill_task(
             err_kind = (final or {}).get("error_kind") or "internal"
             err_step = (final or {}).get("error_step") or "unknown"
             err_msg = (final or {}).get("error") or "agent 未返回 done"
-            raise RuntimeError(f"agent distill failed at {err_step} ({err_kind}): {err_msg}")
+            # CP-TTS-CIRCUIT-RETRY-AFTER：agent state 里的 retry_after
+            # （熔断器给的「多久后再来」）要跟着异常一起传下去，
+            # 否则下面的退避只会用固定 15s —— 15s 落在 60s 熔断窗口内，
+            # Arq 的重试会全部打在「拒绝服务」上，把重试次数烧光。
+            err = RuntimeError(f"agent distill failed at {err_step} ({err_kind}): {err_msg}")
+            retry_after = (final or {}).get("retry_after")
+            if retry_after:
+                try:
+                    err.retry_after = int(float(retry_after))
+                except (TypeError, ValueError):
+                    pass
+            raise err
 
         # CP10: 写回 articles.status=ready + audio_url（派生自 agent final state）
         async with AsyncSessionLocal() as db:
@@ -633,7 +665,11 @@ async def distill_task(
         # 同一时刻连着几次请求连续返回空 content（实测 4 次连续全空），
         # 紧接着又完全正常。立刻重试大概率落在同一个坏窗口里，
         # 等 15s 再试才是有效的恢复策略。
-        raise DistillRetry(str(e), defer=15) from e
+        #
+        # ⚠️ 但**熔断**情形例外：熔断窗口 60s，15s 的退避会落在窗口内，
+        # Arq 的 5 次重试（5×15s=75s）大半都打在「拒绝服务」上 → 重试烧光。
+        # 熔断异常带 retry_after=60 → 按它退避，一次窗口只烧一次重试。
+        raise DistillRetry(str(e), defer=_retry_after_seconds(e)) from e
     finally:
         # CP-AGENT-RUNNER-INTEGRATION：agent 路径下 LLM client 由 agent.runner 内部
         # 通过 _llm_module.get_llm_client() 获取（单例），这里拿同一个实例关闭。

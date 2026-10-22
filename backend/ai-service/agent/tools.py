@@ -186,7 +186,19 @@ async def tts_synthesize_tool(state: dict[str, Any], args: dict[str, Any]) -> di
         )
         audio = await client.synthesize(script, voice=getattr(client, "voice", None))
     except Exception as exc:
-        raise ToolError("internal", f"tts_synthesize 失败: {exc}") from exc
+        # CP-TTS-CIRCUIT-RETRY-AFTER：把底层异常带的 retry_after 传上去。
+        #
+        # 上游 TTS 熔断时会带 `retry_after`（= 熔断窗口秒数），意思是
+        # 「现在打过去只会白等，N 秒后再来」。这个信息必须一路传到
+        # AgentState.retry_after（_error_update 已经会带），否则蒸馏层
+        # 只会用固定的 15s 退避 —— 而 15s < 60s 熔断窗口，
+        # Arq 的重试会全部打在「拒绝服务」上，把重试次数烧光。
+        retry_after = getattr(exc, "retry_after", None)
+        raise ToolError(
+            "internal",
+            f"tts_synthesize 失败: {exc}",
+            retry_after=str(retry_after) if retry_after else None,
+        ) from exc
 
     if not audio or len(audio) < 100:
         raise ToolError("empty", f"TTS 返回空音频（{len(audio or b'')}B）")

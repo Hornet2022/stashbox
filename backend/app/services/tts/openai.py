@@ -67,6 +67,7 @@ IndexTTS provider 早就因为同类问题做了分段，这套实现现在共�
 import asyncio
 import logging
 import os
+import time
 from typing import Any
 
 import httpx
@@ -103,6 +104,68 @@ _MAX_SPLIT_DEPTH = 6
 
 class _TruncatedOutput(RuntimeError):
     """端点返回了 HTTP 200 但内容被静默截断（只念了开头）。"""
+
+
+# ── 熔断 ────────────────────────────────────────────────────────────────────
+#
+# 上游 TTS 有 **60s 墙钟**且是**共享**资源：一次大请求会占住它 60 秒，
+# 期间其他请求全部排队 → 连锁 504。
+#
+# 实测（2026-10-22）：连续打大段长请求把上游压满后，
+# **真实用户的剪藏全部失败**（连续 30 分钟 504 率 100%）。
+#
+# 所以必须有熔断：连续失败就**快速失败**，别再往上游压 ——
+# 熔断期内任务立刻返回失败，Arq 层会退避后重试，
+# 上游才有喘息恢复的时间。硬扛只会让它一直不恢复。
+#
+# 半开状态：熔断期满后放一个请求探路，成功则完全恢复，失败则继续熔断。
+_CIRCUIT_FAIL_THRESHOLD = 3
+_CIRCUIT_OPEN_SECONDS = 60.0
+
+_circuit_state = {"consecutive_failures": 0, "opened_at": 0.0}
+
+
+class _CircuitOpen(RuntimeError):
+    """熔断打开中：上游疑似不可用，**不要**再打它。
+
+    带 `retry_after`（秒）—— 蒸馏层据此把退避拉长到熔断窗口那么久，
+    否则 15s 的固定退避会在熔断窗口内把 Arq 的重试次数全部烧光
+    （5 次 × 15s = 75s，而熔断窗口 60s —— 大半次重试都打在「拒绝服务」上）。
+    """
+
+    retry_after = _CIRCUIT_OPEN_SECONDS
+
+
+def _circuit_allow() -> bool:
+    """当前是否允许发请求。
+
+    关闭态 → 放行。
+    打开态（距上次打开 < `_CIRCUIT_OPEN_SECONDS`）→ 拒绝。
+    半开态（超过窗口）→ 放行（探路）。成功则完全恢复，失败则重新打开。
+    """
+    now = time.time()
+    opened_at = _circuit_state["opened_at"]
+    if not opened_at:
+        return True
+    if now - opened_at < _CIRCUIT_OPEN_SECONDS:
+        return False
+    return True
+
+
+def _circuit_record_success() -> None:
+    _circuit_state["consecutive_failures"] = 0
+    _circuit_state["opened_at"] = 0.0
+
+
+def _circuit_record_failure() -> None:
+    _circuit_state["consecutive_failures"] += 1
+    if _circuit_state["consecutive_failures"] >= _CIRCUIT_FAIL_THRESHOLD:
+        _circuit_state["opened_at"] = time.time()
+        log.warning(
+            "tts_circuit_opened consecutive_failures=%s open_seconds=%s",
+            _circuit_state["consecutive_failures"],
+            _CIRCUIT_OPEN_SECONDS,
+        )
 
 
 class OpenAITTSClient(TTSClient):
@@ -157,29 +220,25 @@ class OpenAITTSClient(TTSClient):
         self.gap_sec = float(os.getenv("OPENAI_TTS_GAP_SEC", "0.3"))
         # 单次请求的最大字数。
         #
-        # 取 500 的依据（2026-10-21 实测，tertu.cn 的 Qwen3-TTS-12Hz-1.7B-Base，
-        # 每档试 2 次）：
-        #     400 字 → 语速 4.64 / 4.78  wall 23s  ✅
-        #     500 字 → 语速 4.31 / 3.79  wall 48s  ✅  ← 取这个
-        #     600 字 → 语速 4.34 / 4.28  wall 49s  ✅
-        #     700 字 → 语速 4.46 / 4.85  wall 52~59s ✅
+        # 取 400 的依据（2026-10-22 实测，tertu.cn 的 Qwen3-TTS-12Hz-1.7B-Base）：
+        #     500 字 → wall=35.7s  音频=130.0s  语速=3.85  ✅
+        #     1000 字 → 504 上游语音合成超时 (60s)          ❌ 必然撞线
+        #     1500/2000/3000 字 → 全部 504                  ❌
         #
-        # **为什么取 500 而不是更小**：段数直接决定「音色一段一段」的严重程度 ——
-        # 每段是一次独立请求，段间韵律各自采样，段与段的接缝就是突变点。
-        # 段长 200 → 900 字稿要 6 段（5 个接缝）；段长 500 → 只要 2 段（1 个接缝）。
-        # 段数减到最少，割裂感就基本消失。
+        # 上游是**共享**的 60s 墙钟：一次大请求会占住上游 60 秒，期间其他请求
+        # 全部排队 → 连锁 504。实测（2026-10-22）我自己的压测把上游压满后，
+        # **真实用户的剪藏全部失败**（连续 30 分钟 100% 504）。
+        # 所以单块要**短**（占用少），不是长。
         #
-        # **为什么不整篇不切**：900+ 字整篇合成会撞上上游自己的 60s 墙钟
-        # （返回 504 backend_timeout「上游语音合成超时 (60s)」），
-        # 而 700 字的 wall 已经 52~59s —— 顶到那条线了。
+        # 400 vs 500 对 ~1057 字的稿**段数相同**（都是 3 段），但单次占用
+        # 从 35.7s 降到 ~28s —— 零代价的安全性提升。
+        #
+        # 为什么不整篇不切：1000+ 字整篇合成必然撞上上游的 60s 墙钟。
         # 我们的 httpx timeout 给到 300s（上游 504 是它自己的限制，给大也没用）。
-        #
-        # 500 字 × 2 段 = ~96s 墙钟，稳稳在 Arq job_timeout(1800s) 之内，
-        # App 那边有阶段显示（正在合成语音…），用户等得住。
         self.chunk_chars = (
             chunk_chars
             if chunk_chars is not None
-            else int(os.getenv("OPENAI_TTS_CHUNK_CHARS", "500"))
+            else int(os.getenv("OPENAI_TTS_CHUNK_CHARS", "400"))
         )
         # 分段并行度。**默认 1（串行）** —— 不是为了性能，是为了让每一段的
         # 计时器从「真正开始被上游处理」起算。
@@ -281,6 +340,11 @@ class OpenAITTSClient(TTSClient):
                 for attempt in range(1, self.chunk_retries + 2):
                     try:
                         return await self._synthesize_chunk(chunk, voice, output_format)
+                    except _CircuitOpen:
+                        # 熔断打开 → 立刻放弃这一篇，别在这里退避重试：
+                        # 退避只会让 Arq 的重试次数烧光，而上游需要的是
+                        # **完全没人打它** 的时间。
+                        raise
                     except Exception as exc:
                         last_exc = exc
                         if attempt > self.chunk_retries:
@@ -288,7 +352,10 @@ class OpenAITTSClient(TTSClient):
                         # 上游抖动是**间歇性**的：实测同一篇稿子的 3 段里，
                         # 有一段 60s 超时而另外两段 16s 就好了。
                         # 重试前先等一下，别在同一个坏窗口里连打。
-                        wait = 3.0 * attempt
+                        # ⚠️ 退避要**长**：上游 TTS 有 60s 墙钟且是共享资源，
+                        # 撞墙之后上游还有排队积压，短退避只会继续往上游压。
+                        # 实测（2026-10-22）：上游被压满时连 80 字短文本都 504。
+                        wait = 10.0 * (3 ** (attempt - 1))
                         log.warning(
                             "OpenAITTS 分块失败，重试: attempt=%s/%s wait=%ss err=%s",
                             attempt,
@@ -381,11 +448,46 @@ class OpenAITTSClient(TTSClient):
         **只抛错是不够的** —— 同样大小的块重试还是会被截断。
         所以这里把被截断的块**按句读边界二分**后分别合成（内容更短 → 不会被截断），
         再拼回去。递归到 min_chunk_chars 仍截断才算真失败。
+
+        ## 超时也走同一条自愈路径
+
+        上游有 **60s 墙钟**（504 backend_timeout「上游语音合成超时 (60s)」）。
+        实测（2026-10-22，tertu.cn 的 Qwen3-TTS-12Hz-1.7B-Base）：
+
+            500 字  → wall=35.7s  音频=130.0s  语速=3.85  ✅
+            1000 字 → 504 上游语音合成超时 (60s)          ❌ 必然撞线
+            1500/2000/3000 字 → 全部 504                  ❌
+
+        而且这墙钟是**负载相关**的：上游被并发压满时，连 80 字短文本都会被
+        误杀（实测：我自己的压测把上游打满后，80 字请求连续 504）。
+
+        所以「超时」和「截断」用**同一个自愈**：把块二分 → 更短 → 更不容易
+        撞 60s 墙钟 → 合成 → 拼回。
+
+        这让「段长放大（减少分段 → 减少音色接缝）」成为安全选项：
+        上游忙时自动细分兜底，而不是整篇失败。
         """
         try:
             audio = await self._synthesize_once(text, voice, output_format)
             self._assert_not_truncated(text, audio)
             return audio
+        except (TimeoutError, httpx.TimeoutException) as exc:
+            if len(text) <= self.min_chunk_chars or depth >= _MAX_SPLIT_DEPTH:
+                raise RuntimeError(f"OpenAITTS 超时: {exc}") from exc
+            parts = split_into_chunks(text, max(1, len(text) // 2))
+            if len(parts) < 2:
+                raise RuntimeError(f"OpenAITTS 超时: {exc}") from exc
+            log.info(
+                "OpenAITTS 分块超时，二分重来: depth=%s chars=%d → %d 块",
+                depth + 1,
+                len(text),
+                len(parts),
+            )
+            pieces = [
+                await self._synthesize_chunk(part, voice, output_format, depth + 1)
+                for part in parts
+            ]
+            return concat_audio(pieces)
         except _TruncatedOutput:
             if len(text) <= self.min_chunk_chars or depth >= _MAX_SPLIT_DEPTH:
                 raise
@@ -438,6 +540,25 @@ class OpenAITTSClient(TTSClient):
             "response_format": output_format,
         }
 
+        # ── 熔断闸门 ────────────────────────────────────────────────
+        # 上游 TTS 是**共享**资源且有 60s 墙钟：上游一慢，我们每个请求
+        # 都白等 60s，然后重试、再白等 60s —— 这不是重试，是**加压**。
+        # 实测（2026-10-22）：上游 100% 504 的 30 分钟里，真实用户的
+        # 剪藏全部失败。
+        #
+        # 熔断打开时**立刻失败**（不占上游 60s），让 Arq 退避后重试，
+        # 上游才有喘息恢复的窗口。
+        if not _circuit_allow():
+            log.warning(
+                "tts_circuit_open fast_fail provider=%s open_seconds=%s",
+                self.base_url,
+                _CIRCUIT_OPEN_SECONDS,
+            )
+            raise _CircuitOpen(
+                f"上游 TTS 熔断中（连续失败 {_circuit_state['consecutive_failures']} 次），"
+                f"暂停请求 {_CIRCUIT_OPEN_SECONDS:.0f}s"
+            )
+
         log.info(
             "OpenAITTS synthesize: provider=%s model=%s voice=%s bytes=%d",
             self.base_url,
@@ -449,8 +570,10 @@ class OpenAITTSClient(TTSClient):
         try:
             resp = await self._client.post(self._endpoint(), json=body)
         except httpx.TimeoutException as e:
+            _circuit_record_failure()
             raise RuntimeError(f"OpenAITTS 超时: {e}") from e
         except httpx.HTTPError as e:
+            _circuit_record_failure()
             raise RuntimeError(f"OpenAITTS HTTP 异常: {e}") from e
 
         if resp.status_code >= 400:
@@ -460,14 +583,23 @@ class OpenAITTSClient(TTSClient):
                 err_body = resp.json()
             except Exception:
                 err_body = resp.text[:500]
+            # ⚠️ 只有「上游自己扛不住」才算熔断理由：
+            #   5xx / 429 = 上游过载或限流 → 继续打只会更糟；
+            #   4xx（音色名写错、参数非法）= **我们自己的请求有问题**，
+            #   重试一万次也是一样的错，而且它根本不代表上游不可用 ——
+            #   把它算进熔断会误伤正常流量。
+            if resp.status_code >= 500 or resp.status_code == 429:
+                _circuit_record_failure()
             raise RuntimeError(f"OpenAITTS 错误 {resp.status_code}: {err_body}")
 
         audio = resp.content
         if not audio:
+            _circuit_record_failure()
             raise RuntimeError(
                 f"OpenAITTS 返回空音频（{resp.status_code}, content-type={resp.headers.get('content-type')}）"
             )
 
+        _circuit_record_success()
         log.info("OpenAITTS synthesized: %d bytes", len(audio))
         return audio
 
