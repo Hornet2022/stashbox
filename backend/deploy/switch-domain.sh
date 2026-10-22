@@ -66,6 +66,18 @@ sed -i "s#^PUBLIC_GATEWAY_URL=.*#PUBLIC_GATEWAY_URL=$GW#" "$ENV_FILE"
 sed -i "s#^LOCAL_STORAGE_PUBLIC_URL=.*#LOCAL_STORAGE_PUBLIC_URL=$STORE#" "$ENV_FILE"
 echo "  ✓ env 已改"
 
+# 应用内更新下发的下载地址也要跟着换 host —— 它是**公开端点**返回的
+# URL，客户端会直接去下载。留在旧 host 上就会出现「域名都切了，更新包
+# 还从 IP 下载」的不一致（2026-10-22 实测：download_url 还指着
+# https://8.148.9.151/downloads/tingxia-0.3.0.apk，版本号也停在 3）。
+if grep -q '^STASHBOX_APP_DOWNLOAD_URL=' "$ENV_FILE"; then
+  cur=$(grep '^STASHBOX_APP_DOWNLOAD_URL=' "$ENV_FILE" | head -1 | cut -d= -f2-)
+  # 只换 host，文件名（含版本号）不动 —— 换包名是另一件事（要同时传 APK 文件名）
+  new_dl=$(printf '%s' "$cur" | sed -E "s#^https?://[^/]+#$GW#")
+  sed -i "s#^STASHBOX_APP_DOWNLOAD_URL=.*#STASHBOX_APP_DOWNLOAD_URL=$new_dl#" "$ENV_FILE"
+  echo "  ✓ 应用内更新下载地址：$new_dl"
+fi
+
 # ── 存量音频：只改 host，路径（含内容 hash）不动 ──────────────────
 #
 # ⚠️ 要改的是**音频基址**的 host，不是 API 的 host。
