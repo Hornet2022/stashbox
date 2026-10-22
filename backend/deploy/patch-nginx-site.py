@@ -131,7 +131,7 @@ server {
         add_header Cache-Control "no-cache, no-store, must-revalidate";
     }
 
-    access_log /var/log/nginx/stashbox-site.access.log;
+    access_log /var/log/nginx/stashbox-site.access.log stashbox;
     error_log  /var/log/nginx/stashbox-site.error.log warn;
 }
 """
