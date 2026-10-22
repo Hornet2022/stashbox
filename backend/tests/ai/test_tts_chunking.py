@@ -210,29 +210,97 @@ def test_default_concurrency_is_serial(openai_mod):
 
 
 def test_default_chunk_chars_is_the_measured_safe_size(openai_mod):
-    """默认段长必须是 400 字 —— 实测出来的安全值，不是拍脑袋。
+    """默认段长必须是 700 字 —— 实测出来的安全值，不是拍脑袋。
 
-    实测（2026-10-22，tertu.cn 的 Qwen3-TTS-12Hz-1.7B-Base）：
-        500 字 → wall=35.7s  音频=130.0s  语速=3.85  ✅
-        1000 字 → 504 上游语音合成超时 (60s)          ❌ 必然撞线
-        1500/2000/3000 字 → 全部 504                  ❌
+    实测（2026-10-22，tertu.cn 的 Qwen3-TTS-12Hz-1.7B-Base，每档连发 3 次）：
+        400 字 → wall 24.6 / 25.0 / 25.2s  语速 4.5 字/秒  3/3 成功
+        700 字 → wall 42.5 / 43.3 / 44.3s  语速 4.5 字/秒  3/3 成功
 
-    上游是**共享**的 60s 墙钟：一次大请求占住上游 60 秒，期间其他请求全部
-    排队 → 连锁 504。实测（2026-10-22）把上游压满后，**真实用户的剪藏
-    全部失败**。所以单块要短（占用少），不是长。
+    墙钟是线性的（约 62ms/字）→ 上游 60s 的墙钟 ≈ 965 字上限。
 
-    400 vs 500 对 ~1057 字的稿**段数相同**（都是 3 段），但单次占用从
-    35.7s 降到 ~28s —— 零代价的安全性提升。
+    **为什么放大段长**：分段 = 多次独立渲染 = 多个「音色接缝」。
+    内测反馈的「一篇三种音色」在音频轨迹上就定位在 chunk2→chunk3 的接缝处
+    （LTAS 跳变 0.39~0.45dB，其余窗只有 0.05~0.15dB）。
+    一篇 973 字的稿：400 字切 → 5 次渲染 / 4 个接缝（其中一次是截断自愈
+    二分出来的）；700 字切 → **2 次渲染 / 1 个接缝**。
 
-    段数决定「音色一段一段」的严重程度（每段一次独立请求，韵律各自采样）：
-    段长 400 → 1057 字稿 3 段（2 个接缝）；400 → 1290 字稿 4 段。
-    接缝本身用响度归一 + crossfade 磨平（见 audio_chunks.concat_mp3）。
+    安全网：上游 60s 墙钟是**负载相关**的（同一个 1158 字的稿子 43.89s 成功过、
+    60.2s 也 504 过），所以大段可能撞线 —— 撞了不二分自愈（见
+    test_upstream_504_triggers_bisect），而是更短 → 更不容易撞线。
 
-    另外 290 字那次语速 7.14（真截断，丢了约 40%）证明端点会**静默**截断，
-    所以仍需保留截断检测 + 二分自愈兜底。
+    ⚠️ 别把段长放到「整篇一次」：实测 1158 字会**静默截断**（返回 200，
+    但只产出 124s 音频，语速 9.3 字/秒 —— 应有 276s）。
+    静默截断比 504 更危险：它看起来成功了。
     """
     client = openai_mod.OpenAITTSClient(api_key="k", base_url="http://x", model="m")
-    assert client.chunk_chars == 400, "默认段长必须是实测安全值 400 字"
+    assert client.chunk_chars == 700, "默认段长必须是实测安全值 700 字"
+
+
+@pytest.mark.asyncio
+async def test_upstream_504_triggers_bisect(openai_mod):
+    """上游 60s 墙钟（504 backend_timeout）必须走**二分自愈**，不能直接失败。
+
+    实测（2026-10-22）：同一个 1158 字的稿子，43.89s 成功过、60.2s 就 504。
+    上游的速度随负载波动 1.4 倍，足以翻过它那条 60s 的线。
+
+    之前这个 504 走不到自愈（自愈只认客户端超时和截断），
+    于是**白重试 3 次**（每次都占满上游 60 秒）才失败 ——
+    而把段二分、更短，就不会撞墙钟。
+    """
+    client = openai_mod.OpenAITTSClient(
+        api_key="k", base_url="http://x", model="m", chunk_chars=200, min_chunk_chars=40
+    )
+    calls: list[str] = []
+
+    async def _wall_clock(text, voice=None, output_format="mp3"):
+        calls.append(text)
+        if len(calls) == 1:
+            raise openai_mod._UpstreamTimeout("上游语音合成超时 (60s)")
+        return b"OK" + text.encode()[:4]
+
+    client._synthesize_once = _wall_clock  # type: ignore[assignment]
+
+    out = await client._synthesize_chunk("这" * 200)
+
+    assert out.startswith(b"OK")
+    assert len(calls) > 1, "504 后应该二分重来，而不是直接失败"
+
+
+@pytest.mark.asyncio
+async def test_upstream_504_body_is_recognised(openai_mod):
+    """只有 504 + backend_timeout 才算「上游墙钟」；别的 504 不算。
+
+    判据要精确：网关的 504 也可能来自别的原因，
+    而我们只该对「上游语音合成超时」做二分自愈。
+    """
+
+    class _Resp:
+        status_code = 504
+        headers = {"content-type": "application/json"}
+
+        def __init__(self, body):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    client = openai_mod.OpenAITTSClient(api_key="k", base_url="http://x", model="m")
+
+    def _with_body(body):
+        class _C:
+            async def post(self, url, json=None):
+                return _Resp(body)
+
+        client._client = _C()
+
+    _with_body({"error": {"code": "backend_timeout", "message": "上游语音合成超时 (60s)"}})
+    with pytest.raises(openai_mod._UpstreamTimeout):
+        await client._synthesize_once("你好。")
+
+    _with_body({"error": {"code": "other", "message": "别的 504"}})
+    with pytest.raises(RuntimeError) as exc:
+        await client._synthesize_once("你好。")
+    assert not isinstance(exc.value, openai_mod._UpstreamTimeout)
 
 
 def test_truncation_threshold_is_tight_enough(openai_mod):

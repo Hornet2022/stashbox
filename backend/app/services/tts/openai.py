@@ -106,6 +106,24 @@ class _TruncatedOutput(RuntimeError):
     """端点返回了 HTTP 200 但内容被静默截断（只念了开头）。"""
 
 
+class _UpstreamTimeout(RuntimeError):
+    """上游自己的 60s 墙钟把请求砍了（HTTP 504 `backend_timeout`）。
+
+    ## 为什么它也要走二分自愈
+
+    它**不是**我们的超时（我们的 timeout 是 300s，远没那么容易到），
+    但后果一样：这次合成拿不到内容。
+
+    实测（2026-10-22）：同一个 1158 字的稿子，
+    43.89s 成功、60.2s 就 504 —— 上游的生成速度随负载波动 1.4 倍，
+    足以翻过它那条 60s 的线。
+
+    之前这个 504 走不到二分自愈（自愈只认客户端超时和截断），
+    于是**白重试 3 次**（每次都占满上游 60 秒）才失败 ——
+    而把段二分、更短，就不会撞墙钟。
+    """
+
+
 # ── 熔断 ────────────────────────────────────────────────────────────────────
 #
 # 上游 TTS 有 **60s 墙钟**且是**共享**资源：一次大请求会占住它 60 秒，
@@ -225,25 +243,31 @@ class OpenAITTSClient(TTSClient):
         self.gap_sec = float(os.getenv("OPENAI_TTS_GAP_SEC", "0.3"))
         # 单次请求的最大字数。
         #
-        # 取 400 的依据（2026-10-22 实测，tertu.cn 的 Qwen3-TTS-12Hz-1.7B-Base）：
-        #     500 字 → wall=35.7s  音频=130.0s  语速=3.85  ✅
-        #     1000 字 → 504 上游语音合成超时 (60s)          ❌ 必然撞线
-        #     1500/2000/3000 字 → 全部 504                  ❌
+        # 取 700 的依据（2026-10-22 实测，tertu.cn 的 Qwen3-TTS-12Hz-1.7B-Base，
+        # 每档连发 3 次）：
+        #     400 字 → wall 24.6 / 25.0 / 25.2s  语速 4.5 字/秒  3/3 成功
+        #     700 字 → wall 42.5 / 43.3 / 44.3s  语速 4.5 字/秒  3/3 成功
+        # 墙钟是**线性**的：约 62ms/字 → 上游 60s 的墙钟 ≈ 965 字上限。
         #
-        # 上游是**共享**的 60s 墙钟：一次大请求会占住上游 60 秒，期间其他请求
-        # 全部排队 → 连锁 504。实测（2026-10-22）我自己的压测把上游压满后，
-        # **真实用户的剪藏全部失败**（连续 30 分钟 100% 504）。
-        # 所以单块要**短**（占用少），不是长。
+        # **为什么放大段长**：分段 = 多次独立渲染 = 多个「音色接缝」。
+        # 实测内测反馈的「一篇三种音色」，在音频轨迹上就定位在
+        # chunk2→chunk3 的接缝处（LTAS 跳变 0.39~0.45dB，其余窗只有 0.05~0.15dB）。
+        # 一篇 973 字的稿：400 字切 → **5 次渲染 / 4 个接缝**（其中一次是
+        # 截断自愈二分出来的），700 字切 → **2 次渲染 / 1 个接缝**。
         #
-        # 400 vs 500 对 ~1057 字的稿**段数相同**（都是 3 段），但单次占用
-        # 从 35.7s 降到 ~28s —— 零代价的安全性提升。
+        # **放大段长的安全网**：上游的 60s 墙钟是**负载相关**的
+        # （同一个 1158 字的稿子，43.89s 成功过、60.2s 也 504 过），
+        # 所以大段可能撞线 —— 撞了不失败，而是**二分自愈**（见 _UpstreamTimeout）：
+        # 更短 → 更不容易撞线。代价是一次 60s 的等待，换来的是不丢内容。
         #
-        # 为什么不整篇不切：1000+ 字整篇合成必然撞上上游的 60s 墙钟。
+        # ⚠️ 别把段长放到「整篇一次」：实测 1158 字会**静默截断**
+        # （返回 200，但只产出 124s 音频，语速 9.3 字/秒 —— 应有 276s）。
+        # 静默截断比 504 更危险：它看起来成功了。
         # 我们的 httpx timeout 给到 300s（上游 504 是它自己的限制，给大也没用）。
         self.chunk_chars = (
             chunk_chars
             if chunk_chars is not None
-            else int(os.getenv("OPENAI_TTS_CHUNK_CHARS", "400"))
+            else int(os.getenv("OPENAI_TTS_CHUNK_CHARS", "700"))
         )
         # 分段并行度。**默认 1（串行）** —— 不是为了性能，是为了让每一段的
         # 计时器从「真正开始被上游处理」起算。
@@ -427,7 +451,7 @@ class OpenAITTSClient(TTSClient):
             audio = await self._synthesize_once(text, voice, output_format)
             self._assert_not_truncated(text, audio)
             return audio
-        except (TimeoutError, httpx.TimeoutException) as exc:
+        except (TimeoutError, httpx.TimeoutException, _UpstreamTimeout) as exc:
             if len(text) <= self.min_chunk_chars or depth >= _MAX_SPLIT_DEPTH:
                 raise RuntimeError(f"OpenAITTS 超时: {exc}") from exc
             parts = split_into_chunks(text, max(1, len(text) // 2))
@@ -539,6 +563,13 @@ class OpenAITTSClient(TTSClient):
                 err_body = resp.json()
             except Exception:
                 err_body = resp.text[:500]
+            # ⚠️ 上游的 60s 墙钟：504 + backend_timeout
+            #    「上游语音合成超时 (60s)」
+            #    它不是我们的超时，但后果一样（拿不到内容），
+            #    所以要单独一个异常类型，让上层走**二分自愈**（更短 → 更不容易撞墙钟）。
+            if resp.status_code == 504 and "backend_timeout" in str(err_body):
+                _circuit_record_failure()
+                raise _UpstreamTimeout(f"上游语音合成超时 (60s): {err_body}")
             # ⚠️ 只有「上游自己扛不住」才算熔断理由：
             #   5xx / 429 = 上游过载或限流 → 继续打只会更糟；
             #   4xx（音色名写错、参数非法）= **我们自己的请求有问题**，
