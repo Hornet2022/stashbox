@@ -211,3 +211,108 @@ async def test_deleted_account_cannot_login():
 
     resp = await _login(email, "admin_secret_123")
     assert resp.status_code == 401, f"注销过的账号还能登后台：{resp.text}"
+
+
+# ---------------------------------------------------------------------------
+# 暴力破解限流（2026-10-22 补）
+#
+# 这个端点原来**没有任何失败计数、没有锁定、没有验证码**，
+# 而公开的 wechat-login 反而有 Redis 限流 —— 口径不一致，
+# 而后台恰恰是更值得防的那个入口。
+#
+# 计数语义是「连续失败次数」：所有尝试都计数，但**登录成功就清零**。
+# 于是正常使用永远不会被锁（每次成功都归零），
+# 而暴力破解时失败数会一路堆上去直到被锁。
+# ---------------------------------------------------------------------------
+
+
+async def _clear_rate_limit(email: str, ip: str = "127.0.0.1") -> None:
+    from stashbox.backend.common import rate_limit
+
+    await rate_limit.reset(f"ratelimit:admin_login:email:{email.lower()}")
+    await rate_limit.reset(f"ratelimit:admin_login:ip:{ip}")
+
+
+@pytest.mark.asyncio
+async def test_连续失败超限后被锁():
+    """连续错 5 次 → 第 6 次直接 429，不再进密码校验。"""
+    email = "brute_" + uuid.uuid4().hex[:8] + "@stashbox.dev"
+    await _make_user(email, "right_pw", tier="admin")
+    await _clear_rate_limit(email)
+
+    try:
+        # 前 5 次：密码错 → 401（还在额度内）
+        for i in range(5):
+            resp = await _login(email, "wrong_pw")
+            assert resp.status_code == 401, f"第 {i + 1} 次应是 401：{resp.text}"
+
+        # 第 6 次：被限流挡住
+        resp = await _login(email, "wrong_pw")
+        assert resp.status_code == 429, f"连续失败超限后应被锁：{resp.text}"
+        assert "429" in resp.text or "频繁" in resp.text
+    finally:
+        await _clear_rate_limit(email)
+
+
+@pytest.mark.asyncio
+async def test_锁住期间正确密码也进不去():
+    """被锁之后即使密码正确也进不去 —— 限流要挡在密码校验**之前**。
+
+    如果限流放在密码校验之后，爆破者可以靠「多试几次总能蒙对」绕过计数。
+    """
+    email = "brute2_" + uuid.uuid4().hex[:8] + "@stashbox.dev"
+    await _make_user(email, "right_pw", tier="admin")
+    await _clear_rate_limit(email)
+
+    try:
+        for _ in range(5):
+            assert (await _login(email, "wrong_pw")).status_code == 401
+        resp = await _login(email, "right_pw")
+        assert resp.status_code == 429, "被锁期间正确密码也该被挡住"
+    finally:
+        await _clear_rate_limit(email)
+
+
+@pytest.mark.asyncio
+async def test_登录成功会清零连续失败计数():
+    """成功一次 → 计数归零 → 又有完整额度。
+
+    这条是「正常使用不会被锁」的关键：手滑输错几次的人不该被永久挡在门外。
+    """
+    email = "ok_" + uuid.uuid4().hex[:8] + "@stashbox.dev"
+    await _make_user(email, "right_pw", tier="admin")
+    await _clear_rate_limit(email)
+
+    try:
+        for _ in range(4):
+            assert (await _login(email, "wrong_pw")).status_code == 401
+        # 成功一次 → 清零
+        assert (await _login(email, "right_pw")).status_code == 200
+        # 清零后又有完整额度
+        for _ in range(5):
+            assert (await _login(email, "wrong_pw")).status_code == 401
+        # 第 6 次才被锁
+        assert (await _login(email, "wrong_pw")).status_code == 429
+    finally:
+        await _clear_rate_limit(email)
+
+
+@pytest.mark.asyncio
+async def test_账号维度互不影响():
+    """A 账号的失败次数不该影响 B 账号（账号维度按 email 分开计）。"""
+    email_a = "a_" + uuid.uuid4().hex[:8] + "@stashbox.dev"
+    email_b = "b_" + uuid.uuid4().hex[:8] + "@stashbox.dev"
+    await _make_user(email_a, "right_pw", tier="admin")
+    await _make_user(email_b, "right_pw", tier="admin")
+    await _clear_rate_limit(email_a)
+    await _clear_rate_limit(email_b)
+
+    try:
+        for _ in range(5):
+            assert (await _login(email_a, "wrong_pw")).status_code == 401
+        assert (await _login(email_a, "wrong_pw")).status_code == 429
+        # B 账号额度独立
+        assert (await _login(email_b, "right_pw")).status_code == 200
+    finally:
+        await _clear_rate_limit(email_a)
+        await _clear_rate_limit(email_b)

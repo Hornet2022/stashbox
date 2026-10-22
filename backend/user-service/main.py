@@ -339,6 +339,25 @@ async def health():
 _LOGIN_RATE_LIMIT = int(os.getenv("STASHBOX_LOGIN_RATE_LIMIT", "20"))
 _LOGIN_RATE_WINDOW = int(os.getenv("STASHBOX_LOGIN_RATE_WINDOW", "60"))
 
+# admin 登录限流（2026-10-22 补）。
+#
+# 与 wechat 登录的限流分开配：那边防的是「刷号」，这边防的是「爆破后台密码」，
+# 强度要求完全不同 —— 爆破的代价（拿到后台 = 拿到全平台数据）远高于刷号。
+#
+# 计数语义是「连续失败次数」：成功登录会把计数清零（见 admin_login），
+# 所以这里配的是**允许连续错几次**，不是「每分钟几次」。
+#
+#   · _ADMIN_LOGIN_FAIL_LIMIT：同一**账号**允许连续失败 5 次。
+#     攻击者换 IP 也没用 —— 被爆破的是固定账号。
+#     5 次是给人留的余量（手滑输错、记不清密码），再多就是脚本了。
+#   · _ADMIN_LOGIN_IP_LIMIT：同一 **IP** 允许连续失败 20 次。
+#     防的是换一个账号喷（将来加了更多 admin 账号时这条才有用），
+#     阈值比账号维度宽，因为它要覆盖「同一个人换账号试」的场景。
+#   · 窗口 10 分钟：锁 10 分钟足够让人冷静下来，也足够让攻击者很慢。
+_ADMIN_LOGIN_FAIL_LIMIT = int(os.getenv("STASHBOX_ADMIN_LOGIN_FAIL_LIMIT", "5"))
+_ADMIN_LOGIN_IP_LIMIT = int(os.getenv("STASHBOX_ADMIN_LOGIN_IP_LIMIT", "20"))
+_ADMIN_LOGIN_RATE_WINDOW = int(os.getenv("STASHBOX_ADMIN_LOGIN_RATE_WINDOW", "600"))
+
 
 def _client_ip(request: Request) -> str:
     """取真实客户端 IP（限流按它计数）。
@@ -1695,8 +1714,44 @@ _ALLOWED_ADMIN_ROLES = {"admin", "operator"}
 
 
 @app.post("/api/v1/admin/auth/login", response_model=AdminLoginResponse)
-async def admin_login(req: AdminLoginRequest, db: AsyncSession = Depends(get_db)):
+async def admin_login(
+    req: AdminLoginRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     """admin / operator 邮箱密码登录，返回 1h JWT + 写审计日志。"""
+    # 0) 暴力破解限流（2026-10-22 补）。
+    #
+    # 这个端点**没有任何失败计数、没有锁定、没有验证码**，
+    # 而公开的 wechat-login 反而有 Redis 限流（:426）——
+    # 口径不一致，而后台恰恰是**更值得防**的那个入口。
+    #
+    # 判据用两个维度，缺一不可：
+    #   · **账号**（email）：被爆破的是固定账号，攻击者换 IP 也没用；
+    #   · **IP**：防止换一个账号喷（将来加了更多 admin 账号时这条就有用了）。
+    #
+    # 计数语义是「**连续失败次数**」：所有尝试都计数，但**登录成功就清零**。
+    # 于是正常使用永远不会被锁（每次成功都把计数归零），
+    # 而暴力破解时失败数会一路堆上去直到被锁。
+    #
+    # 为什么要按 email 也限：只按 IP 的话，攻击者轮换 IP 就能无限试。
+    # email 这一维是「被爆破的那个账号」，与来源无关。
+    email_key = f"ratelimit:admin_login:email:{(req.email or '').lower()}"
+    ip_key = f"ratelimit:admin_login:ip:{_client_ip(request)}"
+    for key, limit in (
+        (email_key, _ADMIN_LOGIN_FAIL_LIMIT),
+        (ip_key, _ADMIN_LOGIN_IP_LIMIT),
+    ):
+        allowed, _remaining = await rate_limit.check(
+            key, limit=limit, window_sec=_ADMIN_LOGIN_RATE_WINDOW
+        )
+        if not allowed:
+            raise BizException(
+                code=42901,
+                message="登录尝试过于频繁，请稍后再试",
+                http_status=429,
+            )
+
     # 1) 字段校验（commit 前，缺字段直接 400，不落库）
     if not req.email or not req.password:
         raise BizException(message="email 和 password 必填", code=40000)
@@ -1710,6 +1765,13 @@ async def admin_login(req: AdminLoginRequest, db: AsyncSession = Depends(get_db)
     # 3) 密码校验（bcrypt），错误 → 401
     if not user.password_hash or not _verify_password(req.password, user.password_hash):
         raise HTTPException(status_code=401, detail="invalid email or password")
+
+    # 3.4) 登录成功 → 把「连续失败」计数清零。
+    #
+    # 放在密码校验之后：只有真的登进去了才算「这个人会用这个账号」，
+    # 正常使用者不该因为之前手滑输错几次就被锁。
+    await rate_limit.reset(email_key)
+    await rate_limit.reset(ip_key)
 
     # 3.5) 已注销（软删）的账号不能登后台。
     #
