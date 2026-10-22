@@ -2100,11 +2100,80 @@ async def clawbot_message(
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """ClawBot 入口（mock）：接收消息，解析出 URL 则建文章。"""
-    art = None
-    if "http" in req.text:
-        art = await _create_article(req.text, _uid(user), "clawbot", None, db)
-    return {"received": True, "article": _to_response(art) if art else None}
+    """ClawBot 入口：接收消息，解析出 URL 则建文章（口径与 submit_article 一致）。
+
+    ## 2026-10-22 修：三个洞一起
+
+    原来的实现只有三行：
+
+        art = None
+        if "http" in req.text:
+            art = await _create_article(req.text, _uid(user), "clawbot", None, db)
+        return {"received": True, "article": _to_response(art) if art else None}
+
+    1. **不扣配额**：登录用户可以无限建文章。articles 表对 (user_id, url)
+       没有唯一约束，换个 URL 就能一直建 → 用户配额纹丝不动，列表里堆满
+       永远 pending 的条目（因为也不派蒸馏）。
+    2. **不派蒸馏**：建出来的文章永远是 pending，用户点了播放没反应。
+    3. **把整段 text 当 URL 用**：`"http" in req.text` 只判断有没有 http，
+       真的传「看看这个 https://xxx」进去，url 存的是**整句话** →
+       抓取必然失败。
+    → 现在与 `submit_article` 同款：抽 URL → 校验 → **先抓后扣** →
+      扣配额 → 建文章 → 打「已扣费」标记 → 派蒸馏。
+      配额是这条路径唯一的天然上限，洞就被堵上了。
+
+    ## 为什么是「先抓后扣」
+
+    抓不到正文就没有可蒸馏的东西 —— 那就不该扣钱。`submit_article` 与
+    `d9_add_article` 都是这个口径，这里必须一样，否则同一个动作有三种计费。
+    """
+    uid = _uid(user)
+
+    url = _extract_url(req.text)
+    if url is None:
+        # 没有 URL：这不是错误（可能就是一句闲聊），照收。
+        return {"received": True, "article": None}
+    if not _is_valid_url(url):
+        raise InvalidRequest(message="url invalid", code=2001)
+
+    # 先抓后扣：抓不到就不建文章也不计费（与 submit_article 同款）。
+    fr = await _prefetch_for_capture(url)
+
+    # 扣配额（与 submit_article / d9_add_article 同口径；用尽抛 3001）。
+    quota = await quota_service.consume(db, uid)
+
+    art = await _create_article(
+        url,
+        uid,
+        "clawbot",
+        fr.title or None,
+        db,
+        raw_content=_to_raw_content(fr),
+        fetch_on_create=False,  # 上面已经抓过了，别再抓一次
+    )
+    await cache_service.mark_article_quota(art.id)  # 打标：该文章已扣过配额
+
+    # 派蒸馏（失败仅 log 不破请求：文章留在 pending，等用户手动重试）。
+    trigger_result = None
+    try:
+        trigger_result = await get_ai_client().trigger_distill(
+            article_id=art.id,
+            auth_token=create_access_token(str(art.user_id)),
+        )
+    except Exception as exc:
+        log.warning(
+            "auto_distill_trigger_failed (clawbot)",
+            extra={"article_id": art.id, "error": str(exc)},
+        )
+
+    return {
+        "received": True,
+        "article": _to_response(art),
+        "task_id": (trigger_result or {}).get("task_id"),
+        "quota_used": quota["quota_used"],
+        "monthly_quota": quota["monthly_quota"],
+        "remaining": quota["monthly_quota"] - quota["quota_used"],
+    }
 
 
 @app.post("/api/v1/callback/wechat-mp-message")
