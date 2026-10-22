@@ -408,6 +408,19 @@ def _resolve_target(path: str) -> str | None:
         return settings.content_service_url
     if segment == "distill":
         return settings.ai_service_url
+    # 2026-10-22：`users`（复数）原来不在白名单里 →
+    # `/api/v1/users/me/quota/reset-monthly` 这种路径在网关直接 404
+    # 「接口不存在」，而实现其实就在 user-service（实测：网关 404，
+    # 直连 user-service 才 401）。这是**同一类事故的第四例** ——
+    # config.py 里注释记着前三次（notifications/mark-read、
+    # admin/export/tags.csv、admin/llm/*）。
+    #
+    # 与其再等第五次，不如把兜底的白名单补齐：显式路由表**先**匹配，
+    # 命中不了的才走这里，所以把 `users` 划给 user-service 不会抢路由。
+    # 兜底猜对 = 端点能通；猜不到 = 404。宁可通到下游让它自己答 404/401，
+    # 也不要网关替下游撒谎说"接口不存在"。
+    if segment == "users":
+        return settings.user_service_url
     return None
 
 
@@ -443,6 +456,14 @@ async def proxy_fallback(request: Request, path: str):
     headers = {
         k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")
     }
+    # 同 proxy()：补 X-Request-ID，让下游日志与网关日志串得上号。
+    #
+    # 2026-10-22：兜底路径原来只补 XFF、不补请求 ID → 走兜底的端点
+    # （当时是剪藏与重试这两个最核心的写端点）在下游日志里是「孤儿」，
+    # 排查「剪藏失败要回溯扣费与蒸馏派发」时两边串不起来。
+    # 显式路由早就补了 ID，兜底却不补 —— 同一个网关两套链路串联口径。
+    if "x-request-id" not in {k.lower() for k in headers}:
+        headers["X-Request-ID"] = request.state.request_id
     # 同 proxy()：补 X-Forwarded-For，让下游拿得到真实客户端 IP（限流/审计要用）。
     # 同上：覆盖而非透传（原因见 proxy() 里的说明）
     _set_forwarded_for(headers, request)

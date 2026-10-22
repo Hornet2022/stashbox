@@ -54,6 +54,19 @@ ROUTES: list[Route] = [
     # 这里两条都加,保证兼容。
     Route("GET", "/api/v1/user/quota", "user-service", _url("user-service")),
     Route("GET", "/api/v1/users/me/quota", "user-service", _url("user-service")),
+    # 2026-10-22：运营手动重置月配额。实现一直都在 user-service
+    # （main.py 的 reset-monthly），也进了 OpenAPI 契约，但**没进路由表** →
+    # 走 proxy_fallback 时首段 "users"（复数）不在白名单里 → 网关直接
+    # 404「接口不存在」。实测确认：网关 404，直连 user-service 才是 401。
+    #
+    # 这条路径用 require_admin（严格 admin），是**全库操作**，
+    # 名字带 me 容易被人当成用户自助接口 —— 路由时看清语义。
+    Route(
+        "POST",
+        "/api/v1/users/me/quota/reset-monthly",
+        "user-service",
+        _url("user-service"),
+    ),
     # CP5.1 onboarding (CP7.4 路由补漏,承宇 2026-09-20 真机发现)
     Route("POST", "/api/v1/users/me/onboarding/start", "user-service", _url("user-service")),
     Route("POST", "/api/v1/users/me/onboarding/step", "user-service", _url("user-service")),
@@ -76,6 +89,18 @@ ROUTES: list[Route] = [
     Route("GET", "/api/v1/articles/pending", "content-service", _url("content-service")),
     Route("GET", "/api/v1/articles/listened", "content-service", _url("content-service")),
     Route("GET", "/api/v1/articles/{article_id}", "content-service", _url("content-service")),
+    # 2026-10-22：剪藏与重试这两个**最核心的写端点**原来不在路由表里，
+    # 靠 proxy_fallback 按首段前缀猜下游（articles → content-service）。
+    # 猜对了，但兜底路径不注入 X-Request-ID → 网关日志和下游日志串不上号，
+    # 而「剪藏失败要回溯扣费与蒸馏派发」恰恰最需要串号排查。
+    # 显式注册 = 走 proxy() 那条完整路径（含请求 ID）。
+    Route("POST", "/api/v1/articles", "content-service", _url("content-service")),
+    Route(
+        "POST",
+        "/api/v1/articles/{article_id}/retry",
+        "content-service",
+        _url("content-service"),
+    ),
     Route(
         "POST",
         "/api/v1/articles/{article_id}/mark-listened",
