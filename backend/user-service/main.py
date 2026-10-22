@@ -386,6 +386,21 @@ async def wechat_login(
     open_id = "wx_" + (req.code or "unknown")[:56]
     result = await db.execute(select(User).where(User.open_id == open_id))
     user = result.scalar_one_or_none()
+    if user is not None and user.deleted_at is not None:
+        # 软删的账号（注销过的）必须**明确拒绝**，不能当成"查不到 → 建新号"。
+        #
+        # 两个后果，都不是小事：
+        #   1. 注销端点承诺「注销后立即停止提供服务」—— 原来软删的 user
+        #      照样能登录拿到新 token，注销形同虚设。
+        #   2. 注销会把 open_id 匿名化成 `del_<uid>_<random>`，于是旧 code
+        #      再登录就查不到了 → 走"建新号"分支 → **users 表多一行**。
+        #      内测期清一批测试账号，清理完一登录又长回来 —— 后台用户
+        #      列表被这个来回折腾撑大。
+        raise BizException(
+            code=40102,
+            message="该账号已注销，如需继续使用请重新注册",
+            http_status=401,
+        )
     if user is None:
         # quota_reset_at 一定要在建号时就写上，别留给 NULL：
         # 定时器的到期判定含 `quota_reset_at IS NULL`，NULL 行会让「任意匿名注册」

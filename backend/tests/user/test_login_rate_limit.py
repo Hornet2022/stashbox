@@ -14,6 +14,9 @@ wechat-login 是**未鉴权**端点，而当前实现是「code 派生 open_id�
   D. 计数落在 Redis 里（多进程部署下多个 user-service 实例共享同一份额度）
 
 前置：本机 PG 5432 + Redis 6379 已起，且已 `alembic upgrade head`。
+
+另含一条**软删账号不可登录**的回归（2026-10-22）：注销过的账号用旧 code
+再登录，既不该拿到 token，也**不该凭空长出一行 users**。
 """
 
 import importlib.util
@@ -150,3 +153,53 @@ async def test_rate_limit_counter_lives_in_redis(user_main, client):
 
     assert raw is not None, "Redis 里没有计数 key —— 限流状态存在进程内存里，多副本会被放大"
     assert int(raw) >= 4
+
+
+# ---------------------------------------------------------------------------
+# E. 软删（注销过）的账号不可登录，且不会凭空建新号
+# ---------------------------------------------------------------------------
+async def test_soft_deleted_user_cannot_login_and_no_new_row(client):
+    """注销后的账号用旧 code 登录 → 明确拒绝，**且 users 表不多出一行**。
+
+    为什么这条重要（2026-10-22）：
+
+    1. 注销端点承诺「注销后立即停止提供服务」，但登录只按 open_id 查、
+       没过滤 deleted_at → 软删的账号照样能登录拿新 token，注销形同虚设。
+    2. 注销会把 open_id 匿名化成 ``del_<uid>_<random>``，于是旧 code 再登录
+       就**查不到**了 → 走「建新号」分支 → users 表 +1 行。内测期清一批
+       测试账号，清理完一登录又长回来 —— 后台用户列表被这个来回撑大。
+    """
+    import asyncpg
+
+    from stashbox.backend.common.config import settings
+
+    code = "del_" + uuid.uuid4().hex[:12]
+    r = await client.post(LOGIN_URL, json={"code": code}, headers={"X-Forwarded-For": _ip()})
+    assert r.status_code == 200, r.text
+    user_id = r.json()["user_id"]
+
+    conn = await asyncpg.connect(
+        host=settings.postgres_host,
+        port=settings.postgres_port,
+        user=settings.postgres_user,
+        password=settings.postgres_password,
+        database=settings.postgres_db,
+    )
+    try:
+        await conn.execute("update users set deleted_at=now() where id=$1", int(user_id))
+        before = await conn.fetchval("select count(*) from users")
+
+        # 同一个 code 再登录 → 必须被拒
+        r2 = await client.post(LOGIN_URL, json={"code": code}, headers={"X-Forwarded-For": _ip()})
+        assert r2.status_code == 401, r2.text
+        body = r2.json()
+        assert body["code"] == 40102, body
+        assert body["message"]
+
+        after = await conn.fetchval("select count(*) from users")
+        assert after == before, (
+            f"软删账号再登录后 users 表多了一行（{before} → {after}）—— "
+            "清理完一登录又长回来，用户列表就是这么被撑大的"
+        )
+    finally:
+        await conn.close()
