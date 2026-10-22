@@ -1,0 +1,498 @@
+{
+ "说明": "客户端实际调用的端点清单（自动抽取）。冒烟脚本读它；也可用于 CI 检查契约漂移。",
+ "生成方式": "Retrofit 注解 @METHOD(\"path\") + admin-web 的 apiClient.METHOD('path')；路径参数统一归一为 {p}",
+ "android": [
+  {
+   "method": "DELETE",
+   "path": "/api/v1/articles/{p}",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ArticleApi.kt"
+  },
+  {
+   "method": "DELETE",
+   "path": "/api/v1/articles/{p}/snooze",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/FavoritesApi.kt"
+  },
+  {
+   "method": "DELETE",
+   "path": "/api/v1/favorites/{p}",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/FavoritesApi.kt"
+  },
+  {
+   "method": "DELETE",
+   "path": "/api/v1/users/me/devices/{p}",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/DeviceApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/app/version",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/AppUpdateApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/articles",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ArticleApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/articles/{p}",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ArticleApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/articles/{p}/audio-url",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ArticleApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/articles/{p}/progress",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ProgressApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/articles/{p}/status",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ArticleApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/auth/me",
+   "src": "app/src/main/kotlin/com/tingxia/audio/auth/AuthApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/distill/{p}",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ArticleApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/distill/{p}/evaluation",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/DistillationApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/distill/{p}/variants",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/DistillationApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/favorites",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/FavoritesApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/favorites/folders",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/FavoritesApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/feedback-v2",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/FeedbackApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/later-listens",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/FavoritesApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/notifications",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/NotificationApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/policies/privacy",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ConsentApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/tags",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/TagApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/tts/voices",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/TtsApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/users/me/consent",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ConsentApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/users/me/devices",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/DeviceApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/users/me/quota",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/QuotaApi.kt"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/users/me/tts-preference",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/TtsApi.kt"
+  },
+  {
+   "method": "PATCH",
+   "path": "/api/v1/favorites/{p}",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/FavoritesApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/articles",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ArticleApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/articles/{p}/distill",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ArticleApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/articles/{p}/favorites",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/FavoritesApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/articles/{p}/listen-complete",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ArticleApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/articles/{p}/progress",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ProgressApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/articles/{p}/rate",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ArticleApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/articles/{p}/retry",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ArticleApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/articles/{p}/skip",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ArticleApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/articles/{p}/snooze",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/FavoritesApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/auth/logout",
+   "src": "app/src/main/kotlin/com/tingxia/audio/auth/AuthApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/auth/refresh-token",
+   "src": "app/src/main/kotlin/com/tingxia/audio/auth/AuthApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/auth/token",
+   "src": "app/src/main/kotlin/com/tingxia/audio/auth/AuthApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/auth/wechat-login",
+   "src": "app/src/main/kotlin/com/tingxia/audio/auth/AuthApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/distill/start",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/DistillationApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/distill/{p}/evaluation",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/DistillationApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/distill/{p}/variants/{p}/warm",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/DistillationApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/feedback-v2",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/FeedbackApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/notifications/{p}/mark-read",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/NotificationApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/tags/{p}/subscribe",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/TagApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/tags/{p}/unsubscribe",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/TagApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/users/me/account/delete",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/AccountApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/users/me/devices",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/DeviceApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/users/me/onboarding/done",
+   "src": "app/src/main/kotlin/com/tingxia/audio/onboarding/OnboardingApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/users/me/onboarding/start",
+   "src": "app/src/main/kotlin/com/tingxia/audio/onboarding/OnboardingApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/users/me/onboarding/step",
+   "src": "app/src/main/kotlin/com/tingxia/audio/onboarding/OnboardingApi.kt"
+  },
+  {
+   "method": "PUT",
+   "path": "/api/v1/users/me/consent",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ConsentApi.kt"
+  },
+  {
+   "method": "PUT",
+   "path": "/api/v1/users/me/tts-preference",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/TtsApi.kt"
+  }
+ ],
+ "admin_web": [
+  {
+   "method": "DELETE",
+   "path": "/api/v1/admin/articles/{p}",
+   "src": "src/api/admin/articles.ts"
+  },
+  {
+   "method": "DELETE",
+   "path": "/api/v1/admin/tags/{p}",
+   "src": "src/api/admin/tags.ts"
+  },
+  {
+   "method": "DELETE",
+   "path": "/api/v1/admin/tts/voices/{p}",
+   "src": "src/api/admin/voice-library.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/ab-report",
+   "src": "src/api/admin/ab-report.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/articles",
+   "src": "src/api/admin/articles.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/audio-variants/stats",
+   "src": "src/api/admin/audio-variants.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/audit-log",
+   "src": "src/api/admin/audit-log.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/consents",
+   "src": "src/api/admin/consents.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/distill-p95",
+   "src": "src/api/admin/dashboard.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/evaluations",
+   "src": "src/api/admin/evaluations.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/evaluations/agreement",
+   "src": "src/api/admin/evaluations.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/few-shot-pool",
+   "src": "src/api/admin/few-shot-pool.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/few-shot-pool/audit-sample",
+   "src": "src/api/admin/few-shot-pool.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/few-shot-pool/health",
+   "src": "src/api/admin/few-shot-pool.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/llm/config",
+   "src": "src/api/admin/llm.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/push-notifications",
+   "src": "src/api/admin/push.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/stats",
+   "src": "src/api/admin/dashboard.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/tags",
+   "src": "src/api/admin/tags.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/tier-config",
+   "src": "src/api/admin/tier-config.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/tts/blind-test/{p}/results",
+   "src": "src/api/admin/tts-blind-test.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/tts/config",
+   "src": "src/api/admin/tts.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/tts/voices",
+   "src": "src/api/admin/voice-library.ts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/admin/users",
+   "src": "src/api/admin/users.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/articles",
+   "src": "src/api/admin/articles.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/articles/{p}/force-retry",
+   "src": "src/api/admin/articles.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/audio/{p}/invalidate",
+   "src": "src/api/admin/articles.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/evaluations/{p}/annotate",
+   "src": "src/api/admin/evaluations.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/few-shot-pool/audit-result",
+   "src": "src/api/admin/few-shot-pool.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/few-shot-pool/cleanup",
+   "src": "src/api/admin/few-shot-pool.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/llm/test",
+   "src": "src/api/admin/llm.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/push-notifications/{p}/retry",
+   "src": "src/api/admin/push.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/tts/blind-test",
+   "src": "src/api/admin/tts-blind-test.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/tts/blind-test/{p}/submit",
+   "src": "src/api/admin/tts-blind-test.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/tts/test",
+   "src": "src/api/admin/tts.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/tts/voices",
+   "src": "src/api/admin/voice-library.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/tts/voices/import-from-config",
+   "src": "src/api/admin/voice-library.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/tts/voices/probe",
+   "src": "src/api/admin/tts.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/tts/voices/{p}/preview",
+   "src": "src/api/admin/voice-library.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/users/{p}/quota-adjust",
+   "src": "src/api/admin/users.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/tags",
+   "src": "src/api/admin/tags.ts"
+  },
+  {
+   "method": "PUT",
+   "path": "/api/v1/admin/llm/config",
+   "src": "src/api/admin/llm.ts"
+  },
+  {
+   "method": "PUT",
+   "path": "/api/v1/admin/tier-config",
+   "src": "src/api/admin/tier-config.ts"
+  },
+  {
+   "method": "PUT",
+   "path": "/api/v1/admin/tts/config",
+   "src": "src/api/admin/tts.ts"
+  },
+  {
+   "method": "PUT",
+   "path": "/api/v1/admin/tts/voices/{p}",
+   "src": "src/api/admin/voice-library.ts"
+  }
+ ]
+}

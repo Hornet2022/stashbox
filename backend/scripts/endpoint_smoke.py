@@ -27,69 +27,66 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-# ── 路径参数的真实值（从生产库取，见 fetch_params）────────────────
-# 客户端调用点（来自 Retrofit 注解 + admin-web 的 apiClient 调用）
-ANDROID_GET = [
-    "/api/v1/users/me/tts-preference",
-    "/api/v1/users/me/consent",
-    "/api/v1/policies/privacy",
-    "/api/v1/app/version",
-    "/api/v1/articles",
-    "/api/v1/articles/{article_id}",
-    "/api/v1/articles/{article_id}/audio-url",
-    "/api/v1/subscription/plans",
-    "/api/v1/quota",
-    "/api/v1/favorites/folders",
-    "/api/v1/tags",
-    "/api/v1/tags/{tag_id_or_slug}",
-    "/api/v1/notifications",
-    "/api/v1/distill/{task_id}",
-    "/api/v1/distill/{task_id}/variants",
-    "/api/v1/users/me/onboarding",
-    "/api/v1/users/me/devices",
-    "/api/v1/subscription/list",
-    "/api/v1/later-listens",
-    "/api/v1/articles/{article_id}/related",
-]
+# ── 端点清单：从 client_endpoints.json 读（自动抽取，不是手写）────────
+#
+# 手写清单会骗人：2026-10-22 第一版里我凭印象写了
+# `GET /api/v1/users/me/onboarding`，而安卓端真实定义的是
+# `POST /api/v1/users/me/onboarding/start|step|done` —— 手写的那条
+# 报 404，看起来像断链，其实**客户端根本没调过它**。
+# 清单必须来自代码。
 
-# 幂等 / 纯上报类（有副作用但可重复、且不改用户可见状态）
-ANDROID_WRITE_SAFE = [
-    ("POST", "/api/v1/articles/{article_id}/progress"),
-    ("POST", "/api/v1/articles/{article_id}/skip"),
-    ("POST", "/api/v1/articles/{article_id}/listen-complete"),
-    ("POST", "/api/v1/tags/{tag_id_or_slug}/subscribe"),
-    ("POST", "/api/v1/tags/{tag_id_or_slug}/unsubscribe"),
-]
+SNAPSHOT = Path(__file__).resolve().parent / "client_endpoints.json"
 
-ADMIN_GET = [
-    "/api/v1/admin/stats",
-    "/api/v1/admin/distill-p95",
-    "/api/v1/admin/articles",
-    "/api/v1/admin/audio-variants/stats",
-    "/api/v1/admin/audit-log",
-    "/api/v1/admin/consents",
-    "/api/v1/admin/evaluations",
-    "/api/v1/admin/evaluations/agreement",
-    "/api/v1/admin/few-shot-pool/health",
-    "/api/v1/admin/few-shot-pool",
-    "/api/v1/admin/few-shot-pool/audit-sample",
-    "/api/v1/admin/llm/config",
-    "/api/v1/admin/tts/config",
-    "/api/v1/admin/tts/voices",
-    "/api/v1/admin/users",
-    "/api/v1/admin/ab-report",
-    "/api/v1/admin/push/health",
-    "/api/v1/admin/push-notifications",
-]
+
+def load_endpoints() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """返回 (安卓端端点, admin-web 端点)。"""
+    data = json.loads(SNAPSHOT.read_text())
+    and_ep = [(e["method"], e["path"]) for e in data["android"]]
+    adm_ep = [(e["method"], e["path"]) for e in data["admin_web"]]
+    return and_ep, adm_ep
+
+
+# 有副作用、但幂等或纯上报 → 可以安全真调
+SAFE_WRITE = {
+    ("POST", "/api/v1/articles/{p}/progress"),
+    ("POST", "/api/v1/articles/{p}/skip"),
+    ("POST", "/api/v1/articles/{p}/listen-complete"),
+    ("POST", "/api/v1/tags/{p}/subscribe"),
+    ("POST", "/api/v1/tags/{p}/unsubscribe"),
+    ("PUT", "/api/v1/users/me/consent"),
+    ("PUT", "/api/v1/users/me/tts-preference"),
+    ("POST", "/api/v1/users/me/onboarding/step"),
+}
 
 
 def sh(cmd: list[str]) -> str:
-    r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    r = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
     return r.stdout.strip()
+
+
+def env_val(key: str) -> str:
+    """从服务器 env 文件取值（脚本在服务器上跑时直接读得到）。"""
+    fp = Path("/etc/stashbox/stashbox.env")
+    if fp.exists():
+        for line in fp.read_text(errors="ignore").splitlines():
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1].strip()
+    return ""
+
+
+def dsn() -> str:
+    """PG 连接串（用 URL 连，避免 sudo 在 subprocess 里没有 tty 而失败）。"""
+    return (
+        f"postgresql://{env_val('POSTGRES_USER') or 'stashbox'}:"
+        f"{env_val('POSTGRES_PASSWORD')}@127.0.0.1:{env_val('POSTGRES_PORT') or '5432'}/"
+        f"{env_val('POSTGRES_DB') or 'stashbox'}"
+    )
 
 
 def fetch_params(base: str) -> dict[str, str]:
@@ -99,19 +96,24 @@ def fetch_params(base: str) -> dict[str, str]:
         "article_id": "select id from articles where deleted_at is null and status='ready' limit 1",
         "task_id": "select id from distilled_articles limit 1",
         "tag_id_or_slug": "select slug from tags limit 1",
+        "favorite_id": "select id from favorites limit 1",
+        "notification_id": "select id from notifications limit 1",
+        "device_id": "select id from device_tokens limit 1",
     }
     for k, q in sql.items():
-        v = sh(
-            [
-                "ssh",
-                "-i",
-                str(Path.home() / ".ssh/stashbox_deploy"),
-                "-o",
-                "StrictHostKeyChecking=no",
-                "root@8.148.9.151",
-                f'sudo -u stashbox psql stashbox -t -A -c "{q}" 2>/dev/null',
-            ]
-        )
+        v = sh(["psql", dsn(), "-t", "-A", "-c", q])
+        if not v:
+            v = sh(
+                [
+                    "ssh",
+                    "-i",
+                    str(Path.home() / ".ssh/stashbox_deploy"),
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "root@8.148.9.151",
+                    f'sudo -u stashbox psql stashbox -t -A -c "{q}" 2>/dev/null',
+                ]
+            )
         out[k] = v.splitlines()[0].strip() if v else ""
     return out
 
@@ -150,7 +152,11 @@ def login(base: str, code: str) -> tuple[str, str]:
         ]
     )
     try:
-        admin_tok = json.loads(r2).get("data", {}).get("access_token", "")
+        d = json.loads(r2)
+        # ⚠️ admin 登录返回的是**顶层** access_token（没有 data 包装）。
+        # 取错位置 → token 为空 → 所有 admin 请求都是「无鉴权」→
+        # 网关把它兜底成 502「暂时连不上后端服务」→ 会被误判成「服务挂了」。
+        admin_tok = d.get("access_token") or (d.get("data") or {}).get("access_token", "")
     except (json.JSONDecodeError, AttributeError):
         admin_tok = ""
     return user_tok, admin_tok
@@ -187,6 +193,33 @@ def call(base: str, method: str, path: str, token: str) -> tuple[int, int, str]:
     return int(status or 0), code, body
 
 
+def fill_path(path: str, params: dict[str, str]) -> str:
+    """把路径里的 {p} 按**位置语义**换成真实 id。
+
+    同一个 {p} 在不同路径里代表不同的东西：
+    /api/v1/articles/{p}/…  → article_id
+    /api/v1/distill/{p}/…   → task_id（第二个是 bitrate）
+    /api/v1/tags/{p}         → tag slug
+    """
+    rules = [
+        ("/api/v1/articles/", "article_id"),
+        ("/api/v1/distill/", "task_id"),
+        ("/api/v1/tags/", "tag_id_or_slug"),
+        ("/api/v1/favorites/", "favorite_id"),
+        ("/api/v1/notifications/", "notification_id"),
+        ("/api/v1/users/me/devices/", "device_id"),
+    ]
+    out = path
+    for prefix, key in rules:
+        if not out.startswith(prefix):
+            continue
+        out = out.replace("{p}", params.get(key) or "MISSING", 1)
+        break
+    # 剩下的 {p}（如 variants/{bitrate}/warm）→ 用一个常见码率
+    out = out.replace("{p}", "96k")
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="https://api.stashbox.cn")
@@ -206,32 +239,37 @@ def main() -> int:
 
     results: list[tuple[str, str, int, int, str]] = []
 
-    def fill(p: str) -> str:
-        for k, v in params.items():
-            p = p.replace("{" + k + "}", v or "MISSING")
-        return p
+    and_ep, adm_ep = load_endpoints()
 
     if not args.admin:
-        print("\n=== 用户端 GET ===")
-        for p in ANDROID_GET:
-            path = fill(p)
-            st, code, body = call(args.base, "GET", path, user_tok)
-            results.append(("GET", path, st, code, body))
-            print(f"  {st:3d} code={code:<6} {path}")
-
-        print("\n=== 用户端 幂等 POST/PUT ===")
-        for m, p in ANDROID_WRITE_SAFE:
-            path = fill(p)
+        print("\n=== 安卓端 GET（全部）===")
+        for m, p in and_ep:
+            if m != "GET":
+                continue
+            path = fill_path(p, params)
             st, code, body = call(args.base, m, path, user_tok)
             results.append((m, path, st, code, body))
-            print(f"  {st:3d} code={code:<6} {m} {path}")
+            print(f"  {st:3d} code={code:<6} {m:6s} {path}")
 
-    print("\n=== 后台 GET（需要 admin token）===")
-    for p in ADMIN_GET:
-        path = fill(p)
-        st, code, body = call(args.base, "GET", path, admin_tok)
-        results.append(("GET", path, st, code, body))
-        print(f"  {st:3d} code={code:<6} {path}")
+        print("\n=== 安卓端 幂等 POST/PUT ===")
+        for m, p in and_ep:
+            if (m, p) not in SAFE_WRITE:
+                continue
+            path = fill_path(p, params)
+            st, code, body = call(args.base, m, path, user_tok)
+            results.append((m, path, st, code, body))
+            print(f"  {st:3d} code={code:<6} {m:6s} {path}")
+
+    print("\n=== admin-web GET（需要 admin token）===")
+    if not admin_tok:
+        print("  ⚠️ 没拿到 admin token → 跳过（拿不到就是测不准，不是端点坏了）")
+    for m, p in adm_ep:
+        if m != "GET":
+            continue
+        path = fill_path(p, params)
+        st, code, body = call(args.base, m, path, admin_tok)
+        results.append((m, path, st, code, body))
+        print(f"  {st:3d} code={code:<6} {m:6s} {path}")
 
     print("\n=== 汇总 ===")
     ok = [r for r in results if 200 <= r[2] < 300 and r[3] in (0, 200)]
