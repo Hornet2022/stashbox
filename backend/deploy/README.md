@@ -540,16 +540,28 @@ sudo ln -sf /etc/nginx/sites-available/stashbox /etc/nginx/sites-enabled/stashbo
 sudo nginx -t && sudo systemctl reload nginx
 
 # ⑨-b 管理后台（静态 SPA，内测必需：推推送 / 看用户 / 管配额）
-#    构建（**在开发机上做**，API 地址编译期写死进 bundle）：
+#    构建（**在开发机上做**）：
 cd stashbox-admin-web
-VITE_API_BASE_URL=https://api.stashbox.cn pnpm build
+pnpm build
 #    传到服务器：
 ssh root@8.148.9.151 'mkdir -p /var/www/stashbox-admin'
 rsync -a dist/ root@8.148.9.151:/var/www/stashbox-admin/
-#    ⚠️ 不传 VITE_API_BASE_URL 的话，bundle 里会写死 http://localhost:8100
-#       （src/api/client.ts:27 的默认值）—— 浏览器里必然连不上。
-#    ⚠️ 备案期间想用 IP 直连，就传 VITE_API_BASE_URL=https://8.148.9.151/
-#       （后台的 API 请求是相对路径 /api/v1/admin，同源即可，不用管）
+#
+#    ⚠️ **不要传 VITE_API_BASE_URL**（2026-10-22 纠正）：
+#       bundle 里的 API 地址**编译期就写死**，传了什么就永远是什么。
+#       · 现在**不传** = 同源相对路径（/api/v1/admin/…）→ 域名入口和
+#         IP 入口（备案期间的临时路径）都能用 —— 两种入口 nginx 都配了 /api/。
+#       · 传 https://api.stashbox.cn = 写死域名 → **备案期间用 IP 访问会废了**
+#         （请求打到域名 → 阿里云监测系统按未备案域名阻断 → 登录直接失败），
+#         而且后台的登录态在 localStorage，跨源时 token 发不过去。
+#       · 传 http://localhost:8100 = 生产构建里写死 localhost → 浏览器必然连不上。
+#       （dev/e2e 场景例外：e2e 注入 http://127.0.0.1:18100，因为 preview 与 API 不同源。）
+#
+#    部署后建议顺手清一下旧 chunk（每次构建的 hash 文件名都不同，
+#    不清会越攒越多）：
+#       ssh root@8.148.9.151 'ls /var/www/stashbox-admin/assets/' | while read f; do
+#         grep -qx "$f" <(ls dist/assets/) || echo "$f"
+#       done   # 再把列出来的移走
 
 # ⑩ 预检（必须 0 FAIL）
 cd backend/deploy && ./preflight.sh /etc/stashbox/stashbox.env
@@ -880,3 +892,60 @@ curl -sI http://admin.stashbox.cn/.well-known/acme-challenge/x | grep -i server
 
 反过来说：**保持 ALPN 就完全不受这件事影响** —— ALPN 走 443，
 443 从来没被拦过。
+
+---
+
+## 13. 日志策略（按天 + 按大小 + 压缩归档）
+
+### 13.1 生产（8.148.9.151）：三层日志，各管各的
+
+| 层 | 落在哪 | 谁管 | 策略 |
+|---|---|---|---|
+| 应用（四个 uvicorn + arq worker） | **journald** | `tune-host.sh` 写的 `/etc/systemd/journald.conf` | `SystemMaxUse=200M`（总量）/ `SystemMaxFileSize=50M`（单文件）/ `MaxRetentionSec=30day`（按天）/ `Storage=persistent`。journal 本身是 zstd 压缩 → 「压缩归档」journald 自带 |
+| nginx 访问/错误日志（4 个 vhost） | `/var/log/nginx/*.log` | 系统的 `/etc/logrotate.d/nginx` + `install-log-policy.sh` 补的一行 | `daily` + `maxsize 100M` + `rotate 14` + `compress` + `delaycompress` |
+| 我们自己的文件日志 | `/var/log/stashbox/*.log` | `/etc/logrotate.d/stashbox`（`install-log-policy.sh` 装） | 同上，`maxsize 50M` |
+
+**策略本体在 `deploy/install-log-policy.sh`（唯一真相源）**，幂等、可重复执行、可 `--dry-run`：
+
+```bash
+bash backend/deploy/install-log-policy.sh --dry-run   # 先看它要干什么
+bash backend/deploy/install-log-policy.sh             # 真装（含 logrotate -d 校验）
+```
+
+`install-log-policy.sh` 干三件事：建日志目录、写 `/etc/logrotate.d/stashbox`、
+给系统的 nginx 策略补 `maxsize`。
+
+⚠️ **两条不能踩的坑**：
+
+1. **不能给同一个文件写两条 logrotate 规则** —— logrotate 会报
+   `duplicate log entry` 并**整轮放弃**（nginx 的日志就全都不轮转了）。
+   所以「按大小」是**加进系统已有的 nginx 那一段**，不是另起一段。
+2. **必须 copytruncate** —— 服务持有日志的 fd，只改名的话它会继续往
+   已改名的文件里写（老文件继续长），等于没轮转。
+
+**实测**（2026-10-22，强制轮转验证）：归档 `.2.gz` 生成正常，1.45MB → 59KB
+（压缩率 ~24x）；轮转后 nginx 继续正常写日志（HTTP 200 + 日志增长）；
+`logrotate -d` 两段都通过。
+
+### 13.2 本机（macOS 开发环境）：newsyslog 用不了，改用 copytruncate 脚本
+
+本机后端服务是**手工起的 uvicorn**，日志重定向到 `/private/tmp/stashbox-*.out`
+（实测一轮就攒到 335MB，且**没有上限**）。
+
+macOS 的 `newsyslog` 是「改名」语义，这些进程持有 fd → 改名后继续往已改名的
+文件里写 → 归档一直长 → 等于没转；让它重开文件得发信号，而手工起的进程
+没有稳定 pidfile。
+
+所以改用 `deploy/local/rotate-dev-logs.sh`（压缩一份 + 截断原文件，fd 不用动），
+并用 launchd 每天跑一次：
+
+```bash
+cp backend/deploy/local/com.stashbox.logrotate.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.stashbox.logrotate.plist
+bash backend/deploy/local/rotate-dev-logs.sh   # 立刻跑一次
+```
+
+阈值 50MB，归档只留**最近 20MB**（gzip 后 ~700KB）——开发日志的价值在
+「最近发生了什么」，开头的几百 MB 基本是噪音。
+
+---

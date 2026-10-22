@@ -470,6 +470,10 @@ if [ -f "$journald_conf" ]; then
 #   journal 总体积上限。应用日志全走 journal（systemd unit 的
 #   StandardOutput=journal），不限容的话 40GB 系统盘会被日志吃光。
 #   200M 够看几天。
+# SystemMaxFileSize = 50M
+#   **单个** journal 文件的上限。总量有上限还不够：一个文件无限长的话，
+#   排查时 tail/grep 会很难受，而且 journal 切文件时会有一次写放大。
+#   journald 自带 zstd 压缩 → 「压缩归档」这一层它已经做了。
 # SystemKeepFree = 512M
 #   无论如何给磁盘留 512M 空闲 —— journald 宁可写不进去也不把盘占满。
 # MaxRetentionSec = 30day
@@ -478,6 +482,7 @@ if [ -f "$journald_conf" ]; then
 #   日志落盘，重启后还在（排查问题需要）。代价是占磁盘（被上面两项兜住）。
 [Journal]
 SystemMaxUse=200M
+SystemMaxFileSize=50M
 SystemKeepFree=512M
 MaxRetentionSec=30day
 Storage=persistent"
@@ -491,18 +496,25 @@ else
 fi
 
 say "logrotate"
-CONTENT="$LOG_DIR/*.log {
-    daily
-    rotate 7
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-    su $SERVICE_USER $SERVICE_USER
-}"
-write_file /etc/logrotate.d/stashbox 0644 root
-ROLLBACK[${#ROLLBACK[@]}]="撤销 logrotate：rm -f /etc/logrotate.d/stashbox"
+# 策略本身在 install-log-policy.sh 里（**唯一真相源**）——
+# 它同时管我们自己的 /var/log/stashbox/*.log 和系统 nginx 那一段的「按大小」，
+# 还要建日志目录。规则写两遍必然漂（nginx 那段有 maxsize、我们这段没有，
+# 或者反过来），所以这里只调用，不复述内容。
+#
+# 为什么 nginx 也要动：它的 access_log 记的就是我们的 4 个 vhost
+# （营销页 / API / 后台 / IP 兜底），而 APK 下载就在 /downloads ——
+# 撞上爬虫猛打，一天能写几百 MB。系统策略只有天级轮转。
+log_policy_script="$(dirname "$0")/install-log-policy.sh"
+if [ -f "$log_policy_script" ]; then
+  if [ "$DRY_RUN" -eq 0 ]; then
+    bash "$log_policy_script" || warn "日志策略安装失败（logrotate 仍按原样工作）"
+  else
+    printf '    [dry-run] bash %s\n' "$log_policy_script"
+  fi
+  ROLLBACK[${#ROLLBACK[@]}]="撤销 logrotate 策略：rm -f /etc/logrotate.d/stashbox（nginx 那段从 /root/nginx-config-backups/nginx.bak.* 恢复）"
+else
+  warn "找不到 $log_policy_script —— 跳过 logrotate 策略安装"
+fi
 
 # ═════════════════════════════════════════════════════════════════════
 # 7. sysctl + MALLOC_ARENA_MAX

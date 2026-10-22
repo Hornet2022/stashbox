@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.stashbox.logrotate</string>
+
+    <!--
+      本机开发服务日志的每日轮转（2026-10-22）。
+
+      背景：本机后端服务是**手工起的 uvicorn**，日志重定向到
+      /private/tmp/stashbox-*.out。实测一轮就攒到 335MB
+      （content-service 272MB / api-gateway 44MB / ai-service 20MB），
+      而且**没有上限** —— 磁盘还有 54G，所以不会立刻出事，
+      但它一直在涨，而且重建机器前没人会看它。
+
+      为什么不用 newsyslog：它是「改名」语义，而这些进程持有日志 fd，
+      改名后继续往已改名的文件里写 → 归档一直长 → 等于没转。
+      脚本走 copytruncate 思路（压缩一份 + 截断原文件），fd 不用动。
+
+      阈值 50MB + 归档只留最近 20MB —— 开发日志的价值在「最近发生了什么」，
+      开头的几百 MB 基本是噪音。
+
+      装法：
+        cp backend/deploy/local/com.stashbox.logrotate.plist \
+           ~/Library/LaunchAgents/
+        launchctl bootstrap gui/$(id -u) \
+           ~/Library/LaunchAgents/com.stashbox.logrotate.plist
+      卸载：
+        launchctl bootout gui/$(id -u)/com.stashbox.logrotate
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/hornet/work/stashbox/backend/deploy/local/rotate-dev-logs.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/hornet/work/stashbox/backend/deploy/local</string>
+
+    <!-- 每天凌晨 3:17 跑一次（避开整点的整点风暴） -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>17</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/stashbox-logrotate.out</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/stashbox-logrotate.err</string>
+</dict>
+</plist>
