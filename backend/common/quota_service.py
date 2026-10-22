@@ -18,6 +18,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from stashbox.backend.common import cache_service
+from stashbox.backend.common import quota_period
 from stashbox.backend.common.exceptions import BizException
 from stashbox.backend.common.logging import get_logger
 from stashbox.backend.common.models import User
@@ -49,27 +50,20 @@ def _now() -> datetime:
 
 
 def _next_month_start(now: datetime) -> datetime:
-    if now.month == 12:
-        return now.replace(
-            year=now.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0
-        )
-    return now.replace(month=now.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    """下月 1 号 00:00（tz-aware）。
+
+    ⚠️ 定义已搬到 `common/quota_period.py` —— 那是「配额周期」的唯一真相。
+    这里保留薄封装是为了不打散既有引用点。
+    """
+    return quota_period.next_month_start(now)
 
 
 def next_reset_at_naive() -> datetime:
     """下月 1 号 00:00（UTC，**naive**）—— 碰 `users.quota_reset_at` 唯一正确的值。
 
-    该列是 `TIMESTAMP WITHOUT TIME ZONE`（alembic 0002），而 `_now()` 是 tz-aware。
-    asyncpg 拿到 tz-aware datetime 绑到 naive 列会直接抛：
-
-        DataError: can't subtract offset-naive and offset-aware datetimes
-
-    所以凡是**写或比**这一列都必须用它，不要各处自己 `.replace(tzinfo=None)`。
-    分散写正是它出事的根因：CP1.7.3 修了写入路径（`reset_monthly`），而
-    `quota_reset_loop` 的比较路径漏了，于是整条跨月重置从来没跑起来过 ——
-    而那正是这条路径存在的唯一理由（见该函数的说明）。
+    ⚠️ 定义已搬到 `common/quota_period.py`（那里有完整口径说明）。
     """
-    return _next_month_start(_now()).replace(tzinfo=None)
+    return quota_period.next_reset_at_naive()
 
 
 async def _load_version(session: AsyncSession, user_id: int) -> tuple[int, int, int]:

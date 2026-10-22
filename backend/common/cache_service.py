@@ -22,6 +22,7 @@ from typing import Any
 import redis.asyncio as redis
 from redis.exceptions import NoScriptError
 
+from stashbox.backend.common import quota_period
 from stashbox.backend.common.redis_client import get_redis_pool
 
 QUOTA_TTL = 60
@@ -212,12 +213,37 @@ async def invalidate_pending(user_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 文章「已扣配额」标记（24h）：content-service 提交时打标，ai-service 蒸馏前查
+# 文章「已扣配额」标记：content-service 提交时打标，ai-service 蒸馏前查
+#
+# ⚠️ 这个标记记的是**事实** —— 「这篇文章在当前配额周期内已经扣过费了」，
+#    不是短期缓存，也不是单纯的并发锁：
+#    剪藏时打标记（mark_article_quota），手动蒸馏时看标记决定要不要再扣
+#    （claim_article_quota 的 SET NX 同时兼了并发互斥）。
+#
+#    所以它的存活时间必须覆盖**整个配额周期**，否则同一个周期内会重复扣费：
+#      剪藏（已扣）→ 蒸馏没派出去 → 次日手动点「开始蒸馏」
+#      → 标记已过期 → 又扣一次 → 一个月内为同一篇付两次钱。
+#
+#    配额是**自然月**重置的（users.quota_reset_at = 下月 1 号 00:00 UTC），
+#    所以判据是「活到下次重置为止」，不是「活 24 小时」也不是「活 30 天」。
+#    口径在 common/quota_period.py（唯一真相），这里只取用。
 # ---------------------------------------------------------------------------
+
+
+def article_quota_ttl_seconds() -> int:
+    """「已扣配额」标记还该活多久（秒）。
+
+    = 距离下次配额重置还有多久（至少 60 秒）。
+
+    周期内不会重复扣；周期结束后配额也重置了，再扣是新周期的正常计费。
+    """
+    return quota_period.seconds_until_next_reset()
+
+
 async def mark_article_quota(article_id: str) -> None:
     client = _client()
     try:
-        await client.set(article_quota_key(article_id), "1", ex=86400)
+        await client.set(article_quota_key(article_id), "1", ex=article_quota_ttl_seconds())
     finally:
         await client.aclose()
 
@@ -246,12 +272,20 @@ async def claim_article_quota(article_id: str) -> bool:
     认领在扣费**之前**、失败时用 `clear_article_quota` 还回去，方向是刻意选的：
       - 扣费成功后进程崩溃 → 标记说「扣过」，实际也真扣了，一致；
       - 认领后扣费失败并已还回 → 下次还能正常扣，一致；
-      - 认领后扣费失败但**还回失败** → 最多白送一次蒸馏，24h 后 TTL 自然过期。
+      - 认领后扣费失败但**还回失败** → 最多白送一次蒸馏，
+        标记活到配额周期结束就自然过期。
     换来的是消除「重复扣费」这个方向 —— 宁可偶尔白送，不要每次并发都收两次钱。
     """
     client = _client()
     try:
-        return bool(await client.set(article_quota_key(article_id), "1", nx=True, ex=86400))
+        return bool(
+            await client.set(
+                article_quota_key(article_id),
+                "1",
+                nx=True,
+                ex=article_quota_ttl_seconds(),
+            )
+        )
     finally:
         await client.aclose()
 

@@ -384,7 +384,7 @@ async def distill_task(
             )
         # 配额照退：用户在剪藏时已经为这篇付过一次了。
         if quota_charged:
-            await _refund_quota_once(task_id=task_id, user_id=user_id)
+            await _refund_quota_once(task_id=task_id, user_id=user_id, article_id=article_id)
         else:
             log.info(
                 "quota_refund_skipped_not_charged",
@@ -631,7 +631,7 @@ async def distill_task(
                     reason="will_retry",
                 )
             else:
-                await _refund_quota_once(task_id=task_id, user_id=user_id)
+                await _refund_quota_once(task_id=task_id, user_id=user_id, article_id=article_id)
         else:
             log.info(
                 "quota_refund_skipped_not_charged",
@@ -732,7 +732,7 @@ async def _delete_superseded_audio(article_id: str, previous_audio_url: str) -> 
         )
 
 
-async def _refund_quota_once(task_id: str, user_id: int) -> None:
+async def _refund_quota_once(task_id: str, user_id: int, article_id: str) -> None:
     """CP-AGENT-QUOTA-REFUND：退还 1 次配额，Redis SETNX 保证幂等（跨 Arq retry）。
 
     与 DistillPipeline._refund_quota 同语义，但由任务层调用（agent 路径不经过 pipeline）。
@@ -742,6 +742,16 @@ async def _refund_quota_once(task_id: str, user_id: int) -> None:
     但落锁早于退款成功。中间失败（乐观锁冲突、DB 抖一下）会留下一把撒谎的锁，
     之后 24h 内所有 Arq 重试都被挡掉 —— 用户为一次失败的蒸馏照付钱，且零告警。
     详见 `quota_service.release_refund_lock`。
+
+    ⚠️ **退款成功后必须清掉「已扣配额」标记**（2026-10-22 补）：
+    退钱与「这篇文章已扣过费」这两件事必须一起变，否则两套状态长期不一致：
+
+    - 标记还在 → 用户手动重试时 `claim_article_quota` 抢不到 → **不再扣费**
+      → 钱退了、活也干了，用户白拿一次蒸馏（收入漏损，且无人察觉）；
+    - 标记清掉了 → 重试时正常扣费，与「这笔已经退过」的语义一致。
+
+    mock 路径（`ai-service/main.py`）一直是对的（refund 之后紧跟一句
+    `clear_article_quota`），只有 agent 路径漏了 —— 同一个动作两套口径。
     """
     from stashbox.backend.common import quota_service
 
@@ -772,6 +782,23 @@ async def _refund_quota_once(task_id: str, user_id: int) -> None:
             quota_metrics.quota_refund_failed_total.labels(trigger="distill_task").inc()
         except Exception:
             pass
+        return
+
+    # 退款成功 → 「已扣配额」标记必须一起清掉（口径与 mock 路径一致）。
+    #
+    # 放在 try 外面：清标记失败**不能**让整笔退款被当成失败（钱已经退了），
+    # 记一条 warn 让人能查即可 —— 标记最坏是让用户下一次重试不扣费（白送一次），
+    # 而把退款报错抛出去会让人以为钱没退。
+    try:
+        await cache_service.clear_article_quota(article_id)
+    except Exception as exc:
+        log.warning(
+            "quota_refund_mark_clear_failed",
+            task_id=task_id,
+            article_id=article_id,
+            user_id=user_id,
+            error=str(exc),
+        )
 
 
 # ---------------------------------------------------------------------------

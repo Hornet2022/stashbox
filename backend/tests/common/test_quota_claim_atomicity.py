@@ -28,11 +28,14 @@
 
 import asyncio
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from stashbox.backend.common import cache_service
+from stashbox.backend.common import quota_period
+from stashbox.backend.common import quota_service
 
 AI_SERVICE_MAIN = Path(__file__).resolve().parents[2] / "ai-service" / "main.py"
 
@@ -125,4 +128,43 @@ def test_认领必须用_nx():
     start = src.index("async def claim_article_quota(")
     body = src[start : src.index("async def clear_article_quota(")]
     assert "nx=True" in body, "认领没用 SET NX —— 并发下会有多个赢家"
-    assert "ex=86400" in body, "认领必须带 TTL，否则失败的认领会永久挡住后续扣费"
+    assert "article_quota_ttl_seconds()" in body, "认领必须带 TTL，否则失败的认领会永久挡住后续扣费"
+
+
+def test_已扣费标记的_ttl_必须覆盖整个配额周期():
+    """标记的 TTL 不能是「24 小时」这种与配额周期无关的魔数。
+
+    标记记的是**事实**：「这篇文章在当前配额周期内已经扣过费了」。
+    配额按**自然月**重置，所以标记必须活到**下次重置**为止。
+
+    原来写死 `ex=86400`（24 小时）→ 剪藏后蒸馏没派出去，次日用户手动点
+    「开始蒸馏」→ 标记已过期 → 又扣一次 → 同一个配额周期内付两次钱。
+
+    ⚠️ TTL 是「到下月 1 号还有多久」，**不是**固定的 31 天 ——
+    月末打标的文章 TTL 只有几小时，但那时配额也马上重置了，
+    所以「同周期内不重复扣」这个不变量依然成立。
+    """
+    now = datetime.now(timezone.utc)
+    expected = int((quota_period.next_month_start(now) - now).total_seconds())
+    ttl = cache_service.article_quota_ttl_seconds()
+
+    assert ttl == max(
+        60, expected
+    ), f"标记 TTL 应等于「到下次配额重置还有多久」= {expected}，实际 {ttl}"
+    assert 0 < ttl <= 31 * 24 * 3600, f"TTL 越界：{ttl}"
+
+
+def test_配额周期是唯一定义():
+    """「下个月 1 号」只能有一处实现。
+
+    配额周期的边界散落过多份时，就一定会出现「某个 TTL 用的月长跟
+    实际重置日不一致」这种洞。唯一真相在 common/quota_period.py。
+    """
+    period_src = (Path(quota_period.__file__)).read_text()
+    assert "def next_month_start(" in period_src
+    assert "def seconds_until_next_reset(" in period_src
+
+    # quota_service 必须转发到它，不能自己再推一遍
+    svc_src = (Path(quota_service.__file__)).read_text()
+    assert "quota_period.next_month_start(" in svc_src
+    assert "quota_period.next_reset_at_naive(" in svc_src

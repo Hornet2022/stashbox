@@ -101,21 +101,72 @@ def refund_env(monkeypatch):
     sessions = FakeSessionFactory()
     refunded: list[int] = []
 
+    cleared: list[str] = []
+
     async def fake_refund(session, user_id):
         refunded.append(user_id)
 
     async def fake_make_client():
         return fake_redis
 
+    async def fake_clear_article_quota(article_id):
+        cleared.append(article_id)
+
     monkeypatch.setattr(quota_service, "refund", fake_refund)
     monkeypatch.setattr(distill_task, "AsyncSessionLocal", sessions, raising=False)
     monkeypatch.setattr(distill_task, "_make_refund_lock_client", fake_make_client)
+    # 「已扣配额」标记的清理也要可控 —— 否则测试会真去删测试 Redis 的键，
+    # 而且没法断言「退款后标记确实被清了」。
+    monkeypatch.setattr(distill_task.cache_service, "clear_article_quota", fake_clear_article_quota)
 
     return type(
         "Env",
         (),
-        {"redis": fake_redis, "sessions": sessions, "refunded": refunded},
+        {
+            "redis": fake_redis,
+            "sessions": sessions,
+            "refunded": refunded,
+            "cleared": cleared,
+        },
     )()
+
+
+# ---------------------------------------------------------------------------
+# 0. 退款成功后必须清掉「已扣配额」标记
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_退款成功后清掉已扣配额标记(refund_env):
+    """退钱与「已扣过费」这两件事必须一起变。
+
+    2026-10-22 补：agent 路径（和 pipeline 路径）原来只退款、不清标记。
+    标记留着 → 用户手动重试时 `claim_article_quota` 抢不到 → **不再扣费**
+    → 钱退了、活也干了，用户白拿一次蒸馏（收入漏损，且无人察觉）。
+
+    mock 路径一直是对的（refund 后紧跟一句 clear_article_quota），
+    只有真实路径漏了 —— 同一个动作两套口径。
+    """
+    from tasks.distill_task import _refund_quota_once
+
+    await _refund_quota_once(task_id="dst_mark", user_id=42, article_id="art_mark_1")
+    assert refund_env.refunded == [42]
+    assert refund_env.cleared == ["art_mark_1"], "退款成功后必须清掉「已扣配额」标记"
+
+
+@pytest.mark.asyncio
+async def test_退款失败不清标记(refund_env, monkeypatch):
+    """退款**失败**时不能清标记 —— 钱没退，标记就该还在。"""
+    from stashbox.backend.common import quota_service
+    from tasks.distill_task import _refund_quota_once
+
+    async def boom(session, user_id):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(quota_service, "refund", boom)
+
+    await _refund_quota_once(task_id="dst_fail", user_id=42, article_id="art_fail_1")
+    assert refund_env.cleared == [], "退款失败不该清标记（钱还没退）"
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +178,7 @@ def refund_env(monkeypatch):
 async def test_首次调用会退一次配额(refund_env):
     from tasks.distill_task import _refund_quota_once
 
-    await _refund_quota_once(task_id="dst_1", user_id=42)
+    await _refund_quota_once(task_id="dst_1", user_id=42, article_id="art_refund_1")
 
     assert refund_env.refunded == [42]
 
@@ -137,7 +188,7 @@ async def test_用_task_id_做锁键(refund_env):
     """锁键必须按 task 维度，而不是 user —— 同一用户可能有多个任务在跑。"""
     from tasks.distill_task import _refund_quota_once
 
-    await _refund_quota_once(task_id="dst_abc", user_id=42)
+    await _refund_quota_once(task_id="dst_abc", user_id=42, article_id="art_refund_abc")
 
     keys = [k for k, _ in refund_env.redis.set_calls]
     assert keys == ["refund:dst_abc"]
@@ -147,7 +198,7 @@ async def test_用_task_id_做锁键(refund_env):
 async def test_锁用_nx_保证原子(refund_env):
     from tasks.distill_task import _refund_quota_once
 
-    await _refund_quota_once(task_id="dst_1", user_id=42)
+    await _refund_quota_once(task_id="dst_1", user_id=42, article_id="art_refund_1")
 
     assert all(nx for _, nx in refund_env.redis.set_calls), "必须用 SETNX，否则并发下会重复退款"
 
@@ -166,7 +217,7 @@ async def test_重复调用只退一次(refund_env):
     from tasks.distill_task import _refund_quota_once
 
     for _ in range(3):  # 首跑 + 2 次重试
-        await _refund_quota_once(task_id="dst_1", user_id=42)
+        await _refund_quota_once(task_id="dst_1", user_id=42, article_id="art_refund_1")
 
     assert refund_env.refunded == [42], f"应只退 1 次，实际 {refund_env.refunded}"
 
@@ -175,8 +226,8 @@ async def test_重复调用只退一次(refund_env):
 async def test_不同_task_id_各自退一次(refund_env):
     from tasks.distill_task import _refund_quota_once
 
-    await _refund_quota_once(task_id="dst_1", user_id=42)
-    await _refund_quota_once(task_id="dst_2", user_id=42)
+    await _refund_quota_once(task_id="dst_1", user_id=42, article_id="art_refund_1")
+    await _refund_quota_once(task_id="dst_2", user_id=42, article_id="art_refund_2")
 
     assert refund_env.refunded == [42, 42], "不同任务应各退各的"
 
@@ -201,7 +252,7 @@ async def test_redis_不可用时仍退款(refund_env, monkeypatch):
 
     monkeypatch.setattr(distill_task, "_make_refund_lock_client", boom)
 
-    await _refund_quota_once(task_id="dst_1", user_id=42)
+    await _refund_quota_once(task_id="dst_1", user_id=42, article_id="art_refund_1")
 
     assert refund_env.refunded == [42], "Redis 挂了也要退款，不能让用户白扣"
 
@@ -222,7 +273,7 @@ async def test_退款失败不向上抛(refund_env, monkeypatch):
 
     monkeypatch.setattr(quota_service, "refund", boom)
 
-    await _refund_quota_once(task_id="dst_1", user_id=42)  # 不应抛
+    await _refund_quota_once(task_id="dst_1", user_id=42, article_id="art_refund_1")  # 不应抛
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +297,7 @@ async def test_退款失败会删掉幂等锁(refund_env, monkeypatch):
 
     monkeypatch.setattr(quota_service, "refund", boom)
 
-    await _refund_quota_once(task_id="dst_1", user_id=42)
+    await _refund_quota_once(task_id="dst_1", user_id=42, article_id="art_refund_1")
 
     # 判据是「DEL 确实打到那把锁上」：锁最终不在 store 里，正是因为它被删了
     assert "refund:dst_1" in refund_env.redis.deleted, "退款失败了却没还锁"
@@ -273,8 +324,12 @@ async def test_退款失败后_arq_重试能补上退款(refund_env, monkeypatch
 
     monkeypatch.setattr(quota_service, "refund", flaky_refund)
 
-    await _refund_quota_once(task_id="dst_1", user_id=42)  # 首跑：退款失败
-    await _refund_quota_once(task_id="dst_1", user_id=42)  # Arq retry：必须还能退
+    await _refund_quota_once(
+        task_id="dst_1", user_id=42, article_id="art_refund_1"
+    )  # 首跑：退款失败
+    await _refund_quota_once(
+        task_id="dst_1", user_id=42, article_id="art_refund_1"
+    )  # Arq retry：必须还能退
 
     assert refund_env.refunded == [42], "重试没补上退款 —— 用户为失败的蒸馏付了钱"
 
@@ -289,7 +344,7 @@ async def test_退款成功后锁仍在_重复退仍被挡(refund_env):
     from tasks.distill_task import _refund_quota_once
 
     for _ in range(3):  # 首跑 + 2 次重试，全部成功
-        await _refund_quota_once(task_id="dst_1", user_id=42)
+        await _refund_quota_once(task_id="dst_1", user_id=42, article_id="art_refund_1")
 
     assert refund_env.refunded == [42], f"退太多次了：{refund_env.refunded}"
     assert refund_env.redis.deleted == [], "退款成功时不该删锁"
@@ -326,7 +381,7 @@ def test_蒸馏失败路径调用了退款():
     """
     src = (Path(AI_SERVICE_DIR) / "tasks" / "distill_task.py").read_text()
 
-    assert "_refund_quota_once(task_id=task_id, user_id=user_id)" in src
+    assert "_refund_quota_once(task_id=task_id, user_id=user_id, article_id=article_id)" in src
     # 必须在抛异常（让 Arq 走 retry）之前调用。
     #
     # 2026-10-21：这里原来定位的是 `raise  # 让 Arq 走 retry 逻辑` 这行注释。

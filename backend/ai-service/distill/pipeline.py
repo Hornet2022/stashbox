@@ -566,3 +566,25 @@ class DistillPipeline:
                 quota_metrics.quota_refund_failed_total.labels(trigger="distill_pipeline").inc()
             except Exception:
                 pass
+            return
+
+        # 退款成功 → 「已扣配额」标记必须一起清掉。
+        #
+        # 口径与 agent 路径（distill_task._refund_quota_once）和 mock 路径
+        # （ai-service/main.py）一致：退钱与「已扣过费」这两件事一起变。
+        # 标记留着 → 用户重试时 claim_article_quota 抢不到 → 不再扣费 →
+        # 钱退了活也干了，白拿一次蒸馏。
+        #
+        # 清标记失败**不能**把退款判成失败（钱已经退了）→ 只记 warn。
+        try:
+            from stashbox.backend.common import cache_service
+
+            await cache_service.clear_article_quota(ctx.article_id)
+        except Exception as exc:
+            log.warning(
+                "quota_refund_mark_clear_failed",
+                task_id=ctx.task_id,
+                article_id=ctx.article_id,
+                user_id=ctx.user_id,
+                error=str(exc),
+            )

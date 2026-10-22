@@ -154,7 +154,7 @@ async def test_退款_只在_真扣过时发生(quota_charged, monkeypatch):
 
     refunded: list[str] = []
 
-    async def _recorder(task_id, user_id):
+    async def _recorder(task_id, user_id, article_id=None):
         refunded.append(task_id)
 
     async def _boom(*a, **k):
@@ -192,7 +192,7 @@ async def test_中间失败不退款(monkeypatch):
 
     refunded: list[str] = []
 
-    async def _recorder(task_id, user_id):
+    async def _recorder(task_id, user_id, article_id=None):
         refunded.append(task_id)
 
     async def _boom(*a, **k):
@@ -241,7 +241,7 @@ async def test_无正文失败时_未扣配额也不退(monkeypatch):
 
     refunded: list[str] = []
 
-    async def _recorder(task_id, user_id):
+    async def _recorder(task_id, user_id, article_id=None):
         refunded.append(task_id)
 
     async def _empty(db, article_id):
@@ -271,7 +271,7 @@ async def test_无正文失败时_已扣配额照退(monkeypatch):
 
     refunded: list[str] = []
 
-    async def _recorder(task_id, user_id):
+    async def _recorder(task_id, user_id, article_id=None):
         refunded.append(task_id)
 
     async def _empty(db, article_id):
