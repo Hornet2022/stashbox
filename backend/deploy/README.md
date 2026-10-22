@@ -651,3 +651,79 @@ LOCAL_STORAGE_PUBLIC_URL=https://api.stashbox.cn/audio
   杭州**公网**端点（产生出方向流量费，内测量级约 1 元/月）。
   内测期用本地磁盘（9.4-b）则完全绕开这个问题。
 
+
+---
+
+## 12. 域名切换（ICP 备案期间 / 备案通过后）
+
+### 12.1 两套证书并行（现状）
+
+服务器上**同时**有两套证书，各管各的 server 块：
+
+| server 块 | server_name | 证书 | SAN |
+|---|---|---|---|
+| API | `api.stashbox.cn` `stashbox.cn` | 域名证书 | `stashbox.cn` `www.stashbox.cn` |
+| 后台 | `admin.stashbox.cn` `www.stashbox.cn` | 域名证书 | 同上 |
+| IP 兜底 | `_`（default_server） | **IP 证书** | IP:8.148.9.151 |
+
+**为什么不能共用一张**（`tls-cert.sh` 的共用片段 `tls-cert.conf`）：
+两张证书的 SAN **不重叠** —— 域名证书不含 IP，IP 证书不含域名。
+共用必然有一边失配：全用域名证书 → **App 现在的 IP 入口直接连不上**；
+全用 IP 证书 → 域名入口失配。所以域名块在 nginx 里**直接写证书路径**，
+不走共用片段。
+
+⚠️ 改 nginx 前先备份到 `sites-enabled/` **外面**（`/etc/nginx/backup/`）——
+放在 `sites-enabled/` 里会被 nginx 当配置加载，报
+`duplicate upstream "stashbox_gateway"`。
+
+### 12.2 签发 / 续期
+
+```bash
+# 签（HTTP-01，需要域名已解析到本机；webroot 模式，nginx 已配好 ACME 路径）
+/root/.acme.sh/acme.sh --issue -d stashbox.cn -d www.stashbox.cn \
+    -w /var/www/html --server letsencrypt --keylength ec-256
+
+# 同步 + reload（acme.sh 的 cron 只负责签发，nginx 还要 reload 才换证书）
+bash /opt/stashbox/deploy/renew-tls.sh
+```
+
+acme.sh 的 cron（`0 3 */3 * *`）负责签发，`renew-tls.sh`（每 6 小时）
+负责同步到 `/etc/letsencrypt/live/` 并 reload nginx。
+
+⚠️ **不要用 certbot 签域名证书**：之前那两张 `api.` / `admin.` 的证书
+是 certbot 签的、**只有 24 小时有效期**，而且 `/etc/letsencrypt/renewal/`
+里**没有 renewal 配置** → 到期即死、永远不会续。域名证书统一走 acme.sh。
+
+### 12.3 一键切换
+
+```bash
+bash /opt/stashbox/deploy/switch-domain.sh status   # 看当前状态
+bash /opt/stashbox/deploy/switch-domain.sh domain   # 切到 https://stashbox.cn
+bash /opt/stashbox/deploy/switch-domain.sh ip       # 切回 https://8.148.9.151
+```
+
+它改**四处**里的三处（第四处不在服务器上）：
+
+1. `env` 的 `PUBLIC_GATEWAY_URL` / `LOCAL_STORAGE_PUBLIC_URL`
+   → 决定**新产出**的 `audio_url` 用什么 host
+2. `articles.audio_url` + `distilled_articles.audio_url`（**两张表都要**）
+   → 存量音频的 URL 在库里，改 env 不会追溯
+3. 重启 4 个服务
+4. **APK**：base URL 是**编译期常量**（`BuildConfig.API_BASE_URL`，
+   来自 `-PapiBaseUrl`），必须**重新构建**并分发给测试者：
+
+   ```bash
+   bash scripts/build_release.sh --api-base-url https://stashbox.cn/
+   ```
+
+   APK 没重打之前，App 仍连旧地址（旧地址仍可用 —— 这是刻意的回退）。
+
+### 12.4 ⚠️ 备案期间为什么建议先不切 App
+
+- **ICP 备案的管局审核期间，阿里云的备案监测系统可能随时阻断域名解析**
+  （`tls-cert.sh` 顶部记着这个坑，服务器上确实被阻断过）。
+- **App 没有多域名容错**：`BaseUrls.gatewayBaseUrl()` 是单一常量，
+  域名一断就是**所有内测用户全部连不上**，且无法远程修复。
+- IP 入口**不受备案影响**（IP 证书不需要备案），所以它就是回退路径。
+
+所以：**服务端域名随时可切（一条命令），App 等备案通过再重打。**
