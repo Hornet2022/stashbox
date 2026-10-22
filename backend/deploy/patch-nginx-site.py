@@ -22,7 +22,11 @@ App 的 base URL 是「host + /api/v1/...」，音频 URL 由服务端下发
 公开页和后台**不同源**，公开页上的任何 XSS 都碰不到后台的 token。
 """
 
-SHARED = """    # ── TLS（域名证书，SAN: stashbox.cn / www.stashbox.cn）────────────
+import subprocess
+import sys
+from pathlib import Path
+
+SHARED = """    # ── TLS（域名证书，SAN: stashbox.cn / www. / admin. / api. stashbox.cn）──
     ssl_certificate     /etc/letsencrypt/live/stashbox.cn/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/stashbox.cn/privkey.pem;
 
@@ -144,6 +148,17 @@ def main() -> int:
 
     with open(path, "w", encoding="utf-8") as f:
         f.write(src)
+
+    # ④ 补齐路由 + 更新过时的证书注释
+    #    这两个 patch 都是**幂等**的，直接调用即可。
+    #    它们修的是「生成器漏抄」的两处：
+    #      · api 块缺 location /api/ → 走 api 域的 API 请求全线 404
+    #      · IP 兜底块缺健康检查 → /healthz 被 SPA 吞成 HTML（状态码仍 200）
+    for helper in ("patch-nginx-api-routes.py", "patch-nginx-tls-comments.py"):
+        helper_path = Path(__file__).resolve().parent / helper
+        if helper_path.exists():
+            subprocess.run([sys.executable, str(helper_path), path], check=False)
+
     print("nginx 配置已改")
     return 0
 
