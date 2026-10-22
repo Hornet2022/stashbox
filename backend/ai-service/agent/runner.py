@@ -932,10 +932,13 @@ def _parse_rewrite(raw: str) -> _RewriteParts:
                 q["issues"] or "{}",
             )
             for bad in q["offenders"]:
+                # ⚠️ 别只打 80 字：实测里「不在A，而在B」这种对比论证的
+                # 推理词就在第 80 字之后，截断之后**根本没法判断是真不合格
+                # 还是误判**（只能靠猜）。
                 log.warning(
                     "agent_rewrite_recreation_weak_item group=%s item=%r",
                     name,
-                    bad[:80],
+                    bad[:200],
                 )
 
         # hook 缺失但有正文 → 拿第一节顶上，别让整稿没有钩子
