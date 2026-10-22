@@ -949,3 +949,61 @@ bash backend/deploy/local/rotate-dev-logs.sh   # 立刻跑一次
 「最近发生了什么」，开头的几百 MB 基本是噪音。
 
 ---
+
+## 14. 音频文件 ↔ DB 引用的一致性（删生产音频前必读）
+
+### 14.1 背景：2026-10-22 误删 6 篇在用文章的音频
+
+做「清理孤儿音频」时，误删了 6 篇文章**仍在使用**的音频文件
+（用户点播放 → 404）。事后复查还原：其中 5 个能从备份按**内容寻址名**
+精确还原（sha256 逐字节一致），第 6 个全盘无副本，只能用生产同款 TTS
+重新合成（229.3s vs 原 242s）并把新 URL 写回两张表。
+
+**根因不是手滑，是判据不完整**：
+
+| 错在哪 | 后果 |
+|---|---|
+| 参考集手写死表名/列名，漏了 `article_audio_variants` | 那类文件被判成「没人引用」 |
+| 文件名提取方式各家不同（URL 取末段 vs oss_key 去前缀） | 引用集合与磁盘集合不可比 |
+| **在已经发现「引用缺失」的情况下仍按「无主文件」清单删除** | 参考集不可信时，「没人引用」这个结论同样不可信 → 删了正在用的文件 |
+
+### 14.2 判据已缝成一份契约（唯一真相源）
+
+`backend/scripts/verify_audio_consistency.py` —— 仓库内工具，不许再手写半套参考集：
+
+- **参考集自动发现**：查 `information_schema`，把所有 public 表里叫
+  `audio_url` / `oss_key` / `audio_path` 的列全部纳入（表名硬编码会漂移）。
+- **键归一化唯一**：URL（含 query）/ oss_key / 文件名 → 同一个 basename。
+- **双向报告**：`引用缺失`（用户播放 404）与 `无主文件`（占磁盘）分开列。
+- **联锁**：只要有引用缺失 → **禁止**任何删除动作（退出码 2）。
+- **只移不删**：清理是「移到隔离目录」，不是 rm；默认 dry-run，要 `--yes` 才执行。
+- **有引用缺失时退出码非 0** → 可挂巡检。
+
+```bash
+# 只读核对（生产上这么跑）
+cd /opt/stashbox/stashbox/backend/ai-service
+sudo -u stashbox /opt/stashbox/venv/bin/python \
+  /opt/stashbox/stashbox/backend/scripts/verify_audio_consistency.py
+
+# 真清理无主文件（先看清单，再加 --yes）
+... verify_audio_consistency.py --delete-orphans --yes
+```
+
+护栏在 `backend/tests/infra/test_verify_audio_consistency.py`（18 例）：
+键归一化、双向判定、联锁（生产事故形状的回归用例）、参考集不硬编码表名、
+只移不删、CLI 默认只读。
+
+### 14.3 音频文件名的内容寻址约定
+
+`audio/{article_id}.{sha256(bytes)[:8]}.{ext}`（`app/services/storage/base.py:versioned_audio_key`）。
+音频重生成 → key 变 → URL 变 → 客户端（Media3 SimpleCache 按 URL 缓存且
+**永不重新验证**）缓存自然失效。
+
+⚠️ 由此产生两个必须知道的点：
+
+1. **同一篇文章的历史版本会变成孤儿**（文件名带旧 hash）—— 这属于正常产物，
+   用上面的核对器判定后再清。
+2. **还原/改名时必须校验内容 hash**：文件名里的 hash8 是内容的 sha256 前 8 位，
+   对得上才说明是同一份内容（2026-10-22 还原 5 个文件时用的就是这个判据）。
+
+---
