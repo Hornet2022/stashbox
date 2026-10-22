@@ -50,7 +50,16 @@ _FETCH_ERROR_USER_MESSAGE: dict[FetcherErrorCode, str] = {
     FetcherErrorCode.UNSUPPORTED: "暂不支持这个链接来源，换个网站再试试",
     # 刻意不点破"内网/安全策略"：告诉攻击者"这个地址被识别了、我们拦了内网"，
     # 等于给 SSRF 探测一个免费 oracle。用户只需要知道"这个链接不能用"。
-    FetcherErrorCode.SSRF_BLOCKED: "暂不支持这个链接来源，换个网站再试试",
+    #
+    # ⚠️ 但**不能**和 UNSUPPORTED 用同一句话（2026-10-22 实测踩出来的）：
+    #   实测 `https://news.ycombinator.com/item?id=1` 报的是这一类，而真实原因
+    #   不是"不支持这个来源"——是**大陆 DNS 对境外域名投毒**，返回了
+    #   `2001::caa0:81a4`（IANA 保留段）→ SSRF 防护按 IP fail-closed 拦截。
+    #   对这种用户说"暂不支持这个链接来源，换个网站再试试"是**双重误导**：
+    #   他剪的就是那个网站，换什么都没用，还会以为产品不支持这类站点。
+    #   「我们暂时读不到内容」对两种真实情况都成立（真内网读不到、被投毒也读不到），
+    #   又不泄露任何 SSRF 判定细节。
+    FetcherErrorCode.SSRF_BLOCKED: "这个链接我们暂时读不到内容，换个来源试试",
     FetcherErrorCode.NETWORK: "没能连上这个网站，可能是网络不通或对方站点暂时不可用，请稍后重试",
     FetcherErrorCode.RATE_LIMIT: "对方网站暂时限制了访问，请过几分钟再试",
     FetcherErrorCode.AUTH: "对方网站限制了非官方客户端访问，微信文章请在微信里打开后重新复制链接",
