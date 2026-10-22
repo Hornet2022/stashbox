@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>听匣 · 把读不完的，变成听得完的</title>
+<meta name="description" content="剪藏一条链接，AI 把它蒸馏成一段刚好能在通勤路上听完的音频。内容消费的 AI 翻译机，Android 内测中。">
+<meta property="og:type" content="website">
+<meta property="og:title" content="听匣 · 把读不完的，变成听得完的">
+<meta property="og:description" content="剪藏一条链接，AI 把它蒸馏成一段刚好能在通勤路上听完的音频。Android 内测中。">
+<meta name="theme-color" content="#F5F2EB">
+<style>
+/* ═══════════════════════════════════════════════════════════════════
+   令牌层 —— 直接取自 stashbox-admin-web 的 tailwind.config.js 与
+   src/index.css。没有重新配色：三个方向共用同一套色板与节奏，
+   这样比较的才是方向本身，而不是谁换了颜色。
+   ═══════════════════════════════════════════════════════════════════ */
+:root {
+  --ink:        #1A1A1A;
+  --cream:      #F5F2EB;
+  --warm-ochre: #A67B5B;
+  --neutral-50:  #F5F2EB;
+  --neutral-100: #E8E4DD;
+  --neutral-200: #D4CFC6;
+  --neutral-300: #B8B2A8;
+  --neutral-400: #8C8680;
+  --neutral-500: #6A665F;
+  --neutral-600: #4A4642;
+  --neutral-700: #353129;
+  --neutral-800: #242019;
+  --neutral-900: #1A1614;
+
+  --space-4:4px;  --space-8:8px;   --space-12:12px; --space-16:16px;
+  --space-24:24px;--space-32:32px; --space-48:48px; --space-64:64px;
+  --space-96:96px;
+
+  --radius-sm:4px; --radius-md:8px; --radius-lg:12px; --radius-xl:16px;
+
+  --dur-micro:80ms; --dur-quick:150ms; --dur-fast:250ms;
+  --ease-smooth-out: cubic-bezier(0.22, 1, 0.36, 1);
+
+  --sans:  'Inter', 'Noto Serif SC', system-ui, -apple-system, 'PingFang SC',
+           'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  --serif: 'Noto Serif SC', 'Songti SC', 'SimSun', Georgia, serif;
+  --mono:  'JetBrains Mono', Menlo, monospace;
+
+  /* 语义：随主题切换而变 */
+  --bg: var(--cream);
+  --surface: #FBF9F4;
+  --fg: var(--neutral-900);
+  --fg-muted: var(--neutral-500);
+  --fg-faint: var(--neutral-400);
+  --rule: var(--neutral-200);
+  --accent: var(--warm-ochre);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: var(--neutral-900);
+    --surface: var(--neutral-800);
+    --fg: var(--neutral-100);
+    --fg-muted: var(--neutral-400);
+    --fg-faint: var(--neutral-500);
+    --rule: var(--neutral-700);
+    --accent: #C4956A;
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-feature-settings: "palt" 1;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+#stage { min-height: 100vh; }
+
+/* 所有方向的入场动效统一走这个类：ease-out、transform/opacity、≤250ms */
+.enter {
+  opacity: 0;
+  transform: translateY(8px);
+  animation: enter 250ms var(--ease-smooth-out) forwards;
+}
+@keyframes enter { to { opacity: 1; transform: none; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .enter { animation: none; opacity: 1; transform: none; }
+  * { animation-duration: 1ms !important; animation-iteration-count: 1 !important;
+      transition-duration: 1ms !important; }
+}
+
+/* ───────── 方向一：纸面 ───────── */
+.v-broadsheet { padding: 0 var(--space-24) var(--space-96); }
+
+.v-broadsheet .masthead {
+  max-width: 1120px; margin: 0 auto;
+  padding: var(--space-24) 0 var(--space-16);
+  border-bottom: 1px solid var(--rule);
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: var(--space-24);
+}
+.v-broadsheet .wordmark {
+  font-family: var(--serif); font-size: 22px; font-weight: 600;
+  letter-spacing: 0.22em; color: var(--fg);
+}
+.v-broadsheet .dateline {
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em;
+  color: var(--fg-faint); text-transform: uppercase;
+}
+
+.v-broadsheet .headline {
+  max-width: 1120px; margin: 0 auto;
+  padding: var(--space-64) 0 var(--space-48);
+  display: grid; grid-template-columns: 1fr; gap: var(--space-24);
+}
+.v-broadsheet .kicker {
+  font-family: var(--mono); font-size: 12px; letter-spacing: 0.16em;
+  color: var(--accent); margin: 0;
+}
+.v-broadsheet h1 {
+  font-family: var(--serif); font-weight: 600;
+  font-size: clamp(38px, 8.2vw, 96px); line-height: 1.08;
+  letter-spacing: -0.01em; margin: 0; max-width: 16ch;
+}
+.v-broadsheet h1 em { font-style: normal; color: var(--accent); }
+.v-broadsheet .standfirst {
+  font-size: clamp(16px, 1.6vw, 19px); line-height: 1.75;
+  color: var(--fg-muted); max-width: 46ch; margin: 0;
+}
+
+.v-broadsheet .cols {
+  max-width: 1120px; margin: 0 auto;
+  border-top: 2px solid var(--fg);
+  display: grid; grid-template-columns: repeat(3, 1fr);
+}
+.v-broadsheet .col {
+  padding: var(--space-24) var(--space-24) 0 0;
+  border-right: 1px solid var(--rule);
+}
+.v-broadsheet .col:last-child { border-right: 0; }
+.v-browsheet-num, .v-broadsheet .col .num {
+  font-family: var(--mono); font-size: 11px; color: var(--fg-faint);
+  letter-spacing: 0.1em; margin: 0 0 var(--space-8);
+}
+.v-broadsheet .col h3 {
+  font-family: var(--serif); font-size: 17px; font-weight: 600;
+  margin: 0 0 var(--space-8); letter-spacing: 0.02em;
+}
+.v-broadsheet .col p {
+  font-size: 14px; line-height: 1.8; color: var(--fg-muted); margin: 0;
+}
+
+.v-broadsheet .cta-row {
+  max-width: 1120px; margin: var(--space-64) auto 0;
+  padding-top: var(--space-24); border-top: 1px solid var(--rule);
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--space-24); flex-wrap: wrap;
+}
+.v-broadsheet .cta-note { font-size: 13px; color: var(--fg-faint); margin: 0; }
+.v-broadsheet .btn {
+  display: inline-flex; align-items: center; gap: var(--space-8);
+  padding: 11px 22px; border: 1px solid var(--fg); border-radius: 999px;
+  background: transparent; color: var(--fg);
+  font-family: var(--sans); font-size: 14px; cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-smooth-out),
+              color var(--dur-fast) var(--ease-smooth-out),
+              transform var(--dur-quick) var(--ease-smooth-out);
+}
+.v-broadsheet .btn:hover { background: var(--fg); color: var(--bg); }
+.v-broadsheet .btn:active { transform: scale(0.98); }
+
+/* ───────── 方向二：声纹 ───────── */
+.v-wave {
+  min-height: 100vh; padding: var(--space-48) var(--space-24) var(--space-64);
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; text-align: center;
+}
+.v-wave .wordmark {
+  position: absolute; top: var(--space-24); left: var(--space-32);
+  font-family: var(--serif); font-size: 19px; letter-spacing: 0.22em;
+  font-weight: 600; margin: 0;
+}
+.v-wave .tagline {
+  position: absolute; top: var(--space-32); right: var(--space-32);
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.14em;
+  color: var(--fg-faint); margin: 0;
+}
+
+.v-wave .canvas {
+  width: min(760px, 100%); height: 190px; margin: 0 0 var(--space-48);
+  display: flex; align-items: center; justify-content: center; gap: 3px;
+}
+.v-wave .bar {
+  width: 2px; border-radius: 1px; background: var(--neutral-300);
+  height: var(--h, 24px);
+  transform-origin: center;
+  transition: background var(--dur-fast) var(--ease-smooth-out);
+}
+.v-wave .bar.lit { background: var(--accent); }
+/* 只有波形在动 —— 这一页其它元素全部静止，让"声音"成为唯一的运动源 */
+.v-wave .bar.playing {
+  animation: pulse 1.25s var(--ease-smooth-out) infinite alternate;
+  animation-delay: var(--d, 0ms);
+}
+@keyframes pulse { from { transform: scaleY(0.34); } to { transform: scaleY(1); } }
+@media (prefers-reduced-motion: reduce) {
+  .v-wave .bar.playing { animation: none; transform: scaleY(0.6); }
+}
+
+.v-wave h1 {
+  font-family: var(--serif); font-weight: 600;
+  font-size: clamp(30px, 5.6vw, 58px); line-height: 1.28;
+  letter-spacing: 0.01em; margin: 0 0 var(--space-24); max-width: 18ch;
+}
+.v-wave .sub {
+  font-size: clamp(15px, 1.5vw, 17px); line-height: 1.8;
+  color: var(--fg-muted); max-width: 40ch; margin: 0 0 var(--space-48);
+}
+
+.v-wave .transport {
+  display: inline-flex; align-items: center; gap: var(--space-16);
+  padding: 10px 10px 10px 20px; border: 1px solid var(--rule);
+  border-radius: 999px; background: var(--surface);
+}
+.v-wave .play {
+  width: 42px; height: 42px; border-radius: 999px; border: 0;
+  background: var(--fg); color: var(--bg); cursor: pointer;
+  display: grid; place-items: center; font-size: 13px;
+  transition: transform var(--dur-quick) var(--ease-smooth-out);
+}
+.v-wave .play:hover { transform: scale(1.06); }
+.v-wave .play:active { transform: scale(0.96); }
+.v-wave .meta { text-align: left; }
+.v-wave .meta .t { font-size: 14px; margin: 0 0 3px; }
+.v-wave .meta .s {
+  font-family: var(--mono); font-size: 11px; color: var(--fg-faint);
+  margin: 0; letter-spacing: 0.06em;
+}
+
+.v-wave .chain {
+  display: flex; align-items: center; gap: var(--space-12);
+  margin-top: var(--space-64); flex-wrap: wrap; justify-content: center;
+}
+.v-wave .chain span {
+  font-size: 13px; color: var(--fg-muted); letter-spacing: 0.04em;
+}
+.v-wave .chain i { color: var(--fg-faint); font-style: normal; }
+
+/* ───────── 方向三：通勤 ───────── */
+.v-commute { padding: var(--space-48) var(--space-24) var(--space-96); }
+.v-commute .wrap { max-width: 760px; margin: 0 auto; }
+
+.v-commute .head { margin: 0 0 var(--space-64); }
+.v-commute .wordmark {
+  font-family: var(--serif); font-size: 20px; letter-spacing: 0.22em;
+  font-weight: 600; margin: 0 0 var(--space-32);
+}
+.v-commute h1 {
+  font-family: var(--serif); font-weight: 600;
+  font-size: clamp(28px, 5vw, 46px); line-height: 1.34;
+  margin: 0 0 var(--space-16); max-width: 20ch;
+}
+.v-commute .sub {
+  font-size: 15px; line-height: 1.8; color: var(--fg-muted);
+  margin: 0; max-width: 44ch;
+}
+
+/* 竖向脊柱：页面结构本身就是叙事 */
+.v-commute .spine { position: relative; padding-left: 92px; }
+.v-commute .spine::before {
+  content: ''; position: absolute; left: 15px; top: 8px; bottom: 8px;
+  width: 1px; background: var(--rule);
+}
+.v-commute .step { position: relative; padding-bottom: var(--space-48); }
+.v-commute .step:last-child { padding-bottom: 0; }
+.v-commute .step .time {
+  position: absolute; left: -92px; top: 1px; width: 62px;
+  font-family: var(--mono); font-size: 11px; color: var(--fg-faint);
+  text-align: right; letter-spacing: 0.04em;
+}
+.v-commute .step .dot {
+  position: absolute; left: -81px; top: 5px; width: 7px; height: 7px;
+  border-radius: 999px; background: var(--neutral-300);
+  border: 2px solid var(--bg);
+  box-shadow: 0 0 0 1px var(--rule);
+}
+.v-commute .step.is-live .dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.v-commute .step h3 {
+  font-size: 16px; font-weight: 600; margin: 0 0 var(--space-8);
+  letter-spacing: 0.01em;
+}
+.v-commute .step p {
+  font-size: 14px; line-height: 1.8; color: var(--fg-muted); margin: 0;
+}
+.v-commute .step .chip {
+  display: inline-block; margin-top: var(--space-12);
+  padding: 3px 10px; border: 1px solid var(--rule); border-radius: 999px;
+  font-family: var(--mono); font-size: 11px; color: var(--fg-faint);
+}
+
+.v-commute .foot {
+  margin-top: var(--space-64); padding-top: var(--space-24);
+  border-top: 1px solid var(--rule);
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--space-16); flex-wrap: wrap;
+}
+.v-commute .foot p { font-size: 13px; color: var(--fg-faint); margin: 0; }
+.v-commute .btn {
+  display: inline-flex; align-items: center; gap: var(--space-8);
+  padding: 12px 24px; border-radius: 999px; border: 0;
+  background: var(--fg); color: var(--bg); font-size: 14px;
+  font-family: var(--sans); cursor: pointer;
+  transition: transform var(--dur-quick) var(--ease-smooth-out),
+              opacity var(--dur-fast) var(--ease-smooth-out);
+}
+.v-commute .btn:hover { opacity: 0.86; }
+.v-commute .btn:active { transform: scale(0.98); }
+
+/* ───────── 窄屏 ───────── */
+@media (max-width: 760px) {
+  .v-broadsheet .cols { grid-template-columns: 1fr; }
+  .v-broadsheet .col { border-right: 0; padding-right: 0;
+                        padding-bottom: var(--space-24); }
+  .v-broadsheet .col + .col { border-top: 1px solid var(--rule);
+                              padding-top: var(--space-24); }
+  .v-broadsheet .masthead { flex-direction: column; align-items: flex-start;
+                            gap: var(--space-8); }
+  .v-wave .wordmark, .v-wave .tagline { position: static; text-align: center;
+                                        margin-bottom: var(--space-32); }
+  .v-wave .tagline { margin-top: calc(var(--space-32) * -1 + 28px); }
+  .v-commute .spine { padding-left: 0; }
+  .v-commute .spine::before { display: none; }
+  .v-commute .step { padding-left: var(--space-32); }
+  .v-commute .step .time { position: static; display: block; width: auto;
+                           text-align: left; margin-bottom: var(--space-8); }
+  .v-commute .step .dot { left: 0; top: 7px; }
+}
+
+/* ═══ 生产化改动（见 infra/web/README.md）═══ */
+/* 方向切换器：原型是「三个方向并排挑」的探索工具，对外不该出现。
+   团队内部用 ?picker=1 打开。 */
+.proto-picker { display: none; }
+body.show-picker .proto-picker { display: flex; }
+/* CTA 从 button 换成 <a>：去掉下划线，其余沿用 .btn 的类样式 */
+a.btn { text-decoration: none; }
+/* 没有 JS 时的兜底：静态预渲染的内容已在 #stage 里，这里只保证可读 */
+</style>
+</head>
+<body>
+
+<div id="stage">
+
+  <main class="v-broadsheet">
+    <header class="masthead">
+      <p class="wordmark">听匣</p>
+      <p class="dateline">内测中 · Android 优先</p>
+    </header>
+
+    <section class="headline">
+      <p class="kicker">内容消费的 AI 翻译机</p>
+      <h1 class="enter" style="animation-delay:40ms">把读不完的，<br>变成<em>听得完</em>的。</h1>
+      <p class="standfirst enter" style="animation-delay:100ms">
+        公众号、抖音、PDF、网页 —— 剪藏一条链接，AI 把它蒸馏成一段刚好能在通勤路上听完的音频。
+      </p>
+    </section>
+
+    <section class="cols">
+      <article class="col">
+        <p class="num">01</p>
+        <h3>为什么是音频</h3>
+        <p>深度阅读要占眼睛，而通勤时眼睛正被世界占着。换成音频，内容才真正进入得了那段时间。</p>
+      </article>
+      <article class="col">
+        <p class="num">02</p>
+        <h3>它怎么工作</h3>
+        <p>剪藏进待听，五分钟内完成结构化、听感改写与语音合成；到站时刚好听完一篇。</p>
+      </article>
+      <article class="col">
+        <p class="num">03</p>
+        <h3>它不做什么</h3>
+        <p>不做信息流，不推算法推荐，不追热点。你的待听队列只有你自己剪进来的东西。</p>
+      </article>
+    </section>
+
+    <div class="cta-row">
+      <p class="cta-note">Android 内测版（v0.3.0）· iOS 规划中</p>
+      <a class="btn" href="/downloads/tingxia-0.3.0.apk" download>下载内测版</a>
+    </div>
+  </main>
+</div>
+
+<nav class="proto-picker" aria-label="Prototype variants">
+  <span class="proto-picker-highlight" aria-hidden="true"></span>
+  <button class="proto-picker-item" data-active aria-current="true">纸面</button>
+  <button class="proto-picker-item">声纹</button>
+  <button class="proto-picker-item">通勤</button>
+  <span class="proto-picker-divider" aria-hidden="true"></span>
+  <button class="proto-picker-item proto-picker-replay" aria-label="Replay animation (R)">↻</button>
+</nav>
+
+<script>
+// ─────────────────────────────────────────────────────────────
+// 方向一：纸面 —— 轴 = 排版主导的编辑感
+// 页面像一份报纸：大字号衬线、发丝分隔线、三栏。几乎不动。
+// ─────────────────────────────────────────────────────────────
+function vBroadsheet() {
+  return `
+  <main class="v-broadsheet">
+    <header class="masthead">
+      <p class="wordmark">听匣</p>
+      <p class="dateline">内测中 · Android 优先</p>
+    </header>
+
+    <section class="headline">
+      <p class="kicker">内容消费的 AI 翻译机</p>
+      <h1 class="enter" style="animation-delay:40ms">把读不完的，<br>变成<em>听得完</em>的。</h1>
+      <p class="standfirst enter" style="animation-delay:100ms">
+        公众号、抖音、PDF、网页 —— 剪藏一条链接，AI 把它蒸馏成一段刚好能在通勤路上听完的音频。
+      </p>
+    </section>
+
+    <section class="cols">
+      <article class="col">
+        <p class="num">01</p>
+        <h3>为什么是音频</h3>
+        <p>深度阅读要占眼睛，而通勤时眼睛正被世界占着。换成音频，内容才真正进入得了那段时间。</p>
+      </article>
+      <article class="col">
+        <p class="num">02</p>
+        <h3>它怎么工作</h3>
+        <p>剪藏进待听，五分钟内完成结构化、听感改写与语音合成；到站时刚好听完一篇。</p>
+      </article>
+      <article class="col">
+        <p class="num">03</p>
+        <h3>它不做什么</h3>
+        <p>不做信息流，不推算法推荐，不追热点。你的待听队列只有你自己剪进来的东西。</p>
+      </article>
+    </section>
+
+    <div class="cta-row">
+      <p class="cta-note">Android 内测版（v0.3.0）· iOS 规划中</p>
+      <a class="btn" href="/downloads/tingxia-0.3.0.apk" download>下载内测版</a>
+    </div>
+  </main>`;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 方向二：声纹 —— 轴 = 元喻，用声音本身组织画面
+// 波形是页面上唯一在动的东西，其余全部静止。
+// ─────────────────────────────────────────────────────────────
+function vWave() {
+  const N = 68;
+  // 固定序列，不用随机：每次刷新形状一致，才谈得上"设计过"
+  const seed = [0.30,0.52,0.74,0.41,0.66,0.95,0.58,0.37,0.28,0.62,0.88,0.71,
+                0.46,0.33,0.55,0.79,0.92,0.64,0.39,0.26,0.48,0.69,0.84,0.57,
+                0.35,0.24,0.44,0.72,0.90,0.61,0.42,0.31,0.53,0.76,0.87,0.60,
+                0.38,0.27,0.50,0.68,0.83,0.56,0.34,0.29,0.47,0.75,0.91,0.59,
+                0.40,0.25,0.45,0.70,0.86,0.63,0.36,0.30,0.51,0.73,0.80,0.58,
+                0.43,0.32,0.49,0.67,0.78,0.55];
+  const bars = seed.map((v, i) => {
+    const h = Math.round(v * 150);
+    // 波形本身是对称的，视觉上才像"一段声音"而不是"一堆柱子"
+    return `<span class="bar" style="--h:${h}px;--d:${Math.round((i % 12) * 55)}ms"></span>`;
+  }).join('');
+
+  return `
+  <main class="v-wave">
+    <p class="wordmark enter">听匣</p>
+    <p class="tagline enter" style="animation-delay:40ms">IN BETA</p>
+
+    <div class="canvas enter" id="waveCanvas" aria-hidden="true">${bars}</div>
+
+    <h1 class="enter" style="animation-delay:80ms">通勤路上，<br>把眼睛闭上。</h1>
+    <p class="sub enter" style="animation-delay:130ms">
+      剪藏一条链接，五分钟后它变成一段音频。戴上耳机，路就变成了阅读时间。
+    </p>
+
+    <div class="transport enter" style="animation-delay:180ms">
+      <button class="play" id="wavePlay" aria-label="播放样例">▶</button>
+      <div class="meta">
+        <p class="t">奇客Solidot｜《星际公民》前传《Squadron 42》完成功能开发</p>
+        <p class="s">03:47 · 真实内测成品</p>
+      </div>
+    </div>
+
+    <div class="chain enter" style="animation-delay:220ms">
+      <span>剪藏</span><i>→</i><span>蒸馏</span><i>→</i><span>通勤</span><i>→</i><span>听完</span>
+    </div>
+  </main>`;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 方向三：通勤 —— 轴 = 结构叙事，页面骨架就是使用流程
+// 一条竖向脊柱串起一次通勤，产品状态直接写在时间线上。
+// ─────────────────────────────────────────────────────────────
+function vCommute() {
+  const steps = [
+    ['07:32', '剪藏', '把一篇公众号文章丢进听匣。它进入待听队列，开始配额预扣。', '剪藏完成'],
+    ['07:33', '蒸馏中', '结构化 → 听感改写 → 语音合成 → 拼接。四步流水线，通常五分钟内完成。', '约 4–6 分钟'],
+    ['07:38', '音频就绪', '生成后可以立刻听，也可以留在通勤里；通勤窗口内会自动预下载。', '支持离线'],
+    ['07:55', '通勤中', '锁屏控制、断点续听、倍速。听到一半退出，下次从原处接着听。', '断点续听'],
+    ['08:20', '听完', '给出评分与一句反馈。它会调整下次的篇幅与语速。', '个性化开启'],
+  ];
+
+  const items = steps.map(([t, h, p, chip], i) => `
+    <div class="step enter${i === 3 ? ' is-live' : ''}" style="animation-delay:${60 + i * 70}ms">
+      <span class="time">${t}</span>
+      <span class="dot"></span>
+      <h3>${h}</h3>
+      <p>${p}</p>
+      <span class="chip">${chip}</span>
+    </div>`).join('');
+
+  return `
+  <main class="v-commute">
+    <div class="wrap">
+      <header class="head">
+        <p class="wordmark enter">听匣</p>
+        <h1 class="enter" style="animation-delay:40ms">一次通勤的长度，<br>够听完三篇深度文章。</h1>
+        <p class="sub enter" style="animation-delay:90ms">
+          听匣只做一件事：把你想读的东西，翻译成你通勤时听得完的音频。
+        </p>
+      </header>
+
+      <section class="spine">${items}</section>
+
+      <div class="foot">
+        <p>Android 内测版（v0.3.0）· iOS 规划中</p>
+        <a class="btn" href="/downloads/tingxia-0.3.0.apk" download>下载内测版</a>
+      </div>
+    </div>
+  </main>`;
+}
+
+const variants = [vBroadsheet, vWave, vCommute];
+</script>
+
+<script>
+// ── Picker 接线（按 PICKER.md 契约）─────────────────────────────
+const stage = document.getElementById('stage');
+const picker = document.querySelector('.proto-picker');
+const highlight = picker.querySelector('.proto-picker-highlight');
+const items = [...picker.querySelectorAll('.proto-picker-item:not(.proto-picker-replay)')];
+const replay = picker.querySelector('.proto-picker-replay');
+let current = 0;
+
+function moveHighlight() {
+  const el = items[current];
+  highlight.style.width = el.offsetWidth + 'px';
+  highlight.style.transform = `translateX(${el.offsetLeft}px)`;
+}
+
+function mount(i) {
+  stage.innerHTML = '';
+  // 先清空、下一帧再渲染，入场动效才会重跑
+  requestAnimationFrame(() => {
+    stage.innerHTML = variants[i]();
+    if (i === 1) wireWave();
+  });
+}
+
+// 声纹方向：波形是唯一在动的东西，播放按钮控制它
+function wireWave() {
+  const play = document.getElementById('wavePlay');
+  const bars = [...document.querySelectorAll('#waveCanvas .bar')];
+  const audio = document.getElementById('sampleAudio');
+  if (!play) return;
+  // 真音频：播到哪，波形亮到哪 —— 波形不是装饰，是进度条
+  if (audio) {
+    audio.addEventListener('timeupdate', () => {
+      const p = audio.duration ? audio.currentTime / audio.duration : 0;
+      const n = bars.length;
+      bars.forEach((b, i) => b.classList.toggle('lit', i / n <= p));
+    });
+    audio.addEventListener('ended', () => {
+      bars.forEach((b) => b.classList.remove('lit'));
+      play.textContent = '▶';
+      play.setAttribute('aria-label', '播放样例');
+    });
+  }
+  play.addEventListener('click', () => {
+    if (!audio) return;
+    if (audio.paused) { audio.play(); play.textContent = '❚❚'; play.setAttribute('aria-label', '暂停样例'); }
+    else { audio.pause(); play.textContent = '▶'; play.setAttribute('aria-label', '播放样例'); }
+  });
+}
+
+function setActive(i) {
+  if (i < 0 || i >= variants.length) return;
+  current = i;
+  items.forEach((el, j) => {
+    el.toggleAttribute('data-active', j === i);
+    if (j === i) el.setAttribute('aria-current', 'true');
+    else el.removeAttribute('aria-current');
+  });
+  moveHighlight();
+  const url = new URL(location);
+  url.searchParams.set('v', i + 1);
+  history.replaceState(null, '', url);
+  mount(i);
+}
+
+items.forEach((el, i) => el.addEventListener('click', () => setActive(i)));
+replay?.addEventListener('click', () => mount(current));
+window.addEventListener('resize', moveHighlight);
+
+document.addEventListener('keydown', (e) => {
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable) return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const num = parseInt(e.key, 10);
+  if (num >= 1 && num <= variants.length) setActive(num - 1);
+  else if (e.key === 'ArrowRight') setActive((current + 1) % variants.length);
+  else if (e.key === 'ArrowLeft') setActive((current - 1 + variants.length) % variants.length);
+  else if (e.key === 'r' || e.key === 'R') mount(current);
+});
+
+if (new URLSearchParams(location.search).get('picker') === '1') document.body.classList.add('show-picker');
+setActive((parseInt(new URLSearchParams(location.search).get('v'), 10) || 1) - 1);
+// 首帧之后再开滑动，加载时不做位移动画
+requestAnimationFrame(() => requestAnimationFrame(() => picker.setAttribute('data-ready', '')));
+</script>
+
+<style>
+/* ═══ Picker 样式（PICKER.md 规格，逐字照抄）═══ */
+.proto-picker {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 999px;
+  background: rgba(10, 10, 10, 0.82);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4);
+  backdrop-filter: blur(12px) saturate(1.4);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.08) inset,
+    0 8px 24px rgba(0, 0, 0, 0.24),
+    0 2px 6px rgba(0, 0, 0, 0.12);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px;
+  line-height: 1;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.proto-picker-highlight {
+  position: absolute;
+  top: 4px;
+  left: 0;
+  height: 28px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  will-change: transform;
+}
+
+.proto-picker[data-ready] .proto-picker-highlight {
+  transition:
+    transform 250ms cubic-bezier(0.23, 1, 0.32, 1),
+    width 250ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .proto-picker[data-ready] .proto-picker-highlight { transition: none; }
+}
+
+.proto-picker-item {
+  position: relative; /* sits above the highlight */
+  display: flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.55);
+  font: inherit;
+  cursor: pointer;
+  transition: color 150ms ease-out;
+}
+
+.proto-picker-item:hover { color: rgba(255, 255, 255, 0.85); }
+.proto-picker-item:active { transform: scale(0.97); }
+.proto-picker-item:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.4);
+  outline-offset: 2px;
+}
+.proto-picker-item[data-active] { color: #fff; }
+
+.proto-picker-divider {
+  width: 1px;
+  height: 16px;
+  margin: 0 4px;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.proto-picker-replay { padding: 0 10px; font-size: 14px; }
+
+.proto-picker[data-position="top"] { bottom: auto; top: 24px; }
+</style>
+
+</body>
+</html>

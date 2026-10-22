@@ -1,0 +1,161 @@
+"""把 `~/.prototypes/tingxia-landing/index.html` 变成可上线的生产页。
+
+原型 README 写着「状态：未决策、这只是探索，没有被提升为任何正式站点」。
+这里做的是**把它变成一个真正的落地页**，改动都记在 README 里：
+
+1. **默认方向 = 纸面**（方向 1），并且**把它的 markup 预渲染进 HTML**。
+   理由：方向 2 的波形是 JS 生成的，方向 1 的是纯静态 —— 静态化之后
+   ①无 JS 也能看到内容 ②微信/Twitter 的分享爬虫不跑 JS，卡片有内容
+   （内测的主分享渠道就是微信，这是硬伤）③首屏不需要等 JS。
+2. **方向切换器默认隐藏**（原型是三个方向并排让人挑的，对外是「没做完」的观感）。
+   团队内部用 `?picker=1` 还能打开，`?v=1|2|3` 直接切方向。
+3. **CTA 从「加入内测名单」改成「下载内测版」**—— 现在真的有可安装的
+   release APK 了（/downloads/tingxia-0.3.0.apk），原型的 README 里
+   「CTA 到底该是什么还没定」这个阻塞已经解除。
+4. **方向 2 的样例音频换成真实成品**（原型里「《注意力经济下的深度阅读》·
+   样例」是占位，没有音频源）。
+5. 加 og: 标签（分享卡片的标题/描述），加 description meta。
+
+用法：python3 build_landing.py <原型路径> <输出路径>
+"""
+
+import re
+import sys
+from pathlib import Path
+
+# 真实成品音频（生产库里 art_881ed5393d9d47248ed48271，227s）
+SAMPLE_TITLE = "奇客Solidot｜《星际公民》前传《Squadron 42》完成功能开发"
+SAMPLE_DUR = "03:47"
+SAMPLE_PATH = "/audio/audio/art_881ed5393d9d47248ed48271.b7416ab1.mp3"
+APK_PATH = "/downloads/tingxia-0.3.0.apk"
+APK_VER = "v0.3.0"
+
+
+def extract_template(src: str, func_name: str) -> str:
+    """从 `function f() { return \`...\`; }` 里取出模板字符串的内容。"""
+    m = re.search(rf"function {func_name}\(\)\s*\{{\s*return\s*`(.*?)`;\s*\}}", src, re.S)
+    if not m:
+        raise SystemExit(f"没找到 {func_name} 的模板")
+    return m.group(1)
+
+
+def main() -> int:
+    proto_path = Path(sys.argv[1])
+    out_path = Path(sys.argv[2])
+    src = proto_path.read_text(encoding="utf-8")
+
+    # ── 1) 标题与 meta ───────────────────────────────────────────
+    src = src.replace(
+        "<title>听匣 · 首页方向探索</title>",
+        "<title>听匣 · 把读不完的，变成听得完的</title>\n"
+        '<meta name="description" content="剪藏一条链接，AI 把它蒸馏成一段刚好能在通勤路上听完的音频。'
+        '内容消费的 AI 翻译机，Android 内测中。">\n'
+        '<meta property="og:type" content="website">\n'
+        '<meta property="og:title" content="听匣 · 把读不完的，变成听得完的">\n'
+        '<meta property="og:description" content="剪藏一条链接，AI 把它蒸馏成一段刚好能在通勤路上听完的音频。Android 内测中。">\n'
+        '<meta name="theme-color" content="#F5F2EB">',
+    )
+
+    # ── 2) 预渲染默认方向（纸面）到 #stage ────────────────────────
+    broadsheet = extract_template(src, "vBroadsheet")
+    # 模板里没有 ${}，可以直接当静态 HTML 用
+    assert "${" not in broadsheet, "纸面方向里出现了模板插值，需要改成先渲染再注入"
+    src = src.replace('<div id="stage"></div>', f'<div id="stage">\n{broadsheet}\n</div>')
+
+    # ── 3) CTA：加入内测名单 → 下载内测版 ────────────────────────
+    src = src.replace(
+        '<p class="cta-note">当前处于内测阶段，Android 优先，iOS 规划中。</p>\n'
+        '      <button class="btn">加入内测名单</button>',
+        '<p class="cta-note">Android 内测版（' + APK_VER + "）· iOS 规划中</p>\n"
+        f'      <a class="btn" href="{APK_PATH}" download>下载内测版</a>',
+    )
+    src = src.replace(
+        "<p>内测中 · Android 优先</p>\n" '        <button class="btn">加入内测名单</button>',
+        f"<p>Android 内测版（{APK_VER}）· iOS 规划中</p>\n"
+        f'        <a class="btn" href="{APK_PATH}" download>下载内测版</a>',
+    )
+    if "加入内测名单" in src:
+        raise SystemExit("还有没换掉的「加入内测名单」")
+
+    # ── 4) 方向 2：真样例音频 ───────────────────────────────────
+    src = src.replace(
+        '<p class="t">《注意力经济下的深度阅读》· 样例</p>\n'
+        '        <p class="s">05:00 · 已蒸馏</p>',
+        f'<p class="t">{SAMPLE_TITLE}</p>\n'
+        f'        <p class="s">{SAMPLE_DUR} · 真实内测成品</p>',
+    )
+    # 播放按钮改成真音频
+    src = src.replace(
+        '</div>\n    <div class="chain enter"',
+        f'</div>\n    <audio id="sampleAudio" preload="none" src="{SAMPLE_PATH}"></audio>\n'
+        '    <div class="chain enter"',
+    )
+
+    # ── 5) 切换器默认隐藏 + 链接样式 ─────────────────────────────
+    css_add = """
+/* ═══ 生产化改动（见 infra/web/README.md）═══ */
+/* 方向切换器：原型是「三个方向并排挑」的探索工具，对外不该出现。
+   团队内部用 ?picker=1 打开。 */
+.proto-picker { display: none; }
+body.show-picker .proto-picker { display: flex; }
+/* CTA 从 button 换成 <a>：去掉下划线，其余沿用 .btn 的类样式 */
+a.btn { text-decoration: none; }
+/* 没有 JS 时的兜底：静态预渲染的内容已在 #stage 里，这里只保证可读 */
+"""
+    src = src.replace("</style>", css_add + "</style>", 1)
+
+    # ── 6) JS：?picker=1 显示切换器；方向 2 播真音频 ─────────────
+    src = src.replace(
+        "setActive((parseInt(new URLSearchParams(location.search).get('v'), 10) || 1) - 1);",
+        "if (new URLSearchParams(location.search).get('picker') === '1') "
+        "document.body.classList.add('show-picker');\n"
+        "setActive((parseInt(new URLSearchParams(location.search).get('v'), 10) || 1) - 1);",
+    )
+    src = src.replace(
+        """function wireWave() {
+  const play = document.getElementById('wavePlay');
+  const bars = [...document.querySelectorAll('#waveCanvas .bar')];
+  if (!play) return;
+  let on = false;
+  play.addEventListener('click', () => {
+    on = !on;
+    bars.forEach((b, i) => b.classList.toggle('playing', on));
+    bars.forEach((b, i) => b.classList.toggle('lit', on && i > 8 && i < 54));
+    play.textContent = on ? '❚❚' : '▶';
+    play.setAttribute('aria-label', on ? '暂停样例' : '播放样例');
+  });
+}""",
+        """function wireWave() {
+  const play = document.getElementById('wavePlay');
+  const bars = [...document.querySelectorAll('#waveCanvas .bar')];
+  const audio = document.getElementById('sampleAudio');
+  if (!play) return;
+  // 真音频：播到哪，波形亮到哪 —— 波形不是装饰，是进度条
+  if (audio) {
+    audio.addEventListener('timeupdate', () => {
+      const p = audio.duration ? audio.currentTime / audio.duration : 0;
+      const n = bars.length;
+      bars.forEach((b, i) => b.classList.toggle('lit', i / n <= p));
+    });
+    audio.addEventListener('ended', () => {
+      bars.forEach((b) => b.classList.remove('lit'));
+      play.textContent = '▶';
+      play.setAttribute('aria-label', '播放样例');
+    });
+  }
+  play.addEventListener('click', () => {
+    if (!audio) return;
+    if (audio.paused) { audio.play(); play.textContent = '❚❚'; play.setAttribute('aria-label', '暂停样例'); }
+    else { audio.pause(); play.textContent = '▶'; play.setAttribute('aria-label', '播放样例'); }
+  });
+}""",
+    )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(src, encoding="utf-8")
+    print(f"已生成 {out_path}（{len(src)} 字节）")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
