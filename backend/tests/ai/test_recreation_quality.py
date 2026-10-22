@@ -84,32 +84,53 @@ def test_topic_label_pattern_is_detected(quality):
     )
 
 
-def test_imperative_start_is_detected(quality):
-    """纯选题式的开头要能识别。
+def test_imperative_start_is_a_signal_not_a_defect(quality):
+    """「以关注/研究开头」只当**信号**记，不当缺陷。
 
-    ⚠️ 「接下来」**不能**算祈使句 —— prompt 自己的 ✓ 示范就是
-    「接下来真正值得盯的是封闭测试的时间线与反馈，那是给听众的判断句」，
-    那是合格写法。要抓的是「关注X」「研究Y」这种没有判断的纯选题。
+    只有整条都是选题时才是毛病；后面跟着推理的条目即使以「关注…」开头
+    也是好内容（实测：「关注'数据清洗'对回测真实性的影响。很多回测漂亮得
+    不真实，根子常在数据里没有退市公司。判断一个AI交易工具，先看它有没有
+    吃退市的账…」三句话都在讲理）。
     """
-    assert "imperative_start" in quality.check_item(
+    profile = quality.check_group(["关注封闭测试的时间线与反馈，它决定这次功能开发能不能兑现"], "")
+    assert profile["signals"].get("imperative_start") == 1
+    # 纯选题（没有推理）仍然是硬缺陷
+    assert "no_reasoning" in quality.check_item(
         "关注封闭测试的时间线与反馈，它决定这次功能开发能不能兑现", ""
     )
-    # 「接下来…」是合格写法，不该被误伤
-    assert "imperative_start" not in quality.check_item(
-        "接下来真正值得盯的是封闭测试的时间线与反馈，"
-        "它是判断这次功能完成能不能兑现的第一道验钞机。",
-        "",
-    )
 
 
-def test_restating_the_body_is_detected(quality):
-    """把原文主旨换个说法复述，要能识别（这正是「不是再创作」）。"""
+def test_restating_the_body_is_caught_by_missing_reasoning(quality):
+    """把原文主旨换个说法复述，要能识别（这正是「不是再创作」）。
+
+    抓它的是 `no_reasoning`：纯复述没有「因为/所以/但」这类推理。
+    """
     body = (
         "对冲基金赢在基建而非天才。它们拥有几十年干净数据、7×24研究集群和永不下线的执行系统。"
         "模型能力与执行基建的脱节是散户最大痛点。"
     )
     item = "模型能力与执行基建的脱节是散户最大痛点，未来竞争焦点将从谁模型强转向谁数据管道更干净。"
-    assert "restates_body" in quality.check_item(item, body)
+    assert "no_reasoning" in quality.check_item(item, body)
+
+
+def test_overlap_ratio_is_a_signal_not_a_defect(quality):
+    """与正文的重合度**不能**当硬判据（实测与质量反相关）。
+
+    prompt 要求「推论要能追回原文的某个事实」→ 好条目必然与正文共享词汇。
+    实测（同一篇原文）：
+
+        旧 prompt 的坏样本   重合度 0.154 ~ 0.333
+        新 prompt 的好样本   重合度 > 0.34
+
+    也就是说重合度高的反而是好内容。这条判据当年差点把「延伸判断」
+    这个产品定位本身给砍掉 —— 所以只能当信号。
+    """
+    body = "对冲基金赢在基建而非天才，它们拥有几十年干净数据、7×24研究集群和永不下线的执行系统。"
+    good = (
+        "QuantGPT的取舍很清楚：它不替用户做决策，只保证算出来的夏普比率真的跑过回测，"
+        "这种把不确定性留在系统外的做法，比再聪明的模型更值得抄。"
+    )
+    assert "restates_body" not in quality.check_item(good, body)
 
 
 def test_original_insight_is_not_flagged_as_restatement(quality):

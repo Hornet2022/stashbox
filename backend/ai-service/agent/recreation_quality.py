@@ -34,12 +34,35 @@
 | `too_short` | 太短，塞不下一个论证 | 字符数 < 40 | ✅ |
 | `no_reasoning` | **没有推论**（只是陈述/定义/标签） | 不含任何推理连接词 | ✅ |
 | `topic_label` | 名词化的选题短语 | 末尾是「…的设计/的影响/的差异/如何…」等 | ✅ |
-| `imperative_start` | 祈使句/选题清单 | 以「关注/研究/对比…」开头 | ✅ |
-| `restates_body` | **复述原文**（不是延伸） | 与正文的字二元组重合度 > 阈值 | ✅ |
+| `imperative_start` | 以「关注/研究/对比…」开头（**信号**） | 开头匹配 | ❌ 只记 |
+| `restates_body` | 与正文重合度高（**信号**，不是缺陷） | 与正文的字二元组重合度 > 阈值 | ❌ 只记 |
 | `no_sentence_end` | 落在「清单模式」（**信号**，不是缺陷） | 末尾不是 。！？ | ❌ 只记 |
+
+`imperative_start` 为什么只算信号：以「关注/研究…」开头只有在**整条都是选题**
+时才是毛病；后面跟着三句推理的条目（实测：「关注'数据清洗'对回测真实性的影响。
+很多回测漂亮得不真实，根子常在数据里没有退市公司。判断一个AI交易工具，
+先看它有没有吃退市的账…」）是**好内容**，只是开头用了「关注」。
 
 `no_reasoning` 是最核心的一条：上面 5 个坏例子**全部**没有任何推理连接词
 （因为/所以/但/反而/这意味着/值得/前提/区别在于…），而合格的样本都有。
+
+⚠️ `restates_body` 为什么只算信号（实测踩到过）：
+
+它本来是想抓「把原文主旨换个说法复述一遍」。但它和 prompt **自相矛盾** ——
+prompt 要求「推论要能追回原文的某个事实、矛盾或数字」，所以**好条目必然
+与正文共享大量词汇**。
+
+实测（2026-10-22，同一篇原文）：
+
+    旧 prompt 的坏样本   二元组重合度 0.154 ~ 0.333
+    新 prompt 的好样本   二元组重合度 > 0.34
+
+**重合度与质量反相关** —— 因为新 prompt 写出的条目是「原文的事实 +
+新的推论」，而旧的是「原文的词 + 换个说法」。二元组重合度分不开这两者，
+所以它只能当信号。
+
+真正抓住「复述」的是 `no_reasoning`：纯复述没有「因为/所以/但」这类推理，
+而复述+推论是有的。
 
 ⚠️ `no_sentence_end` 为什么只算信号：它其实是**「清单模式」的探针** ——
 JSON 数组（`"insights": [...]`）天然把模型切进清单模式，于是这些条目
@@ -79,9 +102,15 @@ _TOPIC_TAIL = re.compile(
 
 # 推理连接词：一条「有深度」的条目必须至少有一个 ——
 # 坏样本（定义/标签/复述）全部一个都没有。
+#
+# ⚠️ 词表要够宽：中文表达推论的方式很多，漏一个就会把好内容误判成标签
+# （实测踩到：「…根子常在数据里没有退市公司。判断一个AI交易工具，
+#   先看它有没有吃退市的账…」被误判成 no_reasoning，
+#   因为词表里只有「因为/所以/但」，没有「根子/先看」）。
 _REASONING = re.compile(
-    r"(因为|所以|这意味着|意味着|反而|但|却|不同于|区别在于|不等于|前提|背后"
-    r"|值得|说明|问题在于|关键在于|如果|一旦|意味着|前提是|根源)"
+    r"(因为|所以|因此|因而|于是|这意味着|意味着|反而|但|却|不同于|区别在于|不等于"
+    r"|前提|背后|值得|说明|证明|问题在于|关键在于|根子|根源|源于|来自|取决于"
+    r"|如果|一旦|除非|不是[^，。；]{0,12}而是|先看|要看|得看|要看的是|意味着)"
 )
 
 # 具体实体线索：产品/公司/协议名（拉丁串）、数字、引号里的概念
@@ -123,13 +152,14 @@ def check_item(item: str, body_text: str = "") -> list[str]:
         issues.append("too_short")
     if not _REASONING.search(text):
         issues.append("no_reasoning")
-    if _IMPERATIVE_START.match(text):
-        issues.append("imperative_start")
     if _TOPIC_TAIL.search(text):
         issues.append("topic_label")
-    if body_text and overlap_ratio(text, body_text) > _RESTATE_THRESHOLD:
-        issues.append("restates_body")
     return issues
+
+
+def restate_ratio(item: str, body_text: str) -> float:
+    """条目与正文的二元组重合度（**信号**，不是判据 —— 见模块 docstring）。"""
+    return overlap_ratio(item, body_text)
 
 
 def check_group(items: list[str], body_text: str = "") -> dict:
@@ -151,9 +181,15 @@ def check_group(items: list[str], body_text: str = "") -> dict:
             offenders.append(item)
             for c in codes:
                 issues[c] = issues.get(c, 0) + 1
-        # 「清单模式」只当信号记，不进 defects
+        # 「清单模式」和「与正文重合度高」都只当**信号**记，不进 defects
         if not (item or "").strip().endswith(_SENTENCE_ENDS):
             signals["no_sentence_end"] = signals.get("no_sentence_end", 0) + 1
+        if body_text and restate_ratio(item, body_text) > _RESTATE_THRESHOLD:
+            signals["restates_body"] = signals.get("restates_body", 0) + 1
+        # 「以关注/研究开头」只有在**整条都是选题**时才是毛病；
+        # 有推理的条目即使以「关注…」开头也是好内容（实测踩到过）→ 只记信号
+        if _IMPERATIVE_START.match((item or "").strip()):
+            signals["imperative_start"] = signals.get("imperative_start", 0) + 1
     return {
         "total": len(items),
         "ok": ok,
