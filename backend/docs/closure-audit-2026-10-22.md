@@ -279,14 +279,71 @@ wechat 登录和 refresh 都查了 `users.deleted_at`，**只有 admin 登录漏
     其它异常      0
     ✅ 没有真断链
 
-## 七、本轮**没有**修的（已知、有意留下）
+## 七、第三轮：遗留清单逐条清掉（2026-10-22 深夜）
+
+上一轮列的遗留项，这一轮逐条处理。先说一条被**证伪**的：
+
+### 「Docker 部署下 P95 面板恒为空」—— 不存在，删掉
+
+生产机实测：
+
+    $ command -v docker
+    无 docker（纯 systemd 部署）
+    $ systemctl list-units 'stashbox*' | wc -l
+    6
+
+`deploy/docker-compose.production.yml` 是仓里的历史产物，**生产根本没在用**。
+而 P95 面板在 systemd 部署下**有真实数据**：
+
+    step3_tts:  p50=300.0  p95=570.0  count=8
+    step2_rewrite: p50=42.9  p95=58.3
+    worker metrics 127.0.0.1:8104 → HTTP 200
+
+所以这条不是「待修」，是**待删的假问题**。留着它会让运维以为面板坏了。
+
+### 逐条修复
+
+| 原遗留项 | 处理 | 依据 |
+|---|---|---|
+| admin 登录无限流 | **已修**：email + IP 双维度，计数语义是「连续失败次数」，登录成功即清零 | 生产实测：错 5 次 → 第 6 次 429；成功后计数归零，再错 5 次都放行 |
+| clawbot 回调不扣配额、不派蒸馏 | **已修**：与 `submit_article` 同款（抽 URL → 校验 → 先抓后扣 → 扣配额 → 建文章 → 打标 → 派蒸馏） | 新增 5 条用例；配额是这条路径唯一的天然上限 |
+| 真实 agent 路径退款后没清「已扣费」标记 | **已修**：agent 路径与 pipeline 路径都补 `clear_article_quota`（mock 路径一直是对的） | 新增「退款成功必清标记 / 退款失败不清标记」两条用例 |
+| 配额标记 24h TTL → 同周期内重复扣费 | **已修**：TTL 改为「活到下次配额重置」，并抽出 `common/quota_period.py` 作为配额周期的唯一真相 | 生产实测：TTL = 804157 秒 = 9.3 天（到 2026-11-01 配额重置），不再是 1 天 |
+| admin-web `AdminRole` 与后端角色集不一致 | **已修**：类型收窄成 `admin`/`operator`，判据退化成集合判定，删掉 `useCanWrite` 与 Sidebar 的 `minRole` 死字段 | 后端 `ADMIN_TIERS = {admin, operator}` 且同权（`require_admin_or_operator`） |
+| 14 个端点零测试（10 个客户端在调） | **部分修**：admin 标签 CRUD + 音色库 CRUD 补 17 条用例（鉴权 / 保护 / 副作用 三层）。仍缺：`admin/export/tags.csv`（导出列齐全）、`admin/push/health`、`subscription/plans`、`user/quota`、`clawbot-message` | 走查统计口径见上 |
+| Docker 部署下 P95 恒为空 | **证伪，删掉** | 见上 |
+
+### 顺带修掉的性能问题（查 TTS 慢时挖出来的）
+
+生产日志里**每个分块**都超时：
+
+    TTS 响度归一失败：Command '[... loudnorm=I=-16.0:TP=-1.5:LRA=11 ...]'
+    timed out after 120 seconds，退回原音频
+
+后果两层，都更糟：归一根本没生效（段间响度差 6.5 LU，用户听到的「换人」一半来自
+响度跳变）；每篇 8~15 个分块 × 120s = 16~30 分钟纯等待
+（蒸馏 P95 面板实测 step3_tts p50=300s / p95=570s）。
+
+生产机实测（2 核，77 秒真实音频，6 个真实样本量一致性）：
+
+| 方案 | 单次 | 4 并发 | 段间一致性（LUFS 极差） |
+|---|---|---|---|
+| loudnorm（原来） | 4.72s | 19.0s | 1.0 LU |
+| dynaudnorm | 0.77s | 2.7s | 2.1 LU |
+| **静态增益（现在）** | **0.14s** | — | **0.5 LU** |
+
+静态增益 = `volumedetect` 测 RMS（单趟，几乎不耗 CPU）→ 算增益 →
+`volume` 施加**静态**增益（不需要动态分析）→ `alimiter` 限峰。
+**两个维度都比 loudnorm 好**：快 34 倍，一致性还更好。
+
+另测：`-threads 1` 对并发**没有**改善（18.9s vs 19.0s）—— 瓶颈是纯 CPU 争抢，
+不是线程超订，所以那不是解法。超时上限也从 120s 降到 30s。
+
+## 八、仍然遗留（有意不修）
 
 | 项 | 为什么不修 |
 |---|---|
-| admin 登录无限流 | 公开的 `wechat-login` 有 Redis 限流，admin 登录没有。bcrypt cost 12 把单次尝试拉到 ~200-300ms。**内测阶段规模够用**，上线前必须补（按 email+IP 维度） |
-| clawbot 回调不扣配额、不派蒸馏 | mock 性质的端点，与 `submit_article` 口径不一致。要么接上配额，要么从网关暴露面摘掉 |
-| 真实 agent 路径退款后没清 Redis「已扣费」标记 | 当下无害（重试不会重复扣），但两套状态长期不一致，后续任何依赖该标记做计费判断的改动都会踩坑 |
-| 配额标记 24h TTL → 超时后手动蒸馏会二次扣费 | 需要把扣费事实落库，改动大。要在配额策略定型后一起做 |
-| Docker 部署下蒸馏 P95 面板恒为空 | `AI_WORKER_METRICS_URL` 在 compose 里没有、8104 绑在容器回环。当前是 **systemd 部署**，不受影响 |
-| admin-web `AdminRole` 里的 `super_admin` / `viewer` 后端不存在 | 前端类型与后端角色集合不一致。后端真实只有 `admin` / `operator` 两档，前端闸门实际形同虚设。收窄类型是**破坏性**改动，等真要分权时一起做 |
-| 14 个端点零测试（其中 10 个客户端在调） | 音色 CRUD 与 admin/tags 至少要补「鉴权 + 归属 + 幂等」三层用例。内测阶段先补最热的 |
+| `admin/export/tags.csv` 等 5 个端点零测试 | 导出类端点要造数据才能断言，收益一般；音色库与标签库（破坏性操作）已优先补上 |
+| 配额退款锁 `refund:{task_id}` 的 TTL 也是 24h | Arq 的 retry 窗口远小于 24h，实测不会跨窗口重复退款；真要改也是独立项 |
+| `require_admin`（严格 admin）定义了但全仓零路由使用 | 要分 admin-only 端点时再启用；**启用时前端必须同步**（顺序反了就会出现「前端以为拦住了、后端其实没拦」） |
+| 上游 TTS（tertu.cn）本身的 RTF | 不是我方问题；本地已把该做的（响度归一）从 34 倍慢降到 0.14s |
