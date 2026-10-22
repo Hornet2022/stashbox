@@ -66,6 +66,32 @@ def _ip() -> str:
     return f"198.51.100.{uuid.uuid4().int % 250 + 1}"
 
 
+@pytest.fixture(autouse=True)
+async def _reset_login_rate_limit():
+    """清掉 Redis 里的登录限流计数，让本模块的用例与「之前跑过几遍」无关。
+
+    为什么必须清（2026-10-22 实测）：
+      计数落在 Redis（`ratelimit:login:{ip}`），**跨测试运行会残留**（TTL 60s）。
+      `_ip()` 是随机 IP（198.51.100.0/24 里随机取），池子只有 250 个 ——
+      连续跑几遍全量测试就可能撞上上一遍用过的 IP，带着旧计数进来，
+      于是「换个 IP 不该受影响」那条用例直接 429（单跑绿、全量跑红）。
+
+    → 限流状态是跨进程共享的外部状态，**每个用例开始前清一次**才是确定的。
+    """
+    from stashbox.backend.common.redis_client import get_redis_pool
+
+    import redis.asyncio as aioredis
+
+    r = aioredis.Redis(connection_pool=get_redis_pool())
+    try:
+        keys = await r.keys("ratelimit:login:*")
+        if keys:
+            await r.delete(*keys)
+    finally:
+        await r.aclose()
+    yield
+
+
 # ---------------------------------------------------------------------------
 # A. 超阈值 → 429 + 业务信封
 # ---------------------------------------------------------------------------

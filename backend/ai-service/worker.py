@@ -1,12 +1,22 @@
 """Arq Worker 入口（CP3.5-pre-3）。
 
-启动（二选一）：
-    cd backend/ai-service && ../.venv/bin/python -m arq worker.WorkerSettings
-    PYTHONPATH=<repo>/backend/ai-service ../.venv/bin/arq worker.WorkerSettings
+启动（**两个条件都要满足**，缺一个都起不来）：
 
-注意：ai-service 目录名带连字符（不是合法包名），worker / arq_settings / tasks
-都是顶层模块 —— 所以要么 cwd 是 ai-service（`python -m` 会把 cwd 加进 sys.path），
-要么把 ai-service 目录放进 PYTHONPATH。
+    cd backend/ai-service && PYTHONPATH=<仓库根的父目录> ../.venv/bin/python -m arq worker.WorkerSettings
+
+① **sys.path 必须含 ai-service 目录** —— ai-service 目录名带连字符（不是合法包名），
+   worker / arq_settings / tasks / variant_transcode_task 都是**顶层模块**：
+   要么 cwd 是 ai-service（`python -m` 会把 cwd 加进 sys.path），
+   要么把 ai-service 目录放进 PYTHONPATH。
+
+② **sys.path 必须含「仓库根的父目录」** —— 代码里是 `stashbox.backend.*` 绝对导入，
+   而 `stashbox` 是**仓库目录名**（不是顶层包），所以要放的是它的父目录：
+   本机 `/Users/hornet/work`（生产 `/opt/stashbox`）。
+
+⚠️ 两种报错对应两种缺失（别混）：
+   - `ModuleNotFoundError: No module named 'worker'`  → 缺 ①（cwd 不对）
+   - `ModuleNotFoundError: No module named 'stashbox'` → 缺 ②（PYTHONPATH 没带仓库父目录）
+   ⚠️ **运行期改 `os.environ["PYTHONPATH"]` 没用** —— sys.path 在解释器启动时就定好了。
 """
 
 import asyncio
