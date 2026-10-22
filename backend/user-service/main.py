@@ -510,6 +510,18 @@ async def refresh_token(req: RefreshTokenRequest, db: AsyncSession = Depends(get
     sub = payload.get("sub")
     if not sub:
         raise Unauthorized(message="invalid refresh token payload")
+    # 登出过的会话不能靠 refresh 复活。
+    #
+    # 2026-10-22 实测（此前 logout 端点刚补上时）：logout 写了吊销标记，
+    # access token 确实 401 了，但拿**同一个 refresh token** 去换新 token
+    # 依然返回 200 —— 因为这个端点只查 users.deleted_at，从不看吊销标记。
+    # 结果是「登出」只杀了 access token 这条腿，refresh 这条腿还活着：
+    # 设备丢了、用户以为登出了，最长 30 天内旧 refresh token 还能无限换出新
+    # access token —— 等于给用户发了一张「已登出」的假凭证。
+    #
+    # 这里补上吊销检查，和 require_user 用同一套判据（common/revocation.py）。
+    if await revocation.is_revoked(payload):
+        raise Unauthorized(message="Token has been revoked")
     result = await db.execute(select(User).where(User.id == int(sub)))
     user = result.scalar_one_or_none()
     if user is None:
@@ -1698,6 +1710,15 @@ async def admin_login(req: AdminLoginRequest, db: AsyncSession = Depends(get_db)
     # 3) 密码校验（bcrypt），错误 → 401
     if not user.password_hash or not _verify_password(req.password, user.password_hash):
         raise HTTPException(status_code=401, detail="invalid email or password")
+
+    # 3.5) 已注销（软删）的账号不能登后台。
+    #
+    # wechat 登录（:440）和 refresh（:523）都查了 users.deleted_at，
+    # 只有 admin 登录漏了 —— 结果是「注销账号」这个承诺对后台不生效：
+    # 注销过的 admin/operator 照样拿密码登进管理后台。
+    # 三处登录口径必须一致，判据也只有一条：deleted_at is not None → 拒绝。
+    if user.deleted_at is not None:
+        raise HTTPException(status_code=401, detail="account has been deleted")
 
     # 4) 角色校验：仅 admin / operator 可登，否则 403
     if user.tier not in _ALLOWED_ADMIN_ROLES:

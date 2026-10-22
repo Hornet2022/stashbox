@@ -63,6 +63,14 @@ async def _login(client, code: str | None = None) -> str:
     return r.json()["access_token"]
 
 
+async def _login_full(client, code: str | None = None) -> dict:
+    """登录并返回完整响应（含 refresh_token）。"""
+    code = code or ("logout_" + uuid.uuid4().hex[:12])
+    r = await client.post(LOGIN_URL, json={"code": code})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
 @pytest.mark.asyncio
 async def test_logout_returns_logged_out(client):
     token = await _login(client)
@@ -116,3 +124,55 @@ async def test_me_returns_current_user(client):
 async def test_me_requires_login(client):
     r = await client.get(ME_URL)
     assert r.status_code == 401, r.text
+
+
+@pytest.mark.asyncio
+async def test_logout_kills_refresh_path_too(client):
+    """登出后，**旧 refresh token 不能换出新 token**。
+
+    这是本文件最重要的一条。2026-10-22 实测（logout 端点刚补上时）：
+    logout 写了吊销标记，access token 确实 401 了，但拿**同一个
+    refresh token** 去换新 token 依然返回 200 —— 因为 refresh 端点
+    只查 users.deleted_at，从不看吊销标记。
+
+    结果是「登出」只杀了 access token 这一条腿，refresh 那条腿还活着：
+    设备丢了、用户以为登出了，旧 refresh token 最长 30 天内能无限换出
+    新 access token —— 等于给用户发了一张「已登出」的假凭证。
+    """
+    body = await _login_full(client)
+    refresh_token = body["refresh_token"]
+    access_token = body["access_token"]
+
+    # 登出前：refresh 能换出新 token
+    r0 = await client.post("/api/v1/auth/refresh-token", json={"refresh_token": refresh_token})
+    assert r0.status_code == 200, r0.text
+
+    r = await client.post(LOGOUT_URL, headers={"Authorization": f"Bearer {access_token}"})
+    assert r.status_code == 200, r.text
+
+    # 登出后：旧 refresh token 必须失效
+    r1 = await client.post("/api/v1/auth/refresh-token", json={"refresh_token": refresh_token})
+    assert (
+        r1.status_code == 401
+    ), f"登出后旧 refresh token 仍能换出新 token —— 会话没死透：{r1.text}"
+
+
+@pytest.mark.asyncio
+async def test_fresh_login_after_logout_works(client):
+    """登出后**重新登录**要能正常用。
+
+    吊销判据用的是毫秒戳（token 里的 iat_ms vs Redis 里的吊销边界）。
+    如果判据粗到「同一秒内签发的 token 一律作废」，那么「登出后立刻重新
+    登录」会拿到一个**立刻失效**的 token —— 表现为登录成功但什么功能都
+    报 401，极难排查。
+
+    这条锁住毫秒精度带来的好处：登出前的 token 死透了，登出后的新 token
+    活得好好的。
+    """
+    first = await _login_full(client)
+    r = await client.post(LOGOUT_URL, headers={"Authorization": f"Bearer {first['access_token']}"})
+    assert r.status_code == 200, r.text
+
+    second = await _login_full(client)
+    r2 = await client.get(QUOTA_URL, headers={"Authorization": f"Bearer {second['access_token']}"})
+    assert r2.status_code == 200, f"重新登录后的 token 不该失效：{r2.text}"

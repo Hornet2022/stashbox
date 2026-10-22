@@ -29,11 +29,24 @@ def create_access_token(
     """
     if expire_minutes is None:
         expire_minutes = settings.jwt_expire_minutes
-    expire = datetime.now(timezone.utc) + timedelta(minutes=expire_minutes)
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(minutes=expire_minutes)
     payload = {
         "sub": user_id,
         "exp": expire,
-        "iat": datetime.now(timezone.utc),
+        "iat": now,
+        # 毫秒级签发时刻。
+        #
+        # JWT 的 iat 只有**秒**级精度 —— python-jose 3.5.0 编码时按
+        # `claims[time_claim].utctimetuple()` 截断（jose/jwt.py:55-58），
+        # 微秒直接丢掉。而吊销判据要回答的是「这个 token 是在登出**之前**
+        # 还是**之后**签发的」—— 同一秒内签发的两个 token，用 iat 分不开。
+        #
+        # 不带这个戳，就只能在「误杀新 token」和「漏杀旧 token」之间二选一：
+        # 宽一点，登出后立刻重新登录会被自己的新 token 拒掉；严一点，
+        # 登出同一秒签发的旧 token 还能继续用满 7 天。
+        # 多带一个毫秒戳，判据就能精确到毫秒，两个错都不用犯。
+        "iat_ms": int(now.timestamp() * 1000),
     }
     if extra:
         payload.update(extra)

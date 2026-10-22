@@ -14,6 +14,7 @@
 fixture 用 create_all + ALTER TABLE ADD COLUMN IF NOT EXISTS 幂等补齐，
 绕过 broken 迁移链（同 test_admin_users.py 思路）。
 """
+
 import importlib.util
 import sys
 import uuid
@@ -53,16 +54,16 @@ async def _ensure_schema():
             Base.metadata.create_all,
             tables=[User.__table__, AdminOperationLog.__table__],
         )
-        await conn.execute(
-            text("ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255)")
-        )
+        await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255)"))
         await conn.execute(
             text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)")
         )
     yield
 
 
-async def _make_user(email: str, password: str, tier: str = "admin", nickname: str | None = None) -> int:
+async def _make_user(
+    email: str, password: str, tier: str = "admin", nickname: str | None = None
+) -> int:
     phash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
     async with AsyncSessionLocal() as s:
         u = User(
@@ -172,9 +173,7 @@ async def test_missing_email():
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=user_app), base_url="http://test"
     ) as client:
-        resp = await client.post(
-            "/api/v1/admin/auth/login", json={"password": "x"}
-        )
+        resp = await client.post("/api/v1/admin/auth/login", json={"password": "x"})
     assert resp.status_code == 400
 
 
@@ -189,3 +188,26 @@ async def test_missing_password():
             json={"email": "a@b.com"},
         )
     assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_deleted_account_cannot_login():
+    """**已注销（软删）的账号不能登后台** → 401。
+
+    2026-10-22 走查发现：wechat 登录和 refresh 都查了 users.deleted_at，
+    只有 admin 登录漏了 —— 结果是「注销账号」这个承诺对后台不生效：
+    注销过的 admin/operator 照样拿密码登进管理后台。
+
+    三处登录口径必须一致，判据只有一条：deleted_at is not None → 拒绝。
+    """
+    from datetime import datetime, timezone
+
+    email = "deleted_" + uuid.uuid4().hex[:8] + "@stashbox.dev"
+    uid = await _make_user(email, "admin_secret_123", tier="admin")
+    async with AsyncSessionLocal() as s:
+        u = await s.get(User, uid)
+        u.deleted_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        await s.commit()
+
+    resp = await _login(email, "admin_secret_123")
+    assert resp.status_code == 401, f"注销过的账号还能登后台：{resp.text}"
