@@ -4865,6 +4865,108 @@
         ]
       }
     },
+    "/api/v1/auth/logout": {
+      "post": {
+        "summary": "Logout",
+        "description": "登出：吊销该用户当前签发的所有 access token。\n\n## 为什么必须有这个端点\n客户端的「退出登录」一直在调它（[AuthApi.logout]），但**服务端从来没实现过**\n→ 一直 404 → 客户端靠 `catch (_: Exception)` 兜住、照样清本地 token，\n**服务端 token 却仍然有效** → 设备丢失、或用户以为登出了却没登出时，\n会话在服务端还能继续用。\n\n吊销用 [common.revocation]（与「注销账号」同一套机制）：记下吊销时刻，\n校验时按 `iat < revoked_at` 判失效 —— 一次 Redis GET，不查库。",
+        "operationId": "logout_api_v1_auth_logout_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogoutResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/auth/me": {
+      "get": {
+        "summary": "Me",
+        "description": "当前用户信息。\n\n客户端定义了 [AuthApi.me]（UserInfoResponse），但服务端一直没实现\n→ 端点 404。它当时**无人调用**（死接口），但客户端模型已定义齐全，\n补齐服务端比删客户端更符合原意。",
+        "operationId": "me_api_v1_auth_me_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserInfoResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service",
+          "api-gateway"
+        ]
+      }
+    },
     "/api/v1/auth/refresh-token": {
       "post": {
         "summary": "Refresh Token",
@@ -8479,6 +8581,18 @@
         ],
         "title": "DeviceResponse"
       },
+      "LogoutResponse": {
+        "properties": {
+          "logged_out": {
+            "type": "boolean",
+            "title": "Logged Out",
+            "default": true
+          }
+        },
+        "type": "object",
+        "title": "LogoutResponse",
+        "description": "POST /api/v1/auth/logout 响应。"
+      },
       "QuotaAdjustRequest": {
         "properties": {
           "monthly_quota": {
@@ -8571,6 +8685,30 @@
           "nickname"
         ],
         "title": "UserInfo"
+      },
+      "UserInfoResponse": {
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "title": "User Id"
+          },
+          "nickname": {
+            "type": "string",
+            "title": "Nickname"
+          },
+          "tier": {
+            "type": "string",
+            "title": "Tier"
+          }
+        },
+        "type": "object",
+        "required": [
+          "user_id",
+          "nickname",
+          "tier"
+        ],
+        "title": "UserInfoResponse",
+        "description": "GET /api/v1/auth/me 响应。"
       },
       "UserQuotaResponse": {
         "properties": {

@@ -362,6 +362,57 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+class LogoutResponse(BaseModel):
+    """POST /api/v1/auth/logout 响应。"""
+
+    logged_out: bool = True
+
+
+class UserInfoResponse(BaseModel):
+    """GET /api/v1/auth/me 响应。"""
+
+    user_id: str
+    nickname: str
+    tier: str
+
+
+@app.post("/api/v1/auth/logout", response_model=LogoutResponse)
+async def logout(user: dict = Depends(require_user)):
+    """登出：吊销该用户当前签发的所有 access token。
+
+    ## 为什么必须有这个端点
+    客户端的「退出登录」一直在调它（[AuthApi.logout]），但**服务端从来没实现过**
+    → 一直 404 → 客户端靠 `catch (_: Exception)` 兜住、照样清本地 token，
+    **服务端 token 却仍然有效** → 设备丢失、或用户以为登出了却没登出时，
+    会话在服务端还能继续用。
+
+    吊销用 [common.revocation]（与「注销账号」同一套机制）：记下吊销时刻，
+    校验时按 `iat < revoked_at` 判失效 —— 一次 Redis GET，不查库。
+    """
+    uid = int(user["sub"])
+    await revocation.revoke(uid, at=datetime.now(timezone.utc).timestamp())
+    return LogoutResponse(logged_out=True)
+
+
+@app.get("/api/v1/auth/me", response_model=UserInfoResponse)
+async def me(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
+    """当前用户信息。
+
+    客户端定义了 [AuthApi.me]（UserInfoResponse），但服务端一直没实现
+    → 端点 404。它当时**无人调用**（死接口），但客户端模型已定义齐全，
+    补齐服务端比删客户端更符合原意。
+    """
+    uid = int(user["sub"])
+    row = await db.get(User, uid)
+    if row is None:
+        raise NotFound(message="用户不存在")
+    return UserInfoResponse(
+        user_id=str(row.id),
+        nickname=row.nickname or "听友",
+        tier=row.tier,
+    )
+
+
 @app.post("/api/v1/auth/wechat-login", response_model=WechatLoginResponse)
 async def wechat_login(
     req: WechatLoginRequest,

@@ -44,6 +44,10 @@ def _url(service: str) -> str:
 ROUTES: list[Route] = [
     Route("POST", "/api/v1/auth/wechat-login", "user-service", _url("user-service")),
     Route("POST", "/api/v1/auth/refresh-token", "user-service", _url("user-service")),
+    # 登出与「我是谁」—— 客户端一直在调 logout（2026-10-22 走查发现服务端
+    # 从没实现 → 一直 404 → 客户端只清本地、服务端 token 不吊销）。
+    Route("POST", "/api/v1/auth/logout", "user-service", _url("user-service")),
+    Route("GET", "/api/v1/auth/me", "user-service", _url("user-service")),
     Route("GET", "/api/v1/user", "user-service", _url("user-service")),
     # CP11.0.4 P1.2: 付费墙配额查询(用户自己 / 配额)。
     # user-service 同时暴露 /api/v1/user/quota 和 /api/v1/users/me/quota,
