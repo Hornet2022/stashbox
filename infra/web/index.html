@@ -84,11 +84,15 @@ body {
 
 /* 所有方向的入场动效统一走这个类：ease-out、transform/opacity、≤250ms */
 .enter {
-  opacity: 0;
-  transform: translateY(8px);
-  animation: enter 250ms var(--ease-smooth-out) forwards;
+  /* 默认可见 —— 动效只是增强，不能让内容消失 */
+  opacity: 1;
+  transform: none;
+  animation: enter 250ms var(--ease-smooth-out);
 }
-@keyframes enter { to { opacity: 1; transform: none; } }
+@keyframes enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
 
 @media (prefers-reduced-motion: reduce) {
   .enter { animation: none; opacity: 1; transform: none; }
@@ -349,11 +353,10 @@ body {
 /* ═══ 生产化改动（见 infra/web/README.md）═══ */
 /* 方向切换器：原型是「三个方向并排挑」的探索工具，对外不该出现。
    团队内部用 ?picker=1 打开。 */
-.proto-picker { display: none; }
-body.show-picker .proto-picker { display: flex; }
+.proto-picker { display: none !important; }
+body.show-picker .proto-picker { display: flex !important; }
 /* CTA 从 button 换成 <a>：去掉下划线，其余沿用 .btn 的类样式 */
 a.btn { text-decoration: none; }
-/* 没有 JS 时的兜底：静态预渲染的内容已在 #stage 里，这里只保证可读 */
 </style>
 </head>
 <body>
@@ -711,6 +714,14 @@ requestAnimationFrame(() => requestAnimationFrame(() => picker.setAttribute('dat
 .proto-picker-replay { padding: 0 10px; font-size: 14px; }
 
 .proto-picker[data-position="top"] { bottom: auto; top: 24px; }
+
+/* ═══ 生产化改动（见 infra/web/README.md）═══ */
+/* 方向切换器：原型是「三个方向并排挑」的探索工具，对外不该出现。
+   团队内部用 ?picker=1 打开。 */
+.proto-picker { display: none !important; }
+body.show-picker .proto-picker { display: flex !important; }
+/* CTA 从 button 换成 <a>：去掉下划线，其余沿用 .btn 的类样式 */
+a.btn { text-decoration: none; }
 </style>
 
 </body>

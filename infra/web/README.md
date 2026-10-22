@@ -34,6 +34,38 @@
 
 **这是设计决策，不是技术决策** —— 换默认方向只需改预渲染的那一段。
 
+## 生产化时踩到的两个坑（都是「看起来没问题但整页是坏的」）
+
+### ① `.enter` 的 `opacity: 0` 让内容**依赖动画才能看见**
+
+原型写法：
+
+```css
+.enter { opacity: 0; animation: enter 250ms ... forwards; }
+```
+
+`opacity: 0` 是**基础样式**，只有动画跑完（且 `forwards` 把 1 定住）才看得见。
+浏览器在**后台标签页**会暂停 CSS 动画 → 动画停在 0% → `forwards` 把
+`opacity: 0` 定住 → **整页白**。
+
+改法：**基础样式就是可见的**，动画只是「淡入」这个增强：
+
+```css
+.enter { opacity: 1; transform: none; animation: enter 250ms ...; }
+@keyframes enter { from { opacity: 0; transform: translateY(8px); } to { ... } }
+```
+
+动画不跑（后台标签 / 被禁用）→ 照样看得见；跑了 → 照常淡入。
+**公开页不能把可见性押在动画上。**
+
+### ② 隐藏 `.proto-picker` 的规则被后面的 style 块覆盖
+
+原型有**两个** `<style>`：第二个是「Picker 样式（逐字照抄）」，它把
+`.proto-picker` 重定义成 `display: flex`。同特异度 → **后写的赢** →
+我加在第一个 style 块末尾的 `display: none` 被它吃掉了，切换器照样显示。
+
+改法：生产化 CSS 放在**最后一个 style 块之后**，并加 `!important` 双保险。
+
 ## 部署
 
 ```bash

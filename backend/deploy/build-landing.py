@@ -91,20 +91,55 @@ def main() -> int:
         '    <div class="chain enter"',
     )
 
-    # ── 5) 切换器默认隐藏 + 链接样式 ─────────────────────────────
+    # ── 5) 入场动效不能决定「内容能不能看见」 ─────────────────────
+    #
+    # 原型的写法是：
+    #     .enter { opacity: 0; animation: enter 250ms ... forwards; }
+    #     @keyframes enter { to { opacity: 1; transform: none; } }
+    #
+    # 这有个真问题：**opacity: 0 是基础样式**，只有动画跑完
+    # （且 fill-mode forwards 把 1 定住）才看得见。浏览器在**后台标签页**
+    # 会暂停 CSS 动画 → 动画停在 0% → forwards 把 opacity: 0 定住 →
+    # **整页白**。公开页不能把可见性押在动画上。
+    #
+    # 改成：基础样式就是可见的，动画只是「淡入」这个增强。
+    # 动画不跑（后台标签/被禁用）→ 照样看得见；跑了 → 照常淡入。
+    old_enter = """.enter {
+  opacity: 0;
+  transform: translateY(8px);
+  animation: enter 250ms var(--ease-smooth-out) forwards;
+}
+@keyframes enter { to { opacity: 1; transform: none; } }"""
+    new_enter = """.enter {
+  /* 默认可见 —— 动效只是增强，不能让内容消失 */
+  opacity: 1;
+  transform: none;
+  animation: enter 250ms var(--ease-smooth-out);
+}
+@keyframes enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}"""
+    if old_enter not in src:
+        raise SystemExit("没找到 .enter 规则（原型结构变了？）")
+    src = src.replace(old_enter, new_enter)
+
+    # ── 6) 切换器默认隐藏 + 链接样式（放最后，压过 picker 样式块）──
+    # ⚠️ 必须放在**最后**：原型有两个 <style>，第二个是「Picker 样式逐字照抄」，
+    #    它把 .proto-picker 重定义成 display:flex —— 放在前面会被它覆盖掉
+    #    （同样特异度，后写的赢）。
     css_add = """
 /* ═══ 生产化改动（见 infra/web/README.md）═══ */
 /* 方向切换器：原型是「三个方向并排挑」的探索工具，对外不该出现。
    团队内部用 ?picker=1 打开。 */
-.proto-picker { display: none; }
-body.show-picker .proto-picker { display: flex; }
+.proto-picker { display: none !important; }
+body.show-picker .proto-picker { display: flex !important; }
 /* CTA 从 button 换成 <a>：去掉下划线，其余沿用 .btn 的类样式 */
 a.btn { text-decoration: none; }
-/* 没有 JS 时的兜底：静态预渲染的内容已在 #stage 里，这里只保证可读 */
 """
-    src = src.replace("</style>", css_add + "</style>", 1)
+    src = src.replace("</style>", css_add + "</style>")
 
-    # ── 6) JS：?picker=1 显示切换器；方向 2 播真音频 ─────────────
+    # ── 7) JS：?picker=1 显示切换器；方向 2 播真音频 ─────────────
     src = src.replace(
         "setActive((parseInt(new URLSearchParams(location.search).get('v'), 10) || 1) - 1);",
         "if (new URLSearchParams(location.search).get('picker') === '1') "
