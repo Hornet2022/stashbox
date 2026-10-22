@@ -119,7 +119,7 @@ server {
     }
 
     # APK 下载（共享片段：漏了会返回 index.html 而不是 APK，状态码还是 200）
-    include /etc/nginx/snippets/stashbox-downloads.conf;
+    include /etc/nginx/snippets/stashbox-downloads-redirect.conf;
 
     # 营销页是单页，路径回落到 index.html
     location / {
