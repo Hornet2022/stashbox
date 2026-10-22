@@ -27,12 +27,12 @@ from pathlib import Path
 SAMPLE_TITLE = "奇客Solidot｜《星际公民》前传《Squadron 42》完成功能开发"
 SAMPLE_DUR = "03:47"
 SAMPLE_PATH = "/audio/audio/art_881ed5393d9d47248ed48271.b7416ab1.mp3"
-APK_PATH = "/downloads/tingxia-0.3.0.apk"
-APK_VER = "v0.3.0"
+APK_PATH = "/downloads/tingxia-0.3.1.apk"
+APK_VER = "v0.3.1"
 
 
 def extract_template(src: str, func_name: str) -> str:
-    """从 `function f() { return \`...\`; }` 里取出模板字符串的内容。"""
+    """从 `function f() { return `...`; }` 里取出模板字符串的内容。"""
     m = re.search(rf"function {func_name}\(\)\s*\{{\s*return\s*`(.*?)`;\s*\}}", src, re.S)
     if not m:
         raise SystemExit(f"没找到 {func_name} 的模板")
