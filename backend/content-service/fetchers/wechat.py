@@ -43,12 +43,13 @@ AUTH。判据已改为「无 `#js_content` + 剔 script 后扫可见文本」双
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 import httpx
 
@@ -123,6 +124,62 @@ _WECHAT_BLOCKLIST_PATTERNS: list[tuple[str, FetcherErrorCode, str]] = [
 _NONVISUAL_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
 # 有 #js_content = 这是真文章页，直接放行。
 _HAS_JS_CONTENT_RE = re.compile(r'id=["\']js_content["\']', re.IGNORECASE)
+
+
+#: 反爬空壳重试前的退避秒数。
+#:
+#: 微信的拦截是**短时**的（同一 IP 连打几次会中招，冷却一阵就恢复）——
+#: 实测无退避连发反而更容易连续撞墙。等一下更稳。
+_SHELL_RETRY_DELAY_SEC = 1.5
+
+#: 空壳页的「可见文本」上限（字节）。
+#:
+#: 实测那个 17,626 字节的微信空壳页，**可见文本只有 43 字节**
+#: （其余全是微信自己的 CSS）—— 所以体积完全不是判据，可见文本才是。
+#: 真文章的可见文本是几千字，200 字节是个安全的分界。
+_SHELL_MAX_VISIBLE_CHARS = 200
+
+
+def _is_wechat_shell(html: str) -> bool:
+    """这个页面是不是「微信反爬空壳 / 错误页」（而不是真文章）。
+
+    ## 核心判据：**没有 `#js_content`**
+
+    真文章页**一定**有正文容器 `#js_content`（抓取器的正文抽取就靠它，
+    实测真文章页里出现 18 处）。所以「没有它」= 这页不可能是文章。
+
+    为什么不能反过来用「体积小」：实测微信的空壳页有 **17,626 字节**
+    （绝大部分是微信自己的 CSS），**超过了** 10KB 的 `MIN_SHELL_BYTES` 阈值
+    —— 靠体积判会漏掉它。
+
+    为什么不能靠提示词：实测那个空壳页的**可见文本只有 43 字节**
+    （「： ， 。 &nbsp; 视频 小程序 赞，轻点两下取消赞…」），
+    **一个提示词都没有**；而真文章页的 webpack 载荷里**天然**带着
+    「请在微信中打开」等文案 11 处 —— 靠提示词判会 100% 误伤正常文章。
+
+    兜底条件：可见文本也极少（< 200 字节）时同样判为壳页 ——
+    双保险，防止哪天微信把正文容器改名，我们白白多打一次请求。
+    （那种情况下重试也拿不到正文，最终仍然按原路径报错，**不会**改变结果。）
+    """
+    if _HAS_JS_CONTENT_RE.search(html):
+        return False
+    visible = _NONVISUAL_RE.sub(" ", html)
+    text = re.sub(r"<[^>]+>", " ", visible)
+    text = re.sub(r"\s+", " ", text).strip()
+    return len(text) < _SHELL_MAX_VISIBLE_CHARS
+
+
+def _with_nwr_flag(url: str) -> str:
+    """给微信文章 URL 加上 `?nwr_flag=1`（微信自己的「继续/重试」标记）。
+
+    实测：成功的请求会被重定向到 `…?nwr_flag=1#wechat_redirect`，
+    而显式带上它请求则稳定拿到正文（3/3）。保留原 query 参数，不覆盖。
+    """
+    parts = urlsplit(url)
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    if not any(k == "nwr_flag" for k, _ in query):
+        query.append(("nwr_flag", "1"))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
 def _check_wechat_block(html: str) -> None:
@@ -282,7 +339,49 @@ class WechatFetcher(Fetcher):
         return Acquired(html=html, final_url=final_url, status=status_code, tier="http", url=url)
 
     async def _download(self, url: str, *, timeout: float) -> tuple[str, int, str]:
-        """抓 HTML：微信 4 件套齐发（+ SSRF 防护 / 退避重试 / 按 host 节流）。"""
+        """抓 HTML：微信 4 件套齐发（+ SSRF 防护 / 退避重试 / 按 host 节流）。
+
+        ## 反爬空壳 → 带 `nwr_flag=1` 重试（2026-10-23 实测）
+
+        微信对同一 IP 的**突发**请求会返回一个**小空壳页**（实测 39B / 31KB）
+        而不是 200 + 正文。壳页里能看到「参数错误」的提示，`<title>` 是空的，
+        页面里**没有** `#js_content` —— 解析器于是报
+        「wechat article body (#js_content) not found (page too small: 39B …)」，
+        用户看到的是 502「暂时连不上后端服务」。
+
+        微信自己给出了绕过办法：**成功的请求会被重定向到
+        `…?nwr_flag=1#wechat_redirect`**（实测 final URL 就是它），
+        而**显式带上 `?nwr_flag=1` 请求则 100% 拿到真文章**
+        （实测 3/3，每次 3.5MB、js_content 18 处）。
+
+        所以这里在「拿到壳页」时**重试一次并带上 nwr_flag=1**，
+        而不是把壳页直接判成失败 —— 后者会让一次偶发的反爬变成用户可见的失败。
+        """
+        html, status, final_url = await self._download_once(url, timeout=timeout)
+
+        if not _is_wechat_shell(html):
+            return html, status, final_url
+
+        retry_url = _with_nwr_flag(url)
+        log.info(
+            "wechat_shell_retry url=%s shell_bytes=%d retry_url=%s",
+            url,
+            len(html),
+            retry_url,
+        )
+        # 退避一下再试：拦截是**短时**的，立刻重试大概率再撞同一堵墙。
+        await asyncio.sleep(_SHELL_RETRY_DELAY_SEC)
+        try:
+            html2, status2, final_url2 = await self._download_once(retry_url, timeout=timeout)
+        except FetcherError:
+            # 重试本身失败 → 交回第一次的结果，让上层按原路径报（错误码更准）
+            return html, status, final_url
+        if _is_wechat_shell(html2):
+            return html, status, final_url
+        return html2, status2, final_url2
+
+    async def _download_once(self, url: str, *, timeout: float) -> tuple[str, int, str]:
+        """抓一次 HTML（4 件套 + SSRF 防护 + 退避重试 + 状态码判定）。"""
         await HOST_THROTTLE.wait(host_of(url))
         client_kwargs = build_client_kwargs(
             self.PROFILE,
