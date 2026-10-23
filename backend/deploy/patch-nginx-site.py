@@ -60,7 +60,10 @@ NEW_BLOCK = """
 #   /            → 营销页（infra/web/index.html 构建产物）
 #   /api/*       → 网关（App 的 base URL 就是这个 host）
 #   /audio/*     → 网关（音频 URL 由服务端 articles.audio_url 下发）
-#   /downloads/* → APK
+#   /downloads/* → APK（**直出**，不 302 到 IP）
+#     ICP 备案已于 2026-10-23 通过 → 域名的流量不再被云厂商限制，
+#     302 到 IP 那一态（备案未过期用的）已撤掉。
+#     需要回退时跑 patch-nginx-downloads-redirect.py（不加 --direct）。
 #
 # ⚠️ 营销页与后台**不同源**（后台在 admin.stashbox.cn）——
 #    后台的登录态在 localStorage，同源就等于把后台的 token 暴露给公开页。
@@ -119,7 +122,7 @@ server {
     }
 
     # APK 下载（共享片段：漏了会返回 index.html 而不是 APK，状态码还是 200）
-    include /etc/nginx/snippets/stashbox-downloads-redirect.conf;
+    include /etc/nginx/snippets/stashbox-downloads.conf;
 
     # 营销页是单页，路径回落到 index.html
     location / {

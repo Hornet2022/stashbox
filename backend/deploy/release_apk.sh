@@ -40,7 +40,16 @@ SSH_KEY="${STASHBOX_SSH_KEY:-$HOME/.ssh/stashbox_deploy}"
 REMOTE_DIR="/var/www/stashbox-downloads"
 REMOTE_APK="${REMOTE_DIR}/tingxia-${VERSION_NAME}.apk"
 ENV_FILE="/etc/stashbox/stashbox.env"
-DOWNLOAD_BASE="https://${HOST}/downloads"
+
+# 对外的下载域名（2026-10-23 ICP 备案通过后从 IP 切回域名）。
+#
+# 之前是 https://8.148.9.151/downloads —— 因为未备案时域名的大流量会被
+# 云厂商限制（nginx 的 /downloads/ 也是 302 到 IP）。备案通过后：
+#   · nginx 的域名入口改成**直出**（patch-nginx-downloads-redirect.py --direct）；
+#   · 下发地址也跟着用域名 —— 让用户看到的地址与实际线路一致。
+#
+# ⚠️ SSH 仍然走 IP（HOST）：那是运维通道，与用户下载无关。
+DOWNLOAD_BASE="${STASHBOX_DOWNLOAD_BASE:-https://stashbox.cn/downloads}"
 
 [[ -f "$APK_PATH" ]] || { echo "✗ 找不到 APK：$APK_PATH" >&2; exit 1; }
 [[ "$VERSION_CODE" =~ ^[0-9]+$ ]] || { echo "✗ versionCode 必须是整数：$VERSION_CODE" >&2; exit 1; }
@@ -87,12 +96,22 @@ echo "  ✓ 版本接口 = ${VERSION_NAME} / code ${VERSION_CODE}"
 
 # 营销页的下载入口必须真的能下到东西（不是 HTML —— 那个坑踩过两次：
 # /downloads/ 路由漏掉时 try_files 会返回 index.html，状态码还是 200）
+#
+# ⚠️ 用**域名**校验，不要用 IP：域名才是用户实际点的那个入口
+# （备案通过前 nginx 会 302 到 IP，用域名测会测到「302 正常」却漏掉
+#  真正的问题；现在改成直出，域名测才等于用户看到的路径）。
 HTTP_CODE="$("${SSH[@]}" "curl -s -o /dev/null -w '%{http_code}' '${DOWNLOAD_BASE}/latest.apk'" | tr -d '\r')"
-[[ "$HTTP_CODE" == "200" ]] || { echo "✗ /downloads/latest.apk 返回 ${HTTP_CODE}" >&2; exit 1; }
+[[ "$HTTP_CODE" == "200" ]] || { echo "✗ ${DOWNLOAD_BASE}/latest.apk 返回 ${HTTP_CODE}" >&2; exit 1; }
 SIZE="$("${SSH[@]}" "curl -s -o /dev/null -w '%{size_download}' '${DOWNLOAD_BASE}/latest.apk'" | tr -d '\r')"
 LOCAL_SIZE="$(wc -c < "$APK_PATH" | tr -d ' ')"
 [[ "$SIZE" == "$LOCAL_SIZE" ]] || { echo "✗ 下载大小 ${SIZE} 与本地 ${LOCAL_SIZE} 不符" >&2; exit 1; }
-echo "  ✓ /downloads/latest.apk 可下载（${SIZE} 字节）"
+echo "  ✓ ${DOWNLOAD_BASE}/latest.apk 可下载（${SIZE} 字节，域名直出）"
+
+# 域名入口必须**直出**（不 302）。备案通过后如果还是 302，说明 nginx 没切干净 ——
+# 那一态是备案未过期用的，用户点的域名会被转到 IP，语义与地址都不一致。
+REDIRECTED="$("${SSH[@]}" "curl -s -o /dev/null -w '%{redirect_url}' '${DOWNLOAD_BASE}/latest.apk'" | tr -d '\r')"
+[[ -z "$REDIRECTED" ]] || { echo "✗ 域名入口仍在 302 到 ${REDIRECTED}（应直出）" >&2; exit 1; }
+echo "  ✓ 域名入口直出（无 302）"
 
 echo
 echo "✅ 发版完成：${VERSION_NAME}（code ${VERSION_CODE}）"

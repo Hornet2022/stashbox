@@ -525,6 +525,40 @@ sudo systemctl enable --now stashbox-api-gateway.service \
 #    站点起不来。2026-10-22 走查发现：仓库里没有任何脚本会拷
 #    stashbox-downloads.conf（只有 patch-nginx-downloads-redirect.py
 #    拷了另一个）→ 严格照步骤部署的新机器在第 ⑨ 步就死。
+# ⑨-补 备案通过后的切换（2026-10-23）
+#
+#    ICP 备案已通过 → 「备案未过期的临时措施」全部撤掉。三处联动：
+#
+#    ① 域名入口的 /downloads/ ：302 到 IP  →  **直出**
+#       备案前：未备案域名的流量被云厂商限制（大流量被掐），所以 302 到 IP 绕开。
+#       备案后：限制解除，302 变成多余的一跳（跨主机跳转，对下载器不友好），
+#               而且营销页链接的语义变成「域名只是个跳转器」。
+#
+#       python3 backend/deploy/patch-nginx-downloads-redirect.py --direct
+#       # 回退（万一云厂商策略又变、或域名线路出问题）：
+#       python3 backend/deploy/patch-nginx-downloads-redirect.py
+#
+#       脚本是**双向**的，且自带备份 + `nginx -t` 失败自动回滚。
+#       IP 入口（server_name _）始终直出（不能跳自己）。
+#
+#    ② 服务端下发的下载地址：IP → 域名
+#       STASHBOX_APP_DOWNLOAD_URL=https://stashbox.cn/downloads/tingxia-<ver>.apk
+#       （release_apk.sh 现在自动做这件事，别手改 env）
+#
+#    ③ 营销页：主按钮本来就是相对路径 /downloads/latest.apk，**不用改** ——
+#       切直出后它自动走域名。
+#       ⚠️ 但「走 IP 直连下载」那条**第二层退路要留着**（切直出后
+#       域名与 IP 重新变成两条不同的路，它又变得有意义了）。
+#       2026-10-23 中间态曾把它删掉过一次（那时域名 302 到 IP，它毫无意义），
+#       现在已加回。
+#
+#    证书**不用动**：域名证书一直是 Let's Encrypt（SAN 覆盖
+#    stashbox.cn / www. / api. / admin. 四个），与备案无关；
+#    IP 证书（6 天自动续签）继续给 IP 兜底块用。
+#
+#    安卓端的 IP 兜底**继续保留**，但定位从「备案未过期的必需品」
+#    降级为「冗余保险」（域名线路本身出问题时它是唯一退路）。
+
 sudo bash backend/deploy/install-nginx-assets.sh
 #    想顺便覆盖主配置（谨慎）：服务器上的 /etc/nginx/nginx.conf 现由
 #    patch-nginx-logformat.py 就地打补丁维护，覆盖前会自动备份。
