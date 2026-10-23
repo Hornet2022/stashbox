@@ -366,18 +366,27 @@ a.btn { text-decoration: none; }
 
    ⚠️ 备案号改这里一处：infra/web/filing.json（发布脚本读它注入）。
       不要再把号码散落到别处 —— 之前就是因为「三处各写各的」漏过。 */
+/* 三行结构照国内站点的通行样式（参考图）：
+     ① © 2026<主体>. All rights reserved.
+     ② <ICP备案号> · [公安图标]<公安备案号>
+     ③ 网站名称：<备案里的名称>
+   配色跟随本站主题（本站是浅色纸面风，参考图是深色）——
+   结构与层级一致，底色不照抄，否则会在浅色页上砸一块深色。 */
 .site-footer {
   padding: 30px 16px 44px;
   text-align: center;
-  font-size: 12px;
-  line-height: 2;
+  font-size: 13px;
+  line-height: 2.1;
   color: var(--fg-faint);
 }
 .site-footer a { color: var(--fg-muted); text-decoration: none; }
 .site-footer a:hover { text-decoration: underline; }
-.site-footer-sep { margin: 0 10px; opacity: .5; }
-.site-footer p + p { margin-top: 2px; }
-.site-footer-name { color: var(--fg-muted); }
+.site-footer-copyright { font-size: 14px; color: var(--fg-muted); }
+.site-footer-filing { margin-top: 4px; }
+.site-footer-sep { margin: 0 10px; opacity: .45; }
+.site-footer-psb { display: inline-flex; align-items: center; gap: 4px; }
+.site-footer-psb-icon { width: 15px; height: 15px; display: inline-block; }
+.site-footer-name { margin-top: 2px; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -817,14 +826,9 @@ a.btn { text-decoration: none; }
      号码没到位时整段不显示（宁缺勿假：页面不能出现一个看着像真号、
      实际是占位的字符串）。 -->
 <footer class="site-footer" data-site-footer>
-  <p>
-    <span class="site-footer-name" data-site-name>网站名称：{{SITE_NAME}}</span>
-  </p>
-  <p>
-    <a href="https://beian.miit.gov.cn" target="_blank" rel="noreferrer noopener" data-icp-number>{{ICP_NUMBER}}</a>
-    <span class="site-footer-sep" data-icp-sep>·</span>
-    <a href="https://beian.mps.gov.cn" target="_blank" rel="noreferrer noopener" data-psb-number>{{PSB_NUMBER}}</a>
-  </p>
+  <p class="site-footer-copyright">{{COPYRIGHT}}</p>
+  <p class="site-footer-filing">{{FILING_LINKS}}</p>
+  <p class="site-footer-name" data-site-name>网站名称：{{SITE_NAME}}</p>
 </footer>
 
 </body>

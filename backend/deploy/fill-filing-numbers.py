@@ -54,6 +54,7 @@ ICP 备案通过前号码不存在（空串）。
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import re
 from pathlib import Path
@@ -79,19 +80,36 @@ SEPARATOR = re.compile(r'\s*<span class="site-footer-sep"[^>]*>·</span>')
 SITE_NAME_SPAN = re.compile(
     r'\s*<span class="site-footer-name"[^>]*data-site-name>\{\{SITE_NAME\}\}</span>'
 )
+FILING_ROW = re.compile(r'\s*<p class="site-footer-filing"[^>]*>\{\{FILING_LINKS\}\}</p>')
+COPYRIGHT_SPAN = re.compile(r'\s*<p class="site-footer-copyright"[^>]*>\{\{COPYRIGHT\}\}</p>')
+PSB_ICON_IMG = re.compile(r'\s*<img class="site-footer-psb-icon"[^>]*data-psb-icon>')
 
 
-def load_numbers() -> tuple[str, str, str]:
-    """返回 (site_name, icp, psb)。三个都来自同一个 filing.json。"""
+PSB_ICON_PATH = REPO_ROOT / "infra/web/images/psb-icon.png"
+
+
+def psb_icon_available() -> bool:
+    """公安备案官方图标是否已就位（从阿里云下载后放到 infra/web/images/）。"""
+    return PSB_ICON_PATH.exists()
+
+
+def load_numbers() -> tuple[str, str, str, str]:
+    """返回 (site_name, copyright_text, icp, psb)。都来自同一个 filing.json。"""
     data = json.loads(FILING.read_text(encoding="utf-8"))
+    holder = (data.get("copyright_holder") or "").strip()
+    year = str(datetime.now().year)
+    copyright_text = f"© {year}{holder}. All rights reserved." if holder else ""
     return (
         (data.get("site_name") or "").strip(),
+        copyright_text,
         (data.get("icp") or "").strip(),
         (data.get("psb") or "").strip(),
     )
 
 
-def render_landing(site_name: str, icp: str, psb: str) -> str:
+def render_landing(
+    site_name: str, copyright_text: str, icp: str, psb: str, psb_icon: str = ""
+) -> str:
     """把源码渲染成发布产物：替换占位符；空号则整段页脚不输出。
 
     工信部要求页脚**同时**标明「网站名称」和备案号（两者都要与备案系统一致），
@@ -99,39 +117,62 @@ def render_landing(site_name: str, icp: str, psb: str) -> str:
     """
     text = LANDING_SRC.read_text(encoding="utf-8")
 
+    if copyright_text:
+        text = text.replace("{{COPYRIGHT}}", copyright_text)
+    else:
+        text = COPYRIGHT_SPAN.sub("", text)
+
     if site_name:
         text = text.replace("{{SITE_NAME}}", site_name)
     else:
         text = SITE_NAME_SPAN.sub("", text)
 
+    # 备案号那一行**整段生成**（而不是逐个链接替换）——
+    # 逐个替换在「有一边没号」时会留下孤零零的分隔符或空标签。
+    links = []
     if icp:
-        text = text.replace("{{ICP_NUMBER}}", icp)
-    else:
-        text = ICP_LINK.sub("", text)
-
+        links.append(
+            f'<a href="https://beian.miit.gov.cn" target="_blank" rel="noreferrer noopener" '
+            f"data-icp-number>{icp}</a>"
+        )
     if psb:
-        text = text.replace("{{PSB_NUMBER}}", psb)
-    else:
-        text = PSB_LINK.sub("", text)
+        # 公安备案图标必须是阿里云「下载备案编号图标」给的**官方那张**。
+        # 没有官方图标就不显示图标 —— 自造一个盾牌等于伪造官方标识。
+        icon = (
+            '<img class="site-footer-psb-icon" src="/images/psb-icon.png" alt="" aria-hidden="true">'
+            if psb_icon
+            else ""
+        )
+        links.append(
+            f'<span class="site-footer-sep">·</span>'
+            f'<a class="site-footer-psb" href="https://beian.mps.gov.cn" target="_blank" '
+            f'rel="noreferrer noopener" data-psb-number>{icon}<span>{psb}</span></a>'
+        )
+    filing_html = "\n    ".join(links)
 
-    # 两边都空 → 连分隔符和整个 footer 一起去掉
-    if not icp and not psb:
-        text = SEPARATOR.sub("", text)
+    if filing_html:
+        text = text.replace("{{FILING_LINKS}}", filing_html)
+    else:
+        text = FILING_ROW.sub("", text)
+
+    # 三个号都没有 → 整个页脚不输出
+    if not icp and not psb and not site_name and not copyright_text:
         text = FOOTER_BLOCK.sub("\n", text)
-    elif not icp or not psb:
-        # 只有一边 → 去掉分隔符（否则会留下一个孤零零的「·」）
-        text = SEPARATOR.sub("", text)
 
     return text
 
 
-def emit_landing(site_name: str, icp: str, psb: str) -> Path:
+def emit_landing(
+    site_name: str, copyright_text: str, icp: str, psb: str, psb_icon: str = ""
+) -> Path:
     LANDING_OUT.parent.mkdir(parents=True, exist_ok=True)
-    LANDING_OUT.write_text(render_landing(site_name, icp, psb), encoding="utf-8")
+    LANDING_OUT.write_text(
+        render_landing(site_name, copyright_text, icp, psb, psb_icon), encoding="utf-8"
+    )
     return LANDING_OUT
 
 
-def check(site_name: str, icp: str, psb: str, admin_repo: Path) -> int:
+def check(site_name: str, copyright_text: str, icp: str, psb: str, admin_repo: Path) -> int:
     """两个站点的发布产物是否都带了号码、且链接正确。"""
     problems = []
 
@@ -148,6 +189,9 @@ def check(site_name: str, icp: str, psb: str, admin_repo: Path) -> int:
         if site_name:
             if site_name not in html:
                 problems.append(f"营销页产物缺网站名称 {site_name}")
+        if copyright_text:
+            if copyright_text not in html:
+                problems.append(f"营销页产物缺版权行 {copyright_text}")
         if icp:
             if icp not in html:
                 problems.append(f"营销页产物缺 ICP 备案号 {icp}")
@@ -190,7 +234,7 @@ def main() -> int:
     args = ap.parse_args()
     admin_repo = Path(args.admin_repo).resolve()
 
-    site_name, icp, psb = load_numbers()
+    site_name, copyright_text, icp, psb = load_numbers()
     if not site_name:
         print("! filing.json 的 site_name 为空 —— 页脚的网站名称行不显示")
     if not icp:
@@ -200,23 +244,29 @@ def main() -> int:
 
     if args.print_admin_env:
         # 供 `pnpm build` 使用的环境变量（值可能为空，空则不注入）
+        # 输出**可直接 eval 的 shell 片段**（值用单引号包起来）——
+        # 版权行里有空格（"© 2026听匣. All rights reserved."），
+        # 用空格分隔的 KEY=VALUE 直接 `env $X pnpm build` 会被拆成多个参数。
         parts = []
-        if site_name:
-            parts.append(f"VITE_SITE_NAME={site_name}")
-        if icp:
-            parts.append(f"VITE_ICP_NUMBER={icp}")
-        if psb:
-            parts.append(f"VITE_PSB_NUMBER={psb}")
-        print(" ".join(parts))
+        for key, value in (
+            ("VITE_SITE_NAME", site_name),
+            ("VITE_COPYRIGHT", copyright_text),
+            ("VITE_ICP_NUMBER", icp),
+            ("VITE_PSB_NUMBER", psb),
+            ("VITE_PSB_ICON", "/images/psb-icon.png" if psb_icon_available() else ""),
+        ):
+            if value:
+                parts.append(f"export {key}='{value}'")
+        print("\n".join(parts))
         return 0
 
     if args.emit_landing:
-        out = emit_landing(site_name, icp, psb)
+        out = emit_landing(site_name, copyright_text, icp, psb, "1" if psb_icon_available() else "")
         print(f"✓ 营销页发布产物：{out}")
         return 0
 
     if args.check:
-        return check(site_name, icp, psb, admin_repo)
+        return check(site_name, copyright_text, icp, psb, admin_repo)
 
     ap.print_help()
     return 0
