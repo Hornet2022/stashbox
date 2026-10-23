@@ -376,6 +376,8 @@ a.btn { text-decoration: none; }
 .site-footer a { color: var(--fg-muted); text-decoration: none; }
 .site-footer a:hover { text-decoration: underline; }
 .site-footer-sep { margin: 0 10px; opacity: .5; }
+.site-footer p + p { margin-top: 2px; }
+.site-footer-name { color: var(--fg-muted); }
 </style>
 </head>
 <body>
@@ -815,6 +817,9 @@ a.btn { text-decoration: none; }
      号码没到位时整段不显示（宁缺勿假：页面不能出现一个看着像真号、
      实际是占位的字符串）。 -->
 <footer class="site-footer" data-site-footer>
+  <p>
+    <span class="site-footer-name" data-site-name>网站名称：{{SITE_NAME}}</span>
+  </p>
   <p>
     <a href="https://beian.miit.gov.cn" target="_blank" rel="noreferrer noopener" data-icp-number>{{ICP_NUMBER}}</a>
     <span class="site-footer-sep" data-icp-sep>·</span>

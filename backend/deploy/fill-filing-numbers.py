@@ -56,7 +56,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -77,16 +76,33 @@ PSB_LINK = re.compile(
     r'\s*<a href="https://beian\.mps\.gov\.cn"[^>]*data-psb-number>\{\{PSB_NUMBER\}\}</a>'
 )
 SEPARATOR = re.compile(r'\s*<span class="site-footer-sep"[^>]*>·</span>')
+SITE_NAME_SPAN = re.compile(
+    r'\s*<span class="site-footer-name"[^>]*data-site-name>\{\{SITE_NAME\}\}</span>'
+)
 
 
-def load_numbers() -> tuple[str, str]:
+def load_numbers() -> tuple[str, str, str]:
+    """返回 (site_name, icp, psb)。三个都来自同一个 filing.json。"""
     data = json.loads(FILING.read_text(encoding="utf-8"))
-    return (data.get("icp") or "").strip(), (data.get("psb") or "").strip()
+    return (
+        (data.get("site_name") or "").strip(),
+        (data.get("icp") or "").strip(),
+        (data.get("psb") or "").strip(),
+    )
 
 
-def render_landing(icp: str, psb: str) -> str:
-    """把源码渲染成发布产物：替换占位符；空号则整段页脚不输出。"""
+def render_landing(site_name: str, icp: str, psb: str) -> str:
+    """把源码渲染成发布产物：替换占位符；空号则整段页脚不输出。
+
+    工信部要求页脚**同时**标明「网站名称」和备案号（两者都要与备案系统一致），
+    少一行就是「备案信息不完整」。
+    """
     text = LANDING_SRC.read_text(encoding="utf-8")
+
+    if site_name:
+        text = text.replace("{{SITE_NAME}}", site_name)
+    else:
+        text = SITE_NAME_SPAN.sub("", text)
 
     if icp:
         text = text.replace("{{ICP_NUMBER}}", icp)
@@ -109,19 +125,19 @@ def render_landing(icp: str, psb: str) -> str:
     return text
 
 
-def emit_landing(icp: str, psb: str) -> Path:
+def emit_landing(site_name: str, icp: str, psb: str) -> Path:
     LANDING_OUT.parent.mkdir(parents=True, exist_ok=True)
-    LANDING_OUT.write_text(render_landing(icp, psb), encoding="utf-8")
+    LANDING_OUT.write_text(render_landing(site_name, icp, psb), encoding="utf-8")
     return LANDING_OUT
 
 
-def check(icp: str, psb: str, admin_repo: Path) -> int:
+def check(site_name: str, icp: str, psb: str, admin_repo: Path) -> int:
     """两个站点的发布产物是否都带了号码、且链接正确。"""
     problems = []
 
     # ① 营销页：看**源码**的占位符 + 产物的内容
     src = LANDING_SRC.read_text(encoding="utf-8")
-    if "{{ICP_NUMBER}}" not in src or "{{PSB_NUMBER}}" not in src:
+    if "{{SITE_NAME}}" not in src or "{{ICP_NUMBER}}" not in src or "{{PSB_NUMBER}}" not in src:
         problems.append("营销页源码的占位符被改掉了（源码必须永远保留占位符）")
 
     out = LANDING_OUT if LANDING_OUT.exists() else None
@@ -129,6 +145,9 @@ def check(icp: str, psb: str, admin_repo: Path) -> int:
         problems.append("营销页发布产物还没生成（跑 --emit-landing）")
     else:
         html = out.read_text(encoding="utf-8")
+        if site_name:
+            if site_name not in html:
+                problems.append(f"营销页产物缺网站名称 {site_name}")
         if icp:
             if icp not in html:
                 problems.append(f"营销页产物缺 ICP 备案号 {icp}")
@@ -148,6 +167,8 @@ def check(icp: str, psb: str, admin_repo: Path) -> int:
             problems.append("admin-web 没改成构建期注入（VITE_ICP_NUMBER）")
         if "{{ICP_NUMBER}}" in admin:
             problems.append("admin-web 源码里还有占位符（应该用构建期注入）")
+        if site_name and site_name not in admin:
+            problems.append(f"admin-web 缺网站名称 {site_name}")
     else:
         problems.append(f"找不到 admin-web 的 {admin_path}")
 
@@ -169,7 +190,9 @@ def main() -> int:
     args = ap.parse_args()
     admin_repo = Path(args.admin_repo).resolve()
 
-    icp, psb = load_numbers()
+    site_name, icp, psb = load_numbers()
+    if not site_name:
+        print("! filing.json 的 site_name 为空 —— 页脚的网站名称行不显示")
     if not icp:
         print("! filing.json 的 icp 为空 —— 页脚的 ICP 段整段不显示（宁缺勿假）")
     if not psb:
@@ -178,6 +201,8 @@ def main() -> int:
     if args.print_admin_env:
         # 供 `pnpm build` 使用的环境变量（值可能为空，空则不注入）
         parts = []
+        if site_name:
+            parts.append(f"VITE_SITE_NAME={site_name}")
         if icp:
             parts.append(f"VITE_ICP_NUMBER={icp}")
         if psb:
@@ -186,12 +211,12 @@ def main() -> int:
         return 0
 
     if args.emit_landing:
-        out = emit_landing(icp, psb)
+        out = emit_landing(site_name, icp, psb)
         print(f"✓ 营销页发布产物：{out}")
         return 0
 
     if args.check:
-        return check(icp, psb, admin_repo)
+        return check(site_name, icp, psb, admin_repo)
 
     ap.print_help()
     return 0
