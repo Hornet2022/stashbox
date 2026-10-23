@@ -1202,6 +1202,27 @@ async def admin_tts_config_put(
     return masked
 
 
+#: TTS 连通性测试用的**长句**（约 110 字）。
+#:
+#: ⚠️ 原来是一句 13 字的「听匣 TTS 连通性测试。」—— 那太短了：
+#: openai provider 有「按语速判静默截断」的护栏（语速 = 字数 / 音频时长），
+#: 而**短文本的时长被首尾留白与句读停顿主导**，13 字产出 2.0s 就是
+#: 6.5 字/秒 —— 落在真截断（7.14）与正常（5.52）之间，判据在这长度上
+#: **测不出真值**。结果是 admin 的「TTS 测试」按钮对 openai provider
+#: 永远报「输出疑似被截断」，而实际合成是好的。
+#:
+#: 换成 110 字左右（≈20s 音频，与 134 字实测样本同量级）后，语速落在
+#: 5.0~6.2 的正常区间，与真截断（7.14）分得开。
+#:
+#: 代价：这次测试多花 ~20s 上游时间 —— 换来的是按钮的绿灯真的代表可用。
+_TTS_TEST_TEXT = (
+    "这是一段用于连通性测试的文字。语音合成服务收到它之后，"
+    "会把它按自然的中文播报节奏读出来，用来确认音色、语速和音量都正常。"
+    "如果这段话能被完整地念完、没有卡顿也没有缺字，就说明当前配置是好的。"
+    "它不需要很短，也不需要很长，只要足够长，语速这个判据才测得准。"
+)
+
+
 @router.post("/api/v1/admin/tts/test")
 async def admin_tts_test_with_config(
     req: TTSConfigUpdate,
@@ -1242,7 +1263,7 @@ async def admin_tts_test_with_config(
     client = None
     try:
         client = build_client(effective)
-        b = await client.synthesize("听匣 TTS 连通性测试。", voice=result["voice"])
+        b = await client.synthesize(_TTS_TEST_TEXT, voice=result["voice"])
         result.update(
             ok=bool(b),
             bytes_len=len(b or b""),
@@ -1398,9 +1419,12 @@ async def admin_tts_test(user: dict = Depends(require_admin_or_operator)):
         "voice": getattr(client, "voice", None),
     }
     try:
-        # 短文，30 字以内；mock 也跑得通（返回静音 mp3）
+        # 用**长句**而不是「30 字以内」：openai provider 有按语速判静默截断的
+        # 护栏，短文本的时长被首尾留白主导 → 语速判据在短句上测不出真值，
+        # 结果是「TTS 烟雾测试。」这种正常合成被判成截断，按钮永远红。
+        # 详见 _TTS_TEST_TEXT 的说明。
         b = await client.synthesize(
-            "TTS 烟雾测试。",
+            _TTS_TEST_TEXT,
             voice=getattr(client, "voice", None),
         )
         result["bytes_len"] = len(b or b"")

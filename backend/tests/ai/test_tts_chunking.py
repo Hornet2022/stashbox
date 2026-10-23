@@ -304,12 +304,64 @@ async def test_upstream_504_body_is_recognised(openai_mod):
 
 
 def test_truncation_threshold_is_tight_enough(openai_mod):
-    """截断阈值必须 5.5 —— 正常上界 4.61，真截断 7.14。
+    """截断阈值必须 6.5 —— **实测正常上界 5.52，真截断 7.14**。
 
-    阈值太松（比如 7.0）会让真截断漏判，内容缺失照样写进库；
-    太紧（比如 4.0）会把正常段误判成截断，白白多合成一次。
+    ⚠️ 原值 5.5 是错的：它**比实测正常样本还低**（134 字实测 5.52 字/秒，
+    文档里就标成「正常」）。后果不只是误报 ——
+      · 短块（≤ min_chunk_chars）→ 异常直接上抛，**admin 的「TTS 测试」
+        按钮对 openai provider 永远是红的**；
+      · 长块 → 触发重试与二分 = 把这一段**重新采样**，
+        分段音色离散度被推高，还平白多出新的接缝。
+    「宁可误报」的前提是误报代价低，而这里代价是白烧一次合成。
+
+    阈值太松（比如 8.0）会让真截断漏判，内容缺失照样写进库；
+    太紧（比如 5.5）会把正常段误判成截断。
     """
-    assert openai_mod._TRUNCATION_CHARS_PER_SEC == 5.5
+    assert openai_mod._TRUNCATION_CHARS_PER_SEC == 6.5
+
+
+def test_admin_测试句足够长_语速判据才有意义(openai_mod):
+    """admin 的 TTS 测试句必须**足够长**。
+
+    语速 = 字数 / 音频时长，而短文本的时长被首尾留白与句读停顿主导 ——
+    13 字的「听匣 TTS 连通性测试。」产出 2.0s 就是 6.5 字/秒，
+    落在真截断（7.14）与正常（5.52）之间，判据在这长度上**测不出真值**。
+    后果：admin 的「TTS 测试」按钮对 openai provider 永远报「疑似被截断」，
+    而实际合成是好的。
+
+    这里锁住「测试句足够长」这个前提，别让谁又改回一句话。
+    """
+    import importlib.util
+    from pathlib import Path
+
+    backend_dir = Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location(
+        "_tts_cfg_fields_admin_router_probe", backend_dir / "content-service" / "admin_router.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    text = module._TTS_TEST_TEXT
+    assert len(text) >= 100, f"测试句太短（{len(text)} 字），语速判据在短文本上不可靠"
+
+
+def test_正常语速不误判(openai_mod):
+    """实测正常样本：134 字 → 24.3s → 5.52 字/秒（文档标为正常）。
+
+    旧阈值 5.5 会把它判成截断 → 白白重试 + 二分（= 重新采样 = 音色更漂）。
+    """
+    client = openai_mod.OpenAITTSClient(api_key="k", base_url="http://x", model="m")
+    client._assert_not_truncated("这" * 134, _fake_mp3_of_seconds(24))
+
+
+def test_真截断仍然被抓(openai_mod):
+    """实测真截断：290 字 → 40.6s → 7.14 字/秒 → 必须报出来。
+
+    放宽阈值不能把真截断一起放过 —— 那是「内容缺失但状态成功」，
+    比报错难查得多。
+    """
+    client = openai_mod.OpenAITTSClient(api_key="k", base_url="http://x", model="m")
+    with pytest.raises(openai_mod._TruncatedOutput):
+        client._assert_not_truncated("这" * 290, _fake_mp3_of_seconds(40))
 
 
 @pytest.mark.asyncio
