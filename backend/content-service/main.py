@@ -188,6 +188,18 @@ class InvalidRequest(BizException):
 
 
 ANONYMOUS_USER_ID = 0  # 匿名文章归属（v1 §4.3.1 无 device_id 列，本期用 user_id=0 标记）
+
+#: 调用方**尚未确定真实来源**时用的占位 source。
+#:
+#: 这些码在 fetcher 跑完之后会被替换成真实来源（github / wechat / pdf / …）——
+#: 留着占位码的话，列表里就会出现「用户剪的是 GitHub 仓库，来源显示通用」。
+#:
+#: · `web`  —— 用户侧剪藏入口的默认值（`AddArticleRequest.source` 默认 "web"）；
+#: · `url`  —— admin 侧录入链接的默认值（admin-web 发 `source: 'url'`）。
+#:
+#: ⚠️ 只放**占位码**，不放真实来源码：wechat/wechat_mp/douyin/pdf 这些是
+#: 调用方**已经知道**来源的路径，不能被 fetcher 的判断改写。
+_GENERIC_SOURCES = frozenset({"web", "url"})
 ANONYMOUS_OPEN_ID = "__anonymous__"
 AUDIO_URL_TTL_SEC = 3600
 OSS_AUDIO_BASE = "https://stashbox-audio.oss-cn-hangzhou.aliyuncs.com"
@@ -542,11 +554,11 @@ async def _create_article(
     # 2026-10-03：失败不再软降级，改为抛错（见 _prefetch_for_capture 的注释）。
     # 抓不到正文就没有可蒸馏的东西，硬失败比"建一条注定失败的记录"诚实得多，
     # 也把用户等待 12 分钟才知道结果的时间差抹掉了。
-    if fetch_on_create and (title is None or source == "web" or raw_content is None):
+    if fetch_on_create and (title is None or source in _GENERIC_SOURCES or raw_content is None):
         fr = await _prefetch_for_capture(url)
         if title is None and fr.title:
             title = fr.title
-        if source == "web" and fr.source and fr.source != "unknown":
+        if source in _GENERIC_SOURCES and fr.source and fr.source != "unknown":
             source = fr.source
         if raw_content is None:
             # 必须走 _to_raw_content：asdict 不转换 datetime（publish_time），

@@ -320,6 +320,50 @@ async def test_admin录入链接_哨兵用户不存在时也不能因外键失�
 
 
 @pytest.mark.asyncio
+async def test_admin录入链接_来源用真实来源而不是占位码(monkeypatch):
+    """admin-web 发 `source: 'url'`（占位码），库里应落**真实来源**。
+
+    为什么锁这条：admin 端点不走 `submit_article`（那条路径自己解析来源），
+    它把 source 直接交给 `_create_article`。若 `_create_article` 不把占位码
+    换成 fetcher 判定的真实来源，运营录一个 GitHub 仓库，库里就是 "url" ——
+    来源筛选失真，用户侧徽章也只会显示「通用」。
+
+    这条在 admin 端点刚修好时是 500（外键），所以历史上**没有**任何
+    admin 建的文章 → 不存在「老数据突变」的问题。
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    # content_main 已把 content-service 目录加进 sys.path，`fetchers` 是顶层包
+    from fetchers.base import FetchResult
+
+    class _FakeGitHubFetcher:
+        async def fetch(self, url: str, timeout: float | None = None, budget: float | None = None):
+            return FetchResult(
+                url=url,
+                title="owner/repo",
+                content_html="<p>README</p>",
+                content_text="README 正文内容，足够长，" * 30,
+                source="github",
+            )
+
+    monkeypatch.setattr(content_main, "get_fetcher", lambda _url: _FakeGitHubFetcher())
+
+    with _override_auth("require_admin_or_operator", ADMIN_USER):
+        transport = ASGITransport(app=content_main.app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/v1/admin/articles",
+                json={"url": "https://github.com/owner/repo", "source": "url"},
+            )
+    assert resp.status_code == 200, resp.text
+
+    async with AsyncSessionLocal() as s:
+        art = await s.get(Article, resp.json()["article_id"])
+        assert art is not None
+        assert art.source == "github", f"应落真实来源，实际 {art.source!r}"
+
+
+@pytest.mark.asyncio
 async def test_admin录入文档_普通用户被拒():
     """普通用户不能往全站塞内容。
 
