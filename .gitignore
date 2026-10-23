@@ -113,3 +113,9 @@ docker-compose.override.yml
 backend/ai-service/data/
 backend/data/audio/
 /data/
+
+# 营销页的**发布产物**（infra/web/dist/）——
+# 由 backend/deploy/fill-filing-numbers.py --emit-landing 生成，
+# 每次换备案号都会变。它是构建输出，不进版本库
+# （进了就等于把「某一时刻的备案号」固化进历史）。
+infra/web/dist/
