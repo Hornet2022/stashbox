@@ -120,11 +120,9 @@ body {
 .v-broadsheet {
   padding: 0 var(--space-24) clamp(16px, 2.4vh, 32px);
   display: flex; flex-direction: column;
-  /* **不**撑满一屏。留白应该落在「主内容 ↔ 页脚」之间，而不是被标题区
-     吸走 —— 之前 .headline 是 flex:1，多出来的空间全被它吃掉，
-     三栏区被顶到页面偏下，中间一大片空白（视口越高越明显）。
-     现在主内容紧凑成一块、页脚照旧贴底。 */
-  flex: 0 0 auto;
+  /* 撑满 #stage（高度由它分配）—— 自己再声明 min-height:100svh
+     会把页脚挤到视口外面。 */
+  flex: 1 1 auto; min-height: 0;
 }
 
 .v-broadsheet .masthead {
@@ -151,8 +149,11 @@ body {
   padding: clamp(12px, 2.6vh, 64px) 0 clamp(8px, 1.7vh, 48px);
   display: flex; flex-direction: column; justify-content: center;
   gap: clamp(8px, 1.3vh, 24px);
-  /* 标题区不再吸收剩余空间（留白改由 #stage 层统一分配）。 */
+  /* 标题区用 **auto margin** 把「标题 + 三栏 + CTA」这一整块
+     在可用空间里**居中**：报头因此留在顶部（报纸的报头就该贴顶），
+     而高视口上多出来的空白不会全堆在一处。 */
   flex: 0 0 auto;
+  margin-top: auto; margin-bottom: auto;
 }
 .v-broadsheet .kicker {
   font-family: var(--mono); font-size: 12px; letter-spacing: 0.16em;
@@ -162,12 +163,12 @@ body {
   font-family: var(--serif); font-weight: 600;
   /* 字号同时受宽度和**高度**约束：矮屏（笔记本 720p、手机横屏）时
      不能只按宽度算，否则标题一行就顶掉半屏。 */
-  font-size: clamp(28px, min(8.2vw, 9.4vh), 96px); line-height: 1.08;
+  font-size: clamp(28px, min(8.2vw, 10vh), 120px); line-height: 1.08;
   letter-spacing: -0.01em; margin: 0; max-width: 16ch;
 }
 .v-broadsheet h1 em { font-style: normal; color: var(--accent); }
 .v-broadsheet .standfirst {
-  font-size: clamp(14px, min(1.6vw, 2.1vh), 19px); line-height: 1.7;
+  font-size: clamp(14px, min(1.6vw, 2.2vh), 22px); line-height: 1.7;
   color: var(--fg-muted); max-width: 46ch; margin: 0;
 }
 
@@ -196,11 +197,12 @@ body {
   letter-spacing: 0.1em; margin: 0 0 var(--space-8);
 }
 .v-broadsheet .col h3 {
-  font-family: var(--serif); font-size: 17px; font-weight: 600;
+  font-family: var(--serif);
+  font-size: clamp(17px, 1.5vh, 21px); font-weight: 600;
   margin: 0 0 var(--space-8); letter-spacing: 0.02em;
 }
 .v-broadsheet .col p {
-  font-size: 14px; line-height: 1.7; color: var(--fg-muted); margin: 0;
+  font-size: clamp(14px, 1.25vh, 18px); line-height: 1.7; color: var(--fg-muted); margin: 0;
   /* 文字与分隔线之间**永远**留出间隙。
      竖线在空隙中央（离栏边缘 24px），文字再往里缩 20px，
      于是文字到线的距离 = 44px（此前 36px），任何宽度下都不会压线。 */
@@ -210,20 +212,33 @@ body {
 .v-broadsheet .cta-row {
   max-width: 1120px; margin: clamp(8px, 1.7vh, 64px) auto 0; width: 100%;
   padding-top: clamp(10px, 1.6vh, 24px); border-top: 1px solid var(--rule);
-  display: flex; align-items: center; justify-content: space-between;
-  gap: var(--space-24); flex-wrap: wrap;
+  /* 靠左**并成一组**，不再两端分散。
+     之前是 justify-content: space-between → 版本说明在左、按钮在最右，
+     中间隔着七百多像素，按钮孤零零地飘着，跟整页的左对齐语言不搭。 */
+  display: flex; align-items: center; justify-content: flex-start;
+  gap: clamp(14px, 1.6vw, 26px); flex-wrap: wrap;
 }
-.v-broadsheet .cta-note { font-size: 13px; color: var(--fg-faint); margin: 0; }
+.v-broadsheet .cta-note {
+  font-size: clamp(13px, 1.3vh, 18px); color: var(--fg-faint); margin: 0;
+}
+/* 下载按钮：实心**暖棕** + 近直角 + 衬线。
+   · 暖棕 = 与标题里「听得完」同一个 accent 色 → 页面上有呼应，不突兀
+   · 近直角（2px）而不是胶囊 —— 整页是报纸的直线语言，胶囊圆角是另一套
+   · 衬线字体 + 字距 = 与标题/栏目同族 */
 .v-broadsheet .btn {
   display: inline-flex; align-items: center; gap: var(--space-8);
-  padding: 11px 22px; border: 1px solid var(--fg); border-radius: 999px;
-  background: transparent; color: var(--fg);
-  font-family: var(--sans); font-size: 14px; cursor: pointer;
+  padding: clamp(10px, 1.25vh, 15px) clamp(20px, 2.4vh, 30px);
+  border: 1px solid var(--accent); border-radius: 2px;
+  background: var(--accent); color: #FFF8F0;
+  font-family: var(--serif); font-size: clamp(14px, 1.45vh, 19px);
+  letter-spacing: 0.08em; cursor: pointer;
   transition: background var(--dur-fast) var(--ease-smooth-out),
-              color var(--dur-fast) var(--ease-smooth-out),
+              border-color var(--dur-fast) var(--ease-smooth-out),
               transform var(--dur-quick) var(--ease-smooth-out);
 }
-.v-broadsheet .btn:hover { background: var(--fg); color: var(--bg); }
+.v-broadsheet .btn:hover {
+  background: var(--fg); border-color: var(--fg); color: var(--bg);
+}
 .v-broadsheet .btn:active { transform: scale(0.98); }
 
 /* ───────── 方向二：声纹 ───────── */
@@ -376,6 +391,27 @@ body {
 .v-commute .btn:hover { opacity: 0.86; }
 .v-commute .btn:active { transform: scale(0.98); }
 
+/* ───────── 按视口高度分档 ─────────
+   内容的字号要跟着**视口高度**走，但不同档位的目标不同：
+   · 高屏（2K 显示器 1920×1300 这类）：视口高、内容矮 →
+     放大内容，把多出来的空间用掉，别在 CTA 与页脚之间空一大块。
+   · 矮屏（笔记本 720p 这类）：视口矮 → 收紧，保证一屏装得下。
+   · 中间是基线。 */
+@media (min-height: 1050px) {
+  .v-broadsheet h1 { font-size: clamp(28px, min(8.2vw, 11.5vh), 150px); }
+  .v-broadsheet .standfirst { font-size: clamp(14px, min(1.6vw, 2.5vh), 26px); }
+  .v-broadsheet .col h3 { font-size: clamp(17px, 1.7vh, 24px); }
+  .v-broadsheet .col p { font-size: clamp(14px, 1.45vh, 20px); }
+  .v-broadsheet .cta-note { font-size: clamp(13px, 1.3vh, 18px); }
+  .v-broadsheet .btn { font-size: clamp(14px, 1.45vh, 19px); }
+}
+@media (max-height: 800px) {
+  .v-broadsheet h1 { font-size: clamp(26px, min(8.2vw, 9vh), 92px); }
+  .v-broadsheet .standfirst { font-size: clamp(13px, min(1.6vw, 1.9vh), 18px); }
+  .v-broadsheet .col h3 { font-size: clamp(16px, 1.3vh, 20px); }
+  .v-broadsheet .col p { font-size: clamp(13px, 1.1vh, 16px); }
+}
+
 /* ───────── 窄屏（手机竖屏）─────────
    之前窄屏把三栏改成**竖排三段** → 占掉 300px+，整页必然超一屏。
    现在改成**横排三小栏**（报纸的迷你版）：只占 ~150px，一屏装得下，
@@ -476,6 +512,8 @@ a.btn { text-decoration: none; }
    → 页脚被挤到视口之外（实测文档高 1043 / 视口 900）。 */
 #stage {
   display: flex; flex-direction: column;
+  /* stage 吃掉除页脚以外的全部高度（页脚因此贴底 —— 备案号要在页面底部）。
+     剩下的空间由 .v-broadsheet 内部再分配。 */
   flex: 1 1 auto; min-height: 0;
 }
 
