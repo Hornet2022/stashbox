@@ -44,6 +44,15 @@ def _env_config() -> dict[str, Any]:
         "openai_base_url": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
         "openai_model": os.getenv("OPENAI_TTS_MODEL", "tts-1"),
         "openai_voice": os.getenv("OPENAI_TTS_VOICE", "alloy"),
+        # 风格控制 prompt（上游字段名就是 `instructions`）。
+        #
+        # ⚠️ 别在这里加 temperature / top_p：生产的托管端点（tertu.cn）
+        # **不收**这两个参数 —— 实测传了被静默丢弃，连 400 都不报。
+        # 「固定采样参数」在自建端点（indextts provider）才成立，见 indextts.py。
+        # 分段一致性在那条链路上靠「固定 voice + 固定 instructions + 后处理对齐」。
+        "openai_instructions": os.getenv("OPENAI_TTS_INSTRUCTIONS", ""),
+        # 语言标签（上游 string 校验）。中文稿一般留空。
+        "openai_language": os.getenv("OPENAI_TTS_LANGUAGE", ""),
         # doubao provider（Coding Plan HTTP POST）
         "doubao_api_key": os.getenv("DOUBAO_TTS_API_KEY", os.getenv("DOUBAO_TTS_TOKEN", "")),
         "doubao_token": os.getenv("DOUBAO_TTS_TOKEN", ""),
@@ -63,6 +72,17 @@ def _env_config() -> dict[str, Any]:
         "indextts_model": os.getenv("INDEXTTS_MODEL", "Qwen3-TTS-12Hz-0.6B-Base-bf16"),
         "indextts_ref_audio": os.getenv("INDEXTTS_REF_AUDIO", ""),
         "indextts_ref_text": os.getenv("INDEXTTS_REF_TEXT", ""),
+        # CustomVoice 模式（Qwen3-TTS-12Hz-1.7B-CustomVoice）：
+        #   speaker  = 预设音色名（上游要 config.spk_id 里有的那个）
+        #   instruct = 风格控制 prompt（同一篇每段必须逐字相同 → 段间风格一致）
+        # 配了它们就不再传 ref_audio（上游会让克隆路径先命中、instruct 静默失效）。
+        "indextts_speaker": os.getenv("INDEXTTS_SPEAKER", ""),
+        "indextts_instruct": os.getenv("INDEXTTS_INSTRUCT", ""),
+        # 采样参数：分段合成 = 多次独立采样，固定住它们段间才不漂。
+        # 官方「稳定播音」推荐 temperature=0.7 / top_p=0.9；
+        # 上游服务默认 top_p=0.95 偏松，这里显式压到 0.9。
+        "indextts_temperature": float(os.getenv("INDEXTTS_TEMPERATURE", "0.7")),
+        "indextts_top_p": float(os.getenv("INDEXTTS_TOP_P", "0.9")),
     }
 
 
@@ -85,6 +105,8 @@ def build_client(config: dict[str, Any]) -> TTSClient:
             base_url=config.get("openai_base_url") or "https://api.openai.com/v1",
             model=config.get("openai_model") or "tts-1",
             voice=config.get("openai_voice") or "alloy",
+            instructions=config.get("openai_instructions") or "",
+            language=config.get("openai_language") or "",
         )
     if provider == "doubao":
         return DoubaoTTSClient(
@@ -105,6 +127,10 @@ def build_client(config: dict[str, Any]) -> TTSClient:
             model=config.get("indextts_model") or "Qwen3-TTS-12Hz-0.6B-Base-bf16",
             ref_audio_path=config.get("indextts_ref_audio") or "",
             ref_text=config.get("indextts_ref_text") or "",
+            speaker=config.get("indextts_speaker") or "",
+            instruct=config.get("indextts_instruct") or "",
+            temperature=config.get("indextts_temperature"),
+            top_p=config.get("indextts_top_p"),
         )
     raise ValueError(
         f"unsupported tts provider: {provider!r} " f"(supported: edge/openai/doubao/local/indextts)"

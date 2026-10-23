@@ -74,6 +74,7 @@ import os
 import time
 import wave
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -207,6 +208,10 @@ class IndexTTSClient(TTSClient):
         ref_audio_path: str | None = None,
         ref_text: str | None = None,
         timeout: float | None = None,
+        speaker: str | None = None,
+        instruct: str | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
     ):
         self.base_url = (base_url or os.getenv("INDEXTTS_BASE_URL", self.DEFAULT_BASE_URL)).rstrip(
             "/"
@@ -214,6 +219,71 @@ class IndexTTSClient(TTSClient):
         self.model = model or os.getenv("INDEXTTS_MODEL", self.DEFAULT_MODEL)
         self.ref_audio_path = ref_audio_path or os.getenv("INDEXTTS_REF_AUDIO", "")
         self.ref_text = ref_text or os.getenv("INDEXTTS_REF_TEXT", "")
+
+        # ── 模式：克隆（ref_audio）还是 CustomVoice（speaker + instruct）────
+        #
+        # 上游 mlx_audio 的 Qwen3 实现里，这两条路是**互斥**的
+        # （qwen3_tts.py 的 can_generate）：
+        #   · 传了 ref_audio/ref_text → 走**克隆**路径，此时
+        #     **voice 与 instruct 必须都是 None**（上游会判 False）；
+        #   · 模型是 custom_voice 类型 → **必须给 voice**（speaker 名），
+        #     否则同样判 False；
+        #   · 模型是 base 类型 → **不能给 instruct**。
+        #
+        # ⚠️ 危险在于「静默」：两者同时配了，上游的 has_ref 分支**先**命中，
+        # 于是 instruct / voice 被**默默忽略** —— 你以为在用「风格控制」，
+        # 实际一直在走克隆，音色漂移也查不到原因。
+        # 所以这里显式定优先级：**CustomVoice 配置优先**，克隆参数被忽略，
+        # 并打一条 WARN 说明（静默降级是最难查的一类问题）。
+        self.speaker = (
+            speaker if speaker is not None else os.getenv("INDEXTTS_SPEAKER", "")
+        ).strip()
+        self.instruct = (
+            instruct if instruct is not None else os.getenv("INDEXTTS_INSTRUCT", "")
+        ).strip()
+        self.use_custom_voice = bool(self.speaker or self.instruct)
+        # ⚠️ 只配了 instruct（风格控制）却没配 speaker（音色名）→ **直接报错**。
+        #
+        # 为什么不能「将就」：CustomVoice 路径靠 speaker 才有意义，而上游的
+        # 规则是「base 类型模型**不能**给 instruct」。于是只配 instruct 时：
+        #   · 走克隆路径 → instruct 被**静默丢掉**（以为在控风格，实际没有）；
+        #   · 走 CustomVoice 路径 → base 模型直接被上游拒（400）。
+        # 两条路都是坏结果，而**报错**是唯一诚实的那个 ——
+        # 静默降级是最难查的一类问题（查不到原因，只能猜）。
+        if self.instruct and not self.speaker:
+            raise IndexTTSError(
+                "IndexTTS 配了 instruct（风格控制）就必须同时配 speaker（音色名）："
+                "上游的 CustomVoice 模式要求两者成对出现 —— 只给 instruct 时，"
+                "克隆路径会把它静默丢掉，而 base 模型又会直接拒收。"
+                "请把 INDEXTTS_SPEAKER 一起配上（或把 instruct 清空）。"
+            )
+        if self.use_custom_voice and (self.ref_audio_path or self.ref_text):
+            log.warning(
+                "IndexTTS: 同时配了 speaker/instruct 与 ref_audio —— "
+                "以 CustomVoice 为准，ref_audio 被忽略（上游会让克隆路径先命中、"
+                "把 instruct 静默丢掉）。想要克隆音色就别配 instruct/speaker。"
+            )
+
+        # ── 采样参数：显式固定，不吃服务端默认 ──────────────────────
+        #
+        # 每一段都是**独立的一次采样**（分段合成必然如此），所以采样参数
+        # 决定了段与段之间的差异：
+        #   · temperature 越高 → 韵律越「活」，但段与段之间越容易漂；
+        #   · top_p 越大 → 核采样越松，发音更发散。
+        # 官方对「稳定播音」的推荐是 temperature=0.7 / top_p=0.9，
+        # 而上游服务的默认是 top_p=0.95（偏松）→ 这里显式压到 0.9。
+        #
+        # **分段音色一致性的三个保证，全在这里**：
+        #   ① 同一篇的所有分段用**完全相同**的 voice / instruct
+        #      （它们是实例属性，_synthesize_once 每次读同一份）；
+        #   ② temperature / top_p 固定成低值 → 段间不各自随机；
+        #   ③ 克隆模式下 ref_audio / ref_text 同样每段一致。
+        self.temperature = (
+            temperature
+            if temperature is not None
+            else float(os.getenv("INDEXTTS_TEMPERATURE", "0.7"))
+        )
+        self.top_p = top_p if top_p is not None else float(os.getenv("INDEXTTS_TOP_P", "0.9"))
         # 超时可配：首次加载 1.7GB 权重 / 机器负载高时，单段合成可能远超 120s，
         # 硬编码会让蒸馏在 TTS 阶段必然超时失败（实测「合成超时(120.0s)」）。
         # 默认放宽到 300s，可用 INDEXTTS_TIMEOUT 覆盖。
@@ -429,20 +499,41 @@ class IndexTTSClient(TTSClient):
                 f"launchctl list | grep tts-serve 和 /tmp/stashbox-tts-serve.err。"
             )
 
-        ref_b64 = await self._load_ref_audio_b64(ref_audio)
-        ref_text_value = self._ensure_ref_text(ref_text)
-
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "input": text.strip(),
-            "ref_audio": ref_b64,
-            "ref_text": ref_text_value,
+            # 采样参数**每段都带、且每次都一样** —— 分段合成是多次独立采样，
+            # 这两个值就是段间一致性的地基（见 __init__ 的说明）。
+            "temperature": self.temperature,
+            "top_p": self.top_p,
         }
+
+        if self.use_custom_voice:
+            # CustomVoice 路径：**不传** ref_audio/ref_text
+            # （上游 has_ref 分支会先命中克隆路径，把 instruct 静默丢掉）。
+            if self.speaker:
+                payload["voice"] = self.speaker
+            if self.instruct:
+                # 风格控制 prompt —— 同一篇的每段逐字相同，
+                # 这才是「分段音色/风格一致」真正起作用的地方。
+                payload["instruct"] = self.instruct
+        else:
+            ref_b64 = await self._load_ref_audio_b64(ref_audio)
+            ref_text_value = self._ensure_ref_text(ref_text)
+            payload["ref_audio"] = ref_b64
+            payload["ref_text"] = ref_text_value
+
         log.info(
-            "IndexTTS synthesize: model=%s text_chars=%d ref=%s endpoints=%s",
+            "IndexTTS synthesize: model=%s text_chars=%d mode=%s voice=%s "
+            "instruct=%r temp=%s top_p=%s ref=%s endpoints=%s",
             self.model,
             len(text),
-            ref_audio or self.ref_audio_path,
+            "custom_voice" if self.use_custom_voice else "clone",
+            self.speaker or None,
+            self.instruct or None,
+            self.temperature,
+            self.top_p,
+            None if self.use_custom_voice else (ref_audio or self.ref_audio_path),
             self.endpoints,
         )
 

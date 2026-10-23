@@ -89,6 +89,50 @@ IndexTTS provider 早就因为同类问题做了分段，这套实现现在共�
 
 依赖: httpx（已在 requirements.txt）
 凭证: OPENAI_TTS_API_KEY（与 LLM 端的 OPENAI_LLM_API_KEY 拆开，CP9.x 决策）
+
+## ⚠️ 上游到底接受哪些字段（2026-10-23 对生产端点实测，别凭直觉猜）
+
+生产端点是 `https://tertu.cn/v1`（元涌平台托管的 Qwen3-TTS）。它的请求体
+是 **Pydantic 校验**的 —— 传错类型会返回 400 并在 `upstream_body` 里点名
+字段，于是可以**用「类型错误」反推哪些字段真的被识别**（未知字段会被静默
+丢弃、连 400 都不给，所以「传了没报错」不能作为「支持」的证据）。
+
+实测结论（模型 `Qwen3-TTS-12Hz-1.7B-CustomVoice`）：
+
+| 字段 | 上游认吗 | 实测依据 |
+|---|---|---|
+| `voice` | ✅ 枚举 | 传错 → 400「Invalid voice 'x'. Supported: aiden, dylan, eric, ono_anna, ryan, serena, sohee, uncle_fu, vivian」 |
+| `instructions` | ✅ string | 传数字 → 400「Input should be a valid string」（**风格控制 prompt**） |
+| `language` | ✅ string | 传数字 → 400 |
+| `speed` | ✅ number | 传字符串 → 400 |
+| `seed` | ✅ int | 传字符串 → 400，**但传了也不影响生成**（见下） |
+| `response_format` | ✅ | `mp3` → `audio/mpeg`；缺省 → `audio/wav` |
+| `temperature` / `top_p` / `top_k` / `repetition_penalty` | ❌ **不在 schema** | 传字符串 `"abc"` 仍返回 200 → 被静默忽略 |
+| `instruct` | ❌ | 传数字仍 200 → 未知字段。风格控制叫 **`instructions`** |
+
+### 「固定 temperature / top_p」这条要求在这条链路上做不到 —— 别假装能做到
+
+官方对「稳定播音」的建议是 temperature=0.7 / top_p=0.9，但**托管端点根本
+不收这两个参数**（schema 里没有，传了被丢）。实测也证实它们无效：
+
+    同一句话、同一个 seed=42，连发两次 → PCM 长度 168960 / 142080 bytes（差 19%）
+    temperature=0.0  连发两次         → PCM 仍不同
+    seed 固定 / 不固定               → 差异量级相同（seed 无效）
+
+即**上游每次请求都是一次全新的独立随机采样**，没有跨请求的一致性保证。
+所以「分段音色一致」在这条链路上**不能靠请求参数**，只能靠三件事：
+
+1. `voice` 固定（音色身份）—— 本类每段都读同一个 `self.voice`；
+2. `instructions` 固定（风格）—— 本类每段都读同一个 `self.instructions`；
+3. **后处理对齐**（音域 + 响度）—— 见 `audio_chunks.concat_audio` 与
+   `voice_align.py`。上游随机漂的那部分，靠这一步拉回来。
+
+其中第 3 步是**真正兜底**的那一步：音高对齐按各段 p25（说话人音域下缘）
+统一到全篇锚点，响度归一逐段做。实测生产日志里对齐生效
+（`TTS 音高对齐: semitones 0.67 / -1.02 / 0`）。
+
+自建端点（`indextts` provider → 本机 mlx-audio）**能**收 temperature/top_p，
+那边的实现在 `indextts.py`；但生产没有走那条路。
 """
 
 import asyncio
@@ -233,11 +277,38 @@ class OpenAITTSClient(TTSClient):
         chunk_concurrency: int | None = None,
         chunk_retries: int | None = None,
         min_chunk_chars: int | None = None,
+        instructions: str | None = None,
+        language: str | None = None,
     ):
         # 优先入参；入参缺省时从环境变量读（pydantic Settings 不会接管 .env 加载到这里）
         self.api_key = api_key if api_key is not None else os.getenv("OPENAI_TTS_API_KEY", "")
         self.model = model if model is not None else os.getenv("OPENAI_TTS_MODEL", _DEFAULT_MODEL)
         self.voice = voice if voice is not None else os.getenv("OPENAI_TTS_VOICE", _DEFAULT_VOICE)
+        # ── 风格控制 prompt（instructions）────────────────────────────────
+        #
+        # CustomVoice 模型（Qwen3-TTS-12Hz-1.7B-CustomVoice）的核心能力：
+        # 音色由 `voice`（预设 speaker 名）决定，**风格/情绪/语速**由
+        # `instructions` 决定。上游对这个字段做 string 校验（传数字会 400），
+        # 所以它是**真被识别**的字段 —— 不是被静默忽略的摆设。
+        #
+        # 对「分段音色一致性」的意义：分段合成 = 每段一次独立请求，
+        # 每次都会重新采样。`instructions` 保证的是**风格取向一致**
+        # （实测：同一段文字加「悲伤低沉的语调」→ 时长变长、基频变低；
+        # 加「开心轻快」→ 时长变短、基频变高）。
+        #
+        # ⚠️ 它**压不住**单次采样本身的随机波动（实测同条件下两次请求的
+        # p25 相差 65%），所以段间一致性的兜底仍然是后处理的音域/响度对齐。
+        # 它的作用是把「平均风格」钉住，避免每段各自发挥。
+        #
+        # 实测是**实例属性** → 同一篇的每一段读到的都是**逐字相同**的同一份
+        # 字符串，这才叫「风格一致」。
+        self.instructions = (
+            instructions if instructions is not None else os.getenv("OPENAI_TTS_INSTRUCTIONS", "")
+        ).strip()
+        # 语言标签（上游 string 校验）。中文稿一般不用配，留空即不传。
+        self.language = (
+            language if language is not None else os.getenv("OPENAI_TTS_LANGUAGE", "")
+        ).strip()
         self.base_url = (
             base_url if base_url is not None else os.getenv("OPENAI_BASE_URL", _DEFAULT_BASE_URL)
         ).rstrip("/")
@@ -546,6 +617,19 @@ class OpenAITTSClient(TTSClient):
             "input": text,
             "response_format": output_format,
         }
+        # ── 风格控制：每段逐字相同 ─────────────────────────────────────
+        #
+        # 这两个字段**每段都带、且每次都一样**（它们是实例属性，
+        # 不是按调用传的）—— 分段合成是多次独立请求，这里保证风格不漂。
+        #
+        # ⚠️ **不要**在这里加 temperature / top_p：实测上游的请求体 schema
+        # 里根本没有这两个字段，传了会被**静默丢弃**（连 400 都不报），
+        # 于是「以为固定了采样、实际每次都重随机」—— 那比不配更糟，
+        # 因为它会让人以为漂移的原因已经排除。详见模块 docstring 的实测表。
+        if self.instructions:
+            body["instructions"] = self.instructions
+        if self.language:
+            body["language"] = self.language
 
         # ── 熔断闸门 ────────────────────────────────────────────────
         # 上游 TTS 是**共享**资源且有 60s 墙钟：上游一慢，我们每个请求
@@ -567,11 +651,17 @@ class OpenAITTSClient(TTSClient):
             )
 
         log.info(
-            "OpenAITTS synthesize: provider=%s model=%s voice=%s bytes=%d",
+            "OpenAITTS synthesize: provider=%s model=%s voice=%s bytes=%d "
+            "instructions=%r language=%s",
             self.base_url,
             self.model,
             body["voice"],
             len(text.encode("utf-8")),
+            # 风格 prompt 打出来：段间漂移排查时，第一件事就是确认
+            # 「这几段用的到底是不是同一句 instructions」。不打印的话，
+            # 配置改了没生效、或某段走了别的分支，日志里看不出来。
+            self.instructions or None,
+            self.language or None,
         )
 
         try:
