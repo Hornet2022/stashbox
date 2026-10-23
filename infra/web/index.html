@@ -8,6 +8,12 @@
 <meta property="og:type" content="website">
 <meta property="og:title" content="听匣 · 把读不完的，变成听得完的">
 <meta property="og:description" content="剪藏一条链接，AI 把它蒸馏成一段刚好能在通勤路上听完的音频。Android 内测中。">
+<!-- 品牌 logo（infra/web/assets/logo/，由 make_logo.py 生成）——
+     favicon 用竖排标记，页眉页脚用横排字标；og:image 用分享卡片。 -->
+<link rel="icon" href="/assets/logo/tingxia-favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/assets/logo/tingxia-favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="/assets/logo/tingxia-mark-180.png">
+<meta property="og:image" content="https://stashbox.cn/assets/logo/tingxia-og.png">
 <meta name="theme-color" content="#F5F2EB">
 <style>
 /* ═══════════════════════════════════════════════════════════════════
@@ -114,9 +120,11 @@ body {
 .v-broadsheet {
   padding: 0 var(--space-24) clamp(16px, 2.4vh, 32px);
   display: flex; flex-direction: column;
-  /* 高度由 #stage 分配（见下面的 #stage 规则）—— 自己再声明
-     min-height:100svh 会把页脚挤到视口外面。 */
-  flex: 1 1 auto; min-height: 0;
+  /* **不**撑满一屏。留白应该落在「主内容 ↔ 页脚」之间，而不是被标题区
+     吸走 —— 之前 .headline 是 flex:1，多出来的空间全被它吃掉，
+     三栏区被顶到页面偏下，中间一大片空白（视口越高越明显）。
+     现在主内容紧凑成一块、页脚照旧贴底。 */
+  flex: 0 0 auto;
 }
 
 .v-broadsheet .masthead {
@@ -124,7 +132,7 @@ body {
   /* width:100% 不能省：父级变成 flex column 之后，子项的
      `margin: 0 auto` 会让它**收缩到内容宽度并居中**（flex 里的 auto
      margin 会吃掉 stretch）—— masthead 的「听匣」会跑到页面中间。 */
-  padding: clamp(10px, 1.6vh, 24px) 0 clamp(8px, 1.2vh, 16px);
+  padding: clamp(8px, 1.3vh, 24px) 0 clamp(6px, 1vh, 16px);
   border-bottom: 1px solid var(--rule);
   display: flex; align-items: baseline; justify-content: space-between;
   gap: var(--space-24);
@@ -140,14 +148,11 @@ body {
 
 .v-broadsheet .headline {
   max-width: 1120px; margin: 0 auto; width: 100%;
-  padding: clamp(14px, 3.4vh, 64px) 0 clamp(10px, 2.2vh, 48px);
+  padding: clamp(12px, 2.6vh, 64px) 0 clamp(8px, 1.7vh, 48px);
   display: flex; flex-direction: column; justify-content: center;
   gap: clamp(8px, 1.3vh, 24px);
-  /* **它**来吸收一屏里多出来的空间（而不是 .cols）。
-     之前是 .cols { flex: 1 } —— 三栏区会抢走剩余高度，把页脚挤到
-     视口**外面**（实测：页脚 top=900=视口底，文档高 1043）。
-     三栏是内容（高度由文字决定），标题区才是适合当「弹性留白」的那块。 */
-  flex: 1 1 auto; min-height: 0;
+  /* 标题区不再吸收剩余空间（留白改由 #stage 层统一分配）。 */
+  flex: 0 0 auto;
 }
 .v-broadsheet .kicker {
   font-family: var(--mono); font-size: 12px; letter-spacing: 0.16em;
@@ -170,14 +175,22 @@ body {
   max-width: 1120px; margin: 0 auto; width: 100%;
   border-top: 2px solid var(--fg);
   display: grid; grid-template-columns: repeat(3, 1fr);
-  /* 自然高度（内容决定），不抢空间 */
+  /* 栏与栏之间留出真正的**空隙**（原来只靠 24px 的 padding 顶着，
+     文字行末几乎贴着竖线）。竖线改画在空隙的中央。 */
+  gap: clamp(24px, 3.4vw, 48px);
   flex: 0 0 auto;
 }
 .v-broadsheet .col {
-  padding: clamp(10px, 1.6vh, 24px) clamp(16px, 2.2vh, 24px) 0 0;
-  border-right: 1px solid var(--rule);
+  padding: clamp(10px, 1.6vh, 24px) 0 0;
+  position: relative;
 }
-.v-broadsheet .col:last-child { border-right: 0; }
+/* 竖线：画在**两栏空隙的中央**（而不是栏的右边缘），
+   于是它到两侧文字的距离都变远了。 */
+.v-broadsheet .col:not(:last-child)::after {
+  content: ""; position: absolute;
+  top: 0; bottom: 0; right: -24px;
+  width: 1px; background: var(--rule);
+}
 .v-browsheet-num, .v-broadsheet .col .num {
   font-family: var(--mono); font-size: 11px; color: var(--fg-faint);
   letter-spacing: 0.1em; margin: 0 0 var(--space-8);
@@ -189,14 +202,13 @@ body {
 .v-broadsheet .col p {
   font-size: 14px; line-height: 1.7; color: var(--fg-muted); margin: 0;
   /* 文字与分隔线之间**永远**留出间隙。
-     之前栏的 padding-right 只有 24px，窄屏时几乎为零（实测 4~6px），
-     文字行末会贴到线上；这里再加 12px 的内缩，
-     任何宽度下都不会压线。 */
-  padding-right: 12px;
+     竖线在空隙中央（离栏边缘 24px），文字再往里缩 20px，
+     于是文字到线的距离 = 44px（此前 36px），任何宽度下都不会压线。 */
+  padding-right: 20px;
 }
 
 .v-broadsheet .cta-row {
-  max-width: 1120px; margin: clamp(10px, 1.9vh, 64px) auto 0; width: 100%;
+  max-width: 1120px; margin: clamp(8px, 1.7vh, 64px) auto 0; width: 100%;
   padding-top: clamp(10px, 1.6vh, 24px); border-top: 1px solid var(--rule);
   display: flex; align-items: center; justify-content: space-between;
   gap: var(--space-24); flex-wrap: wrap;
@@ -371,13 +383,10 @@ body {
    分隔线仍在栏间（border-right），文字的右内缩也保留 → 不会压线。 */
 @media (max-width: 760px) {
   .v-broadsheet { padding: 0 16px clamp(12px, 2vh, 24px); }
-  .v-broadsheet .cols { grid-template-columns: repeat(3, 1fr); }
-  .v-broadsheet .col {
-    border-right: 1px solid var(--rule);
-    padding: 10px 8px 0 0;
-  }
-  .v-broadsheet .col + .col { border-top: 0; padding-top: 10px; padding-left: 8px; }
-  .v-broadsheet .col:last-child { border-right: 0; }
+  .v-broadsheet .cols { grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .v-broadsheet .col { padding: 10px 0 0; }
+  .v-broadsheet .col:not(:last-child)::after { right: -8px; }
+  .v-broadsheet .col + .col { border-top: 0; padding-top: 10px; }
   .v-broadsheet .col h3 { font-size: 13px; line-height: 1.35; margin-bottom: 4px; }
   .v-broadsheet .col p { font-size: 11px; line-height: 1.55; padding-right: 0; }
   .v-broadsheet .col .num { margin-bottom: 4px; }
@@ -406,16 +415,19 @@ body {
 @media (max-width: 380px) {
   .v-broadsheet { padding: 0 12px; }
   .v-broadsheet .masthead { padding: 6px 0 5px; }
-  .v-broadsheet .headline { padding: 8px 0 6px; gap: 6px; }
-  .v-broadsheet h1 { font-size: clamp(24px, 7.6vw, 32px); }
+  .v-broadsheet .headline { padding: 6px 0 5px; gap: 4px; }
+  .v-broadsheet h1 { font-size: clamp(22px, 7.2vw, 30px); }
   .v-broadsheet .standfirst { font-size: 11.5px; line-height: 1.45; }
-  .v-broadsheet .col { padding: 7px 6px 0 0; }
-  .v-broadsheet .col + .col { padding-left: 6px; }
-  .v-broadsheet .col h3 { font-size: 11.5px; }
+  .v-broadsheet .col { padding: 7px 0 0; }
+  .v-broadsheet .cols { gap: 12px; }
+  .v-broadsheet .col:not(:last-child)::after { right: -6px; }
+  .v-broadsheet .col p { padding-right: 8px; }
+  .v-broadsheet .col + .col { padding-left: 0; }
+  .v-broadsheet .col h3 { font-size: 11px; margin-bottom: 3px; }
   .v-browsheet-num, .v-broadsheet .col .num { margin-bottom: 3px; }
-  .v-broadsheet .col p { font-size: 10px; line-height: 1.4; }
+  .v-broadsheet .col p { font-size: 9.5px; line-height: 1.35; }
   .v-broadsheet .cta-row { margin: 8px auto 0; padding-top: 8px; }
-  .site-footer { font-size: 9.5px; line-height: 1.4; padding: 4px 10px 5px; }
+  .site-footer { font-size: 9px; line-height: 1.35; padding: 3px 10px 4px; }
   .site-footer-copyright { font-size: 10.5px; }
 }
 
@@ -436,6 +448,16 @@ body {
   .v-broadsheet .btn { padding: 8px 18px; font-size: 13px; }
   .site-footer { font-size: 9.5px; line-height: 1.4; padding: 3px 12px 4px; }
   .site-footer-copyright { font-size: 10.5px; }
+}
+
+/* ── 品牌 logo ──────────────────────────────────────────────────
+   字标是图片（/assets/logo/tingxia-wordmark.svg，由 make_logo.py 从
+   Songti SC 抽字形生成）—— 用字体渲染的话，缺字体的机器上 logo
+   会掉字或变成方块。尺寸用 em 跟着各方向的字号走（0.95em ≈ 一个
+   CJK 字的墨迹高度，和原来的文字 wordmark 视觉对齐）。 */
+.wordmark img {
+  height: 0.95em; width: auto; display: inline-block;
+  vertical-align: -0.05em;
 }
 
 /* ═══ 生产化改动（见 infra/web/README.md）═══ */
@@ -473,7 +495,7 @@ a.btn { text-decoration: none; }
    结构与层级一致，底色不照抄，否则会在浅色页上砸一块深色。 */
 .site-footer {
   flex: 0 0 auto;
-  padding: clamp(6px, 1.1vh, 20px) 16px clamp(8px, 1.4vh, 26px);
+  padding: clamp(5px, 0.9vh, 20px) 16px clamp(6px, 1.1vh, 26px);
   text-align: center;
   font-size: 12px;
   /* 行高压到 1.65：页脚是三行，行高每松 0.5 就是几十像素 ——
@@ -497,7 +519,7 @@ a.btn { text-decoration: none; }
 
   <main class="v-broadsheet">
     <header class="masthead">
-      <p class="wordmark">听匣</p>
+      <p class="wordmark"><img src="/assets/logo/tingxia-wordmark.svg" alt="听匣" width="47" height="19"></p>
       <p class="dateline">内测中 · Android 优先</p>
     </header>
 
@@ -552,7 +574,7 @@ function vBroadsheet() {
   return `
   <main class="v-broadsheet">
     <header class="masthead">
-      <p class="wordmark">听匣</p>
+      <p class="wordmark"><img src="/assets/logo/tingxia-wordmark.svg" alt="听匣" width="47" height="19"></p>
       <p class="dateline">内测中 · Android 优先</p>
     </header>
 
@@ -610,7 +632,7 @@ function vWave() {
 
   return `
   <main class="v-wave">
-    <p class="wordmark enter">听匣</p>
+    <p class="wordmark enter"><img src="/assets/logo/tingxia-wordmark.svg" alt="听匣" width="47" height="19"></p>
     <p class="tagline enter" style="animation-delay:40ms">IN BETA</p>
 
     <div class="canvas enter" id="waveCanvas" aria-hidden="true">${bars}</div>
@@ -660,7 +682,7 @@ function vCommute() {
   <main class="v-commute">
     <div class="wrap">
       <header class="head">
-        <p class="wordmark enter">听匣</p>
+        <p class="wordmark enter"><img src="/assets/logo/tingxia-wordmark.svg" alt="听匣" width="47" height="19"></p>
         <h1 class="enter" style="animation-delay:40ms">一次通勤的长度，<br>够听完三篇深度文章。</h1>
         <p class="sub enter" style="animation-delay:90ms">
           听匣只做一件事：把你想读的东西，翻译成你通勤时听得完的音频。
