@@ -639,12 +639,24 @@ async def submit_article(
     # 抓到了再扣配额建库 —— 这时建库只差一次 DB insert。
     fr = await _prefetch_for_capture(req.url)
 
+    # 2026-10-23：GitHub 走**专属 fetcher** 时，来源要用**真实来源**。
+    #
+    # 为什么只改这一个：`articles.source` 落的是**请求体里传的** source
+    # （默认 "web"），而真正解析它的是 fetcher（`raw_content["source"]`）。
+    # 剪藏一个 GitHub 仓库若存 "web"，列表里就显示「通用」—— 用户分不清
+    # 自己剪的是网页还是代码库，admin 的来源筛选也跟着失真。
+    #
+    # ⚠️ 只对**新增的**专属来源改，不动既有映射（wechat/wechat_mp/douyin/pdf
+    # 的既有口径保持不变）—— 那几个的历史数据里两种写法都存在，
+    # 现在统一会让老数据的来源显示突变。
+    source = "github" if fr.source == "github" else req.source
+
     # 后半程（去重 → 扣配额 → 建库 → 派蒸馏 → 失效缓存）与文档剪藏**共用一份**
     # 实现，见 _clip_after_fetch 的说明。
     return await _clip_after_fetch(
         url=req.url,
         uid=uid,
-        source=req.source,
+        source=source,
         title=req.title or fr.title or None,
         raw_content=_to_raw_content(fr),
         db=db,
