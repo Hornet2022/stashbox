@@ -241,7 +241,16 @@ except ValueError:
 # 剪藏类路径：抓取在下游是**同步**的（建文章前必须先拿到正文），
 # 慢的时候能跑满整个抓取预算。这些路径超时时，文案必须告诉用户
 # 「可能已经提交」—— 因为下游其实已经把文章建好、配额也扣了。
-_CAPTURE_PATHS = frozenset({"/api/v1/articles", "/api/v1/articles/add"})
+_CAPTURE_PATHS = frozenset(
+    {
+        "/api/v1/articles",
+        "/api/v1/articles/add",
+        # 文档剪藏（2026-10-23）：上传/解析也在下游同步完成，耗时量级与
+        # 链接抓取相当（解析很快，但大文档的解析 + 建库 + 派蒸馏不便宜），
+        # 所以超时时同样要按「可能已提交」的口径回。
+        "/api/v1/articles/document",
+    }
+)
 
 
 def _client_ip(request: Request) -> str:

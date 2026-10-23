@@ -86,6 +86,21 @@ def fetch_error_user_message(code: FetcherErrorCode, source: str = "") -> str:
     """
     if code is FetcherErrorCode.AUTH and source.startswith("wechat"):
         return "对方网站限制了非官方客户端访问，微信文章请在微信里打开后重新复制链接"
+    # 文档剪藏（2026-10-23）：同一套错误码，文档的成因与链接**完全不同**。
+    #
+    # 链接剪藏的 PARSE 多是「页面需要登录/渲染不出来」；文档剪藏的 PARSE
+    # 主要是**扫描件 PDF**（没有文本层）、加密 PDF、空文档。
+    # 沿用链接那句「页面可能需要登录后才能查看」会让人以为要去登录 ——
+    # 而文档根本没有「登录」这回事，用户会白找不存在的原因。
+    if source == "document":
+        if code is FetcherErrorCode.PARSE:
+            return (
+                "没能从这个文档里读出文字。"
+                "如果是扫描件（图片版 PDF）或加密文件，我们暂时读不了，"
+                "可以换个文件或直接粘贴文本试试"
+            )
+        if code is FetcherErrorCode.UNSUPPORTED:
+            return "暂时不支持这个文档格式，可以换个文件或直接粘贴文本试试"
     return _FETCH_ERROR_USER_MESSAGE.get(code, "抓取失败，请稍后重试")
 
 

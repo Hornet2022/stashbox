@@ -95,6 +95,11 @@ ROUTES: list[Route] = [
     # 而「剪藏失败要回溯扣费与蒸馏派发」恰恰最需要串号排查。
     # 显式注册 = 走 proxy() 那条完整路径（含请求 ID）。
     Route("POST", "/api/v1/articles", "content-service", _url("content-service")),
+    # 2026-10-23：文档剪藏（上传文件/粘贴文本）。显式注册而不是靠 fallback ——
+    # `articles` 前缀在兜底白名单里（→ content-service）能通，但显式注册才
+    # 走完整的路由表匹配，漏网的后果是「实现了但没进路由表 → 404」
+    # （这个仓已经因此踩过四次）。
+    Route("POST", "/api/v1/articles/document", "content-service", _url("content-service")),
     Route(
         "POST",
         "/api/v1/articles/{article_id}/retry",

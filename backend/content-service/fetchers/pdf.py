@@ -52,6 +52,46 @@ MAX_PDF_BYTES = 100 * 1024 * 1024
 _FILENAME_RE = re.compile(r"[^A-Za-z0-9\u4e00-\u9fa5._-]+")
 
 
+def extract_pdf_text(body: bytes) -> tuple[list[str], dict[str, str]]:
+    """PDF 字节 → (每页文本, 文档属性)。**纯函数，不碰网络**。
+
+    ## 为什么要抽出来
+
+    文档剪藏（`fetchers/document.py`）与 PDF 直链抓取（`PdfFetcher`）需要
+    **同一份解析逻辑**，但两者的入口完全不同：前者是「用户上传的字节」，
+    后者是「先下载再解析」。
+
+    原来解析逻辑内嵌在 `PdfFetcher.fetch()` 里，文档剪藏只能**再抄一份** ——
+    而这个仓反复吃过「同一件事两处定义必出两套真相」的亏（抄的那份很快
+    就会与原版漂移：加密 PDF 的处理、页级容错、标题启发式都要各自演进）。
+
+    所以这里抽成**模块级纯函数**：`fetch()` 只管「下载 + 校验」，
+    解析侧由两条路共用。
+
+    ## 抛什么
+
+    - `PdfReadError`（文件损坏/加密）→ 调用方转成 `FetcherError(PARSE)`；
+    - 其他异常（pypdf 版本相关的怪错）→ 同样由调用方兜住。
+
+    注意：**单页**解析失败不影响其他页（只记 warning，页文本置空）。
+    """
+    reader = PdfReader(BytesIO(body))
+    page_texts: list[str] = []
+    for page in reader.pages:
+        try:
+            page_text = page.extract_text() or ""
+        except Exception as exc:  # 单页解析失败不影响其他页
+            log.warning("[pdf] page extract failed: %s", exc)
+            page_text = ""
+        page_texts.append(page_text)
+    try:
+        doc_meta = reader.metadata or {}
+        metadata = {str(k): str(v) for k, v in doc_meta.items() if v is not None}
+    except Exception:
+        metadata = {}
+    return page_texts, metadata
+
+
 class PdfFetcher(Fetcher):
     """PDF 直链抓取器（v1 §11.2 CP11.0.8 P3.3）。
 
@@ -155,16 +195,7 @@ class PdfFetcher(Fetcher):
 
         # 3. pypdf 解析
         try:
-            reader = PdfReader(BytesIO(body))
-            page_texts: list[str] = []
-            for page in reader.pages:
-                try:
-                    page_text = page.extract_text() or ""
-                except Exception as exc:  # 单页解析失败不影响其他页
-                    log.warning("[pdf] page extract failed: %s", exc)
-                    page_text = ""
-                page_texts.append(page_text)
-            content_text = "\n\n".join(t for t in page_texts if t).strip()
+            page_texts, pdf_metadata = extract_pdf_text(body)
         except PdfReadError as exc:
             raise FetcherError(
                 code=FetcherErrorCode.PARSE,
@@ -177,6 +208,8 @@ class PdfFetcher(Fetcher):
                 message=f"pdf parse failed: {type(exc).__name__}: {exc}",
                 source=self.name,
             ) from exc
+
+        content_text = "\n\n".join(t for t in page_texts if t).strip()
 
         if not content_text:
             raise FetcherError(
@@ -199,14 +232,8 @@ class PdfFetcher(Fetcher):
             "content_type": content_type,
             "page_count": len(page_texts),
             "text_length": len(content_text),
+            "pdf_metadata": pdf_metadata,
         }
-        try:
-            doc_meta = reader.metadata or {}
-            raw_metadata["pdf_metadata"] = {
-                str(k): str(v) for k, v in doc_meta.items() if v is not None
-            }
-        except Exception:
-            raw_metadata["pdf_metadata"] = {}
 
         # 6. 构造 FetchResult（PDF 无 HTML，正文段落转 <p>）
         #     content_html 用 <p> 包裹每页文本，便于后续蒸馏 LLM 解析。
@@ -258,4 +285,4 @@ class PdfFetcher(Fetcher):
         return _FILENAME_RE.sub(" ", basename).strip() or "未命名 PDF"
 
 
-__all__ = ["PdfFetcher"]
+__all__ = ["PdfFetcher", "extract_pdf_text"]

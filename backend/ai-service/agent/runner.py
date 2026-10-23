@@ -203,11 +203,27 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
             prompt,
             # ⚠️ 用 replace 而不是 str.format：system prompt 里有 **JSON 示例**，
             # 里面的 `{` `}` 会被 format 当成占位符 → KeyError/IndexError。
-            system_prompt=_REWRITE_SYSTEM.replace(
-                "{tag_vocabulary}", state.get("tag_vocabulary") or _FALLBACK_TAG_VOCABULARY
+            system_prompt=(
+                _REWRITE_SYSTEM.replace(
+                    "{tag_vocabulary}",
+                    state.get("tag_vocabulary") or _FALLBACK_TAG_VOCABULARY,
+                )
+                # 素材类型差异（文档 / 代码库）—— 见 _material_guidance 的说明。
+                + _material_guidance(state.get("source") or "")
             ),
             step="agent_rewrite",
             task_id=state.get("trace_id", ""),
+            # ⚠️ **必须显式给 max_tokens**（2026-10-23）。
+            #
+            # 不给就吃默认 4096 —— 而文档稿的输出是
+            # 「1000-1400 字正文 + JSON 结构 + 三类再创作」，中文 token 化后
+            # 很容易顶到上限。顶到上限 = **JSON 被截断** = 解析失败
+            # → 降级成纯文本按空行切 → **稿子的结构全丢**
+            # （hook/sections/insights/related/follow_ups 全部糊成一坨）。
+            #
+            # 这个失败是**静默**的：稿子照样生成、照样能播，只是质量塌了。
+            # 8192 足够一篇长文档的完整结构化输出。
+            max_tokens=8192,
         )
         # 结构化解析（CP-AGENT-REWRITE-STRUCTURED）：LLM 必须回 JSON
         # {hook, sections, outro}，这样 script_text 的段落边界才是可靠的。
@@ -784,6 +800,70 @@ _REWRITE_SYSTEM = """你是一个中文播客主理人。任务：把原文改�
     （sections + insights + related + follow_ups 合计）
 
 输出纯 JSON。"""
+
+
+#: 各类素材的**写作口径差异**（按 source 追加到 system prompt 末尾）。
+#:
+#: ## 为什么是「追加一段」而不是维护两套 prompt
+#:
+#: 公众号文章 / 技术文档 / 代码库 README 的**共同要求**占了绝大多数
+#: （JSON 契约、三类再创作的硬要求、标签从候选里选、长度自适应…）。
+#: 维护两套 prompt 意味着那些共同要求会被改一处漏一处 —— 而漏的地方
+#: 恰恰是最要紧的（JSON 契约一变，解析就降级成纯文本）。
+#:
+#: ⇒ 共同部分留在 `_REWRITE_SYSTEM`，**只有真正不同的部分**进这里。
+#:
+#: ## 每条差异都必须有「不这样会怎样」
+#:
+#: 凭空加的规则会稀释 LLM 的注意力。下面每条都标了「不这样会怎样」。
+_MATERIAL_KIND_BY_SOURCE: dict[str, str] = {
+    "document": "document",
+    "pdf": "document",  # PDF 直链抓取 —— 本质也是文档
+}
+
+
+def _material_guidance(source: str) -> str:
+    """按素材类型返回**追加段**（空串 = 默认口径，即公众号文章）。
+
+    ⚠️ 判定依据是 `raw_content["source"]`（真实来源），
+    **不是** `articles.source`（那是请求体里传的，默认 "web"，会判错）。
+    """
+    kind = _MATERIAL_KIND_BY_SOURCE.get(source or "")
+    if kind == "document":
+        return _DOCUMENT_MATERIAL_GUIDANCE
+    return ""
+
+
+_DOCUMENT_MATERIAL_GUIDANCE = """
+
+【素材类型：技术文档 / 报告（不是公众号文章）】
+原文是**一份文档**，不是一篇有叙事线公众号文章。下面几条与上面的默认口径不同，
+**按这里的来**：
+
+1. **hook 讲「这份文档解决什么问题」，不讲「你有多久没听 Podcast 了」**。
+   文档没有悬念，硬造悬念 = **编造**。写不出钩子就别写 hook（空串合法）。
+2. **outro 讲「什么时候该翻回原文查证」，不要强行呼应意象**。
+   文档没有意象可呼应；硬造 = 编造。
+3. **「不要复读原文」这条要放宽**：文档的价值恰恰是**准确**。
+   改成「**复述要准确**（数字/版本号/API 名/命令一个字都不能错），
+   但要在准确之上加你的判断，而不是把原文换个说法」。
+4. **sections 按文档的章节/主题组织**，不要为了凑「3-5 节」把不相干的部分
+   硬凑成节。文档有 8 个主题就写 8 节。**允许超出 3-5 节**。
+5. **长度自适应放宽**：文档常有上万字，默认的「>2000 字 → 1000-1400 字」
+   会逼 LLM **漏掉要点**。改成「覆盖文档的**主要章节**，每个都点到；
+   篇幅由文档实际结构决定，但**不要为了凑字数注水**」。
+6. **不要念代码块 / 命令 / 路径 / 配置片段的原文**。它们会被 TTS 念成
+   「派 pip install」，听众完全听不懂。要提到就用一句话说清它干什么
+   （例如「项目要求 Python 3.11 以上」），**不要逐字念**。
+   公式/表格同理：说结论，不念符号。
+7. **insights（延伸判断）在文档上常常不成立** —— 「往后看会怎样、什么时候会失效」
+   文档本身没给依据。**没有依据就给空数组，不要凑数**。
+   related（关联思考：和什么相关/矛盾）与 follow_ups（拓展方向：该盯什么）
+   在文档上成立，照常写。
+8. **tags 只能从候选标签里逐字选**。文档主题（Python / 数据库 / 前端…）
+   大概率不在候选里 —— 不在就**少选或空数组**，
+   **不要自己造**（造了订阅推送永远匹配不上，等于白写）。
+"""
 
 
 @dataclass

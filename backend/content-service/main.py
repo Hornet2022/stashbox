@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Annotated, Optional
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import String, cast, delete, func, select
@@ -58,6 +58,11 @@ from fetchers import (  # noqa: E402
     fetch_error_user_message,
     get_fetcher,
     map_fetcher_error,
+)
+from fetchers.document import (  # noqa: E402
+    DOCUMENT_SOURCE,
+    MAX_DOCUMENT_BYTES,
+    parse_document,
 )
 from schemas import (  # noqa: E402
     AddArticleRequest,
@@ -629,20 +634,191 @@ async def submit_article(
     # 抓到了再扣配额建库 —— 这时建库只差一次 DB insert。
     fr = await _prefetch_for_capture(req.url)
 
+    # 后半程（去重 → 扣配额 → 建库 → 派蒸馏 → 失效缓存）与文档剪藏**共用一份**
+    # 实现，见 _clip_after_fetch 的说明。
+    return await _clip_after_fetch(
+        url=req.url,
+        uid=uid,
+        source=req.source,
+        title=req.title or fr.title or None,
+        raw_content=_to_raw_content(fr),
+        db=db,
+    )
+
+
+@app.post("/api/v1/articles/document")
+async def submit_document(
+    file: UploadFile | None = File(default=None),
+    text: str | None = Form(default=None),
+    title: str | None = Form(default=None),
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """**文档剪藏**：直接提交一份文档（而不是链接）。
+
+    ## 为什么单独一个端点而不是给 `POST /api/v1/articles` 加字段
+
+    那条链路的轴是 **URL**（`get_fetcher(url)` → 抓 → 建库）。文档没有 URL，
+    硬塞进去就要在链路中间插一个「这次不抓，用上传的正文」的分叉 ——
+    而分叉一旦插在链路中间，后面每一环都要记得「这次没有 fetcher 结果」。
+
+    这里改成**在链路之前**分叉：正文从哪来（抓 / 解析）由入口决定，
+    之后的每一步（去重 → 扣配额 → 建库 → 派蒸馏 → 失效缓存）完全共用。
+
+    ## 与链接剪藏的语义对齐
+
+    · **先解析后扣费**：解析不出正文 → 2002 返回，**不建库也不计费**
+      （与链接剪藏「先抓后扣」同口径，2026-10-03 定的）。
+    · **去重**：`url` 用**内容 hash**（`doc://{sha256[:16]}`）→ 同一份文档
+      重复上传复用同一篇，不重复扣配额。
+    · **正文形状不变**：`raw_content` 仍是 FetchResult 同形
+      ⇒ 蒸馏、订阅、TTS 全链路**零改动**。
+
+    ## 参数
+
+    · `file`：文档文件（二进制）。与 `text` **二选一**。
+    · `text`：直接粘贴的文本（Markdown / 纯文本）。与 `file` 二选一。
+      走这个参数时不需要 multipart 的 file 部分，但请求仍是 multipart
+      （`text` 是 Form 字段）—— 客户端实现更简单。
+
+    ## 大小控制
+
+    文件 ≤ [MAX_DOCUMENT_BYTES]（与 nginx 的 `client_max_body_size 10m` 同口径）。
+    **端点与网关必须一致**，否则用户看到的是「413」这种没有信息量的报错。
+    """
+    uid = _uid(user)
+
+    # -- 入参校验：file 与 text 二选一 --------------------------------
+    has_file = file is not None and file.filename is not None
+    has_text = text is not None and text.strip() != ""
+    if not has_file and not has_text:
+        raise InvalidRequest(message="请上传一个文档文件，或直接粘贴文本内容")
+    if has_file and has_text:
+        raise InvalidRequest(message="文档文件与文本内容二选一，不要同时提交")
+
+    filename = "pasted.md"
+    content_type = ""
+    data = b""
+    if has_file:
+        filename = file.filename or "upload"
+        content_type = file.content_type or ""
+        data = await file.read()
+        if len(data) > MAX_DOCUMENT_BYTES:
+            raise InvalidRequest(
+                message=(
+                    f"文档太大了（{len(data) // 1024 // 1024}MB），"
+                    f"上限 {MAX_DOCUMENT_BYTES // 1024 // 1024}MB"
+                )
+            )
+        if len(data) == 0:
+            raise InvalidRequest(message="文件是空的")
+    else:
+        # 粘贴文本按 UTF-8 存成字节，**走与文件完全相同的解析路径**
+        # （而不是另开一条）—— 两条路径的判据必须一致，否则同样的内容
+        # 「粘贴能读、上传读不了」会变成一个查不到原因的问题。
+        data = text.encode("utf-8")  # type: ignore[union-attr]
+        content_type = "text/markdown"
+        if len(data) > MAX_DOCUMENT_BYTES:
+            raise InvalidRequest(
+                message=f"文本太长了（{len(data) // 1024 // 1024}MB），"
+                f"上限 {MAX_DOCUMENT_BYTES // 1024 // 1024}MB"
+            )
+
+    # -- 解析（失败 → 不建库不计费）----------------------------------
+    try:
+        fr = parse_document(
+            filename=filename,
+            data=data,
+            content_type=content_type,
+        )
+    except FetcherError as exc:
+        # 复用抓取侧的错误映射（业务码 2001/2002 + 按 source 分流的话术）
+        raise map_fetcher_error(exc) from exc
+
+    # 内容 hash 当 url → 同一份文档重复上传天然去重
+    doc_url = fr.url
+    final_title = (title or "").strip() or fr.title
+
+    result = await _clip_after_fetch(
+        url=doc_url,
+        uid=uid,
+        source=DOCUMENT_SOURCE,
+        title=final_title,
+        raw_content=_to_raw_content(fr),
+        db=db,
+    )
+    result["filename"] = filename
+    result["content_type"] = content_type
+    result["text_length"] = len(fr.content_text)
+    return result
+
+
+async def _clip_after_fetch(
+    *,
+    url: str,
+    uid: int,
+    source: str,
+    title: str | None,
+    raw_content: dict,
+    db: AsyncSession,
+) -> dict:
+    """**剪藏拿到正文之后**的公共后半程（建库 → 扣配额 → 派蒸馏 → 失效缓存）。
+
+    ## 为什么要抽出来
+
+    链接剪藏（`POST /api/v1/articles`）与文档剪藏（`POST /api/v1/articles/document`）
+    的**后半程完全一样**：去重 → 扣配额 → 建库 → 派蒸馏 → 失效缓存。
+    差别只在「正文从哪来」。
+
+    这两段一旦各写一份，就会各自漂移 —— 而漂移的方向恰恰是**扣费与幂等**：
+    文档路径漏了「先抓后扣」就会变成「解析失败也扣配额」，
+    漏了 `mark_article_quota` 就会二次扣费。
+
+    ⚠️ 扣配额在**建库之前**，但**解析在扣配额之前**（见调用方）——
+    顺序是「先拿到正文 → 再扣钱 → 再建库」，与链接剪藏同口径
+    （2026-10-03 定的：抓不到正文就不建库不计费）。
+    """
+    # 去重：同 user + 同 url（文档路径的 url 是内容 hash）已有未删文章 → 复用
+    dup = await _find_existing_clip(url, uid, db)
+    if dup is not None:
+        log.info(
+            "clip_duplicate_reuse",
+            extra={"url": url, "user_id": uid, "article_id": dup.id},
+        )
+        try:
+            await get_ai_client().trigger_distill(
+                article_id=dup.id, auth_token=create_access_token(str(uid))
+            )
+        except Exception as exc:
+            log.warning("auto_distill_trigger_failed (dup): article=%s error=%s", dup.id, exc)
+        return {
+            "article_id": dup.id,
+            "url": dup.url,
+            "status": dup.status,
+            # 复用旧文章：没有新的 task_id（trigger_distill 内部会判断
+            # 「已在跑就不再入队」），返回 None 表示「没有新 task_id」而非失败。
+            "task_id": None,
+            "quota_used": 0,
+            "monthly_quota": 0,
+            "remaining": 0,
+            "reused": True,
+        }
+
     quota = await quota_service.consume(db, uid)  # 用尽抛 QuotaExceededError(3001)
     art = await _create_article(
-        req.url,
+        url,
         uid,
-        req.source,
-        req.title or fr.title or None,
+        source,
+        title,
         db,
-        raw_content=_to_raw_content(fr),
+        raw_content=raw_content,
         event=EventName.ARTICLE_SUBMIT,
-        fetch_on_create=False,  # 上面已经抓过了，别再抓一次
+        fetch_on_create=False,  # 正文已经拿到了，别再抓一次
     )
     await cache_service.mark_article_quota(art.id)  # 打标：该文章已扣过配额
 
     # 自动派蒸馏：失败仅 log 不破请求（ai-service 不可达时文章仍 pending，等下次重试）
+    trigger_result = None
     try:
         trigger_result = await get_ai_client().trigger_distill(
             article_id=art.id,
@@ -667,6 +843,7 @@ async def submit_article(
         "quota_used": quota["quota_used"],
         "monthly_quota": quota["monthly_quota"],
         "remaining": quota["monthly_quota"] - quota["quota_used"],
+        "reused": False,
     }
 
 

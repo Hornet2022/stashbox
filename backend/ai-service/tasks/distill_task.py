@@ -309,6 +309,37 @@ async def _load_raw_content(db: AsyncSession, article_id: str) -> str:
     )
 
 
+async def _load_material_source(db: AsyncSession, article_id: str) -> str:
+    """取**真实来源**（素材类型）："wechat_mp" / "document" / "pdf" / "generic_url" ...
+
+    来源取自 `raw_content["source"]`（FetchResult 的 source 字段 = 真正解析它的
+    fetcher/解析器），**不是** `articles.source`。
+
+    ⚠️ 为什么不�� `articles.source`：那一列是**请求体里传的** source
+    （`submit_article` 直接把 `req.source` 存进去），默认值 "web"，
+    而实际来源是 fetcher 定的 —— 用它判断素材类型会**判错**
+    （剪藏一个 PDF 直链，articles.source 是 "web"，但 raw_content.source 是 "pdf"；
+    文档剪藏是 "document"）。
+
+    ## 为什么单独一个函数而不改 `_load_raw_content` 的返回值
+
+    `_load_raw_content` 是个**被广泛 mock 的契约**（多个测试直接替掉它）。
+    改它的返回类型会把那些测试全变成「构造函数的守门员」——
+    测的不是行为，而是「我有没有改签名」。
+
+    这里用 `db.get()` 取同一 session 里已加载的 Article（identity map 命中，
+    **不会**额外打 SQL），两个函数各管一件事。
+    """
+    try:
+        art = await db.get(Article, article_id)
+        raw = getattr(art, "raw_content", None) if art is not None else None
+        if isinstance(raw, dict):
+            return str(raw.get("source") or "unknown")
+    except Exception as exc:  # noqa: BLE001 - 取不到来源不该毁掉整篇蒸馏
+        log.warning("material_source_load_failed", article_id=article_id, error=str(exc))
+    return "unknown"
+
+
 async def distill_task(
     ctx: dict,
     task_id: str,
@@ -412,6 +443,7 @@ async def distill_task(
     try:
         async with AsyncSessionLocal() as db:
             raw_content = await _load_raw_content(db, article_id)
+            source = await _load_material_source(db, article_id)
     except EmptyArticleContentError as e:
         log.warning("arq_distill_skipped_empty_content", task_id=task_id, error=str(e))
         try:
@@ -458,6 +490,7 @@ async def distill_task(
             user_id=user_id,
             url=url,
             raw_content=raw_content,
+            source=source,
             simulate_failure=simulate_failure,
         )
         # CP-AGENT-FAILURE-PROPAGATION：agent 失败（final.status != "done"）必须走

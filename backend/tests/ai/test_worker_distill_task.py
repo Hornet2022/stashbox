@@ -190,6 +190,22 @@ def raw_content_calls(monkeypatch):
     return calls
 
 
+@pytest.fixture(autouse=True)
+def material_source_calls(monkeypatch):
+    """把 _load_material_source 打成替身（它要查真 DB）。
+
+    返回记录的 article_id 列表，供用例断言确实去查了真实来源。
+    """
+    calls: list = []
+
+    async def _source(db, article_id):
+        calls.append(article_id)
+        return "wechat_mp"
+
+    monkeypatch.setattr(dt_module, "_load_material_source", _source)
+    return calls
+
+
 async def _noop_refund(session, user_id, amount=1):
     """不碰 DB 的 refund 替身（真 refund 会查 users 表）。"""
     return {}
@@ -222,8 +238,10 @@ async def test_task_passes_args_to_agent(fake_agent):
     assert call["article_id"] == "art_1"
     assert call["user_id"] == 7
     assert call["url"] == "https://x.com/a"
-    # source 默认 "web"
-    assert call["source"] == "web"
+    # source 是**真实来源**（从 raw_content.source 查出来的），不是硬编码的 "web"。
+    # 它决定改写 prompt 走哪种素材口径（文章 / 文档 / 代码库）——
+    # 传错的后果是「用公众号的写法改文档」= 逼出编造。
+    assert call["source"] == "wechat_mp"
 
 
 async def test_task_loads_raw_content_from_db(fake_agent, raw_content_calls):
