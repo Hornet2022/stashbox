@@ -49,18 +49,23 @@ APK_PATH = "/downloads/latest.apk"
 # 静态渲染出来是空的 → 降级文案「Android 内测版 · iOS 规划中」。
 APK_VER = '<span class="ver-slot" data-ver-slot></span>'
 
-# 备用下载入口（IP 直连）。
+# ── 曾经的「IP 直连」备用入口：2026-10-23 删掉了 ──────────────
 #
-# 为什么需要（2026-10-22 实测）：有内测用户反馈「App 下载不了」，生产日志显示
-#   GET /downloads/tingxia-0.3.1.apk  →  200 但只传了 96KB / 884736 就断了
-#   （APK 是 3.8MB；nginx 无任何错误、curl 能下完、Range 206 正常）
-# → **服务器侧完全正常**，是那个用户的网络在**大流量**上把连接切了
-#   （落地页 9.6KB 正常、小请求正常、大流量断）。
+# 原来有第二个下载链接「走 IP 直连下载（不经过域名）」，它的理由是：
+# 当时**域名入口是直出的**，所以给一个 IP 入口当兜底，还能顺带区分病因
+# （IP 能下完 = 域名线路问题；IP 也断 = 大流量 QoS）。
 #
-# App 里的 API 与音频都有「域名失败 → 切 IP」的兜底，**唯独浏览器下载这条
-# 路径没有** —— 浏览器不会自己换地址。于是给一个手动兜底：直连 IP 下载。
-# 顺带它还能一次性区分两种病因：IP 能下完 = 域名线路问题；IP 也断 = 大流量 QoS。
-APK_FALLBACK_URL = "https://8.148.9.151/downloads/latest.apk"
+# 现在这个前提没了 —— 域名入口改成 **302 到 IP**（备案未过期的既有设计，
+# 见 nginx 的 stashbox-downloads-redirect.conf）。于是：
+#   · 主按钮点下去**本来就落到 IP 入口** → 「IP 直连」这个链接不绕过任何东西；
+#   · 断流**就发生在 IP 入口上**（2026-10-23 07:13 实测：Chrome/135 经 302 到 IP
+#     后只传了 224KB 就断）→ 它给的"解法"根本不解决断流；
+#   · 那套「IP 能下完 = 域名线路问题」的判据也一并失效（两条路现在是同一条）。
+#
+# 留着它还有害：它把用户引向「域名有问题」的错误归因，而真实病因是
+# **当前网络掐大流量连接**。所以删掉，只留有证据的那条建议
+# ——「用系统下载器打开」（系统下载器会用 Range 续传，2026-10-23 07:13 实测
+# 它靠 206 把 3.8MB 下完了，而 Chrome 只下了 224KB）。
 
 
 def extract_template(src: str, func_name: str) -> str:
@@ -101,20 +106,18 @@ def main() -> int:
         '<p class="cta-note">Android 内测版' + APK_VER + " · iOS 规划中</p>\n"
         f'      <a class="btn" href="{APK_PATH}" download>下载内测版</a>\n'
         '      <p class="cta-note" style="margin-top:10px">'
-        "下载中断或很慢？可能是浏览器自带下载器的问题 —— "
-        "试试<strong>用系统下载器打开</strong>（长按链接 → 复制到下载工具），"
-        '或<a href="' + APK_FALLBACK_URL + '" download>走 IP 直连下载</a>'
-        "（不经过域名）。</p>",
+        "下载卡在几百 KB 不动？多半是当前网络把大流量连接掐断了。"
+        "试试<strong>用系统下载器打开</strong>：长按上面的按钮 → 复制链接地址 → "
+        "粘到系统下载器，它支持断点续传。</p>",
     )
     src = src.replace(
         "<p>内测中 · Android 优先</p>\n" '        <button class="btn">加入内测名单</button>',
         f"<p>Android 内测版{APK_VER} · iOS 规划中</p>\n"
         f'        <a class="btn" href="{APK_PATH}" download>下载内测版</a>\n'
         '        <p class="cta-note" style="margin-top:10px">'
-        "下载中断或很慢？可能是浏览器自带下载器的问题 —— "
-        "试试<strong>用系统下载器打开</strong>（长按链接 → 复制到下载工具），"
-        '或<a href="' + APK_FALLBACK_URL + '" download>走 IP 直连下载</a>'
-        "（不经过域名）。</p>",
+        "下载卡在几百 KB 不动？多半是当前网络把大流量连接掐断了。"
+        "试试<strong>用系统下载器打开</strong>：长按上面的按钮 → 复制链接地址 → "
+        "粘到系统下载器，它支持断点续传。</p>",
     )
     if "加入内测名单" in src:
         raise SystemExit("还有没换掉的「加入内测名单」")
