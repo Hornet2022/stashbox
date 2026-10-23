@@ -216,10 +216,10 @@ body {
 .v-broadsheet .cta-row {
   max-width: 1120px; margin: clamp(8px, 1.7vh, 64px) auto 0; width: 100%;
   padding-top: clamp(10px, 1.6vh, 24px); border-top: 1px solid var(--rule);
-  /* 靠左**并成一组**，不再两端分散。
-     之前是 justify-content: space-between → 版本说明在左、按钮在最右，
-     中间隔着七百多像素，按钮孤零零地飘着，跟整页的左对齐语言不搭。 */
-  display: flex; align-items: center; justify-content: flex-start;
+  /* PC 宽屏：版本说明在左、**按钮在右**（两端对齐）。
+     窄屏（手机竖屏）：两者**并成一组居中** —— 窄屏上两端对齐会把
+     按钮甩到屏幕另一头，拇指够不着，中间那一大片也空得尴尬。 */
+  display: flex; align-items: center; justify-content: space-between;
   gap: clamp(14px, 1.6vw, 26px); flex-wrap: wrap;
 }
 .v-broadsheet .cta-note {
@@ -402,30 +402,6 @@ body {
 .v-commute .btn:hover { opacity: 0.86; }
 .v-commute .btn:active { transform: scale(0.98); }
 
-/* ───────── 超宽屏：版心偏右（中文书籍的左开本传统）─────────
-   中文书是**左开本**（翻页方向决定的），装订边在左、版心偏右。
-   网页默认是「内容居中」，但在 1920 这类超宽屏上，1120px 的版心
-   居中会左右各空 400px —— 整块内容浮在屏幕正中间，报纸感就没了。
-
-   所以超宽屏时：版心**加宽**（三栏的文字行长从 24 字到 30 字，仍在
-   杂志栏宽的正常区间）并**整体右移**，左边留出装订边。
-   ⚠️ 只右移**不加宽**是不行的 —— 那会让左边空出 800px，比原来更糟。 */
-@media (min-width: 1700px) {
-  .v-broadsheet .masthead,
-  .v-broadsheet .headline,
-  .v-broadsheet .cols,
-  .v-broadsheet .cta-row,
-  .site-footer {
-    max-width: 1360px;
-    /* width:100% 不能省：flex 里的 auto margin 会吃掉 stretch，
-       元素会收缩成**内容宽**（页脚就会缩成那几个字的宽度，贴到右边缘）。
-       同一个坑在 masthead 上已经踩过一次。 */
-    width: 100%;
-    margin-left: auto;
-    margin-right: 0;
-  }
-}
-
 /* ───────── 按视口高度分档 ─────────
    内容的字号要跟着**视口高度**走，但不同档位的目标不同：
    · 高屏（2K 显示器 1920×1300 这类）：视口高、内容矮 →
@@ -466,6 +442,9 @@ body {
   .v-broadsheet .standfirst { font-size: 13px; line-height: 1.6; }
   .v-broadsheet .masthead { flex-direction: row; align-items: baseline;
                             gap: var(--space-8); }
+  /* 窄屏：CTA 整体居中（版本说明 + 按钮并成��组），
+     宽屏才是「说明在左、按钮在右」的两端对齐。 */
+  .v-broadsheet .cta-row { justify-content: center; }
   .site-footer { font-size: 11px; line-height: 1.6;
                  padding: 8px 12px 12px; }
   .site-footer-copyright { font-size: 12px; }
