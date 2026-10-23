@@ -215,14 +215,39 @@ node scripts/measure-landing.mjs ../stashbox/infra/web/index.html [--shots]
 
 ## 改完怎么发布
 
+⚠️ **现在有两样东西要发**：页面本身（`index.html`）+ **静态资源目录**
+（`assets/`，logo 图在那儿）。只发 html 的后果是：logo 图 404，
+页面上字标位置变成空的 —— 页面还能打开，所以**不报错、只是logo没了**。
+
 ```bash
-# 1) 改源码（原型或本文件）
-python3 /tmp/build_landing.py <原型路径> infra/web/index.html   # 重新生成
-# 2) 传到服务器
-rsync -a infra/web/index.html root@8.148.9.151:/var/www/stashbox-site/index.html
-# 3) reload（nginx 不用改，除非路由变了）
+# 1) 改源码 infra/web/index.html（页面里留 {{ICP_NUMBER}} 之类的占位符）
+# 2) 生成发布产物：把备案号注入进去 → infra/web/dist/index.html
+python3 backend/deploy/fill-filing-numbers.py --emit-landing
+# 3) 传到服务器（两个都要）
+rsync -a infra/web/dist/index.html root@8.148.9.151:/var/www/stashbox-site/index.html
+rsync -a infra/web/assets/ root@8.148.9.151:/var/www/stashbox-site/assets/
+# 4) reload（nginx 不用改，除非路由变了）
 ssh root@8.148.9.151 'systemctl reload nginx'
 ```
 
 营销页的 html 是 `no-cache` 的（nginx 里 `location = /index.html`），
 改完 reload 就能看到，不用清 CDN。
+
+### 品牌 logo（assets/logo/）
+
+字形是从 Songti SC 抽出来的**路径**（不是字体）—— logo 出现在别人浏览器、
+系统图标、favicon 上，那些地方不一定装了宋体，用字体渲染会掉字。
+
+```bash
+# 改了字形/配色/排版后重新生成（网页 + 安卓 + 后台 favicon 一起）
+python3 infra/web/assets/logo/make_logo.py
+```
+
+生成器会同时写三处（跨仓）：
+  - `infra/web/assets/logo/`（网页：字标 / 标记 / favicon / og 卡片）
+  - `stashbox-android/app/src/main/res/`（安卓：前景矢量 + 各密度 mipmap）
+  - `stashbox-admin-web/public/`（后台 favicon）
+
+⚠️ 安卓那边**前景不能直接用网页那套比例**：自适应图标 108dp 画布里
+只有中央 72dp 一定可见，圆形遮罩的安全区是直径 66dp 的圆。
+生成器里 `android_foreground()` 单独按 57dp 排版。
