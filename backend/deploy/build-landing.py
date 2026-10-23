@@ -105,22 +105,12 @@ def main() -> int:
         '<p class="cta-note">当前处于内测阶段，Android 优先，iOS 规划中。</p>\n'
         '      <button class="btn">加入内测名单</button>',
         '<p class="cta-note">Android 内测版' + APK_VER + " · iOS 规划中</p>\n"
-        f'      <a class="btn" href="{APK_PATH}" download>下载内测版</a>\n'
-        '      <p class="cta-note" style="margin-top:10px">'
-        "下载卡在几百 KB 不动？多半是当前网络把大流量连接掐断了。"
-        "试试<strong>用系统下载器打开</strong>：长按上面的按钮 → 复制链接地址 → "
-        "粘到系统下载器，它支持断点续传。域名线路也不行时，"
-        '<a href="' + APK_FALLBACK_URL + '" download>走 IP 直连下载</a>。</p>',
+        f'      <a class="btn" href="{APK_PATH}" download>下载内测版</a>\n',
     )
     src = src.replace(
         "<p>内测中 · Android 优先</p>\n" '        <button class="btn">加入内测名单</button>',
         f"<p>Android 内测版{APK_VER} · iOS 规划中</p>\n"
-        f'        <a class="btn" href="{APK_PATH}" download>下载内测版</a>\n'
-        '        <p class="cta-note" style="margin-top:10px">'
-        "下载卡在几百 KB 不动？多半是当前网络把大流量连接掐断了。"
-        "试试<strong>用系统下载器打开</strong>：长按上面的按钮 → 复制链接地址 → "
-        "粘到系统下载器，它支持断点续传。域名线路也不行时，"
-        '<a href="' + APK_FALLBACK_URL + '" download>走 IP 直连下载</a>。</p>',
+        f'        <a class="btn" href="{APK_PATH}" download>下载内测版</a>\n',
     )
     if "加入内测名单" in src:
         raise SystemExit("还有没换掉的「加入内测名单」")

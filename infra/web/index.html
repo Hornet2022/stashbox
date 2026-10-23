@@ -78,6 +78,10 @@ body {
   font-feature-settings: "palt" 1;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  /* 一屏的高度分配在 body 这一层做：#stage 拿走除页脚外的全部高度，
+     页脚按内容高度贴在底部。 */
+  display: flex; flex-direction: column;
+  min-height: 100svh;
 }
 
 #stage { min-height: 100vh; }
@@ -101,11 +105,26 @@ body {
 }
 
 /* ───────── 方向一：纸面 ───────── */
-.v-broadsheet { padding: 0 var(--space-24) var(--space-96); }
+/* ═══ 整页一屏（2026-10-23）═══
+   营销页的转化目标就是「一眼看到 + 一键下载」—— 页面要滚一屏，
+   就说明首屏没装下 CTA。
+   所以：**关键尺寸跟着视口高度走**（vh 钳制），视口越矮字和间距越小，
+   保证任何常见视口下都是一屏。
+   骨架用 flex：masthead 贴顶、cols 撑开中间并垂直居中、CTA+页脚贴底。 */
+.v-broadsheet {
+  padding: 0 var(--space-24) clamp(16px, 2.4vh, 32px);
+  display: flex; flex-direction: column;
+  /* 高度由 #stage 分配（见下面的 #stage 规则）—— 自己再声明
+     min-height:100svh 会把页脚挤到视口外面。 */
+  flex: 1 1 auto; min-height: 0;
+}
 
 .v-broadsheet .masthead {
-  max-width: 1120px; margin: 0 auto;
-  padding: var(--space-24) 0 var(--space-16);
+  max-width: 1120px; margin: 0 auto; width: 100%;
+  /* width:100% 不能省：父级变成 flex column 之后，子项的
+     `margin: 0 auto` 会让它**收缩到内容宽度并居中**（flex 里的 auto
+     margin 会吃掉 stretch）—— masthead 的「听匣」会跑到页面中间。 */
+  padding: clamp(10px, 1.6vh, 24px) 0 clamp(8px, 1.2vh, 16px);
   border-bottom: 1px solid var(--rule);
   display: flex; align-items: baseline; justify-content: space-between;
   gap: var(--space-24);
@@ -120,9 +139,15 @@ body {
 }
 
 .v-broadsheet .headline {
-  max-width: 1120px; margin: 0 auto;
-  padding: var(--space-64) 0 var(--space-48);
-  display: grid; grid-template-columns: 1fr; gap: var(--space-24);
+  max-width: 1120px; margin: 0 auto; width: 100%;
+  padding: clamp(14px, 3.4vh, 64px) 0 clamp(10px, 2.2vh, 48px);
+  display: flex; flex-direction: column; justify-content: center;
+  gap: clamp(8px, 1.3vh, 24px);
+  /* **它**来吸收一屏里多出来的空间（而不是 .cols）。
+     之前是 .cols { flex: 1 } —— 三栏区会抢走剩余高度，把页脚挤到
+     视口**外面**（实测：页脚 top=900=视口底，文档高 1043）。
+     三栏是内容（高度由文字决定），标题区才是适合当「弹性留白」的那块。 */
+  flex: 1 1 auto; min-height: 0;
 }
 .v-broadsheet .kicker {
   font-family: var(--mono); font-size: 12px; letter-spacing: 0.16em;
@@ -130,22 +155,26 @@ body {
 }
 .v-broadsheet h1 {
   font-family: var(--serif); font-weight: 600;
-  font-size: clamp(38px, 8.2vw, 96px); line-height: 1.08;
+  /* 字号同时受宽度和**高度**约束：矮屏（笔记本 720p、手机横屏）时
+     不能只按宽度算，否则标题一行就顶掉半屏。 */
+  font-size: clamp(28px, min(8.2vw, 9.4vh), 96px); line-height: 1.08;
   letter-spacing: -0.01em; margin: 0; max-width: 16ch;
 }
 .v-broadsheet h1 em { font-style: normal; color: var(--accent); }
 .v-broadsheet .standfirst {
-  font-size: clamp(16px, 1.6vw, 19px); line-height: 1.75;
+  font-size: clamp(14px, min(1.6vw, 2.1vh), 19px); line-height: 1.7;
   color: var(--fg-muted); max-width: 46ch; margin: 0;
 }
 
 .v-broadsheet .cols {
-  max-width: 1120px; margin: 0 auto;
+  max-width: 1120px; margin: 0 auto; width: 100%;
   border-top: 2px solid var(--fg);
   display: grid; grid-template-columns: repeat(3, 1fr);
+  /* 自然高度（内容决定），不抢空间 */
+  flex: 0 0 auto;
 }
 .v-broadsheet .col {
-  padding: var(--space-24) var(--space-24) 0 0;
+  padding: clamp(10px, 1.6vh, 24px) clamp(16px, 2.2vh, 24px) 0 0;
   border-right: 1px solid var(--rule);
 }
 .v-broadsheet .col:last-child { border-right: 0; }
@@ -158,12 +187,17 @@ body {
   margin: 0 0 var(--space-8); letter-spacing: 0.02em;
 }
 .v-broadsheet .col p {
-  font-size: 14px; line-height: 1.8; color: var(--fg-muted); margin: 0;
+  font-size: 14px; line-height: 1.7; color: var(--fg-muted); margin: 0;
+  /* 文字与分隔线之间**永远**留出间隙。
+     之前栏的 padding-right 只有 24px，窄屏时几乎为零（实测 4~6px），
+     文字行末会贴到线上；这里再加 12px 的内缩，
+     任何宽度下都不会压线。 */
+  padding-right: 12px;
 }
 
 .v-broadsheet .cta-row {
-  max-width: 1120px; margin: var(--space-64) auto 0;
-  padding-top: var(--space-24); border-top: 1px solid var(--rule);
+  max-width: 1120px; margin: clamp(10px, 1.9vh, 64px) auto 0; width: 100%;
+  padding-top: clamp(10px, 1.6vh, 24px); border-top: 1px solid var(--rule);
   display: flex; align-items: center; justify-content: space-between;
   gap: var(--space-24); flex-wrap: wrap;
 }
@@ -330,15 +364,31 @@ body {
 .v-commute .btn:hover { opacity: 0.86; }
 .v-commute .btn:active { transform: scale(0.98); }
 
-/* ───────── 窄屏 ───────── */
+/* ───────── 窄屏（手机竖屏）─────────
+   之前窄屏把三栏改成**竖排三段** → 占掉 300px+，整页必然超一屏。
+   现在改成**横排三小栏**（报纸的迷你版）：只占 ~150px，一屏装得下，
+   而且保留了「三栏并列」这个设计语言。
+   分隔线仍在栏间（border-right），文字的右内缩也保留 → 不会压线。 */
 @media (max-width: 760px) {
-  .v-broadsheet .cols { grid-template-columns: 1fr; }
-  .v-broadsheet .col { border-right: 0; padding-right: 0;
-                        padding-bottom: var(--space-24); }
-  .v-broadsheet .col + .col { border-top: 1px solid var(--rule);
-                              padding-top: var(--space-24); }
-  .v-broadsheet .masthead { flex-direction: column; align-items: flex-start;
+  .v-broadsheet { padding: 0 16px clamp(12px, 2vh, 24px); }
+  .v-broadsheet .cols { grid-template-columns: repeat(3, 1fr); }
+  .v-broadsheet .col {
+    border-right: 1px solid var(--rule);
+    padding: 10px 8px 0 0;
+  }
+  .v-broadsheet .col + .col { border-top: 0; padding-top: 10px; padding-left: 8px; }
+  .v-broadsheet .col:last-child { border-right: 0; }
+  .v-broadsheet .col h3 { font-size: 13px; line-height: 1.35; margin-bottom: 4px; }
+  .v-broadsheet .col p { font-size: 11px; line-height: 1.55; padding-right: 0; }
+  .v-broadsheet .col .num { margin-bottom: 4px; }
+  .v-broadsheet .headline { padding: 14px 0 10px; gap: 10px; }
+  .v-broadsheet h1 { font-size: clamp(28px, 8.4vw, 40px); }
+  .v-broadsheet .standfirst { font-size: 13px; line-height: 1.6; }
+  .v-broadsheet .masthead { flex-direction: row; align-items: baseline;
                             gap: var(--space-8); }
+  .site-footer { font-size: 11px; line-height: 1.6;
+                 padding: 8px 12px 12px; }
+  .site-footer-copyright { font-size: 12px; }
   .v-wave .wordmark, .v-wave .tagline { position: static; text-align: center;
                                         margin-bottom: var(--space-32); }
   .v-wave .tagline { margin-top: calc(var(--space-32) * -1 + 28px); }
@@ -350,6 +400,44 @@ body {
   .v-commute .step .dot { left: 0; top: 7px; }
 }
 
+/* ───────── 超窄屏（≤380px，如 iPhone SE 尺寸）─────────
+   三栏横排已经是最省的形态了，这里只能再压字号与行距。
+   11px 的中文已经偏小，所以只压到 10.5px，再小就伤可读性了。 */
+@media (max-width: 380px) {
+  .v-broadsheet { padding: 0 12px; }
+  .v-broadsheet .masthead { padding: 6px 0 5px; }
+  .v-broadsheet .headline { padding: 8px 0 6px; gap: 6px; }
+  .v-broadsheet h1 { font-size: clamp(24px, 7.6vw, 32px); }
+  .v-broadsheet .standfirst { font-size: 11.5px; line-height: 1.45; }
+  .v-broadsheet .col { padding: 7px 6px 0 0; }
+  .v-broadsheet .col + .col { padding-left: 6px; }
+  .v-broadsheet .col h3 { font-size: 11.5px; }
+  .v-browsheet-num, .v-broadsheet .col .num { margin-bottom: 3px; }
+  .v-broadsheet .col p { font-size: 10px; line-height: 1.4; }
+  .v-broadsheet .cta-row { margin: 8px auto 0; padding-top: 8px; }
+  .site-footer { font-size: 9.5px; line-height: 1.4; padding: 4px 10px 5px; }
+  .site-footer-copyright { font-size: 10.5px; }
+}
+
+/* ───────── 矮屏（手机横屏）─────────
+   高度只有 390px 左右，标题与三栏都要再收一档，
+   目标是把 CTA（下载按钮）拉回首屏。 */
+@media (max-height: 520px) and (orientation: landscape) {
+  .v-broadsheet { padding: 0 20px 4px; }
+  .v-broadsheet .masthead { padding: 4px 0; }
+  .v-broadsheet .headline { padding: 4px 0; gap: 4px; }
+  .v-broadsheet h1 { font-size: clamp(20px, 5.6vh, 30px); }
+  .v-broadsheet .kicker { font-size: 10px; }
+  .v-broadsheet .standfirst { font-size: 11px; line-height: 1.4; }
+  .v-broadsheet .col { padding: 5px 14px 0 0; }
+  .v-broadsheet .col p { font-size: 11px; line-height: 1.4; }
+  .v-broadsheet .col h3 { font-size: 13px; margin-bottom: 4px; }
+  .v-broadsheet .cta-row { margin: 6px auto 0; padding-top: 6px; }
+  .v-broadsheet .btn { padding: 8px 18px; font-size: 13px; }
+  .site-footer { font-size: 9.5px; line-height: 1.4; padding: 3px 12px 4px; }
+  .site-footer-copyright { font-size: 10.5px; }
+}
+
 /* ═══ 生产化改动（见 infra/web/README.md）═══ */
 /* 方向切换器：原型是「三个方向并排挑」的探索工具，对外不该出现。
    团队内部用 ?picker=1 打开。 */
@@ -357,6 +445,17 @@ body {
 body.show-picker .proto-picker { display: flex !important; }
 /* CTA 从 button 换成 <a>：去掉下划线，其余沿用 .btn 的类样式 */
 a.btn { text-decoration: none; }
+
+/* ═══ 一屏的骨架（2026-10-23）═══
+   #stage 是三个方向的容器，页脚是它的**兄弟**节点（在 </main> 之后）——
+   所以「一屏」的高度分配必须发生在 #stage 这一层：
+   #stage 高 = 一屏，.v-broadsheet 拿走剩下的，页脚按内容高度。
+   之前页脚在 main 外面，main 自己又声明了 min-height:100svh
+   → 页脚被挤到视口之外（实测文档高 1043 / 视口 900）。 */
+#stage {
+  display: flex; flex-direction: column;
+  flex: 1 1 auto; min-height: 0;
+}
 
 /* ═══ 备案号页脚（法定义务，2026-10-23 加）═══
    《互联网信息服务管理办法》：网站底部必须**显著标明**工信部备案号，
@@ -373,10 +472,13 @@ a.btn { text-decoration: none; }
    配色跟随本站主题（本站是浅色纸面风，参考图是深色）——
    结构与层级一致，底色不照抄，否则会在浅色页上砸一块深色。 */
 .site-footer {
-  padding: 30px 16px 44px;
+  flex: 0 0 auto;
+  padding: clamp(6px, 1.1vh, 20px) 16px clamp(8px, 1.4vh, 26px);
   text-align: center;
-  font-size: 13px;
-  line-height: 2.1;
+  font-size: 12px;
+  /* 行高压到 1.65：页脚是三行，行高每松 0.5 就是几十像素 ——
+     而它整体必须待在一屏里。 */
+  line-height: 1.65;
   color: var(--fg-faint);
 }
 .site-footer a { color: var(--fg-muted); text-decoration: none; }
@@ -403,7 +505,7 @@ a.btn { text-decoration: none; }
       <p class="kicker">内容消费的 AI 翻译机</p>
       <h1 class="enter" style="animation-delay:40ms">把读不完的，<br>变成<em>听得完</em>的。</h1>
       <p class="standfirst enter" style="animation-delay:100ms">
-        公众号、PDF、网页 —— 剪藏一条链接，AI 把它蒸馏成一段刚好能在通勤路上听完的音频。
+        公众号、文档、网页 —— 剪藏一条链接，AI 把它蒸馏成一段刚好能在通勤路上听完的音频。
       </p>
     </section>
 
@@ -428,7 +530,6 @@ a.btn { text-decoration: none; }
     <div class="cta-row">
       <p class="cta-note">Android 内测版<span class="ver-slot" data-ver-slot></span> · iOS 规划中</p>
       <a class="btn" href="/downloads/latest.apk" download>下载内测版</a>
-      <p class="cta-note" style="margin-top:10px">下载卡在几百 KB 不动？多半是当前网络把大流量连接掐断了。试试<strong>用系统下载器打开</strong>：长按上面的按钮 → 复制链接地址 → 粘到系统下载器，它支持断点续传。域名线路也不行时，<a href="https://8.148.9.151/downloads/latest.apk" download>走 IP 直连下载</a>。</p>
     </div>
   </main>
 </div>
@@ -459,7 +560,7 @@ function vBroadsheet() {
       <p class="kicker">内容消费的 AI 翻译机</p>
       <h1 class="enter" style="animation-delay:40ms">把读不完的，<br>变成<em>听得完</em>的。</h1>
       <p class="standfirst enter" style="animation-delay:100ms">
-        公众号、PDF、网页 —— 剪藏一条链接，AI 把它蒸馏成一段刚好能在通勤路上听完的音频。
+        公众号、文档、网页 —— 剪藏一条链接，AI 把它蒸馏成一段刚好能在通勤路上听完的音频。
       </p>
     </section>
 
@@ -484,7 +585,6 @@ function vBroadsheet() {
     <div class="cta-row">
       <p class="cta-note">Android 内测版<span class="ver-slot" data-ver-slot></span> · iOS 规划中</p>
       <a class="btn" href="/downloads/latest.apk" download>下载内测版</a>
-      <p class="cta-note" style="margin-top:10px">下载卡在几百 KB 不动？多半是当前网络把大流量连接掐断了。试试<strong>用系统下载器打开</strong>：长按上面的按钮 → 复制链接地址 → 粘到系统下载器，它支持断点续传。域名线路也不行时，<a href="https://8.148.9.151/downloads/latest.apk" download>走 IP 直连下载</a>。</p>
     </div>
   </main>`;
 }
@@ -572,7 +672,6 @@ function vCommute() {
       <div class="foot">
         <p>Android 内测版<span class="ver-slot" data-ver-slot></span> · iOS 规划中</p>
         <a class="btn" href="/downloads/latest.apk" download>下载内测版</a>
-        <p class="cta-note" style="margin-top:10px">下载卡在几百 KB 不动？多半是当前网络把大流量连接掐断了。试试<strong>用系统下载器打开</strong>：长按上面的按钮 → 复制链接地址 → 粘到系统下载器，它支持断点续传。域名线路也不行时，<a href="https://8.148.9.151/downloads/latest.apk" download>走 IP 直连下载</a>。</p>
       </div>
     </div>
   </main>`;
