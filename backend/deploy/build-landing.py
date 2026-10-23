@@ -17,6 +17,11 @@
 5. 加 og: 标签（分享卡片的标题/描述），加 description meta。
 
 用法：python3 build_landing.py <原型路径> <输出路径>
+
+⚠️ 2026-10-23：原型 ~/.prototypes/tingxia-landing/index.html **已不存在**，
+   本脚本当前**跑不起来**。infra/web/index.html 是现存的唯一真相源，
+   改它请直接改（并同步本文件里的常量，否则将来原型找回来重新生成
+   会把下载链接改回旧写法）。
 """
 
 import re
@@ -27,8 +32,22 @@ from pathlib import Path
 SAMPLE_TITLE = "奇客Solidot｜《星际公民》前传《Squadron 42》完成功能开发"
 SAMPLE_DUR = "03:47"
 SAMPLE_PATH = "/audio/audio/art_881ed5393d9d47248ed48271.b7416ab1.mp3"
-APK_PATH = "/downloads/tingxia-0.3.1.apk"
-APK_VER = "v0.3.1"
+# 下载链接**不写死版本号**。
+#
+# 2026-10-23 实测的坑：这里写死成 v0.3.1，而发版流程（上传 APK / 改 env /
+# 重启服务）**完全不知道营销页的存在** → 页面的下载入口一路停在 0.3.1，
+# 服务上却已经是 0.3.6，中间漏了 5 个版本。根因是「当前版本」没有唯一真相源。
+#
+# 现在的分工：
+#   · 下载链接 → 稳定路径 /downloads/latest.apk
+#     （nginx 的 /downloads/ 是 alias 到 /var/www/stashbox-downloads/，
+#      里面有一个 latest.apk 软链指向当前版本，由 deploy/release_apk.sh 维护）
+#   · 版本号文字 → 运行时从同源 /api/v1/app/version 取，取不到就留空
+#     （文案不含版本号 → 永不过时、不会说谎）
+APK_PATH = "/downloads/latest.apk"
+# 版本号的占位：页面运行时用接口返回的版本填这里。
+# 静态渲染出来是空的 → 降级文案「Android 内测版 · iOS 规划中」。
+APK_VER = '<span class="ver-slot" data-ver-slot></span>'
 
 # 备用下载入口（IP 直连）。
 #
@@ -41,7 +60,7 @@ APK_VER = "v0.3.1"
 # App 里的 API 与音频都有「域名失败 → 切 IP」的兜底，**唯独浏览器下载这条
 # 路径没有** —— 浏览器不会自己换地址。于是给一个手动兜底：直连 IP 下载。
 # 顺带它还能一次性区分两种病因：IP 能下完 = 域名线路问题；IP 也断 = 大流量 QoS。
-APK_FALLBACK_URL = "https://8.148.9.151/downloads/tingxia-0.3.1.apk"
+APK_FALLBACK_URL = "https://8.148.9.151/downloads/latest.apk"
 
 
 def extract_template(src: str, func_name: str) -> str:
@@ -79,7 +98,7 @@ def main() -> int:
     src = src.replace(
         '<p class="cta-note">当前处于内测阶段，Android 优先，iOS 规划中。</p>\n'
         '      <button class="btn">加入内测名单</button>',
-        '<p class="cta-note">Android 内测版（' + APK_VER + "）· iOS 规划中</p>\n"
+        '<p class="cta-note">Android 内测版' + APK_VER + " · iOS 规划中</p>\n"
         f'      <a class="btn" href="{APK_PATH}" download>下载内测版</a>\n'
         '      <p class="cta-note" style="margin-top:10px">'
         "下载中断或很慢？可能是浏览器自带下载器的问题 —— "
@@ -89,7 +108,7 @@ def main() -> int:
     )
     src = src.replace(
         "<p>内测中 · Android 优先</p>\n" '        <button class="btn">加入内测名单</button>',
-        f"<p>Android 内测版（{APK_VER}）· iOS 规划中</p>\n"
+        f"<p>Android 内测版{APK_VER} · iOS 规划中</p>\n"
         f'        <a class="btn" href="{APK_PATH}" download>下载内测版</a>\n'
         '        <p class="cta-note" style="margin-top:10px">'
         "下载中断或很慢？可能是浏览器自带下载器的问题 —— "

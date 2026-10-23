@@ -67,6 +67,60 @@
 
 改法：生产化 CSS 放在**最后一个 style 块之后**，并加 `!important` 双保险。
 
+## 下载入口：为什么不再写死版本号（2026-10-23）
+
+### 事故
+
+页面的下载按钮写死 `tingxia-0.3.1.apk`（6 处：3 个方向的 CTA × 主链接 + IP 兜底），
+版本号文字写死 `v0.3.1`（3 处）。而**发版流程完全不知道营销页的存在** ——
+发版 = 上传 APK + 改 env + 重启服务，三步都不碰这个静态页。
+
+结果：服务上已经是 0.3.6，页面还写着 0.3.1，**中间漏了 5 个版本**。
+而且是「看起来正常」—— 链接还能点，下载下来的却是一个五个月前的包。
+
+### 根因
+
+不是「忘了改」，是**「当前版本」没有唯一真相源**：
+
+| 事实 | 原来存在哪 |
+|---|---|
+| APK 文件 | `/var/www/stashbox-downloads/tingxia-<ver>.apk` |
+| 版本号（接口读的） | `/etc/stashbox/stashbox.env` |
+| 版本号（页面显示的） | 营销页 HTML 里写死 |
+
+三处各说各的，谁也不校验谁。靠「记得改」来维持一致，必然漏。
+
+### 现在的分工
+
+| 事实 | 唯一真相源 | 谁维护 |
+|---|---|---|
+| 当前版本号 | `stashbox.env` 的三个 `STASHBOX_APP_*` 变量 | `deploy/release_apk.sh` |
+| 最新 APK | `/var/www/stashbox-downloads/latest.apk` → 软链 | `deploy/release_apk.sh` |
+| 页面上的版本号文字 | 运行时从 `/api/v1/app/version` 取 | 无（自动） |
+
+**下载链接不再随版本变**：页面指向稳定路径 `/downloads/latest.apk`，
+nginx 的 `/downloads/` 是 `alias /var/www/stashbox-downloads/`，
+里面有个 `latest.apk` 软链指向当前版本。页面**一次都不用再改**。
+
+**版本号文字运行时取**：`/api/` 走网关，与页面**同源**（无 CORS 问题），
+所以页面可以直接 fetch `/api/v1/app/version`。
+取不到时（无 JS / 爬虫 / 接口挂了）占位留空 → 文案变成
+「Android 内测版 · iOS 规划中」—— **不含版本号就不会过期、不会说谎**。
+
+### 发版脚本
+
+`backend/deploy/release_apk.sh` 一次做完：上传 APK → 更新 `latest.apk` 软链 →
+改 env → 重启 user-service → **校验**（哈希、软链指向、版本接口、实际下载大小）。
+
+校验不是装饰：软链指错、env 写错、上传了半个文件，这三种错在
+「页面上看起来一切正常」时最难发现。
+
+```bash
+./backend/deploy/release_apk.sh <apk 路径> <版本名> <versionCode>
+```
+
+---
+
 ## 部署
 
 ```bash

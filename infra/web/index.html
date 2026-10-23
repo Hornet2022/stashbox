@@ -396,9 +396,9 @@ a.btn { text-decoration: none; }
     </section>
 
     <div class="cta-row">
-      <p class="cta-note">Android 内测版（v0.3.1）· iOS 规划中</p>
-      <a class="btn" href="/downloads/tingxia-0.3.1.apk" download>下载内测版</a>
-      <p class="cta-note" style="margin-top:10px">下载中断或很慢？可能是浏览器自带下载器的问题 —— 试试<strong>用系统下载器打开</strong>（长按链接 → 复制到下载工具），或<a href="https://8.148.9.151/downloads/tingxia-0.3.1.apk" download>走 IP 直连下载</a>（不经过域名）。</p>
+      <p class="cta-note">Android 内测版<span class="ver-slot" data-ver-slot></span> · iOS 规划中</p>
+      <a class="btn" href="/downloads/latest.apk" download>下载内测版</a>
+      <p class="cta-note" style="margin-top:10px">下载中断或很慢？可能是浏览器自带下载器的问题 —— 试试<strong>用系统下载器打开</strong>（长按链接 → 复制到下载工具），或<a href="https://8.148.9.151/downloads/latest.apk" download>走 IP 直连下载</a>（不经过域名）。</p>
     </div>
   </main>
 </div>
@@ -452,9 +452,9 @@ function vBroadsheet() {
     </section>
 
     <div class="cta-row">
-      <p class="cta-note">Android 内测版（v0.3.1）· iOS 规划中</p>
-      <a class="btn" href="/downloads/tingxia-0.3.1.apk" download>下载内测版</a>
-      <p class="cta-note" style="margin-top:10px">下载中断或很慢？可能是浏览器自带下载器的问题 —— 试试<strong>用系统下载器打开</strong>（长按链接 → 复制到下载工具），或<a href="https://8.148.9.151/downloads/tingxia-0.3.1.apk" download>走 IP 直连下载</a>（不经过域名）。</p>
+      <p class="cta-note">Android 内测版<span class="ver-slot" data-ver-slot></span> · iOS 规划中</p>
+      <a class="btn" href="/downloads/latest.apk" download>下载内测版</a>
+      <p class="cta-note" style="margin-top:10px">下载中断或很慢？可能是浏览器自带下载器的问题 —— 试试<strong>用系统下载器打开</strong>（长按链接 → 复制到下载工具），或<a href="https://8.148.9.151/downloads/latest.apk" download>走 IP 直连下载</a>（不经过域名）。</p>
     </div>
   </main>`;
 }
@@ -540,9 +540,9 @@ function vCommute() {
       <section class="spine">${items}</section>
 
       <div class="foot">
-        <p>Android 内测版（v0.3.1）· iOS 规划中</p>
-        <a class="btn" href="/downloads/tingxia-0.3.1.apk" download>下载内测版</a>
-        <p class="cta-note" style="margin-top:10px">下载中断或很慢？可能是浏览器自带下载器的问题 —— 试试<strong>用系统下载器打开</strong>（长按链接 → 复制到下载工具），或<a href="https://8.148.9.151/downloads/tingxia-0.3.1.apk" download>走 IP 直连下载</a>（不经过域名）。</p>
+        <p>Android 内测版<span class="ver-slot" data-ver-slot></span> · iOS 规划中</p>
+        <a class="btn" href="/downloads/latest.apk" download>下载内测版</a>
+        <p class="cta-note" style="margin-top:10px">下载中断或很慢？可能是浏览器自带下载器的问题 —— 试试<strong>用系统下载器打开</strong>（长按链接 → 复制到下载工具），或<a href="https://8.148.9.151/downloads/latest.apk" download>走 IP 直连下载</a>（不经过域名）。</p>
       </div>
     </div>
   </main>`;
@@ -637,6 +637,66 @@ if (new URLSearchParams(location.search).get('picker') === '1') document.body.cl
 setActive((parseInt(new URLSearchParams(location.search).get('v'), 10) || 1) - 1);
 // 首帧之后再开滑动，加载时不做位移动画
 requestAnimationFrame(() => requestAnimationFrame(() => picker.setAttribute('data-ready', '')));
+</script>
+
+<!-- ─────────────────────────────────────────────────────────────
+     版本号：运行时从同源的后端接口取，不写死在 HTML 里。
+
+     为什么（这是一个真实踩过的坑）：
+     营销页是静态页，而发版是**另一条流程**（上传 APK + 改 env + 重启服务），
+     两者之间没有任何一步会同步 → 写死的版本号**一定会漏**。
+     实测：页面写着 v0.3.1，服务上已经是 0.3.6，中间漏了 5 个版本。
+
+     现在的分工：
+       · 下载链接 → 稳定路径 /downloads/latest.apk
+         （nginx 的 /downloads/ 是 alias 到 /var/www/stashbox-downloads/，
+           里面有一个 latest.apk 软链指向当前版本，由发版脚本维护）
+       · 版本号   → 这里运行时取，取不到就留空
+     取不到时文案变成「Android 内测版 · iOS 规划中」——
+     **不含版本号就不会过期、不会说谎**。无 JS（爬虫/禁用 JS）也是这个结果。
+     ───────────────────────────────────────────────────────────── -->
+<script>
+(function () {
+  var ver = null;        // 取到的版本号
+  var inflight = false;  // 有请求在飞 → 别再发第二个
+
+  function fill() {
+    if (!ver) return;
+    var slots = document.querySelectorAll('[data-ver-slot]');
+    for (var i = 0; i < slots.length; i++) {
+      // 只填空占位：写完就不再改 → 不会自己触发 observer → 不会自激
+      if (!slots[i].textContent) slots[i].textContent = '（v' + ver + '）';
+    }
+  }
+
+  function load() {
+    if (ver) { fill(); return; }   // 已取到就只填，不再发请求
+    if (inflight) return;          // 别并发
+    inflight = true;
+    fetch('/api/v1/app/version', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        // 成功响应是**裸对象**（约定：成功=裸对象，错误={code,message,data}）
+        if (d && d.latest_version_name) { ver = d.latest_version_name; fill(); }
+      })
+      .catch(function () { /* 取不到就留空 —— 不显示错版本 */ })
+      .then(function () { inflight = false; });
+  }
+
+  load();
+
+  // 切换方向会重建 #stage 的内容（stage.innerHTML = variants[i]()），
+  // 新插入的占位元素是空的 → 监听 DOM 变化再填一次。
+  //
+  // ⚠️ 这里**只能调 fill()、不能再调 load()**：observer 监听的子树里
+  // 包含我们要填的占位元素，fill 写 textContent 会再次触发 observer
+  // → 若回调里发请求，就会变成「改 DOM → 发请求 → 改 DOM」的循环。
+  var stage = document.getElementById('stage');
+  if (stage && window.MutationObserver) {
+    new MutationObserver(function () { fill(); })
+      .observe(stage, { childList: true, subtree: true });
+  }
+})();
 </script>
 
 <style>
