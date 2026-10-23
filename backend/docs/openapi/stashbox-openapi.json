@@ -265,6 +265,64 @@
         ]
       }
     },
+    "/api/v1/admin/articles/document": {
+      "post": {
+        "summary": "Admin Create Article Document",
+        "description": "**运营侧**录入文档（admin 全局视图用）。\n\n## 为什么不复用用户侧的 `POST /api/v1/articles/document`\n\n那个端点是**用户剪藏**入口，用 admin token 打过去会连带三件运营不想要的事\n（与 `POST /api/v1/admin/articles` 同理由）：扣**运营账号自己的**配额、\n文章 owner 变成运营本人（于是「全站公共内容」变成运营名下的私有文章）、\n语义上把「运营造内容」和「用户剪藏」混成同一类数据。\n\n本端点：归属记 `ANONYMOUS_USER_ID(0)`、**不扣配额**、写 admin 审计日志、\n照常派蒸馏。\n\n## 与用户侧端点的差异只有三处\n\n· 归属：`ANONYMOUS_USER_ID` 而不是操作者；\n· 配额：不扣；\n· 鉴权：`require_admin_or_operator`。\n\n**正文解析用的是同一份 `parse_document`** —— 判据（大小上限、空文件、\n正文下限、格式分派）全部共用，避免「用户能传运营传不了」。\n\n## 与 admin 链接录入端点的差异\n\n链接录入 `POST /api/v1/admin/articles` 只收 URL（**运营自己贴链接**），\n那个端点不带正文 —— 抓取发生在建库前（`_create_article` 的\n`fetch_on_create`）。本端点是**运营直接上传正文**，不经过抓取，\n所以 `fetch_on_create=False` + 显式传 `raw_content`。",
+        "operationId": "admin_create_article_document_api_v1_admin_articles_document_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_admin_create_article_document_api_v1_admin_articles_document_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
     "/api/v1/admin/articles/{article_id}": {
       "get": {
         "summary": "Admin Get Article",
@@ -9361,6 +9419,46 @@
           "duration_sec"
         ],
         "title": "AudioUrlResponse"
+      },
+      "Body_admin_create_article_document_api_v1_admin_articles_document_post": {
+        "properties": {
+          "file": {
+            "anyOf": [
+              {
+                "type": "string",
+                "contentMediaType": "application/octet-stream"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "type": "object",
+        "title": "Body_admin_create_article_document_api_v1_admin_articles_document_post"
       },
       "Body_submit_document_api_v1_articles_document_post": {
         "properties": {

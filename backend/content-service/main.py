@@ -663,6 +663,58 @@ async def submit_article(
     )
 
 
+async def _read_document_upload(
+    file: UploadFile | None,
+    text: str | None,
+) -> tuple[str, str, bytes]:
+    """上传载荷 → (filename, content_type, data)。
+
+    **用户侧与 admin 侧共用同一份判据** —— 这两条路径的行为必须逐字一致：
+    同一份内容「用户能传、运营传不了」是个查不到原因的问题（两边各写一份
+    判据时，改了一边另一边就漂了）。
+
+    · `file` 与 `text` **二选一**，同时给或都不给都是 400。
+    · 文件 ≤ MAX_DOCUMENT_BYTES（与 nginx `client_max_body_size 10m` 同口径）。
+    · 粘贴文本按 UTF-8 存成字节，**走与文件完全相同的解析路径**。
+
+    Raises:
+        InvalidRequest: 入参不合法 / 超限 / 空文件。
+    """
+    has_file = file is not None and file.filename is not None
+    has_text = text is not None and text.strip() != ""
+    if not has_file and not has_text:
+        raise InvalidRequest(message="请上传一个文档文件，或直接粘贴文本内容")
+    if has_file and has_text:
+        raise InvalidRequest(message="文档文件与文本内容二选一，不要同时提交")
+
+    if has_file:
+        filename = file.filename or "upload"
+        content_type = file.content_type or ""
+        data = await file.read()
+        if len(data) > MAX_DOCUMENT_BYTES:
+            raise InvalidRequest(
+                message=(
+                    f"文档太大了（{len(data) // 1024 // 1024}MB），"
+                    f"上限 {MAX_DOCUMENT_BYTES // 1024 // 1024}MB"
+                )
+            )
+        if len(data) == 0:
+            raise InvalidRequest(message="文件是空的")
+    else:
+        filename = "pasted.md"
+        content_type = "text/markdown"
+        data = text.encode("utf-8")  # type: ignore[union-attr]
+        if len(data) > MAX_DOCUMENT_BYTES:
+            raise InvalidRequest(
+                message=(
+                    f"文本太长了（{len(data) // 1024 // 1024}MB），"
+                    f"上限 {MAX_DOCUMENT_BYTES // 1024 // 1024}MB"
+                )
+            )
+
+    return filename, content_type, data
+
+
 @app.post("/api/v1/articles/document")
 async def submit_document(
     file: UploadFile | None = File(default=None),
@@ -705,41 +757,8 @@ async def submit_document(
     """
     uid = _uid(user)
 
-    # -- 入参校验：file 与 text 二选一 --------------------------------
-    has_file = file is not None and file.filename is not None
-    has_text = text is not None and text.strip() != ""
-    if not has_file and not has_text:
-        raise InvalidRequest(message="请上传一个文档文件，或直接粘贴文本内容")
-    if has_file and has_text:
-        raise InvalidRequest(message="文档文件与文本内容二选一，不要同时提交")
-
-    filename = "pasted.md"
-    content_type = ""
-    data = b""
-    if has_file:
-        filename = file.filename or "upload"
-        content_type = file.content_type or ""
-        data = await file.read()
-        if len(data) > MAX_DOCUMENT_BYTES:
-            raise InvalidRequest(
-                message=(
-                    f"文档太大了（{len(data) // 1024 // 1024}MB），"
-                    f"上限 {MAX_DOCUMENT_BYTES // 1024 // 1024}MB"
-                )
-            )
-        if len(data) == 0:
-            raise InvalidRequest(message="文件是空的")
-    else:
-        # 粘贴文本按 UTF-8 存成字节，**走与文件完全相同的解析路径**
-        # （而不是另开一条）—— 两条路径的判据必须一致，否则同样的内容
-        # 「粘贴能读、上传读不了」会变成一个查不到原因的问题。
-        data = text.encode("utf-8")  # type: ignore[union-attr]
-        content_type = "text/markdown"
-        if len(data) > MAX_DOCUMENT_BYTES:
-            raise InvalidRequest(
-                message=f"文本太长了（{len(data) // 1024 // 1024}MB），"
-                f"上限 {MAX_DOCUMENT_BYTES // 1024 // 1024}MB"
-            )
+    # -- 入参校验与读取（判据与 admin 侧共用一份，见 _read_document_upload）--
+    filename, content_type, data = await _read_document_upload(file, text)
 
     # -- 解析（失败 → 不建库不计费）----------------------------------
     try:
@@ -927,6 +946,109 @@ async def admin_create_article(
         "url": art.url,
         "status": art.status,
         "task_id": task_id,
+    }
+
+
+@app.post("/api/v1/admin/articles/document")
+async def admin_create_article_document(
+    file: UploadFile | None = File(default=None),
+    text: str | None = Form(default=None),
+    title: str | None = Form(default=None),
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """**运营侧**录入文档（admin 全局视图用）。
+
+    ## 为什么不复用用户侧的 `POST /api/v1/articles/document`
+
+    那个端点是**用户剪藏**入口，用 admin token 打过去会连带三件运营不想要的事
+    （与 `POST /api/v1/admin/articles` 同理由）：扣**运营账号自己的**配额、
+    文章 owner 变成运营本人（于是「全站公共内容」变成运营名下的私有文章）、
+    语义上把「运营造内容」和「用户剪藏」混成同一类数据。
+
+    本端点：归属记 `ANONYMOUS_USER_ID(0)`、**不扣配额**、写 admin 审计日志、
+    照常派蒸馏。
+
+    ## 与用户侧端点的差异只有三处
+
+    · 归属：`ANONYMOUS_USER_ID` 而不是操作者；
+    · 配额：不扣；
+    · 鉴权：`require_admin_or_operator`。
+
+    **正文解析用的是同一份 `parse_document`** —— 判据（大小上限、空文件、
+    正文下限、格式分派）全部共用，避免「用户能传运营传不了」。
+
+    ## 与 admin 链接录入端点的差异
+
+    链接录入 `POST /api/v1/admin/articles` 只收 URL（**运营自己贴链接**），
+    那个端点不带正文 —— 抓取发生在建库前（`_create_article` 的
+    `fetch_on_create`）。本端点是**运营直接上传正文**，不经过抓取，
+    所以 `fetch_on_create=False` + 显式传 `raw_content`。
+    """
+    filename, content_type, data = await _read_document_upload(file, text)
+
+    # -- 解析（失败 → 不建库）----------------------------------------
+    try:
+        fr = parse_document(
+            filename=filename,
+            data=data,
+            content_type=content_type,
+        )
+    except FetcherError as exc:
+        raise map_fetcher_error(exc) from exc
+
+    final_title = (title or "").strip() or fr.title
+    # 内容 hash 当 url → 同一份文档重复录入复用同一篇（与用户侧同口径）
+    art = await _create_article(
+        fr.url,
+        ANONYMOUS_USER_ID,
+        DOCUMENT_SOURCE,
+        final_title,
+        db,
+        raw_content=_to_raw_content(fr),
+        event=EventName.ARTICLE_SUBMIT,
+        fetch_on_create=False,  # 正文已经在上传里了，不该再去抓一次
+    )
+
+    db.add(
+        AdminOperationLog(
+            admin_tier=str(user.get("tier", "admin")),
+            action="ADMIN_CREATE_ARTICLE",
+            target_type="article",
+            target_id=str(art.id),
+            reason="admin 手动录入文档",
+            method="POST",
+            path="/api/v1/admin/articles/document",
+            request_body={
+                "filename": filename,
+                "content_type": content_type,
+                "title": final_title,
+                "text_length": len(fr.content_text),
+            },
+        )
+    )
+    await db.commit()
+
+    task_id = None
+    try:
+        trigger_result = await get_ai_client().trigger_distill(
+            article_id=art.id,
+            auth_token=create_access_token(str(art.user_id)),
+        )
+        task_id = (trigger_result or {}).get("task_id")
+    except Exception as exc:  # 蒸馏派发失败不该让录入回滚
+        log.warning(
+            "admin_create_article_distill_failed", extra={"article_id": art.id, "error": str(exc)}
+        )
+
+    return {
+        "article_id": art.id,
+        "url": art.url,
+        "status": art.status,
+        "task_id": task_id,
+        "filename": filename,
+        "content_type": content_type,
+        "text_length": len(fr.content_text),
     }
 
 

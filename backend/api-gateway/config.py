@@ -264,6 +264,14 @@ ROUTES: list[Route] = [
         "content-service",
         _url("content-service"),
     ),
+    # 运营手动录入**文档**（与上面的链接录入同属 admin 命名空间）。
+    # 必须显式注册：fallback 表里没有这个路径，否则网关会 404。
+    Route(
+        "POST",
+        "/api/v1/admin/articles/document",
+        "content-service",
+        _url("content-service"),
+    ),
     Route(
         "GET",
         "/api/v1/admin/articles/{article_id}",

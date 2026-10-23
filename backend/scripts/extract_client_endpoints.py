@@ -75,7 +75,13 @@ def norm(method: str, path: str) -> tuple[str, str]:
 def scan_android() -> dict[tuple[str, str], str]:
     out: dict[tuple[str, str], str] = {}
     root = ANDROID_DIR / "app/src/main/kotlin"
-    for f in root.rglob("*.kt"):
+    # ⚠️ 必须 **sorted**：rglob 的遍历顺序取决于文件系统目录项的顺序（不是字典序），
+    # 而下面用 setdefault（先到先得）决定「这个端点记在哪个文件名下」。
+    # 不排序的话，同一个端点的 src 会在两次生成之间来回跳 —— 实测
+    # `/api/v1/admin/stats` 有一次从 `api/admin/dashboard.ts` 变成了
+    # `api/client.interceptor.test.ts`，产生了一处**与代码无关**的快照 diff，
+    # 让人以为契约漂移了。归属必须可复现。
+    for f in sorted(root.rglob("*.kt")):
         text = f.read_text(errors="ignore")
         for m in RETROFIT.finditer(text):
             key = norm(m.group(1), m.group(2))
@@ -86,7 +92,8 @@ def scan_android() -> dict[tuple[str, str], str]:
 def scan_admin_web() -> dict[tuple[str, str], str]:
     out: dict[tuple[str, str], str] = {}
     root = ADMIN_WEB_DIR / "src"
-    for f in root.rglob("*.ts"):
+    # 同 scan_android：排序，保证「端点 → 源文件」的归属可复现。
+    for f in sorted(root.rglob("*.ts")):
         text = f.read_text(errors="ignore")
         for m in AXIOS.finditer(text):
             key = norm(m.group(1), m.group(2))

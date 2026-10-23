@@ -104,6 +104,11 @@
   },
   {
    "method": "GET",
+   "path": "/api/v1/subscriptions/feed",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/SubscriptionApi.kt"
+  },
+  {
+   "method": "GET",
    "path": "/api/v1/tags",
    "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/TagApi.kt"
   },
@@ -140,6 +145,11 @@
   {
    "method": "POST",
    "path": "/api/v1/articles",
+   "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ArticleApi.kt"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/articles/document",
    "src": "app/src/main/kotlin/com/tingxia/audio/data/remote/ArticleApi.kt"
   },
   {
@@ -392,6 +402,11 @@
   {
    "method": "POST",
    "path": "/api/v1/admin/articles",
+   "src": "src/api/admin/articles.ts"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/admin/articles/document",
    "src": "src/api/admin/articles.ts"
   },
   {
