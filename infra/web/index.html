@@ -25,6 +25,10 @@
   --ink:        #1A1A1A;
   --cream:      #F5F2EB;
   --warm-ochre: #A67B5B;
+  /* 暖棕的**深一档**：#A67B5B 在米色底（#F5F2EB）上只有 ~3.4:1，
+     小字号文字达不到 WCAG AA 的 4.5:1 —— 大标题里当装饰色用没问题，
+     但按钮文字是正文，必须够。#7A573C ≈ 5.6:1。 */
+  --warm-ochre-deep: #7A573C;
   --neutral-50:  #F5F2EB;
   --neutral-100: #E8E4DD;
   --neutral-200: #D4CFC6;
@@ -227,17 +231,24 @@ body {
    · 衬线字体 + 字距 = 与标题/栏目同族 */
 .v-broadsheet .btn {
   display: inline-flex; align-items: center; gap: var(--space-8);
-  padding: clamp(10px, 1.25vh, 15px) clamp(20px, 2.4vh, 30px);
-  border: 1px solid var(--accent); border-radius: 2px;
-  background: var(--accent); color: #FFF8F0;
-  font-family: var(--serif); font-size: clamp(14px, 1.45vh, 19px);
+  padding: clamp(7px, 0.9vh, 11px) clamp(14px, 1.8vh, 22px);
+  border: 1px solid var(--warm-ochre-deep); border-radius: 2px;
+  /* **描边**而不是实心 —— 实心暖棕在米色纸面上是一块很跳的色块，
+     与整页「细线 + 留白」的报纸语言不协调（用户反馈过「太突兀」）。
+     改成描边 + 深暖棕字：同样点得出来，但安静得多；
+     文字用深一档的暖棕是为了小字号的对比度达标（正文要 4.5:1）。 */
+  background: transparent; color: var(--warm-ochre-deep);
+  font-family: var(--serif); font-size: clamp(13px, 1.25vh, 16px);
   letter-spacing: 0.08em; cursor: pointer;
   transition: background var(--dur-fast) var(--ease-smooth-out),
               border-color var(--dur-fast) var(--ease-smooth-out),
+              color var(--dur-fast) var(--ease-smooth-out),
               transform var(--dur-quick) var(--ease-smooth-out);
 }
+/* hover 才反色 —— 平时安静，指向它时它才「亮」起来。 */
 .v-broadsheet .btn:hover {
-  background: var(--fg); border-color: var(--fg); color: var(--bg);
+  background: var(--warm-ochre-deep); border-color: var(--warm-ochre-deep);
+  color: #FFF8F0;
 }
 .v-broadsheet .btn:active { transform: scale(0.98); }
 
@@ -390,6 +401,30 @@ body {
 }
 .v-commute .btn:hover { opacity: 0.86; }
 .v-commute .btn:active { transform: scale(0.98); }
+
+/* ───────── 超宽屏：版心偏右（中文书籍的左开本传统）─────────
+   中文书是**左开本**（翻页方向决定的），装订边在左、版心偏右。
+   网页默认是「内容居中」，但在 1920 这类超宽屏上，1120px 的版心
+   居中会左右各空 400px —— 整块内容浮在屏幕正中间，报纸感就没了。
+
+   所以超宽屏时：版心**加宽**（三栏的文字行长从 24 字到 30 字，仍在
+   杂志栏宽的正常区间）并**整体右移**，左边留出装订边。
+   ⚠️ 只右移**不加宽**是不行的 —— 那会让左边空出 800px，比原来更糟。 */
+@media (min-width: 1700px) {
+  .v-broadsheet .masthead,
+  .v-broadsheet .headline,
+  .v-broadsheet .cols,
+  .v-broadsheet .cta-row,
+  .site-footer {
+    max-width: 1360px;
+    /* width:100% 不能省：flex 里的 auto margin 会吃掉 stretch，
+       元素会收缩成**内容宽**（页脚就会缩成那几个字的宽度，贴到右边缘）。
+       同一个坑在 masthead 上已经踩过一次。 */
+    width: 100%;
+    margin-left: auto;
+    margin-right: 0;
+  }
+}
 
 /* ───────── 按视口高度分档 ─────────
    内容的字号要跟着**视口高度**走，但不同档位的目标不同：
