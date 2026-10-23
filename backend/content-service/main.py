@@ -379,7 +379,34 @@ def _is_valid_url(url: str) -> bool:
 
 
 async def _ensure_anonymous_user(db: AsyncSession) -> None:
-    """匿名哨兵用户（id=0）：articles.user_id 有 FK，匿名文章落库前必须存在该行。"""
+    """匿名哨兵用户（id=0）：articles.user_id 有 FK，匿名文章落库前必须存在该行。
+
+    ## 为什么先查再插
+
+    这个函数以前是**无条件** INSERT + COMMIT。两个副作用：
+
+    1. 多一次写往返（哪怕行早就存在）；
+    2. **无条件 COMMIT 会把调用方 session 里尚未落库的东西一起提交掉** ——
+       而 `_create_article` 现在也会调它（见下），多一次中途 commit
+       会让「谁负责提交」的边界变得含糊。
+
+    改成「先查，存在就直接返回」：绝大多数调用是「哨兵早就建好了」，
+    这时一次 SELECT 就结束，不碰事务边界。
+
+    ## 为什么 `_create_article` 也要调它（2026-10-23 生产实测）
+
+    生产上 `articles_user_id_fkey` 拦掉了一批 admin 录入：
+    **users 表里从来没有过 id=0 这一行**（哨兵是按需建的，匿名剪藏才会建），
+    而 admin 端点用 `ANONYMOUS_USER_ID` 归属却没先确保哨兵存在。
+
+    ⇒ 修在**收口处**（`_create_article`）而不是逐个端点打补丁：
+    凡是往 articles 写 `user_id=0` 的路径（匿名剪藏 / wechat_mp /
+    admin 录入链接 / admin 录入文档）都自动安全，不会再出现
+    「新加一个端点忘了建哨兵 → 线上必现外键错误」。
+    """
+    exists = await db.scalar(select(User.id).where(User.id == ANONYMOUS_USER_ID))
+    if exists is not None:
+        return
     await db.execute(
         insert(User)
         .values(
@@ -500,6 +527,16 @@ async def _create_article(
     fetch_on_create: bool = True,  # True=建库前调 fetcher 抓 title/source/raw_content
     dedup: bool = True,  # True=同用户同 URL 已有未删文章则复用（CP-DUPLICATE-CLIP）
 ) -> Article:
+    # 2026-10-23：往 articles 写 `user_id=0` 之前，哨兵用户必须存在 ——
+    # articles.user_id 有 FK 到 users(id)，而哨兵（id=0）是**按需**建的
+    # （只有匿名剪藏路径会建）。生产上 users 表从来没有过 id=0 这一行，
+    # 于是 admin 录入端点必现 `articles_user_id_fkey` 错误。
+    #
+    # 修在这里（**收口处**）而不是逐个端点打补丁：凡是往 articles 写
+    # `user_id=0` 的路径都自动安全，不会再有「新端点忘了建哨兵」。
+    if user_id == ANONYMOUS_USER_ID:
+        await _ensure_anonymous_user(db)
+
     # CP11.0.7 P1.1：建库前同步抓一下页面，拿到 title/source/raw_content。
     #
     # 2026-10-03：失败不再软降级，改为抛错（见 _prefetch_for_capture 的注释）。

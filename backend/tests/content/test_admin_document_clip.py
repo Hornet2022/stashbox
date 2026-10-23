@@ -64,6 +64,40 @@ def _override_auth(dep_name: str, mock_user: dict):
 ADMIN_USER = {"id": 9001, "sub": "9001", "tier": "admin"}
 
 
+async def _drop_anonymous_sentinel() -> None:
+    """把哨兵用户（id=0）删掉，复现**生产**状态。
+
+    为什么需要这么麻烦：哨兵被 `articles.user_id` 等 7 张表引用，
+    直接删会撞外键 —— 所以要先把引用它的行清掉。
+
+    清掉的都是**上一轮测试留下的孤儿数据**（生产库里从来没有过 id=0），
+    端点跑完会把哨兵重建回来。
+    """
+    from sqlalchemy import delete, select, text
+
+    from stashbox.backend.common.models import Article, User
+
+    async with AsyncSessionLocal() as s:
+        art_ids = list(await s.scalars(select(Article.id).where(Article.user_id == 0)))
+        if art_ids:
+            # 这几张表对 articles 是 FK（多数没有 ON DELETE CASCADE）
+            for tbl in (
+                "push_notifications",
+                "listening_statuses",
+                "later_listens",
+                "favorites",
+                "feedback_v2",
+                "distilled_articles",
+            ):
+                await s.execute(
+                    text(f"DELETE FROM {tbl} WHERE article_id = ANY(:ids)"),
+                    {"ids": list(art_ids)},
+                )
+            await s.execute(delete(Article).where(Article.id.in_(art_ids)))
+        await s.execute(delete(User).where(User.id == 0))
+        await s.commit()
+
+
 @pytest.mark.asyncio
 async def test_admin录入文档_归属匿名且不扣配额():
     """录入的文章属于**全站公共内容**，不挂在运营名下、也不扣运营配额。"""
@@ -215,6 +249,74 @@ async def test_admin录入文档_粘贴文本也可以():
         assert art is not None
         assert art.title == "运营标题"
         assert art.user_id == 0
+
+
+@pytest.mark.asyncio
+async def test_admin录入文档_哨兵用户不存在时自建_不能因外键失败():
+    """生产实测踩到的坑（2026-10-23 部署后）：**users 表里没有 id=0 的哨兵行**时，
+    admin 端点建库会撞 `articles_user_id_fkey` → 500。
+
+    ## 为什么会踩
+
+    匿名哨兵用户（`id=0`）是**按需**建的：`_ensure_anonymous_user` 只在
+    匿名剪藏 / wechat_mp 两条路径上被调用。而 admin 端点用同一个
+    `ANONYMOUS_USER_ID` 归属，却**没有**先确保哨兵存在。
+
+    本地测试库之所以一直是绿的：别的用例（匿名剪藏）早就把 id=0 建出来了。
+    生产库则从来没有过 id=0 —— 于是 admin 端点**必现**外键错误。
+
+    ⇒ 这个用例必须**先把哨兵删掉**再调用，否则它测的是「哨兵已存在」，
+    永远抓不到这个 bug（护栏没牙齿）。
+
+    同一个坑也影响既有的 `POST /api/v1/admin/articles`（运营录入链接）——
+    线上实测它同样 500。
+    """
+    await _drop_anonymous_sentinel()
+
+    from httpx import ASGITransport, AsyncClient
+
+    with _override_auth("require_admin_or_operator", ADMIN_USER):
+        transport = ASGITransport(app=content_main.app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/v1/admin/articles/document",
+                files={"file": ("哨兵.md", _unique_md("哨兵"), "text/markdown")},
+            )
+    assert resp.status_code == 200, resp.text
+
+    async with AsyncSessionLocal() as s:
+        from sqlalchemy import select
+
+        from stashbox.backend.common.models import User
+
+        row = await s.scalar(select(User).where(User.id == 0))
+        assert row is not None, "端点应自建匿名哨兵用户（否则文章挂不上 FK）"
+        art = await s.get(Article, resp.json()["article_id"])
+        assert art is not None
+        assert art.user_id == 0
+
+
+@pytest.mark.asyncio
+async def test_admin录入链接_哨兵用户不存在时也不能因外键失败():
+    """同一个坑也在**既有**的运营录入链接端点上（线上实测同样 500）。
+
+    这里只锁「不 500」—— 抓取用的是 example.com，会撞网络，
+    所以断言放在「没有 ForeignKeyViolationError」这一层：
+    状态码不是 500，且响应里没有外键错误。
+    """
+    await _drop_anonymous_sentinel()
+
+    from httpx import ASGITransport, AsyncClient
+
+    with _override_auth("require_admin_or_operator", ADMIN_USER):
+        transport = ASGITransport(app=content_main.app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/v1/admin/articles",
+                json={"url": "https://example.com/x", "source": "url"},
+            )
+    assert resp.status_code != 500, resp.text
+    assert "ForeignKeyViolation" not in resp.text
 
 
 @pytest.mark.asyncio
