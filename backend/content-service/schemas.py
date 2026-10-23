@@ -64,6 +64,24 @@ class ArticleResponse(BaseModel):
     # CP-DISTILL-TEXT：LLM 听感改写稿全文（hook/body/outro 以空行分段）。
     # 详情页展示"整理后的正文"。蒸馏未完成时为 None。
     script_text: str | None = None
+    # 三类再创作内容的**分区**（2026-10-23）。
+    #
+    # {"sections": [...], "insights": [...], "related": [...], "follow_ups": [...]}
+    #
+    # 为什么需要它：这四类在改写 JSON 里本来就是分开的，但落库时被
+    # **合并进 script_text**（TTS 要连着念）—— 合并之后客户端就分不清
+    # 「关联思考」和「正文要点」，只能把所有段落平铺显示。
+    # ⇒ 这三类内容**一直在生成，用户却看不到**。
+    #
+    # 形状说明：
+    # · `sections` = 正文要点（不含 hook/outro，也不含下面三类）
+    # · `insights` = 延伸判断 / `related` = 关联思考 / `follow_ups` = 拓展方向
+    # · `hook` / `outro` 仍在 script_text 的首末段（老客户端不受影响）
+    #
+    # **只在详情页填**（列表恒为 null）：分区内容有字数，列表每行挂一份
+    # 会让响应膨胀好几倍。
+    # 蒸馏未完成 / 0039 之前的历史数据 → None（客户端按「无分区」处理）。
+    content_parts: dict | None = None
     # CP-TTS-VOICE 溯源：这段音频当时用哪个音色合成的。
     # None 有两种含义，客户端无法也不必区分：迁移前跑的历史文章（无从得知）、
     # 以及用全局配置合成的（source 不可溯源，刻意不塞假音色）。

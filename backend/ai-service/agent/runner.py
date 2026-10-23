@@ -228,6 +228,20 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
         # 结构化解析（CP-AGENT-REWRITE-STRUCTURED）：LLM 必须回 JSON
         # {hook, sections, outro}，这样 script_text 的段落边界才是可靠的。
         parts = _parse_rewrite(raw)
+        if parts.degraded:
+            # ⚠️ **降级必须可观测**（2026-10-23）。
+            #
+            # 降级 = LLM 没按 JSON 输出 → 整稿被当纯文本按空行切 →
+            # **hook/sections/三类再创作内容全部丢失**（分区是空的、稿子没有节拍）。
+            # 而这个失败**完全静默**：稿子照样生成、照样能播，只是质量塌了。
+            #
+            # 之前没记原始输出 ⇒ 线上看到「分区全空」根本查不出是 LLM 没输出
+            # 三类、还是 JSON 解析失败、还是提示词把契约带跑了。
+            # 这里记前 800 字 —— 足够看出「是纯文本 / 是围栏 / 是字段名不对 / 被截断」。
+            log.warning(
+                "agent_rewrite_degraded raw_head=%r",
+                (raw or "")[:800],
+            )
         log.info(
             "agent_rewrite_parsed hook=%dB sections=%d outro=%dB fallback=%s",
             len(parts.hook),
@@ -270,6 +284,15 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
             # （生产 `push_notifications` 表实测 0 行）。
             # 现在标签由 LLM 从 tags 表的候选里选（见 _REWRITE_SYSTEM 的标签段）。
             "rewrite_tags": list(parts.tags),
+            # 三类再创作内容**原样**带出（2026-10-23）。
+            # 它们同时也被合并进了 rewrite_sections（TTS 整稿念）——
+            # 这里多带一份，是为了让「关联思考/延伸判断/拓展方向」
+            # 能**分区落库、分区展示**，而不是糊成一坨。
+            "rewrite_insights": list(parts.insights),
+            "rewrite_related": list(parts.related),
+            "rewrite_follow_ups": list(parts.follow_ups),
+            # ⚠️ **合并前**的正文要点（分区展示要用这一份）
+            "rewrite_body_sections": list(parts.body_sections),
             # CP-AGENT-PASSTHROUGH：LangGraph 默认 reducer 不一定保留
             # init state 字段；显式 return 让 memory 字段在节点之间留存
             "user_profile": user_profile,
@@ -819,6 +842,7 @@ _REWRITE_SYSTEM = """你是一个中文播客主理人。任务：把原文改�
 _MATERIAL_KIND_BY_SOURCE: dict[str, str] = {
     "document": "document",
     "pdf": "document",  # PDF 直链抓取 —— 本质也是文档
+    "github": "github",  # 开源库 README
 }
 
 
@@ -831,6 +855,8 @@ def _material_guidance(source: str) -> str:
     kind = _MATERIAL_KIND_BY_SOURCE.get(source or "")
     if kind == "document":
         return _DOCUMENT_MATERIAL_GUIDANCE
+    if kind == "github":
+        return _GITHUB_MATERIAL_GUIDANCE
     return ""
 
 
@@ -866,6 +892,34 @@ _DOCUMENT_MATERIAL_GUIDANCE = """
 """
 
 
+_GITHUB_MATERIAL_GUIDANCE = """
+
+【素材类型：GitHub 开源库的 README】
+原文是一个**开源库的 README**（外加仓库元信息：描述 / star 数 / 语言 / 许可证）。
+读者是「想知道这个库能干什么、值不值得用、跟别的库怎么比」的通勤者。
+
+1. **hook 讲「这个库解决什么问题」，不要讲 Podcast 本身**。
+   README 没有悬念，硬造悬念 = 编造。写不出钩子就留空（空串合法）。
+2. **sections 按「这个库能做什么 / 怎么用 / 适合谁 / 有什么坑」组织**，
+   而不是照抄 README 的章节标题。
+3. **related（关联思考）是这类素材的主力**：它和什么同类项目可比、
+   替代方案是什么、和另一个库的关键差异在哪。**这条在开源库上非常成立，
+   优先写好它。**
+4. **insights（延伸判断）要谨慎**：README 通常不提供「往后看会怎样」的依据。
+   没有依据就给**空数组**，不要凑数。
+5. **follow_ups（拓展方向）**：这个库接下来值得关注什么（版本节奏、
+   维护者活跃度、生态动向）—— README 给不出就别写。
+6. **命令 / 安装步骤 / 代码片段不要逐字念**。用一句话说清它做什么
+   （例如「一条命令装好，Python 3.9 以上可用」），不要念
+   `pip install requests`。
+7. **数字要准**：版本号、star 数、依赖要求都是原文里的，照抄，
+   不要四舍五入或夸大。
+8. **tags 只能从候选标签里逐字选**。代码库主题（Python / 数据库 / Web 框架…）
+   大概率**不在**候选里 —— 不在就**少选或空数组**，
+   **绝对不要自己造**（造出来的标签订阅推送永远匹配不上，等于白写）。
+"""
+
+
 @dataclass
 class _RewriteParts:
     """解析后的改写结果。
@@ -880,6 +934,20 @@ class _RewriteParts:
     degraded: bool = False
     #: 主题标签（订阅推送的检索键）。LLM 从 tags 表的候选里选，逐字照抄。
     tags: list[str] = field(default_factory=list)
+    #: 三类再创作内容**各自的原文**（2026-10-23）。
+    #:
+    #: 为什么单独存：它们在改写 JSON 里是三个独立字段，但解析时被
+    #: **合并进 sections**（`extra = insights + related + follow_ups`）——
+    #: 于是下游**彻底分不清**：「关联思考」和「正文要点」变成同一堆段落，
+    #: 既不能分区展示，也不能被程序化消费（API 里只有一坨 `script_text`）。
+    #:
+    #: 保留合并行为（TTS 整稿念、下游 script_text 全部不变），
+    #: 只是**另外**把三栏原样带出来 → 落库进 `content_parts` → App 能分区显示。
+    insights: list[str] = field(default_factory=list)
+    related: list[str] = field(default_factory=list)
+    follow_ups: list[str] = field(default_factory=list)
+    #: **合并前**的正文要点（不含上面三类）。分区展示要用这一份。
+    body_sections: list[str] = field(default_factory=list)
 
     @property
     def script(self) -> str:
@@ -1001,6 +1069,12 @@ def _parse_rewrite(raw: str) -> _RewriteParts:
         n_related = len(related)
         n_follow = len(follow_ups)
         extra = insights + related + follow_ups
+        # ⚠️ **合并前**的正文要点（2026-10-23）。
+        #
+        # 合并之后 sections 里就混进了三类再创作内容，下游再也分不清
+        # 「哪段是正文要点、哪段是关联思考」—— 存进 content_parts 的
+        # 必须是**合并前**的这一份，否则分区只是换了个写法的同一坨。
+        body_sections = list(sections)
         if extra:
             sections = sections + extra
         # 结构化计数（比关键词匹配准 —— 关键词会低估：LLM 写的是
@@ -1062,7 +1136,17 @@ def _parse_rewrite(raw: str) -> _RewriteParts:
             log.info("agent_rewrite_tags tags=%s", tags)
 
         if hook or sections or outro:
-            return _RewriteParts(hook=hook, sections=sections, outro=outro, tags=tags)
+            return _RewriteParts(
+                hook=hook,
+                sections=sections,
+                outro=outro,
+                tags=tags,
+                # 三类再创作内容原样带出（合并进 sections 的行为不变）
+                insights=insights,
+                related=related,
+                follow_ups=follow_ups,
+                body_sections=body_sections,
+            )
 
     # 降级：按空行切段，跳掉开头的音效标注段
     paras = [_flatten_para(p) for p in (raw or "").split("\n\n")]

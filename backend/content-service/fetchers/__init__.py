@@ -12,6 +12,7 @@ from .base import Fetcher, FetcherError, FetcherErrorCode, FetchResult
 from .douyin import DouyinFetcher
 from .generic_url import GenericURLFetcher
 from .pdf import PdfFetcher
+from .github import GitHubFetcher
 from .wechat import WechatFetcher
 
 # 顺序 = 优先级：专属域名在前，通用兜底在后
@@ -20,6 +21,14 @@ _ALL_FETCHERS: list[Fetcher] = [
     DouyinFetcher(),
     # CP11.0.8 P3.3: PDF 直链（URL path 以 .pdf 结尾才接）
     PdfFetcher(),
+    # 2026-10-23：GitHub 仓库。
+    #
+    # ⚠️ **必须在 GenericURLFetcher 之前** —— 通用那个是 catch-all
+    # （supports 恒 True），放在它后面就永远轮不到。
+    # 不接专属通道的话，GitHub 仓库页会被网页密度启发式抽成
+    # 一堆导航文字（GitHub 首页是 JS 应用壳，正文异步加载）⇒
+    # 用户剪藏一个开源库，拿到一篇没信息的稿子。
+    GitHubFetcher(),
     GenericURLFetcher(),  # 通用放最后（catch-all，优先级最低）
 ]
 

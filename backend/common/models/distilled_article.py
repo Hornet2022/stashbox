@@ -37,6 +37,20 @@ class DistilledArticle(Base, TimestampMixin):
     audio_url: Mapped[str | None] = mapped_column(String(512), nullable=True)  # OSS URL
     duration_sec: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 音频时长（秒）
     tags: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # 主题标签 ["科技","商业"]
+    # 2026-10-23：**三类再创作内容分区**。
+    #
+    # {"sections": [...], "insights": [...], "related": [...], "follow_ups": [...]}
+    #
+    # 为什么单独一列：这三类在改写 JSON 里是三个独立字段，但解析时被
+    # **合并进 sections**（TTS 整稿念的那一份）。合并之后下游**彻底分不清**
+    # 「关联思考」和「正文要点」—— API 里只有一坨 `script_text`，
+    # App 端也没法分区展示（等于这三类一直在生成、用户却永远看不到）。
+    #
+    # 存**一列 JSONB** 而不是六个 Text 列：这三类天然是一组，
+    # 一起读写、一起版本演进；拆成六列会让每次加字段都要写迁移。
+    #
+    # NULL = 0039 之前的历史数据（没有分区信息）→ 读取方按「空分区」处理。
+    content_parts: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     quality_score: Mapped[float | None] = mapped_column(Float, nullable=True)  # LLM 自评 0-10
     # B4（修 D1）：A/B 实验分组落库。NULL = 0029 上线前的历史数据（未实验期），
     # ab-report 按 NULL 单独一组过滤。方案 §2.7-D：user_id % 100 < 30 → personalized。

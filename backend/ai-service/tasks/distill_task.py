@@ -1185,6 +1185,32 @@ async def _persist_agent_final(
                             names,
                         )
 
+            # ── 三类再创作内容分区（2026-10-23）────────────────────────
+            #
+            # 这三类在改写 JSON 里是三个独立字段，但解析时被**合并进 sections**
+            # （TTS 整稿念的那一份）。合并之后下游就彻底分不清了 ——
+            # 落库只有一列 script_text，App 端也没有分区 UI。
+            #
+            # 这里把三栏**原样**另存进 content_parts：
+            # `script_text` / TTS / few-shot 入池**全部不变**（纯增量）。
+            da.content_parts = {
+                # ⚠️ 用**合并前**的正文要点（rewrite_body_sections）——
+                # rewrite_sections 里已经混进了三类，分不开。
+                "sections": list(final.get("rewrite_body_sections") or []),
+                "insights": list(final.get("rewrite_insights") or []),
+                "related": list(final.get("rewrite_related") or []),
+                "follow_ups": list(final.get("rewrite_follow_ups") or []),
+            }
+            log.info(
+                "agent_persist_content_parts article=%s sections=%d insights=%d "
+                "related=%d follow_ups=%d",
+                article_id,
+                len(da.content_parts["sections"]),
+                len(da.content_parts["insights"]),
+                len(da.content_parts["related"]),
+                len(da.content_parts["follow_ups"]),
+            )
+
             # 先 flush 让 IntegrityError 在这里暴露（而不是拖到 commit 把事务搞废）
             await db.flush()
             await db.commit()

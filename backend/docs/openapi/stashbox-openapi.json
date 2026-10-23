@@ -9162,6 +9162,18 @@
             ],
             "title": "Script Text"
           },
+          "content_parts": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content Parts"
+          },
           "tts_voice": {
             "anyOf": [
               {

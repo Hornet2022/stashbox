@@ -44,6 +44,16 @@ class AgentState(TypedDict, total=False):
     rewrite_outro: Optional[str]
     rewrite_quality_score: Optional[float]
     rewrite_tags: Optional[list[str]]
+    # 三类再创作内容**原样**（2026-10-23）。
+    #
+    # 它们同时也被合并进 `rewrite_sections`（那是 TTS 整稿念的来源）。
+    # 单独留一份是为了分区落库 / 分区展示 —— 合并之后下游就再也分不清
+    # 「关联思考」和「正文要点」了。
+    rewrite_insights: Optional[list[str]]
+    rewrite_related: Optional[list[str]]
+    rewrite_follow_ups: Optional[list[str]]
+    # **合并前**的正文要点（不含上面三类）—— 分区展示用这一份。
+    rewrite_body_sections: Optional[list[str]]
     # 标签候选清单（tags 表的 name 列表，逗号分隔）。
     # 由调用方（distill_task）加载后注入 —— agent 模块不碰 DB。
     # LLM 必须**逐字**从里面选：订阅推送是按标签名精确匹配的。

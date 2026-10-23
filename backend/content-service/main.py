@@ -259,6 +259,11 @@ def _to_response(
         tags=list(task.tags) if task and task.tags else None,
         # CP-DISTILL-TEXT：详情页透出听感改写稿全文；列表页用摘要前缀避免响应膨胀
         script_text=_script_text_for(task, list_mode=not full_script),
+        # 2026-10-23：三类再创作内容的分区（关联思考/延伸判断/拓展方向）。
+        # 同样**只在详情页填** —— 分区内容有字数，列表每行挂一份会让响应膨胀。
+        content_parts=(task.content_parts if task and task.content_parts else None)
+        if full_script
+        else None,
         # CP-TTS-VOICE 溯源：只有详情页调用方才解析（列表恒 None，见 schema 注释）
         tts_voice=tts_voice,
     )
