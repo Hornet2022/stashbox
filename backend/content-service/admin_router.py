@@ -934,6 +934,13 @@ class TTSConfigUpdate(BaseModel):
     openai_base_url: str | None = None
     openai_model: str | None = None
     openai_voice: str | None = None
+    # 风格控制 prompt（上游字段名 `instructions`）+ 语言标签。
+    #
+    # 同一篇的每个分段都读**同一份**这两个值 → 段间风格一致。
+    # ⚠️ 这里**没有** temperature/top_p：生产的托管端点不收它们
+    # （实测传了被静默丢弃）。自建端点的采样参数在 indextts_* 那一组。
+    openai_instructions: str | None = None
+    openai_language: str | None = None
     # doubao
     doubao_api_key: str | None = None
     doubao_token: str | None = None
@@ -948,6 +955,14 @@ class TTSConfigUpdate(BaseModel):
     indextts_model: str | None = None
     indextts_ref_audio: str | None = None
     indextts_ref_text: str | None = None
+    # CustomVoice（Qwen3-TTS-12Hz-1.7B-CustomVoice）：
+    #   speaker  = 预设音色名；instruct = 风格控制 prompt。
+    # 同一篇的每个分段都用**完全相同**的这两个值 → 段间音色/风格一致。
+    indextts_speaker: str | None = None
+    indextts_instruct: str | None = None
+    # 采样参数（分段合成 = 多次独立采样，固定住才不漂）
+    indextts_temperature: float | None = None
+    indextts_top_p: float | None = None
 
 
 #: 普通字段：传了就动（null / "" 都归一成 None = 清空回 env）。
@@ -956,6 +971,8 @@ _TTS_PLAIN_FIELDS = (
     "openai_base_url",
     "openai_model",
     "openai_voice",
+    "openai_instructions",
+    "openai_language",
     "doubao_voice",
     "doubao_resource_id",
     "doubao_app_id",
@@ -965,6 +982,10 @@ _TTS_PLAIN_FIELDS = (
     "indextts_model",
     "indextts_ref_audio",
     "indextts_ref_text",
+    "indextts_speaker",
+    "indextts_instruct",
+    "indextts_temperature",
+    "indextts_top_p",
 )
 
 #: 密钥字段：语义与普通字段**不同**，是三态。
@@ -981,6 +1002,29 @@ _TTS_PLAIN_FIELDS = (
 #:   · `null`（显式 null） → **清除**（从已存配置里删掉，回落到 env）
 #:   · 非空              → 覆盖
 _TTS_SECRET_FIELDS = ("openai_api_key", "doubao_api_key", "doubao_token")
+
+
+def _normalize_tts_plain_field(v: Any) -> Any:
+    """普通字段归一化：空 → None（= 清空，回落到 env）。
+
+    ⚠️ **不能一律 `str.strip()`**：普通字段里混着数值型
+    （`indextts_temperature` / `indextts_top_p`），float 没有 `.strip()` ——
+    一律 strip 会抛 AttributeError，把**整个保存请求**打挂（连别的字段
+    也存不进去）。
+
+    ⚠️ 也**不能一律 `v or ""`**：`0.0 or ""` → `""` → None —— 于是
+    temperature=0.0（贪心解码，是个有意义的值）会被当成「没填」丢掉。
+    「空」只该指「没给」（None / 空串），不是「等于零」。
+    """
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return v.strip() or None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v
+    return v
 
 
 def _merge_tts_config(stored: dict, req: TTSConfigUpdate) -> dict:
@@ -1002,7 +1046,7 @@ def _merge_tts_config(stored: dict, req: TTSConfigUpdate) -> dict:
     for fname in _TTS_PLAIN_FIELDS:
         if fname in fields:
             v = getattr(req, fname)
-            merged[fname] = (v or "").strip() or None
+            merged[fname] = _normalize_tts_plain_field(v)
 
     for fname in _TTS_SECRET_FIELDS:
         if fname not in fields:
@@ -1039,6 +1083,8 @@ def _masked_tts_config(config: dict, source: str, updated_at: str | None) -> dic
         "openai_base_url": config.get("openai_base_url"),
         "openai_model": config.get("openai_model"),
         "openai_voice": config.get("openai_voice"),
+        "openai_instructions": config.get("openai_instructions"),
+        "openai_language": config.get("openai_language"),
         "doubao_voice": config.get("doubao_voice"),
         "doubao_resource_id": config.get("doubao_resource_id"),
         "local_voice": config.get("local_voice"),
@@ -1047,6 +1093,10 @@ def _masked_tts_config(config: dict, source: str, updated_at: str | None) -> dic
         "indextts_model": config.get("indextts_model"),
         "indextts_ref_audio": config.get("indextts_ref_audio"),
         "indextts_ref_text": config.get("indextts_ref_text"),
+        "indextts_speaker": config.get("indextts_speaker"),
+        "indextts_instruct": config.get("indextts_instruct"),
+        "indextts_temperature": config.get("indextts_temperature"),
+        "indextts_top_p": config.get("indextts_top_p"),
         "api_key_set": bool(api_key),
         "api_key_last4": api_key[-4:] if api_key else None,
         # 分 provider 的「这把 key 有没有」—— 前端按当前 provider 取用。
