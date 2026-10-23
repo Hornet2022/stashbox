@@ -39,11 +39,12 @@ from pathlib import Path
 from typing import Annotated, Optional
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import String, cast, delete, func, select
 from sqlalchemy.dialects.postgresql import JSONB, insert
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
 
@@ -2473,6 +2474,115 @@ async def unsubscribe_tag(
     await db.commit()
 
     return {"ok": True, "tag_id": tag_id, "tag_slug": tag_slug}
+
+
+# ---------------------------------------------------------------------------
+# 订阅内容流（2026-10-23）
+# ---------------------------------------------------------------------------
+#
+# ## 为什么要有这个端点
+#
+# 订阅这件事此前**只有「写」，没有「读回」**：
+#   · 写：`POST /api/v1/tags/{id}/subscribe` ✅ 有
+#   · 读：「我订阅的标签下有哪些新内容」❌ **一个端点都没有**
+#
+# 而 `GET /api/v1/articles?tag=` 又被属主过滤限死（只返回**自己**的文章）——
+# 那是文章列表的语义（防越权），不该拿它来承载「订阅带来的是**别人**的内容」。
+#
+# 结果就是：用户订阅了一个标签 → 订阅行写进库了 → **再没有任何地方能看到它**。
+# 加上 agent 路径从不写 `distilled_articles.tags`（推送的唯一输入），
+# 整条链路上「订阅」= 一个**永远没有回报的开关**。
+#
+# ## 口径
+#
+# · 只返回**已就绪**（status=done 且有 audio_url）的内容 —— 还没合成出来的
+#   推给用户没意义（点开是空的）。
+# · 包含**别人**蒸馏的文章 —— 这正是订阅的意义。
+# · 自己的文章也包含（订阅自己的内容不奇怪，且方便确认订阅是否生效）。
+#
+# ## 鉴权
+#
+# 走 `require_user`（和订阅端点同一套）。**不要**在这里放宽详情页的属主校验 ——
+# 那是防越权的红线；订阅者看摘要可以，点全文的可见性口径要单独出方案。
+
+
+@app.get("/api/v1/subscriptions/feed")
+async def subscription_feed(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """我订阅的标签下产生的文章（订阅内容流）。
+
+    这是订阅闭环的**读回**一环：订阅 → 有内容 → 这里能看到。
+    """
+    uid = _uid(user)
+
+    # 1) 我订阅的标签 → 名字（da.tags 存的是 name，推送也按 name 精确匹配）
+    rows = await db.execute(
+        select(Tag.name)
+        .join(TagSubscription, TagSubscription.tag_id == Tag.id)
+        .where(TagSubscription.user_id == uid)
+    )
+    tag_names = [r[0] for r in rows.fetchall()]
+    if not tag_names:
+        # 没订阅 → 空列表（不是 404：这是合法状态）
+        return {"items": [], "total": 0, "tags": []}
+
+    # 2) 这些标签下、已就绪的蒸馏结果
+    #    `jsonb_exists_any(tags, text[])` = 「tags 数组里存在任一给定标签」。
+    #
+    # ⚠️ 右侧**必须显式 cast 成 text[]**：直接传 Python list 会被 SQLAlchemy
+    # 渲染成 `jsonb ?| $2::JSONB` → Postgres 报
+    # `operator does not exist: jsonb ?| jsonb`（实测踩过）。
+    tag_array = cast(tag_names, ARRAY(String))
+    tag_filter = func.jsonb_exists_any(DistilledArticle.tags, tag_array)
+
+    count_stmt = (
+        select(func.count())
+        .select_from(DistilledArticle)
+        .where(
+            DistilledArticle.status == "done",
+            DistilledArticle.deleted_at.is_(None),
+            DistilledArticle.audio_url.isnot(None),
+            tag_filter,
+        )
+    )
+    total = (await db.execute(count_stmt)).scalar() or 0
+
+    list_stmt = (
+        select(DistilledArticle, Article)
+        .join(Article, Article.id == DistilledArticle.article_id)
+        .where(
+            DistilledArticle.status == "done",
+            DistilledArticle.deleted_at.is_(None),
+            DistilledArticle.audio_url.isnot(None),
+            tag_filter,
+        )
+        .order_by(DistilledArticle.created_at.desc(), DistilledArticle.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    rows = await db.execute(list_stmt)
+
+    items = []
+    for da, art in rows.all():
+        items.append(
+            {
+                "article_id": art.id,
+                "title": art.title or "未命名",
+                "source": art.source,
+                "tags": da.tags if isinstance(da.tags, list) else [],
+                "audio_url": da.audio_url,
+                "duration_sec": da.duration_sec,
+                "created_at": da.created_at.isoformat() if da.created_at else None,
+                # 安卓 NavHost 注册的 deep link scheme（见 MainActivity 的 navDeepLink）
+                "deeplink": f"stashbox://detail/{art.id}",
+            }
+        )
+
+    return {"items": items, "total": int(total), "tags": tag_names}
 
 
 # [已搁置 2026-10] tag_filter 埋点（原 CP5.3b）。

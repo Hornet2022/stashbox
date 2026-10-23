@@ -44,6 +44,10 @@ class AgentState(TypedDict, total=False):
     rewrite_outro: Optional[str]
     rewrite_quality_score: Optional[float]
     rewrite_tags: Optional[list[str]]
+    # 标签候选清单（tags 表的 name 列表，逗号分隔）。
+    # 由调用方（distill_task）加载后注入 —— agent 模块不碰 DB。
+    # LLM 必须**逐字**从里面选：订阅推送是按标签名精确匹配的。
+    tag_vocabulary: Optional[str]
     # CP-AGENT-IS-PERSONALIZED：as-treated 口径 —— 这次改写**实际**有没有用上
     # 个性化记忆（few-shot 或用户画像）。之前这个字段不存在，导致
     # distill_task 的 `bool(final.get("is_personalized"))` 恒为 False。

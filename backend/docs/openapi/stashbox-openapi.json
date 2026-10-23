@@ -6352,6 +6352,78 @@
         ]
       }
     },
+    "/api/v1/subscriptions/feed": {
+      "get": {
+        "summary": "Subscription Feed",
+        "description": "我订阅的标签下产生的文章（订阅内容流）。\n\n这是订阅闭环的**读回**一环：订阅 → 有内容 → 这里能看到。",
+        "operationId": "subscription_feed_api_v1_subscriptions_feed_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
     "/api/v1/tags": {
       "get": {
         "summary": "List Tags",
@@ -9734,6 +9806,28 @@
             ],
             "title": "Openai Voice"
           },
+          "openai_instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Openai Instructions"
+          },
+          "openai_language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Openai Language"
+          },
           "doubao_api_key": {
             "anyOf": [
               {
@@ -9854,6 +9948,50 @@
               }
             ],
             "title": "Indextts Ref Text"
+          },
+          "indextts_speaker": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Indextts Speaker"
+          },
+          "indextts_instruct": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Indextts Instruct"
+          },
+          "indextts_temperature": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Indextts Temperature"
+          },
+          "indextts_top_p": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Indextts Top P"
           }
         },
         "type": "object",

@@ -87,6 +87,48 @@ def _retry_after_seconds(exc: BaseException, default: int = 15) -> int:
     return default
 
 
+async def _filter_known_tag_names(db: AsyncSession, names: list[str]) -> list[str]:
+    """只保留 tags 表里**真实存在**的标签名。
+
+    订阅推送按 `Tag.name.in_(da.tags)` 精确匹配 —— 表里没有的名字写进去
+    只是垃圾（查不到 → 推送不出），还会让「为什么没推送」变成查不到原因。
+
+    查不到表 / 出错 → **原样返回**（宁可多存，也别把标签丢了 ——
+    标签是订阅推送的唯一入口）。
+    """
+    try:
+        from stashbox.backend.common.models.tag import Tag
+
+        rows = await db.execute(select(Tag.name).where(Tag.name.in_(names)))
+        known = {row[0] for row in rows.fetchall()}
+        # 保持 LLM 给的顺序（第一个当主标签）
+        return [n for n in names if n in known]
+    except Exception as exc:
+        log.warning("tag_filter_failed", error=str(exc))
+        return names
+
+
+async def _load_tag_vocabulary() -> str:
+    """拉一次 tags 表的候选标签清单（供 LLM 逐字选）。
+
+    复用 pipeline 的那一份（`ai-service/distill/tag_vocab_cache`，Redis 缓存 5min）——
+    **不另造一套**：两处各拉一次就会有两个口径，而标签名必须逐字一致
+    （推送按 `Tag.name.in_(da.tags)` 精确匹配）。
+
+    拉不到就返回空串 → prompt 里给兜底文案 → LLM 不输出 tags。
+    失败绝不破主流程（蒸馏比标签重要）。
+    """
+    try:
+        # ai-service 目录在 sys.path 上（与本文件里 `from distill.agent_hook_bridge …` 同惯例）
+        from distill.tag_vocab_cache import load_tag_vocabulary as _load
+
+        async with AsyncSessionLocal() as db:
+            return await _load(db)
+    except Exception as exc:
+        log.warning("tag_vocabulary_load_failed", error=str(exc))
+        return ""
+
+
 async def _trigger_subscription_pushes(
     db: AsyncSession,
     article_id: str,
@@ -140,10 +182,15 @@ async def _trigger_subscription_pushes(
             return 0
 
         # 2. da.tags 存的是 name（"科技"/"财经"），需映射为 slug（"tech"/"finance"）
-        tag_slugs_result = await db.execute(select(Tag.slug).where(Tag.name.in_(article_tags)))
-        tag_slugs = [row[0] for row in tag_slugs_result.fetchall()]
-        if not tag_slugs:
+        #    ⚠️ 同时把 name 一起取出来：推送正文要给用户看**中文名**，
+        #    slug（"tech"）是内部检索键，直接给人看像 bug。
+        tag_rows = await db.execute(select(Tag.name, Tag.slug).where(Tag.name.in_(article_tags)))
+        tag_pairs = [(row[0], row[1]) for row in tag_rows.fetchall()]
+        if not tag_pairs:
             return 0
+        tag_slugs = [slug for _, slug in tag_pairs]
+        primary_tag_name = tag_pairs[0][0]
+        primary_tag_slug = tag_slugs[0]
 
         # 3. 查订阅了这些 tag 的 user_ids（去重 + 排除 exclude_user_id）
         subs_result = await db.execute(
@@ -167,8 +214,14 @@ async def _trigger_subscription_pushes(
                 article_id=article_id,
                 tag_slug=primary_tag_slug,
                 title=f"新文章：{article_title[:50]}",
-                body=f"你订阅的 {primary_tag_slug} 标签有新文章蒸馏完成",
-                deeplink=f"/articles/{article_id}",
+                # 给用户看**中文标签名**，不是内部 slug（"你订阅的 tech 标签"像 bug）
+                body=f"你订阅的 {primary_tag_name} 标签有新文章蒸馏完成",
+                # ⚠️ deeplink 必须是安卓 NavHost 认的那个 scheme：
+                # 安卓注册的是 `stashbox://detail/{id}`（MainActivity.kt 的 navDeepLink），
+                # 而这里原来写 `/articles/{id}` —— 安卓的解析器只认 `stashbox://article/`，
+                # **三方各说各话**，于是用户点通知「只标已读、不跳转」。
+                # 统一成 NavHost 真正注册的那个。
+                deeplink=f"stashbox://detail/{article_id}",
                 # 2026-10-21：status 严格表示**投递状态**。
                 # 默认值原是 'sent'（"历史行已发出,无失败回执"），
                 # 那等于**创建即宣称已送达**——而当时根本没有投递。
@@ -891,6 +944,10 @@ async def _run_distill_via_agent(
         # Phase 1 简化：raw_content 直接当 fetched_content 喂进 rewrite
         # （避免真实 fetch_url 工具调外部网络；agent 后续可换 tool_registry.invoke）
         "fetched_content": raw_content,
+        # 标签候选（tags 表的 name 列表）。LLM 必须逐字从里面选，
+        # 订阅推送是按标签名**精确匹配**的（_trigger_subscription_pushes）。
+        # 复用 pipeline 的那一份（Redis 缓存 5min），不另造一套。
+        "tag_vocabulary": await _load_tag_vocabulary(),
     }
 
     log.info(
@@ -1062,6 +1119,38 @@ async def _persist_agent_final(
                 da.ab_group = final["ab_group"]
             if final.get("is_personalized") is not None:
                 da.is_personalized = bool(final["is_personalized"])
+
+            # ── 主题标签 ────────────────────────────────────────────────
+            #
+            # ⚠️ 这一列是**订阅推送的唯一输入**：
+            # `_trigger_subscription_pushes` 第一行就是 `if not da.tags: return 0`。
+            # agent 路径此前**从不写这一列**（且 runner 里 rewrite_tags 硬编码 []）
+            # → 生产 `distilled_articles.tags` 实测 25 行全空 →
+            # **推送一次都没产生过**（`push_notifications` 实测 0 行）。
+            #
+            # 写之前**按 tags 表过滤**：推送是 `Tag.name.in_(da.tags)` 精确匹配，
+            # LLM 若输出表里没有的名字（「科技资讯」而不是「科技」），
+            # 存进去也只是垃圾 → 查不到 → 推送不出。过滤掉比存着好。
+            raw_tags = final.get("rewrite_tags") or []
+            if raw_tags:
+                names = [str(t).strip() for t in raw_tags if str(t).strip()]
+                if names:
+                    valid = await _filter_known_tag_names(db, names)
+                    da.tags = valid
+                    if valid:
+                        log.info(
+                            "agent_persist_tags article=%s tags=%s (raw=%s)",
+                            article_id,
+                            valid,
+                            names,
+                        )
+                    else:
+                        # 全都不是已知标签 → 记一条，否则「推送没来」又变成查不到原因
+                        log.warning(
+                            "agent_persist_tags_none_known article=%s raw=%s",
+                            article_id,
+                            names,
+                        )
 
             # 先 flush 让 IntegrityError 在这里暴露（而不是拖到 commit 把事务搞废）
             await db.flush()

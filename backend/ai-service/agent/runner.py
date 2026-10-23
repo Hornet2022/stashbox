@@ -201,7 +201,11 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
         raw = await _chat_text(
             llm,
             prompt,
-            system_prompt=_REWRITE_SYSTEM,
+            # ⚠️ 用 replace 而不是 str.format：system prompt 里有 **JSON 示例**，
+            # 里面的 `{` `}` 会被 format 当成占位符 → KeyError/IndexError。
+            system_prompt=_REWRITE_SYSTEM.replace(
+                "{tag_vocabulary}", state.get("tag_vocabulary") or _FALLBACK_TAG_VOCABULARY
+            ),
             step="agent_rewrite",
             task_id=state.get("trace_id", ""),
         )
@@ -244,7 +248,12 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
             "is_personalized": bool(few_shot_examples)
             or bool(user_profile and user_profile.get("preferences")),
             "rewrite_quality_score": None,
-            "rewrite_tags": [],
+            # ⚠️ 之前这里是**硬编码的空列表** —— 于是 agent 路径永远没有标签，
+            # `distilled_articles.tags` 全表为空，订阅推送函数第一行就
+            # `if not da.tags: return 0` → **推送一次都没产生过**
+            # （生产 `push_notifications` 表实测 0 行）。
+            # 现在标签由 LLM 从 tags 表的候选里选（见 _REWRITE_SYSTEM 的标签段）。
+            "rewrite_tags": list(parts.tags),
             # CP-AGENT-PASSTHROUGH：LangGraph 默认 reducer 不一定保留
             # init state 字段；显式 return 让 memory 字段在节点之间留存
             "user_profile": user_profile,
@@ -684,8 +693,19 @@ _REWRITE_SYSTEM = """你是一个中文播客主理人。任务：把原文改�
   "insights": ["延伸判断，2-3 条，每条 50-100 字"],
   "related": ["关联思考，1-2 条，每条 45-80 字"],
   "follow_ups": ["拓展方向，1-2 条，每条 45-80 字"],
-  "outro": "收束，≤ 80 字，呼应 hook 的开头句式或意象"
+  "outro": "收束，≤ 80 字，呼应 hook 的开头句式或意象",
+  "tags": ["主题标签，1-3 个，必须从候选标签里原样选"]
 }
+
+【主题标签 — 必须从候选标签里原样选】
+候选标签：{tag_vocabulary}
+
+规则：
+1. **只能从上面的候选标签里挑**，逐字照抄，不要改写、不要新造、不要加后缀。
+   订阅推送是**按标签名精确匹配**的 —— 写成「科技资讯」「财经类」这类
+   近似词，订阅了这个标签的用户就**永远收不到**这篇的推送。
+2. 选 1~3 个真正切题的；都不贴切就别选（空数组也是合法答案）。
+3. 标签**不参与播报**，只是给订阅用的检索键 —— 不要在正文里念标签。
 
 【写作原则】
 1. **信息密度**：每句要么给新事实，要么给新视角。删掉"咱们一起来看看""接下来要说的是"这类水词
@@ -778,6 +798,8 @@ class _RewriteParts:
     sections: list[str] = field(default_factory=list)
     outro: str = ""
     degraded: bool = False
+    #: 主题标签（订阅推送的检索键）。LLM 从 tags 表的候选里选，逐字照抄。
+    tags: list[str] = field(default_factory=list)
 
     @property
     def script(self) -> str:
@@ -792,6 +814,10 @@ class _RewriteParts:
 
 # 音效/舞台提示：整段就是括号或方括号包着的一小段，且不含句号
 _SFX_RE = re.compile(r"^[\(（\[【][^\n]{0,24}[\)）\]】]\s*$")
+
+
+#: 标签候选不可用时的兜底文案（与 pipeline 的 tag_vocab_cache 保持一致口径）。
+_FALLBACK_TAG_VOCABULARY = "（候选标签暂不可用，本次不输出 tags）"
 
 
 def _rewrite_prompt(fetched_content: str) -> str:
@@ -944,8 +970,19 @@ def _parse_rewrite(raw: str) -> _RewriteParts:
         # hook 缺失但有正文 → 拿第一节顶上，别让整稿没有钩子
         if not hook and sections:
             hook, sections = sections[0], sections[1:]
+
+        # ── 主题标签（订阅推送的检索键）────────────────────────────────
+        #
+        # ⚠️ 必须**逐字**保留 LLM 给的标签名：推送是按
+        # `Tag.name.in_(da.tags)` 精确匹配的（distill_task.py:143），
+        # 近似词（「科技资讯」而不是「科技」）会让订阅者永远收不到。
+        # 所以这里**不做任何归一化**，清洗放到落库那一层（那里能查 tags 表）。
+        tags = [str(t).strip() for t in _str_list(obj.get("tags")) if str(t).strip()][:3]
+        if tags:
+            log.info("agent_rewrite_tags tags=%s", tags)
+
         if hook or sections or outro:
-            return _RewriteParts(hook=hook, sections=sections, outro=outro)
+            return _RewriteParts(hook=hook, sections=sections, outro=outro, tags=tags)
 
     # 降级：按空行切段，跳掉开头的音效标注段
     paras = [_flatten_para(p) for p in (raw or "").split("\n\n")]

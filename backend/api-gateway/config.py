@@ -138,6 +138,11 @@ ROUTES: list[Route] = [
         "DELETE", "/api/v1/articles/{article_id}/snooze", "content-service", _url("content-service")
     ),
     Route("GET", "/api/v1/tags", "content-service", _url("content-service")),
+    # 2026-10-23：订阅内容流（订阅闭环的「读回」一环）。
+    # 显式注册而不是靠 fallback 猜 —— `subscriptions` 虽然在 fallback 的
+    # 白名单里（指向 user-service），但这个端点在 **content-service**，
+    # 靠猜会打到错的服务上。仓库已记过「实现了但没进路由表 → 404」的事故。
+    Route("GET", "/api/v1/subscriptions/feed", "content-service", _url("content-service")),
     # CP-TTS-VOICE：音色列表 + 用户音色/语速偏好 → content-service 的
     # tts_voice_router。显式注册而不是靠 fallback 猜 —— fallback 的
     # _resolve_target 只认 articles/tags/callback/distill/user/subscription，

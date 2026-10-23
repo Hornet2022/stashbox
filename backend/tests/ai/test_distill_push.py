@@ -93,7 +93,7 @@ async def test_trigger_subscription_pushes_stores_articles_id_not_distilled_id()
         m.fetchall = MagicMock(return_value=rows)
         return m
 
-    mock_db.execute = AsyncMock(side_effect=[_rows([("tech",)]), _rows([(7,)])])
+    mock_db.execute = AsyncMock(side_effect=[_rows([("科技", "tech")]), _rows([(7,)])])
     mock_db.add_all = MagicMock()
     mock_db.commit = AsyncMock()
 
@@ -104,4 +104,11 @@ async def test_trigger_subscription_pushes_stores_articles_id_not_distilled_id()
     assert result == 1
     added = mock_db.add_all.call_args[0][0]
     assert added[0].article_id == "art_target"  # 不是 dst_target
-    assert added[0].deeplink == "/articles/art_target"
+    # ⚠️ deeplink 必须与安卓 NavHost 注册的 scheme **完全一致**
+    # （MainActivity 的 navDeepLink = `stashbox://detail/{id}`）。
+    # 原来这里写 `/articles/{id}`，而安卓的解析器只认 `stashbox://article/` ——
+    # 三方各说各话 → 用户点通知只标已读、不跳转（订阅闭环断在最后一步）。
+    assert added[0].deeplink == "stashbox://detail/art_target"
+    # 推送正文给用户看**中文标签名**，不是内部 slug（"你订阅的 tech 标签"像 bug）
+    assert "科技" in added[0].body
+    assert "tech" not in added[0].body
