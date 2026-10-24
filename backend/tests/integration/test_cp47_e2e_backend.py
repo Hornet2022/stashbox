@@ -56,19 +56,28 @@ async def _login_via_wechat(code: str = "cp47_e2e_test") -> tuple[str, str]:
 async def _poll_task_status(
     client: httpx.AsyncClient, task_id: str, auth: dict, timeout: int = 600
 ) -> dict:
-    """轮询 GET /api/v1/distill/{task_id} 直到 status == 'done'（最多 timeout 秒）。
+    """轮询 GET /api/v1/distill/{task_id} 直到 status == 'ready'（最多 timeout 秒）。
 
     CP9.x 起蒸馏是真实 LLM（火山 ark）+ 真实 TTS（indextts）流水线，单任务
     端到端需要数分钟（step1 结构化 → step2 改写 → step3 TTS → step4 拼接），
     旧 60s 是 mock LLM 时代的设置，会误报超时。
     POST /distill/start 只创建 DistilledArticle(status=queued)，不更新 Article.status。
     因此轮询 Article.status 永远得到 'pending'。正确做法是轮询 task status。
+
+    ⚠️ 判据必须是**对外 5 态**，不是内部状态机（2026-10-25 修）。
+    `GET /api/v1/distill/{id}` 会把内部状态经 `_external_distill_status` 映射：
+        内部 queued  → 对外 pending
+        内部 step1~4 → 对外 distilling
+        内部 done    → 对外 **ready**
+        内部 failed  → 对外 failed
+    原来这里等的是内部值 "done" ⇒ **永远等不到**（外层看到的是 "ready"）⇒
+    用例一路轮询到超时才失败，症状像「蒸馏卡住」，实际是判据用错了状态层。
     """
     for i in range(timeout):
         resp = await client.get(f"/api/v1/distill/{task_id}", headers=auth)
         assert resp.status_code == 200, f"task status poll failed: {resp.status_code} {resp.text}"
         data = resp.json()
-        if data.get("status") == "done":
+        if data.get("status") == "ready":
             return data
         if data.get("status") in ("failed", "error"):
             pytest.fail(f"蒸馏任务失败: {data}")
@@ -145,9 +154,11 @@ async def test_wechat_url_full_distill_pipeline():
         job_id = distill_data.get("job_id") or task_id
         print(f"[CP4.7] 蒸馏任务已入队: task_id={task_id}, job_id={job_id}")
 
-        # Step 3: 轮询任务状态直到 done（真实 LLM+TTS 流水线，最多 600s）
+        # Step 3: 轮询任务状态直到 ready（真实 LLM+TTS 流水线，最多 600s）
+        # ⚠️ 对外状态是 "ready"（内部 done 经 _external_distill_status 映射），
+        # 不是内部状态机的 "done" —— 判据用错状态层会一路轮询到超时。
         task_data = await _poll_task_status(client, task_id, auth, timeout=600)
-        assert task_data["status"] == "done", f"蒸馏未完成: status={task_data['status']}"
+        assert task_data["status"] == "ready", f"蒸馏未完成: status={task_data['status']}"
         print(f"[CP4.7] 蒸馏完成: task_status={task_data['status']}")
 
         # Step 4: 获取 audio_url
@@ -215,14 +226,28 @@ async def test_distill_failure_refund_quota():
     """
     蒸馏失败（simulate_failure=True）→ 配额退还。
 
-    步骤：
-    1. 用独立用户登录（有配额）
-    2. POST /api/v1/articles/{id}/distill?simulate_failure=true（直打 ai-service）
-    3. 等几秒让 worker 处理完（失败）
-    4. 再次 POST /distill/start，验证任务状态是 failed（未重复入队扣配额）
+    ⚠️ 这里有个**结构性的坑**（2026-10-25 才定位到，之前这条用例一直红）：
 
-    注意：/articles/{id}/distill 在 gateway 中 fallback 到 content-service（无此端点），
-    需直打 ai-service（8103）。
+    剪藏**本身就已经自动派了一次蒸馏**（content-service 建库后调 trigger_distill），
+    所以「创建文章」这一步就有一个任务在跑。而
+    `POST /api/v1/articles/{id}/distill` 的**入队幂等守卫**规定：
+    已有 queued/running 的任务 → **不重复入队**
+    （防的是同一篇文章入队两个 job ⇒ TTS 跑两遍、白烧一倍算力）。
+
+    ⇒ 原用例在剪藏后立刻 POST `simulate_failure=true`，会命中那个守卫：
+    返回 **200 + job_id="" + 现有任务**，而 `simulate_failure` 这个标志
+    **根本没生效** —— worker 照常跑完整条流水线（真实 LLM + 真实 TTS），
+    任务最后是 done 而不是 failed。
+
+    症状极像「失败路径坏了」，实际是「失败压根没被触发」。
+    判据是 `job_id`：守卫命中时它是空串。
+
+    修法：先等**自动派的那次蒸馏**跑完（status=done，守卫不再命中），
+    再 POST `simulate_failure=true` → 这时才会真的入队一个「注定失败」的任务
+    （失败在 agent 之前抛出，不烧 LLM/TTS，几秒内就结束）。
+
+    另注：`/articles/{id}/distill` 在 gateway 里显式路由到 ai-service
+    （不是 fallback），所以这里直打 ai-service 是为了看 job_id。
     """
     import uuid
 
@@ -230,18 +255,36 @@ async def test_distill_failure_refund_quota():
     auth = {"Authorization": f"Bearer {token}"}
 
     async with httpx.AsyncClient(base_url=GATEWAY_URL, timeout=60.0) as client:
-        # 创建一篇文章（content-service，消耗配额）
+        # 夹具 URL：example.org 的**根路径**（IANA 保留的文档用域名）。
+        # ⚠️ 必须是根路径：example.com / example.org 的**子路径是硬 404**
+        #    ⇒ 抓取失败在建文章这步就断了（2026-10-03 后失败是当场报错）。
+        # ⚠️ 外部站点会偶发抓取失败（网络抖动/限流）⇒ 502 时要能一眼看出
+        #    「是外部站点没抓到」而不是「契约不对」。
         create_resp = await client.post(
             "/api/v1/articles",
             json={"url": "https://example.org/", "source": "web"},
             headers=auth,
         )
-        assert create_resp.status_code in (200, 201), create_resp.text
-        article_id = create_resp.json().get("article_id") or create_resp.json().get("id")
-        print(f"[CP4.7] 文章已创建: {article_id}")
+        assert create_resp.status_code in (200, 201), (
+            f"创建文章失败 {create_resp.status_code}: {create_resp.text}\n"
+            "  若 code=2002/2001 → **外部站点（example.org）这次没抓到**，"
+            "属夹具抖动，重跑即可；否则是契约问题。"
+        )
+        create_data = create_resp.json()
+        article_id = create_data.get("article_id") or create_data.get("id")
+        auto_task_id = create_data.get("task_id")
+        print(f"[CP4.7] 文章已创建: {article_id}（自动蒸馏任务 {auto_task_id}）")
 
-    # 直打 ai-service（8103）触发蒸馏（模拟失败）
+        # 剪藏后配额应是 1
+        quota_before = (await client.get("/api/v1/users/me/quota", headers=auth)).json()
+        assert quota_before["quota_used"] == 1, quota_before
+
     async with httpx.AsyncClient(base_url=AI_SERVICE_URL, timeout=60.0) as ai_client:
+        # 等自动派的那次蒸馏跑完 —— 否则幂等守卫会吞掉 simulate_failure
+        assert auto_task_id, "创建响应里没有 task_id，无法等自动蒸馏"
+        await _poll_task_status(ai_client, auto_task_id, auth, timeout=900)
+
+        # 现在再请求「模拟失败」：守卫不该命中（已有任务是 done）
         distill_resp = await ai_client.post(
             f"/api/v1/articles/{article_id}/distill",
             headers=auth,
@@ -250,18 +293,40 @@ async def test_distill_failure_refund_quota():
         assert (
             distill_resp.status_code == 200
         ), f"distill 触发失败: {distill_resp.status_code} {distill_resp.text}"
-        task_id = distill_resp.json().get("task_id")
-        print(f"[CP4.7] 模拟失败任务已入队: task_id={task_id}")
+        body = distill_resp.json()
+        task_id = body.get("task_id")
+        # ⚠️ 关键断言：job_id 非空 = **真的入队了一个新任务**。
+        # 为空就说明又命中了幂等守卫 → simulate_failure 没生效 → 后面必然是 done。
+        assert body.get("job_id"), f"没有入队新任务（守卫命中，simulate_failure 会失效）: {body}"
+        print(f"[CP4.7] 模拟失败任务已入队: task_id={task_id} job_id={body['job_id']}")
 
-        # 等 worker 处理完（失败）
-        await asyncio.sleep(10)
+        # 等 worker 处理完（最终失败）
+        #
+        # ⚠️ 判据要打在**用户真正看到的那条链路**上：
+        # `GET /api/v1/distill/{task_id}`（ai-service）读的是 distilled_articles.status，
+        # 而失败路径按设计**只写 articles.status='failed'**、不动产物表
+        # （中间态更不能写 'queued'/'running'，否则幂等守卫会挡住用户重试），
+        # ⇒ 那个端点对一次终局失败永远显示 "pending"。
+        # 用户看到的状态走 content-service 的 `GET /api/v1/articles/{id}/status`
+        # （`_derive_status` 以 articles.status 为准）—— 那里才是 "failed"。
+        #
+        # Arq 的重试退避是 15s + 30s ⇒ 终局失败在 ~1 分钟后出现。
+        async with httpx.AsyncClient(base_url=GATEWAY_URL, timeout=30.0) as gw_client:
+            for _ in range(180):
+                st = await gw_client.get(f"/api/v1/articles/{article_id}/status", headers=auth)
+                assert st.status_code == 200, f"文章状态查询失败: {st.status_code} {st.text}"
+                status_data = st.json()
+                if status_data.get("status") == "failed":
+                    break
+                await asyncio.sleep(1)
+            else:
+                pytest.fail(f"文章状态没有变成 failed: {status_data}")
 
-        # 验证：任务状态应该是 failed（说明 simulate_failure 生效）
-        status_resp = await ai_client.get(f"/api/v1/distill/{task_id}", headers=auth)
-        assert status_resp.status_code == 200, f"任务查询失败: {status_resp.status_code}"
-        status_data = status_resp.json()
-        assert status_data["status"] == "failed", f"期望任务失败，实际: {status_data['status']}"
-        print(f"[CP4.7] 蒸馏失败验证通过: task_status={status_data['status']}")
+    # 失败 ⇒ 配额退还（剪藏时扣的那 1 次要退回来）
+    async with httpx.AsyncClient(base_url=GATEWAY_URL, timeout=30.0) as client:
+        quota_after = (await client.get("/api/v1/users/me/quota", headers=auth)).json()
+    assert quota_after["quota_used"] == 0, f"蒸馏失败后配额应退还: {quota_after}"
+    print(f"[CP4.7] 蒸馏失败验证通过，配额已退还: {quota_after}")
 
 
 # ---------------------------------------------------------------------------
