@@ -63,7 +63,6 @@ from fetchers.document import (  # noqa: E402
     parse_document_async,
     DOCUMENT_SOURCE,
     MAX_DOCUMENT_BYTES,
-    parse_document,
 )
 from schemas import (  # noqa: E402
     AddArticleRequest,
