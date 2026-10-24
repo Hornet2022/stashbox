@@ -38,6 +38,7 @@ from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common.redis_client import get_redis_pool
 from stashbox.backend.common.analytics import track_simple
 from stashbox.backend.common.events import EventName
+from stashbox.backend.common.distill_status import derive_distill_status
 
 # ai-service 目录名带连字符，不能当包导入；且 dispatcher 等平级模块（DistillDispatcher、
 # arq_settings 等）需要本目录在 sys.path 上才能 `from dispatcher import ...`。
@@ -688,10 +689,16 @@ async def distill_status(
     return {
         "task_id": da.id,
         "article_id": da.article_id,
-        # 状态机：内部 7 态（queued / step1-4 / done / failed）→ 外部 5 态枚举
+        # 状态机：内部态（queued / step1-4 / done / failed）→ 对外 5 态枚举。
         # Android (DistillStatus.kt) 与 admin-web 都消费外部 5 态。
-        # 映射详见 _external_distill_status()。
-        "status": _external_distill_status(da.status),
+        #
+        # ⚠️ 这里**不再**自己维护映射表（原 `_DISTILL_STATUS_MAP` /
+        # `_external_distill_status`：只看产物表，与 content-service 的
+        # `_derive_status` 口径不一致 ⇒ 同一个任务在两个端点上状态不同，
+        # 实测终局失败时这里给 `pending`、那边给 `failed`）。
+        # 现在两边共用 `common.distill_status.derive_distill_status` ——
+        # 口径说明见该模块 docstring。
+        "status": derive_distill_status(article, da),
         "audio_url": da.audio_url,
         "duration_sec": da.duration_sec,
         "tags": da.tags,
@@ -699,26 +706,6 @@ async def distill_status(
         "created_at": da.created_at.isoformat() if da.created_at else None,
         "updated_at": da.updated_at.isoformat() if da.updated_at else None,
     }
-
-
-# 蒸馏内部状态 → 跨端契约状态（CP3.5-pre-2 Android 强校验枚举需要）
-_DISTILL_STATUS_MAP: dict[str, str] = {
-    "queued": "pending",
-    "step1_structuring": "distilling",
-    "step2_rewriting": "distilling",
-    "step3_ttsing": "distilling",
-    "step4_concatenating": "distilling",
-    "done": "ready",
-    "failed": "failed",
-}
-
-
-def _external_distill_status(internal: str) -> str:
-    """把内部状态机字符串映射成跨端契约状态（5 态枚举）。
-
-    未知值（DB 被人工改、状态机错误等）→ 降级为 `distilling`，避免 Android 强校验枚举崩溃。
-    """
-    return _DISTILL_STATUS_MAP.get(internal or "", "distilling")
 
 
 # ---------------------------------------------------------------------------

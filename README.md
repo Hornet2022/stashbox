@@ -225,7 +225,7 @@ export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
 - 免费 TTS 备选：`TTS_PROVIDER=edge`（Microsoft Edge TTS，`pip install edge-tts`，无需 key）。
 - Step4 拼接已修正：段为 mp3 时改 `-c:a aac` 转码，避免 `-c copy` 把 mp3 塞进 m4a(MP4) 容器报错（`Could not find tag for codec mp3`）；本地用 ffmpeg 实测拼接时长与分段之和一致。
 - 完整模板：`backend/.env.example`（已含所有可走方案占位符 + CORS 白名单示例）；真实凭证写 `backend/.env`（已 gitignore）。
-- **状态契约**（CP3.5-pre-2）：Android 端 `DistillStatus` 枚举 = `pending | distilling | ready | failed | listened`；后端 ai-service `main.py::_external_distill_status()` 把内部 7 态（`queued / step1-4 / done / failed`）映射到这 5 态，避免 Android 强校验枚举崩溃。
+- **状态契约**（CP3.5-pre-2）：Android 端 `DistillStatus` 枚举 = `pending | distilling | ready | failed | listened`；后端 `backend/common/distill_status.py::derive_distill_status()` 把内部态（`queued / step1-4 / done / failed`）+ `articles.status` 派生到这 5 态，避免 Android 强校验枚举崩溃。**内容服务的文章状态端点与 AI 服务的任务状态端点共用这一个函数**（2026-10-25 收口：此前两边各有一份实现、输入不同 ⇒ 同一个任务在两个端点上状态不同）。
 
 ## 许可
 

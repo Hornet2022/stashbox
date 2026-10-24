@@ -65,11 +65,10 @@ async def _poll_task_status(
     因此轮询 Article.status 永远得到 'pending'。正确做法是轮询 task status。
 
     ⚠️ 判据必须是**对外 5 态**，不是内部状态机（2026-10-25 修）。
-    `GET /api/v1/distill/{id}` 会把内部状态经 `_external_distill_status` 映射：
-        内部 queued  → 对外 pending
-        内部 step1~4 → 对外 distilling
-        内部 done    → 对外 **ready**
-        内部 failed  → 对外 failed
+    `GET /api/v1/distill/{id}` 走 `common/distill_status.py::derive_distill_status()`：
+        产物表 done   → 对外 **ready**
+        产物表 failed + 还在重试 → 对外 distilling
+        产物表 queued / step1~4 → articles.status（pending 或 distilling）
     原来这里等的是内部值 "done" ⇒ **永远等不到**（外层看到的是 "ready"）⇒
     用例一路轮询到超时才失败，症状像「蒸馏卡住」，实际是判据用错了状态层。
     """
@@ -155,7 +154,7 @@ async def test_wechat_url_full_distill_pipeline():
         print(f"[CP4.7] 蒸馏任务已入队: task_id={task_id}, job_id={job_id}")
 
         # Step 3: 轮询任务状态直到 ready（真实 LLM+TTS 流水线，最多 600s）
-        # ⚠️ 对外状态是 "ready"（内部 done 经 _external_distill_status 映射），
+        # ⚠️ 对外状态是 "ready"（内部 done 经 common/distill_status.derive_distill_status 派生），
         # 不是内部状态机的 "done" —— 判据用错状态层会一路轮询到超时。
         task_data = await _poll_task_status(client, task_id, auth, timeout=600)
         assert task_data["status"] == "ready", f"蒸馏未完成: status={task_data['status']}"

@@ -30,6 +30,7 @@ from stashbox.backend.common.models.push_notification import PushNotification
 from stashbox.backend.common.models.distilled_article import DistilledArticle
 from stashbox.backend.common.analytics import track_simple, track
 from stashbox.backend.common.events import EventName
+from stashbox.backend.common.distill_status import mark_distill_task_failed
 
 # CP-AGENT-RUNNER-INTEGRATION：distill_task.py 走 LangGraph agent（替代 DistillPipeline.run）
 # 向后兼容：pipeline 仍保留（被外部测试 mock / 老 arq 重试 queue 里残留任务可能用到）
@@ -462,6 +463,13 @@ async def distill_task(
                     .where(Article.id == article_id)
                     .values(status="failed", audio_url=None)
                 )
+                # 产物表**也要**落 failed（同一事务）。
+                # 此前这条早退路径只写 articles ⇒ 产物表永远停在 'queued'：
+                #  ① 用户点「重试蒸馏」被入队幂等守卫挡住（守卫只挡 queued/running）
+                #     ⇒ 按钮按下去 15 分钟没反应（STALE_DISTILL_TASK_SEC 兜底才放行）
+                #  ② admin 统计按 DistilledArticle.status='failed' 算失败数
+                #     ⇒ 这类失败一次都没被算进去
+                await mark_distill_task_failed(db, article_id)
                 await db.commit()
         except Exception as track_exc:
             log.warning(
@@ -675,14 +683,32 @@ async def distill_task(
                     #     task.status=='failed' 当终态），所以产物表保持 failed
                     #     也不影响用户看到「正在重试」。
                     #
-                    # 真正到最后一次仍失败时，articles.status='failed' 就够了 ——
+                    # 真正到最后一次仍失败时，articles.status='failed' +
+                    # 产物表落 failed（见下面 else 分支）就够了 ——
                     # _derive_status 会回落到它。
+                    #
+                    # ⚠️ 注意：产物表在中间态**未必**是 queued —— agent 路径的
+                    # `_persist_agent_final` 在 agent 返回非 done 时就写了
+                    # 'failed'。这里不动它 ≠ 它保持 queued；读侧规则
+                    # 「产物表 failed + articles 还在进行 ⇒ 以 articles 为准」
+                    # 覆盖了这种情况（口径见 common/distill_status.py）。
                 else:
                     await db.execute(
                         update(Article)
                         .where(Article.id == article_id)
                         .values(status="failed", audio_url=None, error=str(e)[:200] or None)
                     )
+                    # 终局失败：**产物表也要落 failed**（同一事务）。
+                    # 理由（实测症状，非洁癖）：
+                    #  ① 用户点「重试蒸馏」被入队幂等守卫挡住 ——
+                    #     守卫只放行产物表状态为 done/failed 的行，
+                    #     产物表停在 'queued' 时要等到陈旧兜底
+                    #     （STALE_DISTILL_TASK_SEC=900s）才放行
+                    #     ⇒ 用户点了重试，15 分钟里什么都没发生。
+                    #  ② admin 统计（failed_distillations_24h /
+                    #     distill_success_rate）按 DistilledArticle.status
+                    #     == 'failed' 算，非 agent 失败路径此前一次都算不到。
+                    await mark_distill_task_failed(db, article_id)
                 await db.commit()
         except Exception as exc:
             log.warning("articles_status_failed_write_err", article_id=article_id, error=str(exc))

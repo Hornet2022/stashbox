@@ -109,6 +109,7 @@ from stashbox.backend.common.models import (
 from stashbox.backend.common.observability import install_health_endpoints
 from stashbox.backend.common.analytics import track, track_simple
 from stashbox.backend.common.events import EventName
+from stashbox.backend.common.distill_status import derive_distill_status
 
 
 def _uid(user: dict) -> int:
@@ -404,43 +405,22 @@ async def _get_readable_with_task(
 
 
 def _derive_status(art: Article, task: DistilledArticle | None) -> str:
-    """ai-service 只更新 distilled_articles，articles.status 会停在 distilling，故按任务派生。
+    """对外状态派生 —— **委托 `common.distill_status` 的唯一一份实现**。
 
-    ⚠️ 2026-10-21：`task.status == 'failed'` 但 `articles.status == 'distilling'`
-    时**不是终态** —— 那是「这次尝试失败了，但 Arq 还会自动重试」的中间态。
+    ⚠️ 这里曾经**自己写了一份**判定，而 ai-service 那边又有一份
+    （`_external_distill_status`，只看产物表）。两份输入不同 ⇒ 同一个任务
+    在两个端点上状态不同（实测：终局失败时任务端点给 `pending`，
+    这里给 `failed`）。
 
-    背景：内测实测一篇稿子 LLM 返回空 content → 首次尝试失败 → 产物表先被写成
-    failed → 15 秒后 Arq 重试**成功**（1052 字稿 / 250 秒音频 / 语速 4.21 正常）。
-    用户截到的正是中间态那张「失败 / 换个源试试？」的页面。
+    口径说明（为什么以 articles.status 为准、为什么中间态不能显示 failed、
+    未知值为什么降级）全部在 `common/distill_status.py` 的 docstring 里 ——
+    **只留一份**，别再在这里复述一遍，两处复述迟早会漂。
 
-    所以这里以 **articles.status 为准**判「还在进行」：蒸馏任务每次执行
-    （含 Arq 重试）都会把 articles.status 置回 distilling（见 distill_task），
-    真正失败时才会置成 failed。两者不一致 → 以 articles 为准。
-
-    另：中间态**不**把产物表写成 'running'/'queued' —— 那两个值在
-    IN_FLIGHT_DISTILL_STATUSES 里，会挡住用户手动重试，且 Arq 若没真正重试
-    就永久卡住（用户既不能重试也不能重生成）。
+    Args:
+        art: `articles` 行（状态权威来源）
+        task: `distilled_articles` 行（没有就是 None）
     """
-    if task is None:
-        return art.status
-    if task.status == "done":
-        return "ready"
-    if task.status == "failed":
-        # ⚠️ `articles.status` 不是终态 → 这次失败**还在重试**，不是最终失败。
-        #
-        # 两种「还在重试」：
-        #  ① Arq 自动重试：distill_task 把 articles.status 置回 'distilling'
-        #     （内测实测：一篇稿子 LLM 返回空 content → 首次失败 → 15 秒后
-        #      Arq 重试**成功**，用户截到的正是中间态那张「失败」页）
-        #  ② 用户手动点「重试蒸馏」：user_retry_distill 把 articles.status
-        #     置回 'pending'，但产物表要等 ai-service 回写新任务才更新 ——
-        #     在那之前 _derive_status 会继续返回 'failed'，用户点了「重试」
-        #     却还看到「失败」，像是按钮没生效（这是**既有行为**，之前没人当 bug）。
-        #
-        # 所以：**articles 不是终态就是「进行中」**，产物表的 failed 只是
-        # 「上一次尝试的结果」。
-        return art.status if art.status in ("pending", "distilling") else "failed"
-    return art.status
+    return derive_distill_status(art, task)
 
 
 def _validate_url(url: str) -> None:
