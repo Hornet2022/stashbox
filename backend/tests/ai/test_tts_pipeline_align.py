@@ -35,10 +35,7 @@ AI_SERVICE_DIR = BACKEND_DIR / "ai-service"
 if str(AI_SERVICE_DIR) not in sys.path:
     sys.path.insert(0, str(AI_SERVICE_DIR))
 
-from app.services.tts.audio_chunks import (  # noqa: E402
-    align_and_normalize,
-    concat_audio,
-)
+from app.services.tts.audio_chunks import align_and_normalize  # noqa: E402
 from app.services.tts import voice_align  # noqa: E402
 
 
