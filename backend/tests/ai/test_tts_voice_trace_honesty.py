@@ -162,3 +162,45 @@ async def test_indextts下溯源照常记录(user_with_voice, fake_tts):
     assert out["tts_voice_id"] == voice_id
     assert out["tts_voice_source"] == "user"
     assert out["tts_voice_name"] == "婷婷假音色"
+
+
+async def test_音色行没有参考音时溯源也不记(fake_tts, monkeypatch):
+    """音色行 ref_audio 为空 → 克隆**根本没发生** → 溯源必须记 None。
+
+    「有没有传覆盖参数」不等于「覆盖有没有生效」：
+    overrides 非空（ref_audio=""、ref_text="参考文本"），
+    但空参考音 = 没有克隆 = 上游随机挑了个音色在念。
+    这时记下 voice_id，详情页就会显示「本期由 X 朗读」——
+    而实际发声的人跟 X 无关，溯源在说谎，
+    用户还会以为「换音色重生成」没生效。
+    """
+    from agent.tools import tts_synthesize_tool
+    from stashbox.backend.common.tts_voice_service import ResolvedVoice
+
+    async def _fake_resolve(user_id):
+        return ResolvedVoice(
+            ref_audio="",
+            ref_text="参考文本",
+            voice_id="ttsv_empty_ref",
+            display_name="没有参考音的音色",
+            source="default",
+        )
+
+    monkeypatch.setattr(
+        "stashbox.backend.common.tts_voice_service.resolve_voice_for_user",
+        _fake_resolve,
+    )
+    fake_tts(OverrideCapableClient)
+
+    out = await tts_synthesize_tool(
+        {
+            "article_id": "art_bug8_empty_ref",
+            "user_id": 0,
+            "rewritten_script": "这是一段测试文本。",
+        },
+        {},
+    )
+
+    assert out["tts_voice_id"] is None, "空参考音时克隆没发生，溯源不许记音色"
+    assert out["tts_voice_source"] == "not_applied"
+    assert out["tts_voice_name"] is None
