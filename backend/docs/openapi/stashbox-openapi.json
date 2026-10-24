@@ -3310,7 +3310,7 @@
     "/api/v1/admin/tts/voices/{voice_id}/preview": {
       "post": {
         "summary": "Admin Preview Voice",
-        "description": "试听：拿这个音色的 ref_audio 真合成一段。\n\n真调 oMLX 而不是假装成功 —— 音色库里最容易翻车的是「参考音频和参考文本\n对不上」「音频根本不是有效 wav」，这两个只有真合成一次才会暴露。",
+        "description": "试听：拿这个音色的 ref_audio 真合成一段。\n\n真调 oMLX 而不是假装成功 —— 音色库里最容易翻车的是「参考音频和参考文本\n对不上」「音频根本不是有效 wav」，这两个只有真合成一次才会暴露。\n\n⚠️ 2026-10-24：openai provider 现在也支持按调用覆盖 ref_audio/ref_text\n（零样本克隆），所以这条路径**不再只对 indextts 生效** ——\n之前这里对 openai 会 TypeError → 400「音色库只对 indextts 生效」。",
         "operationId": "admin_preview_voice_api_v1_admin_tts_voices__voice_id__preview_post",
         "parameters": [
           {

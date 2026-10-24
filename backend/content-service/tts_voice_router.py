@@ -454,6 +454,10 @@ async def admin_preview_voice(
 
     真调 oMLX 而不是假装成功 —— 音色库里最容易翻车的是「参考音频和参考文本
     对不上」「音频根本不是有效 wav」，这两个只有真合成一次才会暴露。
+
+    ⚠️ 2026-10-24：openai provider 现在也支持按调用覆盖 ref_audio/ref_text
+    （零样本克隆），所以这条路径**不再只对 indextts 生效** ——
+    之前这里对 openai 会 TypeError → 400「音色库只对 indextts 生效」。
     """
     voice = await get_voice(voice_id)
     if voice is None:
@@ -470,12 +474,9 @@ async def admin_preview_voice(
             ref_text=voice.ref_text,
         )
     except TypeError:
-        # 非 IndexTTS provider 不支持按调用覆盖音色
+        # provider 的 synthesize() 没有 ref_audio/ref_text 形参
         raise InvalidRequest(
-            message=(
-                f"当前 TTS provider（{client.provider_name}）不支持按音色试听，"
-                "音色库只对 indextts 生效"
-            )
+            message=(f"当前 TTS provider（{client.provider_name}）不支持按音色试听")
         )
     except Exception as exc:
         log.warning("tts_voice_preview_failed", voice_id=voice_id, error=str(exc))
@@ -483,12 +484,22 @@ async def admin_preview_voice(
 
     from stashbox.backend.app.services.storage import get_storage
 
-    key = f"voices/preview_{uuid.uuid4().hex}.wav"
-    url = await get_storage().save(key, audio, content_type="audio/wav")
+    # ⚠️ 扩展名/时长要跟**实际产物**对上：
+    #   · provider 默认出 mp3，硬写成 .wav 会让客户端按 wav 解析
+    #   · 时长用 `len(audio) // 32000`（假设 32kbps CBR）对不上
+    #     → 生产实际是 55kbps，时长被低估 1.7 倍；
+    #     短试听（几秒）更是直接算出 0。
+    from stashbox.backend.app.services.tts.audio_duration import audio_duration_sec
+
+    is_wav = audio[:4] == b"RIFF"
+    ext = "wav" if is_wav else "mp3"
+    content_type = "audio/wav" if is_wav else "audio/mpeg"
+    key = f"voices/preview_{uuid.uuid4().hex}.{ext}"
+    url = await get_storage().save(key, audio, content_type=content_type)
     return VoicePreviewOut(
         audio_url=url,
         bytes_len=len(audio),
-        duration_sec=len(audio) // 32000,
+        duration_sec=audio_duration_sec(audio) or 0,
         voice_id=voice_id,
     )
 
