@@ -63,17 +63,24 @@ def test_extra_fields_are_merged_into_sections(runner):
 
 
 def test_extra_fields_keep_their_order(runner):
-    """顺序：正文 → 关联思考 → 关联关键点 → 拓展方向 → 收束。"""
+    """顺序：正文要点 → 关联思考 → 延伸判断 → 拓展方向 → 收束。
+
+    ⚠️ 2026-10-24：顺序按**产品定义**统一了 ——
+    「原文核心要点 + 关联思考 + 延伸判断 + 拓展方向」。
+    原来是把 `insights` 排在 `related` 前面，与 App 的分区展示顺序也不一致
+    （看到的顺序 ≠ 听到的顺序）。现在 backend 的合并顺序、prompt 的
+    JSON 契约示例、App 的分区展示三处一致。
+    """
     raw = (
-        '{"hook": "H", "sections": ["S1"], "insights": ["I1"], '
-        '"related": ["R1"], "follow_ups": ["F1"], "outro": "O"}'
+        '{"hook": "H", "sections": ["S1"], "related": ["R1"], '
+        '"insights": ["I1"], "follow_ups": ["F1"], "outro": "O"}'
     )
     script = runner._parse_rewrite(raw).script
     pos = {
         k: script.index(v)
-        for k, v in {"H": "H", "S1": "S1", "I1": "I1", "R1": "R1", "F1": "F1", "O": "O"}.items()
+        for k, v in {"H": "H", "S1": "S1", "R1": "R1", "I1": "I1", "F1": "F1", "O": "O"}.items()
     }
-    assert pos["H"] < pos["S1"] < pos["I1"] < pos["R1"] < pos["F1"] < pos["O"], pos
+    assert pos["H"] < pos["S1"] < pos["R1"] < pos["I1"] < pos["F1"] < pos["O"], pos
 
 
 def test_missing_extra_fields_is_fine(runner):
