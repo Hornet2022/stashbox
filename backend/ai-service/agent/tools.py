@@ -137,8 +137,16 @@ async def tts_synthesize_tool(state: dict[str, Any], args: dict[str, Any]) -> di
     from stashbox.backend.common.tts_voice_service import resolve_voice_for_user
 
     # CP-TTS-VOICE：解析这个用户该用哪个音色（用户偏好 → 全局默认 → 全局配置）。
-    # 只有 IndexTTS 支持按调用覆盖 ref_audio/ref_text；其他 provider 的音色
-    # 由各自的配置项决定（edge_voice / openai_voice / …），不接受覆盖。
+    #
+    # 支持按调用覆盖 ref_audio/ref_text 的 provider：**indextts**（本地零样本克隆）
+    # 与 **openai**（托管端点的零样本克隆，2026-10-24 实测打通）。
+    # 其他 provider 的音色由各自的配置项决定（edge_voice / …），不接受覆盖。
+    #
+    # ⚠️ 为什么克隆音源只从**音色库**来（source = user / default）：
+    #   全局配置里的 `indextts_ref_audio` 是 **IndexTTS 专用**的历史兜底，
+    #   而托管端点要的是 **data: URL** 形态的参考音频 ——
+    #   两者的「形态契约」不同。音色库是唯一同时表达
+    #   「参考音频来源 + 参考文本」的地方，克隆走它才不会各写一套。
     resolved = await resolve_voice_for_user(state.get("user_id"))
     overrides: dict[str, Any] = {}
     if resolved.source in ("user", "default"):
@@ -168,13 +176,16 @@ async def tts_synthesize_tool(state: dict[str, Any], args: dict[str, Any]) -> di
     # 覆盖没生效时必须记 None（与 global_config 同义：来源不可溯源）。
     applied = False
     try:
-        # 非 IndexTTS 的 synthesize() 没有 ref_audio/ref_text 形参，直接传会 TypeError
+        # 不支持覆盖的 provider 没有 ref_audio/ref_text 形参，直接传会 TypeError
         audio = await client.synthesize(
             script,
             voice=getattr(client, "voice", None),
             **overrides,
         )
-        applied = bool(overrides)
+        # ⚠️ `applied` 不能只看「有没有传 overrides」：
+        # overrides 里的 ref_audio 可能是空串（音色库那行没填参考音），
+        # 那样克隆根本没发生 —— 这时记下 voice_id 就是**溯源说谎**。
+        applied = bool(overrides) and bool(resolved.ref_audio)
     except TypeError as exc:
         # 兜底：provider 不支持覆盖时退回原调用，不要整个任务挂掉。
         # ⚠️ 这里 TypeError 既可能是「形参不匹配」，也可能是 provider 内部真炸了

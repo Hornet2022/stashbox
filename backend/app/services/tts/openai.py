@@ -20,32 +20,37 @@
 
 响应：raw audio bytes（Content-Type: audio/mpeg）。
 
-⚠️ **本 provider 不透传 ref_audio —— 但这不代表端点不支持克隆**（2026-10-22 实测）：
+⚠️ **「分段音色差异」的根因与修法（2026-10-24 实测闭合）**
 
-    生产的 openai provider（tertu.cn / Qwen3-TTS-12Hz-1.7B-Base）走的是
-    固定音色（voice=uncle_fu），音色库里的「克隆音色」用不上 ——
-    worker 日志里是 `tts_voice_resolved ... applied=False`。
+    症状：内测反馈「历史音频分段音色差异」—— 一篇稿子里像好几个人在念。
 
-    但实测**端点本身是支持零样本克隆的**（在生产服务器上直接打端点验证）：
-        ① 不带 ref_audio          → 200，音频正常
-        ② 带 ref_audio(裸 base64)  → 504（上游 60s 超时）
-        ③ 带 ref_audio 不带 ref_text → 400，且报错里明写
-            "ref_audio must be a URL (http/https), base64 data URL (data:...),
-             or file URI (file://...)"
-        ④ 带 ref_audio = **data:audio/wav;base64,...** + ref_text
-                                 → 200，音频正常（9.6s），两次都稳定
-        ⑤ 克隆是否真的生效 —— 基频三点对齐：
-            参考音频（婷婷，克隆源）  225.4 Hz
-            输出（带 ref_audio）      224.3 Hz   ← 与参考音频一致
-            输出（不带，uncle_fu）    191.2 Hz   ← 固定音色
+    根因**不在我们**：托管端点（tertu.cn / Qwen3-TTS-12Hz-1.7B-Base）
+    **不认 `voice` 这个说话人名**。同一段文本、同一个 `voice=uncle_fu`
+    连发 3 次，基频中位数 165.0 / 188.5 / 105.3 Hz —— 三个不同的人，
+    时长 7.60 / 6.88 / 6.88s。
 
-    → 结论：**要支持音色库克隆，不需要换模型**，需要的是
-      ① 本 provider 支持并透传 ref_audio / ref_text；
-      ② base64 必须用 **data: URL** 形式（裸 base64 上游不认）；
-      ③ 配置里要有克隆音源（音色库的 ref_audio URL 或本地 wav）。
+    我们按 700 字分块 → 每块一次请求 → **每块一个人**。
+    生产 317 篇的分块分布：1 块 1 篇、2 块 154 篇、3 块 111 篇、最多 7 块
+    ⇒ 几乎每篇都有音色接缝。
 
-    在这三件事做完之前，**不要**在别处下结论说「这个模型不能克隆」——
-    那是把「我们没传」说成了「端点不支持」。
+    换模型没用（实测 `Qwen3-TTS-12Hz-1.7B-CustomVoice` 同样随机：
+    145.2 / 151.5 / 190.9 Hz）。
+
+    **修法只有一条：让零样本克隆真的生效。** 同一份 `ref_audio` 连发 3 次
+    → 基频 217.9 / 219.3 / 224.7 Hz（±1.6%），其中两次字节完全相同。
+
+    所以本 provider 现在**透传** `ref_audio` / `ref_text`（见 `synthesize`）：
+
+    ① `ref_audio` 必须是 **data: URL**（`data:audio/wav;base64,...`）。
+       裸 base64 上游不认 —— 它会**超时**（504），而不是报错：
+       请求合法，只是上游读不出音频 → 干等 60s 墙钟。
+    ② `ref_text` 必须同时给，缺了上游 400。
+    ③ 克隆模式下上游**完全忽略 `voice`**（实测连非法 voice 名都返回 200），
+       音色由参考音频决定。
+
+    复现与验收见 `backend/scripts/check_tts_voice_consistency.py`
+    （实测分块渲染后各块基频中位数差异 < 5%）与
+    `backend/tests/tts/test_openai_clone_ref_audio.py`（契约测试）。
 
 ⚠️ **长稿必须分段合成**（2026-10-21 生产实测踩过）：
 
@@ -139,14 +144,31 @@ import asyncio
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 from .audio_chunks import concat_audio, split_into_chunks
 from .base import TTSClient
+from .ref_audio import RefAudioError, load_ref_audio_data_url
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _CloneSpec:
+    """一次合成要用的克隆音色（参考音频 + 参考文本）。
+
+    ⚠️ `data_url` 是**整篇共用同一份**的：分段合成是多次独立请求，
+    每一次都必须带**逐字节相同**的参考音频 —— 只要有一块带了别的参考音，
+    那一块就是另一个人说话（这正是本次要修的「分段音色差异」）。
+    所以它在 `synthesize()` 里解析一次，然后逐块传下去。
+    """
+
+    source: str
+    data_url: str
+    text: str
 
 
 # OpenAI 默认 base_url（覆写后可指向任意 OpenAI 兼容 TTS 端点）
@@ -412,6 +434,13 @@ class OpenAITTSClient(TTSClient):
                 "Content-Type": "application/json",
             },
         )
+        # 克隆参考音频的 data URL 缓存（同一份参考音只编码一次）。
+        #
+        # ⚠️ 这里**不能**复用 `self._client` 去下载参考音频：
+        # 那个 client 带着 `Authorization: Bearer <TTS key>`，
+        # 拿它去请求存储地址等于把 TTS 密钥发给了存储服务。
+        # `load_ref_audio_data_url` 自己开一个不带鉴权的 client。
+        self._clone_spec: _CloneSpec | None = None
 
     @property
     def provider_name(self) -> str:
@@ -426,23 +455,41 @@ class OpenAITTSClient(TTSClient):
         text: str,
         voice: str | None = None,
         output_format: str = "mp3",
+        ref_audio: str | None = None,
+        ref_text: str | None = None,
     ) -> bytes:
         """合成文本为音频字节（OpenAI 协议 /audio/speech）。
 
-        长文本会**自动分段**（按句读边界切块 → 并行合成 → 拼接），
+        长文本会**自动分段**（按句读边界切块 → 串行合成 → 拼接），
         原因见文件头的实测记录：整篇合成在 ~1000 字时会撞上固定超时。
 
         Args:
             text: 待合成文本（蒸馏后的"听感版本"）
             voice: 音色 ID（provider-specific；None 走构造时设置的 self.voice）
             output_format: 输出格式（默认 mp3，OpenAI 还支持 opus/aac/flac）
+            ref_audio: **克隆参考音频**（本地路径 / http(s) URL / data URL）。
+                给了就走零样本克隆，音色由这份音频决定。
+            ref_text: 参考音频的**逐字转录**。克隆时必填。
 
         Returns:
             拼接后的音频 bytes
 
         Raises:
-            ValueError: text 为空 / api_key 缺失
+            ValueError: text 为空 / api_key 缺失 / 克隆缺 ref_text
             RuntimeError: HTTP 异常 / 端点返回错误
+
+        ## 克隆（ref_audio / ref_text）
+
+        这是修复「分段音色差异」的核心（实测记录见模块头）：
+
+        - 托管端点**不认 voice 名**（同一 voice 连发 3 次 = 3 个人），
+          唯一能把音色钉死的是零样本克隆。
+        - `ref_audio` 必须编成 **data: URL**；裸 base64 上游不认，
+          表现是 **504 超时**（不是 400）—— 一次白等 60s。
+        - `ref_text` 缺失上游 400，所以**本地就拦**（省一次 60s 请求）。
+        - 克隆模式下上游**忽略 voice**（实测非法 voice 名也 200），
+          所以这里照常带上 `voice`（不新增风险：非克隆路径本来就在带），
+          但音色以参考音频为准。
         """
         if not text or not text.strip():
             raise ValueError("text 不能为空")
@@ -452,8 +499,10 @@ class OpenAITTSClient(TTSClient):
                 "火山方舟：填 ARK API Key；OpenAI：填 sk-...；Azure：填 api key。"
             )
 
+        clone = await self._resolve_clone(ref_audio, ref_text)
+
         if self.chunk_chars <= 0 or len(text) <= self.chunk_chars:
-            return await self._synthesize_chunk(text, voice, output_format)
+            return await self._synthesize_chunk(text, voice, output_format, clone=clone)
 
         # ── 长稿：切块 → 逐块合成 → 拼接 ──────────────────────────────
         #
@@ -467,11 +516,12 @@ class OpenAITTSClient(TTSClient):
         # 上游串行处理，并发零收益，却会让末段在队列里等到逼近超时。
         chunks = split_into_chunks(text, self.chunk_chars)
         log.info(
-            "OpenAITTS 分段合成: total_chars=%d chunks=%d chunk_chars<=%d concurrency=%d",
+            "OpenAITTS 分段合成: total_chars=%d chunks=%d chunk_chars<=%d concurrency=%d clone=%s",
             len(text),
             len(chunks),
             self.chunk_chars,
             self.chunk_concurrency,
+            "on" if clone else "off",
         )
 
         sem = asyncio.Semaphore(max(1, self.chunk_concurrency))
@@ -481,7 +531,9 @@ class OpenAITTSClient(TTSClient):
                 last_exc: Exception | None = None
                 for attempt in range(1, self.chunk_retries + 2):
                     try:
-                        return await self._synthesize_chunk(chunk, voice, output_format)
+                        return await self._synthesize_chunk(
+                            chunk, voice, output_format, clone=clone
+                        )
                     except _CircuitOpen:
                         # 熔断打开 → 立刻放弃这一篇，别在这里退避重试：
                         # 退避只会让 Arq 的重试次数烧光，而上游需要的是
@@ -515,12 +567,61 @@ class OpenAITTSClient(TTSClient):
         log.info("OpenAITTS 分段合成完成: chunks=%d bytes=%d", len(pieces), len(merged))
         return merged
 
+    async def _resolve_clone(
+        self,
+        ref_audio: str | None,
+        ref_text: str | None,
+    ) -> _CloneSpec | None:
+        """把「参考音频 + 参考文本」解析成一份**整篇共用**的克隆参数。
+
+        返回 None = 不走克隆（沿用 voice 名的老路径）。
+
+        ⚠️ 为什么在 `synthesize()` 里解析一次、而不是每块各自解析：
+        每一块必须带**逐字节相同**的参考音频。分块各读一次文件在
+        实践上也没差别，但一旦以后有人给某一块换了来源，
+        那一块就是另一个人说话 —— 所以这里把解析点收敛到一个地方。
+        """
+        src = (ref_audio or "").strip()
+        if not src:
+            return None
+
+        transcript = (ref_text or "").strip()
+        if not transcript:
+            # 上游缺 ref_text 会 400；这里本地拦下来，
+            # 省一次「白跑 60s 才发现参数不对」。
+            raise ValueError(
+                "克隆模式必须同时提供 ref_text（参考音频的逐字转录）："
+                "上游缺 ref_text 直接 400，而缺 ref_audio 会 504 超时 —— "
+                "两者都会白等一次上游。"
+            )
+
+        cached = self._clone_spec
+        if cached is not None and cached.source == src and cached.text == transcript:
+            return cached
+
+        try:
+            data_url = await load_ref_audio_data_url(src)
+        except RefAudioError as exc:
+            raise RuntimeError(f"克隆参考音频不可用: {exc}") from exc
+
+        spec = _CloneSpec(source=src, data_url=data_url, text=transcript)
+        self._clone_spec = spec
+        log.info(
+            "OpenAITTS 克隆音色已就绪: source=%s data_url_bytes=%d ref_text_chars=%d",
+            src[:80],
+            len(data_url),
+            len(transcript),
+        )
+        return spec
+
     async def _synthesize_chunk(
         self,
         text: str,
         voice: str | None = None,
         output_format: str = "mp3",
         depth: int = 0,
+        *,
+        clone: _CloneSpec | None = None,
     ) -> bytes:
         """合成一块文本，**自带截断自愈**：被端点静默截断就自动二分重来。
 
@@ -559,9 +660,13 @@ class OpenAITTSClient(TTSClient):
 
         这让「段长放大（减少分段 → 减少音色接缝）」成为安全选项：
         上游忙时自动细分兜底，而不是整篇失败。
+
+        ⚠️ `clone` 必须是**逐块相同**的那一份参考音频：
+        二分自愈会把一块拆成两块重合成，这两块也必须带同一份参考音，
+        否则自愈出来的接缝就是「另一个人」。
         """
         try:
-            audio = await self._synthesize_once(text, voice, output_format)
+            audio = await self._synthesize_once(text, voice, output_format, clone=clone)
             self._assert_not_truncated(text, audio)
             return audio
         except (TimeoutError, httpx.TimeoutException, _UpstreamTimeout) as exc:
@@ -577,7 +682,7 @@ class OpenAITTSClient(TTSClient):
                 len(parts),
             )
             pieces = [
-                await self._synthesize_chunk(part, voice, output_format, depth + 1)
+                await self._synthesize_chunk(part, voice, output_format, depth + 1, clone=clone)
                 for part in parts
             ]
             return concat_audio(pieces)
@@ -595,7 +700,7 @@ class OpenAITTSClient(TTSClient):
                 len(parts),
             )
             pieces = [
-                await self._synthesize_chunk(part, voice, output_format, depth + 1)
+                await self._synthesize_chunk(part, voice, output_format, depth + 1, clone=clone)
                 for part in parts
             ]
             return concat_audio(pieces)
@@ -629,6 +734,8 @@ class OpenAITTSClient(TTSClient):
         text: str,
         voice: str | None = None,
         output_format: str = "mp3",
+        *,
+        clone: _CloneSpec | None = None,
     ) -> bytes:
         """单次请求合成（不分段）。分段逻辑在 synthesize() 里。"""
         body: dict[str, Any] = {
@@ -637,6 +744,20 @@ class OpenAITTSClient(TTSClient):
             "input": text,
             "response_format": output_format,
         }
+        # ── 克隆（零样本）：音色由参考音频决定 ───────────────────────
+        #
+        # ⚠️ `ref_audio` 必须是 **data: URL**。裸 base64 上游不认，
+        #    表现是 504 超时而不是 400（请求合法、上游读不出音频 → 干等墙钟）。
+        # ⚠️ `ref_text` 必须同时给，否则上游 400。
+        # ⚠️ 这一段在**每一次**请求里都要有 —— 分段合成是多次独立请求，
+        #    少一块带就等于那一块换个人。
+        #
+        # 克隆模式下上游**忽略 voice**（实测传非法 voice 名也返回 200），
+        # 所以这里照常带 `voice`：不新增风险（非克隆路径本来就在带），
+        # 音色以参考音频为准。
+        if clone is not None:
+            body["ref_audio"] = clone.data_url
+            body["ref_text"] = clone.text
         # ── 风格控制：每段逐字相同 ─────────────────────────────────────
         #
         # 这两个字段**每段都带、且每次都一样**（它们是实例属性，
@@ -672,7 +793,7 @@ class OpenAITTSClient(TTSClient):
 
         log.info(
             "OpenAITTS synthesize: provider=%s model=%s voice=%s bytes=%d "
-            "instructions=%r language=%s",
+            "instructions=%r language=%s clone=%s",
             self.base_url,
             self.model,
             body["voice"],
@@ -682,6 +803,8 @@ class OpenAITTSClient(TTSClient):
             # 配置改了没生效、或某段走了别的分支，日志里看不出来。
             self.instructions or None,
             self.language or None,
+            # 克隆也要打：段间漂移排查时，要确认「这几段带的是同一份参考音」。
+            "on" if clone else "off",
         )
 
         try:

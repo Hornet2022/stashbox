@@ -73,7 +73,6 @@ import logging
 import os
 import time
 import wave
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -84,6 +83,7 @@ from .audio_chunks import (
     split_into_chunks,
 )
 from .base import TTSClient
+from .ref_audio import RefAudioError, load_ref_audio_bytes
 
 log = logging.getLogger(__name__)
 
@@ -360,6 +360,10 @@ class IndexTTSClient(TTSClient):
 
         缓存键是**来源字符串本身**，所以同一个 client 连着合成不同音色的稿件时
         会自动换缓存（正常流程下 distill 一次只用一个音色，属防御性设计）。
+
+        ⚠️ 加载逻辑在 `ref_audio.py`（与 openai provider **共用**）：
+        同一个能力两套实现、其中一套没跟上，正是这次要修的
+        「分段音色差异」的同类形状 —— 别再在这里抄一份。
         """
         src = (source or self.ref_audio_path or "").strip()
         if not src:
@@ -370,34 +374,15 @@ class IndexTTSClient(TTSClient):
         if self._ref_b64 is not None and self._ref_b64_for == src:
             return self._ref_b64
 
-        if src.startswith(("http://", "https://")):
-            data = await self._fetch_ref_audio(src)
-        else:
-            p = Path(src).expanduser()
-            if not p.is_file():
-                raise IndexTTSError(f"参考音频文件不存在: {p}")
-            data = p.read_bytes()
+        try:
+            data = await load_ref_audio_bytes(src, http_client=self._client)
+        except RefAudioError as exc:
+            raise IndexTTSError(str(exc)) from exc
 
-        if len(data) < 1000:
-            raise IndexTTSError(f"参考音频太小({len(data)}B)，可能不是有效 wav: {src}")
         self._ref_b64 = base64.b64encode(data).decode("ascii")
         self._ref_b64_for = src
         log.info("IndexTTS ref audio loaded: %s (%dB)", src, len(data))
         return self._ref_b64
-
-    async def _fetch_ref_audio(self, url: str) -> bytes:
-        """从 URL 拉参考音频。
-
-        复用同一个 httpx client（已带 `trust_env=False`）。超时给 30s：
-        音色库里的音频在 S3 上正常 <1s，但外网 OSS 可能慢。
-        """
-        try:
-            resp = await self._client.get(url, timeout=30.0)
-        except httpx.HTTPError as exc:
-            raise IndexTTSError(f"参考音频下载失败: {url} ({exc})") from exc
-        if resp.status_code != 200:
-            raise IndexTTSError(f"参考音频下载失败 HTTP {resp.status_code}: {url}")
-        return resp.content
 
     def _ensure_ref_text(self, override: str | None = None) -> str:
         """取参考文本。`override` 非 None 时用它（音色库自带 ref_text）。"""
