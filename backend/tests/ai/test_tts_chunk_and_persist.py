@@ -473,6 +473,76 @@ async def test_persist_same_article_different_task_id_keeps_script(isolated_arti
 
 
 @pytest.mark.asyncio
+async def test_persist_failure_keeps_old_audio_file(isolated_article, monkeypatch):
+    """**失败时绝不能删掉旧音频文件**（2026-10-24 生产实测踩到）。
+
+    生产事故：存量重跑第 1 篇 TTS 判据误伤 → 整篇失败 →
+    失败路径把「被覆盖的旧音频」删了，而 `articles.audio_url` 还指着它
+    ⇒ 用户侧立刻 404，且**不可逆**（文件已删），直到 Arq 重试成功才恢复。
+
+    正确语义：**只有真的产出了新音频、把它替换掉时**，才删旧文件。
+    失败时旧文件必须留着（这一行不再指向它，但文件在 → 可回滚、可人工恢复）。
+
+    这正是代码里那句取舍的本意：「宁可留孤儿文件等 GC，不可音频没了文章还在」。
+    """
+    from sqlalchemy import select
+
+    from stashbox.backend.common.database import AsyncSessionLocal
+    from stashbox.backend.common.models import DistilledArticle
+    from tasks import distill_task
+
+    article_id = isolated_article
+    old_url = "https://api.stashbox.cn/audio/audio/art_old.abc12345.mp3"
+
+    # 预置一条「已经成功过一次」的蒸馏行：带旧音频
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(DistilledArticle).where(DistilledArticle.article_id == article_id)
+        )
+        row = result.scalars().first()
+        assert row is not None
+        row.status = "done"
+        row.audio_url = old_url
+        row.duration_sec = 200
+        await db.commit()
+
+    deleted: list[str] = []
+
+    async def _fake_delete(article_id_: str, previous_audio_url: str) -> None:
+        deleted.append(previous_audio_url)
+
+    monkeypatch.setattr(distill_task, "_delete_superseded_audio", _fake_delete)
+
+    # 本次**失败**（没有 tts_audio_url）
+    await distill_task._persist_agent_final(
+        "cp_persist_keepold",
+        article_id,
+        1,
+        {
+            "status": "failed",
+            "error": "tts_synthesize 失败: 输出疑似被截断",
+            "rewritten_script": "重写稿" * 30,
+            "error_kind": "internal",
+            "error_step": "tts",
+        },
+    )
+
+    assert not deleted, (
+        f"失败时不该删旧音频文件，却删了 {deleted} —— "
+        f"articles.audio_url 还指着它，删了就变成 404 且不可逆"
+    )
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(DistilledArticle).where(DistilledArticle.article_id == article_id)
+        )
+        row = result.scalars().first()
+        assert row is not None
+        assert row.audio_url is None, "失败时这一行不再指向旧音频（指针清空是对的）"
+        await db.rollback()
+
+
+@pytest.mark.asyncio
 async def test_persist_failure_does_not_rollback_data_writes(isolated_article):
     """埋点失败绝不能连带回滚业务数据行（两段事务隔离）。"""
     from sqlalchemy import select

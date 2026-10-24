@@ -376,6 +376,131 @@ def test_long_text_truncation_is_still_detected():
         client._assert_not_truncated("这" * 290, _fake_mp3_of_seconds(40))
 
 
+# ---------------------------------------------------------------------------
+# 短块判据的长度自适应（2026-10-24 生产实测标定）
+# ---------------------------------------------------------------------------
+#
+# 生产事故：存量重跑第 1 篇失败于
+#     「OpenAITTS 输出疑似被截断：47 字只产出 5.0s 音频（9.40 字/秒，正常应 < 6.5）」
+#
+# 根因是**两个阈值打架**：
+#   · 语速判据从 40 字就启用（`_MIN_CHARS_FOR_RATE_CHECK`）
+#   · 二分自愈的最小粒度是 60 字（`min_chunk_chars`）
+# ⇒ 40 ≤ 字数 < 60 的块一旦超阈值就**必然抛错、无法自愈** → 整篇蒸馏失败。
+# 而 250 字分块的**最后一块**常常只剩 40~60 字 —— 那是**每篇都有**的余块。
+#
+# 实测标定（同一段文本、同一份参考音，连渲 3 次）：
+#     47 字 → cps 5.88~6.71（波动 14.3%）
+#     52 字 → cps 5.20~6.50（波动 25.0%）
+#     55 字 → cps 5.50~6.88（波动 25.0%）
+#    114 字 → cps 5.70~6.71（波动 17.6%）
+#    250 字 → cps 5.72~6.25（波动  4.5%）
+# ⇒ 阈值 6.5 **就落在短块的噪声带里** → 正常渲染被判成截断。
+
+
+@pytest.mark.parametrize(
+    ("chars", "seconds"),
+    [
+        (47, 7),  # 实测 5.88~6.71 cps
+        (47, 8),
+        (52, 8),  # 实测 5.20~6.50 cps
+        (55, 8),  # 实测 5.50~6.88 cps
+        (114, 17),  # 实测 5.70~6.71 cps
+    ],
+)
+def test_短块在实测噪声带内不误判(chars, seconds):
+    """短块的语速落在**实测噪声带**里时，不能判成截断。
+
+    这是生产上真实触发的那一类：47 字的块被报成 9.40 字/秒 → 整篇挂掉。
+    """
+    client = _client()
+    client._assert_not_truncated("这" * chars, _fake_mp3_of_seconds(seconds))
+
+
+def test_生产实测那条会被判出来():
+    """生产事故原样复现：47 字 / 5.0s（9.40 字/秒）→ **要判成异常**。
+
+    47 字的自然带是 7.0~8.0s（5.88~6.71 cps），5.0s 明显在带外 →
+    它**确实**是个异常，不该被放过。
+
+    注意：判出来只是第一步 —— 真正拖死整篇的是「判出来之后没法自愈」，
+    那由下面那条用例守住。
+    """
+    client = _client()
+    with pytest.raises(openai_module._TruncatedOutput):
+        client._assert_not_truncated("这" * 47, _fake_mp3_of_seconds(5))
+
+
+@pytest.mark.asyncio
+async def test_生产实测那条不会拖死整篇():
+    """**死区修复**：47 字的块被判异常后，必须能自愈重渲，而不是整篇挂掉。
+
+    老写法 `len(text) <= min_chunk_chars(60) → raise` 让短块一旦误判就
+    **直接放弃自愈** → 整篇蒸馏失败（生产实测：第 1 篇就挂，靠 Arq 重试才救回来）。
+
+    这里模拟真实上游：第一次渲染偏短（5.0s）→ 判异常 → 二分 →
+    子块重新渲染（正常长度）→ 通过 → 整块合成成功。
+    """
+    client = _client(min_chunk_chars=60)
+    calls: list[str] = []
+
+    async def _sometimes_short(text, voice=None, output_format="mp3", *, clone=None):
+        calls.append(text)
+        # 整块（47 字）偏短；子块正常
+        if len(text) > 30:
+            return _fake_mp3_of_seconds(5)
+        return _fake_mp3_of_seconds(4)
+
+    client._synthesize_once = _sometimes_short  # type: ignore[assignment]
+
+    audio = await client._synthesize_chunk("这" * 47)
+
+    assert audio, "自愈后应该合成出音频"
+    assert len(calls) > 1, (
+        "47 字的块比 min_chunk_chars(60) 还小，但**仍应触发二分自愈** —— "
+        "老写法在这里直接放弃，导致整篇蒸馏失败"
+    )
+    assert all(len(c) < 47 for c in calls[1:]), "自愈应该把块切小后重渲"
+
+
+def test_短块的明确缺失仍然被抓():
+    """短块只认「明显缺失」—— 不能把真截断一起放过。"""
+    client = _client()
+    with pytest.raises(openai_module._TruncatedOutput):
+        # 20 字 → 1 秒 → 18.7 字/秒，远超短文本阈值 8.0
+        client._assert_not_truncated("这" * 20, _fake_mp3_of_seconds(1))
+
+
+@pytest.mark.asyncio
+async def test_自愈切不动时就停():
+    """自愈的地板是「切不动了」，不是 min_chunk_chars。
+
+    ⚠️ 地板管的是「**被切的文本**」：文本比 `_MIN_SPLIT_CHARS` 还小就不切了。
+    切**出来**的块可以更小（硬切会留下 1 字的余块）—— 那不是问题。
+    """
+    client = _client(min_chunk_chars=60)
+    calls: list[str] = []
+
+    async def _short_audio(text, voice=None, output_format="mp3", *, clone=None):
+        calls.append(text)
+        return _fake_mp3_of_seconds(1)
+
+    client._synthesize_once = _short_audio  # type: ignore[assignment]
+
+    with pytest.raises(Exception):
+        await client._synthesize_chunk("这" * 47)
+
+    # 递归必须收敛（深度上限 6 ⇒ 最多 2^6 个叶子），不能无限切
+    assert len(calls) <= 2 ** (
+        openai_module._MAX_SPLIT_DEPTH + 1
+    ), f"自愈切了 {len(calls)} 次，没有收敛"
+    # 且确实切到了地板以下（说明是被地板挡住的，不是被 min_chunk_chars 挡住的）
+    assert min(len(c) for c in calls) < openai_module._MIN_SPLIT_CHARS, (
+        "递归应该一路切到地板以下才停 —— "
+        "否则说明它是被 min_chunk_chars 挡住的（老行为：短块直接放弃自愈）"
+    )
+
+
 def _fake_mp3_of_seconds(seconds: int) -> bytes:
     """造一段指定时长的假 mp3（够解析出帧数即可）。"""
     from app.services.tts.audio_duration import _SAMPLE_RATES

@@ -330,18 +330,36 @@ def test_admin_测试句足够长_语速判据才有意义(openai_mod):
     而实际合成是好的。
 
     这里锁住「测试句足够长」这个前提，别让谁又改回一句话。
+
+    ⚠️ **下限跟判据的长度门槛对齐**（2026-10-24）：
+    判据现在分成两条分支 —— ≥ `_MIN_CHARS_FOR_RATE_CHECK`（150）字才用
+    语速判据（能分辨真截断与正常），更短的只认「缺一半以上」这种明确缺失。
+    测试句若落在短分支里，这个按钮就只能查出 gross 截断，
+    失去「确认这一段完整念完了」的意义 ⇒ 测试句必须 ≥ 150 字。
     """
     import importlib.util
+    import sys
     from pathlib import Path
 
     backend_dir = Path(__file__).resolve().parents[2]
+    # ⚠️ admin_router.py 里是 `from clients.ai_client import ...` ——
+    # `clients` 包在 content-service/ 下，单跑这个文件时不在 sys.path 上
+    # （全量跑能过是靠别的用例先把它塞进去 → 典型的测试隔离问题）。
+    # 这里显式补上，让这条用例**单跑也能过**。
+    content_service_dir = str(backend_dir / "content-service")
+    if content_service_dir not in sys.path:
+        sys.path.insert(0, content_service_dir)
     spec = importlib.util.spec_from_file_location(
         "_tts_cfg_fields_admin_router_probe", backend_dir / "content-service" / "admin_router.py"
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     text = module._TTS_TEST_TEXT
-    assert len(text) >= 100, f"测试句太短（{len(text)} 字），语速判据在短文本上不可靠"
+    min_len = openai_mod._MIN_CHARS_FOR_RATE_CHECK
+    assert len(text) >= min_len, (
+        f"测试句太短（{len(text)} 字 < {min_len}），它落在判据的短文本分支里，"
+        f"只能查出 gross 截断，测不出「内容是不是完整念完了」"
+    )
 
 
 def test_正常语速不误判(openai_mod):
@@ -366,10 +384,21 @@ def test_真截断仍然被抓(openai_mod):
 
 @pytest.mark.asyncio
 async def test_truncated_chunk_is_detected_and_split(openai_mod):
-    """被静默截断的块 → 自动二分重来，而不是把缺内容的音频当成功。
+    """被静默截断的块 → 自动二分**重渲**，而不是把缺内容的音频当成功。
 
-    构造一个「每次调用都只产出开头」的假端点：返回的音频时长远小于
+    构造一个「整块只产出开头」的假端点：返回的音频时长远小于
     文本应有的时长 → 语速超阈值 → 触发二分。
+
+    ⚠️ **语义变更（2026-10-24）**：自愈现在会**收敛**（切到判据无法分辨的长度为止），
+    所以结果不再是「抛错」，而是「切小重渲 → 拼回来」。
+
+    为什么这样更好：老语义在**短块**上直接抛错 → 整篇蒸馏失败 ——
+    生产实测（存量重跑第 1 篇）：47 字的余块被判 9.40 字/秒 →
+    直接放弃自愈 → 整篇挂掉。
+
+    而「短块到底缺没缺」在原理上就判不出来（实测同一段文本连渲 3 次的
+    cps 带宽 5.20~6.88，波动 25%）—— 所以正确做法是**重渲一次**，
+    而不是替用户决定「这篇不要了」。
     """
     client = openai_mod.OpenAITTSClient(
         api_key="k", base_url="http://x", model="m", chunk_chars=200, min_chunk_chars=40
@@ -378,16 +407,19 @@ async def test_truncated_chunk_is_detected_and_split(openai_mod):
 
     async def _truncating(text, voice=None, output_format="mp3", *, clone=None):
         calls.append(text)
-        # 造一段「时长固定 1 秒」的假音频 → 文本越长语速越高
-        return _fake_mp3_of_seconds(1)
+        # 整块（≥40 字）只产出开头 → 判截断；切小后的子块渲染完整
+        if len(text) >= 40:
+            return _fake_mp3_of_seconds(1)
+        return _fake_mp3_of_seconds(4)
 
     client._synthesize_once = _truncating  # type: ignore[assignment]
 
-    # 60 字的块：1 秒音频 → 60 字/秒 → 远超阈值 → 触发二分
-    with pytest.raises(Exception):
-        await client._synthesize_chunk("这" * 60)
+    # 60 字的块：1 秒音频 → 56 字/秒 → 远超阈值 → 触发二分
+    audio = await client._synthesize_chunk("这" * 60)
 
+    assert audio, "自愈后应该拼出音频"
     assert len(calls) > 1, "应该被二分重试，而不是一次就放弃"
+    assert all(len(c) < 60 for c in calls[1:]), "自愈应该把块切小后重渲"
 
 
 def _fake_mp3_of_seconds(seconds: int) -> bytes:
