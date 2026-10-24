@@ -1161,29 +1161,68 @@ async def _persist_agent_final(
             # → 生产 `distilled_articles.tags` 实测 25 行全空 →
             # **推送一次都没产生过**（`push_notifications` 实测 0 行）。
             #
+            # 运营指定的分类（`articles.manual_tags`，0040）也要读 ——
+            # 这一行是「运营录的内容靠订阅分发」能不能成立的关键：
+            # 没有它，运营指定的分类会被 LLM 猜的覆盖掉。
+            art = await db.get(Article, article_id)
+            #
             # 写之前**按 tags 表过滤**：推送是 `Tag.name.in_(da.tags)` 精确匹配，
             # LLM 若输出表里没有的名字（「科技资讯」而不是「科技」），
             # 存进去也只是垃圾 → 查不到 → 推送不出。过滤掉比存着好。
-            raw_tags = final.get("rewrite_tags") or []
-            if raw_tags:
-                names = [str(t).strip() for t in raw_tags if str(t).strip()]
+            #
+            # ── 运营指定的分类**优先**（2026-10-24 产品拍板）────────────
+            #
+            # 产品决策：admin 录入的内容「**订阅了分类就可以看到，没订阅就看不到**」
+            # ⇒ 这类内容的分发**只认分类**，所以分类必须**可靠**。
+            # 而分类原先只有一条来源：LLM 猜的 —— 实测 GitHub 稿的 tags 是**空的**
+            # （代码库主题大概率不在 tags 表候选里），于是它**永远进不了任何人的
+            # 订阅流** = 死内容（运营录了没人看得到，而且没有任何报错）。
+            #
+            # 所以运营录入时能**指定**分类（`articles.manual_tags`，0040）：
+            # 指定了就**以运营指定的为准**，LLM 猜的作废（运营比 LLM 更清楚
+            # 这篇东西该归到哪个分类）；没指定才用 LLM 猜的。
+            manual_tags = getattr(art, "manual_tags", None) if art else None
+            if manual_tags:
+                names = [str(t).strip() for t in manual_tags if str(t).strip()]
                 if names:
                     valid = await _filter_known_tag_names(db, names)
                     da.tags = valid
                     if valid:
                         log.info(
-                            "agent_persist_tags article=%s tags=%s (raw=%s)",
+                            "agent_persist_tags article=%s tags=%s (manual=运营指定)",
                             article_id,
                             valid,
-                            names,
                         )
                     else:
-                        # 全都不是已知标签 → 记一条，否则「推送没来」又变成查不到原因
+                        # 运营指定的分类**不在 tags 表里** → 订阅匹配不上 → 内容等于死内容。
+                        # 记一条 warning，否则「录了没人看得到」又变成查不到原因。
                         log.warning(
-                            "agent_persist_tags_none_known article=%s raw=%s",
+                            "agent_persist_tags_none_known article=%s manual=%s "
+                            "(分类不在 tags 表里 → 订阅匹配不上，内容不会有任何订阅者看到)",
                             article_id,
                             names,
                         )
+            else:
+                raw_tags = final.get("rewrite_tags") or []
+                if raw_tags:
+                    names = [str(t).strip() for t in raw_tags if str(t).strip()]
+                    if names:
+                        valid = await _filter_known_tag_names(db, names)
+                        da.tags = valid
+                        if valid:
+                            log.info(
+                                "agent_persist_tags article=%s tags=%s (raw=%s)",
+                                article_id,
+                                valid,
+                                names,
+                            )
+                        else:
+                            # 全都不是已知标签 → 记一条，否则「推送没来」又变成查不到原因
+                            log.warning(
+                                "agent_persist_tags_none_known article=%s raw=%s",
+                                article_id,
+                                names,
+                            )
 
             # ── 三类再创作内容分区（2026-10-23）────────────────────────
             #

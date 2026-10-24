@@ -38,6 +38,25 @@ class Article(Base, TimestampMixin):
     raw_content: Mapped[dict | None] = mapped_column(
         JSONB, nullable=True
     )  # 抓取后的原始内容（L4 多模态理解输入）
+    # 0040：**运营指定的分类**（2026-10-24 产品拍板）。
+    #
+    # 产品决策：「admin 录入的内容……应该在用户 app 的订阅功能中形成闭环，
+    # **订阅了分类就可以看到，没订阅就看不到**」。
+    #
+    # ⇒ 这类内容的分发**只认分类**。而分类原先只有一条来源：蒸馏时 LLM 猜的
+    # （`distilled_articles.tags`）。实测 GitHub 稿的 tags 就是**空的** ——
+    # 没有分类 = 永远进不了任何人的订阅流 = **死内容**（运营录了没人看得到，
+    # 而且没有任何报错）。
+    #
+    # 所以运营录入时必须能**指定**分类。本列存运营指定的（中文标签名数组），
+    # 蒸馏落 `distilled_articles.tags` 时**优先用它**；没指定才用 LLM 猜的。
+    #
+    # 为什么是 articles 表的一列而不是塞进 raw_content：raw_content 是
+    # 「抓取/解析结果」，运营的选择不是抓取结果 —— 混在一起会让
+    # 「原文长什么样」与「运营怎么分类」两件事分不开。
+    manual_tags: Mapped[list | None] = mapped_column(
+        JSONB, nullable=True
+    )  # 运营指定的分类（中文标签名数组，NULL = 未指定，用 LLM 猜的）
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0", nullable=False

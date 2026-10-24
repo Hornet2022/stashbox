@@ -5,7 +5,7 @@
 
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class AddArticleRequest(BaseModel):
@@ -16,6 +16,33 @@ class AddArticleRequest(BaseModel):
     # 于是标题被静默丢弃，运营填完看到"创建成功"但库里没有标题。
     # 保持 optional：老客户端不传时行为不变（走 fetcher 抓标题）。
     title: Optional[str] = None
+
+
+class AdminArticleRequest(AddArticleRequest):
+    """运营录入专用请求体（2026-10-24 产品拍板后加的 `tags`）。
+
+    ## 为什么单独一个类，而不是给 [AddArticleRequest] 加字段
+
+    产品决策：「admin 录入的内容……**订阅了分类就可以看到，没订阅就看不到**」
+    ⇒ 运营录入时必须能**指定分类**。
+
+    但这个字段**不能**加到 [AddArticleRequest] 上 —— 那是**用户侧剪藏**入口的
+    请求体。加上去等于把「用户可以自己给自己的内容指定分类」也开放了，
+    而那是另一个产品决策（现在用户剪藏的分类由 LLM 猜）。
+
+    ⇒ 单独一个子类：只有 admin 端点用它，用户侧入口的契约一个字没变
+    （旧客户端不传 `tags` 也能正常用）。
+
+    ## `tags` 的语义
+
+    · 存**中文标签名**（"科技"），不是 slug（"tech"）——
+      推送与订阅都是按 name 精确匹配（`Tag.name.in_(da.tags)`）；
+    · 空 = 不指定 → 蒸馏时用 LLM 猜的分类；
+    · 指���了 → **优先用运营指定的**（LLM 猜的作废），
+      理由见 `articles.manual_tags` 列的注释。
+    """
+
+    tags: list[str] = Field(default_factory=list)
 
 
 class TTSVoiceBrief(BaseModel):

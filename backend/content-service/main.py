@@ -66,6 +66,7 @@ from fetchers.document import (  # noqa: E402
 )
 from schemas import (  # noqa: E402
     AddArticleRequest,
+    AdminArticleRequest,
     ArticleResponse,
     ArticleStatusResponse,
     AudioUrlResponse,
@@ -302,6 +303,68 @@ async def _get_owned(article_id: str, user_id: int, db: AsyncSession) -> Article
     return art
 
 
+# ---------------------------------------------------------------------------
+# 订阅授权（2026-10-24 产品拍板：运营录入的内容靠订阅分发）
+# ---------------------------------------------------------------------------
+#
+# 产品决策：「admin 录入的内容……应该在用户 app 的订阅功能中形成闭环，
+# **订阅了分类就可以看到，没订阅就看不到**」。
+#
+# ## 为什么需要这一层
+#
+# 订阅流（`GET /api/v1/subscriptions/feed`）与订阅推送**本来就不按 owner 过滤**
+# —— 它们按**分类**分发，所以运营录入的内容（归属 `user_id=0`）天然会出现在
+# 订阅者的流里。
+#
+# 但**读侧端点只认属主**：详情 / 音频 / 进度 / 听完 / 评分 全走
+# `_get_owned`，非属主一律 403 ⇒ **闭环断在最后一步**：
+# 订阅流里明明列出了这篇文章，用户点进去却是「无权访问」、音频也拿不到。
+#
+# ## 授权规则（三个条件都要满足，缺一不可）
+#
+# 1. 文章**已就绪**（`distilled_articles.status == 'done'` 且有 audio_url）
+#    —— 没蒸馏完的没有可听的东西，也不该出现在订阅流里；
+# 2. 文章的分类（`distilled_articles.tags`）非空；
+# 3. **我确实订阅了**其中某个分类（`tag_subscriptions`）。
+#
+# ⇒ 这条规则与订阅流的筛选条件**同源**：流里能看到的，这里就能打开；
+#    流里看不到的，这里也打不开（403）。不会出现「列表里有、点开没权限」。
+#
+# ⚠️ **只放行「消费」类操作**：读稿、听音频、记自己的收听进度/评分/收藏。
+#    **删除、重试蒸馏、稍后读**这些是**属主的私有操作**，不给订阅者
+#    （否则订阅者能删掉别人的文章）。
+async def _subscription_grants_access(art: Article, user_id: int, db: AsyncSession) -> bool:
+    """订阅者是否可以消费这篇文章（读 / 听 / 记录自己的状态）。"""
+    da = await db.scalar(select(DistilledArticle).where(DistilledArticle.article_id == art.id))
+    if da is None or da.status != "done" or not da.audio_url:
+        return False
+    art_tags = da.tags if isinstance(da.tags, list) else []
+    if not art_tags:
+        return False
+    rows = await db.execute(
+        select(Tag.name)
+        .join(TagSubscription, TagSubscription.tag_id == Tag.id)
+        .where(TagSubscription.user_id == user_id)
+    )
+    subscribed = {r[0] for r in rows.fetchall()}
+    return bool(subscribed & set(art_tags))
+
+
+async def _get_readable(article_id: str, user_id: int, db: AsyncSession) -> Article:
+    """读侧：属主**或订阅者**。
+
+    与 [_get_owned] 的唯一区别：非属主时先问「订阅授权」，
+    不通过才 403。属主路径的行为**一个字没变**。
+    """
+    result = await db.execute(select(Article).where(Article.id == article_id))
+    art = result.scalar_one_or_none()
+    if art is None:
+        raise NotFound(message=f"article {article_id} not found")
+    if art.user_id != user_id and not await _subscription_grants_access(art, user_id, db):
+        raise Forbidden(message="not the owner of this article")
+    return art
+
+
 async def _get_owned_with_task(
     article_id: str, user_id: int, db: AsyncSession
 ) -> tuple[Article, DistilledArticle | None]:
@@ -317,6 +380,25 @@ async def _get_owned_with_task(
         raise NotFound(message=f"article {article_id} not found")
     art, task = row
     if art.user_id != user_id:
+        raise Forbidden(message="not the owner of this article")
+    return art, task
+
+
+async def _get_readable_with_task(
+    article_id: str, user_id: int, db: AsyncSession
+) -> tuple[Article, DistilledArticle | None]:
+    """读侧（属主**或订阅者**）：见 [_get_readable] 的说明。"""
+    row = (
+        await db.execute(
+            select(Article, DistilledArticle)
+            .outerjoin(DistilledArticle, DistilledArticle.article_id == Article.id)
+            .where(Article.id == article_id)
+        )
+    ).first()
+    if row is None:
+        raise NotFound(message=f"article {article_id} not found")
+    art, task = row
+    if art.user_id != user_id and not await _subscription_grants_access(art, user_id, db):
         raise Forbidden(message="not the owner of this article")
     return art, task
 
@@ -538,6 +620,7 @@ async def _create_article(
     *,
     fetch_on_create: bool = True,  # True=建库前调 fetcher 抓 title/source/raw_content
     dedup: bool = True,  # True=同用户同 URL 已有未删文章则复用（CP-DUPLICATE-CLIP）
+    manual_tags: list[str] | None = None,  # 运营指定的分类（0040；None=用 LLM 猜的）
 ) -> Article:
     # 2026-10-23：往 articles 写 `user_id=0` 之前，哨兵用户必须存在 ——
     # articles.user_id 有 FK 到 users(id)，而哨兵（id=0）是**按需**建的
@@ -598,6 +681,35 @@ async def _create_article(
             "duplicate_clip_reuse",
             extra={"url": url, "user_id": user_id, "article_id": art.id},
         )
+        # 复用时**若这次指定了分类，就更新它**（0040）。
+        #
+        # 为什么不能静默丢掉：运营的分类是**分发依据**（订阅了分类才看得到），
+        # 丢掉它 = 运营明明选了「财经」，内容却还挂在「科技」下 ——
+        # 而运营看到的是「创建成功」，**没有任何报错**。
+        # 这正是这一轮在消灭的那类静默失败。
+        #
+        # ⚠️ 但**已经蒸馏完**的稿子，其 `distilled_articles.tags` 不会跟着变 ——
+        # 那要等**重新蒸馏**才会生效。所以这里记一条 warning 把这件事说出来，
+        # 而不是让运营以为改了分类就立刻生效了。
+        if manual_tags:
+            new_tags = [str(t).strip() for t in manual_tags if str(t).strip()]
+            if new_tags and new_tags != (art.manual_tags or []):
+                art.manual_tags = new_tags
+                await db.commit()
+                if art.status in ("ready", "listened"):
+                    log.warning(
+                        "duplicate_clip_manual_tags_updated article=%s tags=%s "
+                        "(已发布的稿子需要**重新蒸馏**才会换分类 —— "
+                        "distilled_articles.tags 是蒸馏时写的)",
+                        art.id,
+                        new_tags,
+                    )
+                else:
+                    log.info(
+                        "duplicate_clip_manual_tags_updated article=%s tags=%s",
+                        art.id,
+                        new_tags,
+                    )
         return art
 
     art = Article(
@@ -608,6 +720,8 @@ async def _create_article(
         title=title,
         status="pending",
         raw_content=raw_content,  # FetchResult 全字段（JSONB，ai-service 蒸馏输入）
+        # 运营指定的分类（0040）。
+        manual_tags=(list(manual_tags) if manual_tags else None),
         favorite=False,
         skip=False,
     )
@@ -934,7 +1048,7 @@ async def _clip_after_fetch(
 
 @app.post("/api/v1/admin/articles")
 async def admin_create_article(
-    req: AddArticleRequest,
+    req: AdminArticleRequest,
     user: dict = Depends(require_admin_or_operator),
     db: AsyncSession = Depends(get_db),
 ):
@@ -961,6 +1075,7 @@ async def admin_create_article(
         req.title,
         db,
         event=EventName.ARTICLE_SUBMIT,
+        manual_tags=req.tags,
     )
     # 记审计：这条是 admin 写操作，不能只靠 AuditMiddleware（它只挂在网关上，
     # 直连 content-service:8102 绕过网关时不会有记录 —— 见 plist 绑定收紧的说明）。
@@ -1003,6 +1118,8 @@ async def admin_create_article_document(
     file: UploadFile | None = File(default=None),
     text: str | None = Form(default=None),
     title: str | None = Form(default=None),
+    # 运营指定的分类（multipart 里重复字段：tags=科技&tags=财经）
+    tags: list[str] = Form(default_factory=list),
     user: dict = Depends(require_admin_or_operator),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1055,6 +1172,7 @@ async def admin_create_article_document(
         final_title,
         db,
         raw_content=_to_raw_content(fr),
+        manual_tags=tags,
         event=EventName.ARTICLE_SUBMIT,
         fetch_on_create=False,  # 正文已经在上传里了，不该再去抓一次
     )
@@ -1297,7 +1415,8 @@ async def get_article(
         cached["stage"] = await get_stage(article_id)
         return cached
 
-    art, task = await _get_owned_with_task(article_id, uid, db)
+    art, task = await _get_readable_with_task(article_id, uid, db)
+    # 订阅授权：属主或订阅者都可读（见 _get_readable 的说明）
     # CP-DISTILL-TEXT：详情页返回蒸馏稿全文（列表页只要 120 字摘要）
     payload = _to_response(
         art,
@@ -1576,7 +1695,8 @@ async def favorite(
     原注释描述的故障模式本身就不成立。现已对齐复数 /favorites 的预查写法。
     """
     uid = _uid(user)
-    art = await _get_owned(article_id, uid, db)
+    art = await _get_readable(article_id, uid, db)
+    # 订阅授权：属主或订阅者都可个人收藏（见 _get_readable 的说明）
 
     if art.favorite:
         existing = await db.scalar(
@@ -1610,7 +1730,8 @@ async def unfavorite_article(
     幂等：文章本来就没收藏时直接返回 ok。
     """
     uid = _uid(user)
-    art = await _get_owned(article_id, uid, db)
+    art = await _get_readable(article_id, uid, db)
+    # 订阅授权：属主或订阅者都可个人收藏（见 _get_readable 的说明）
     art.favorite = False
     fb = await _write_feedback(db, uid, article_id, "unfavorite")
     await db.commit()
@@ -1724,7 +1845,8 @@ async def add_favorite(
     # 所以这不是越权读 —— 写进去的行挂在**调用者**名下。但结果是调用者的收藏列表里
     # 会出现**打不开（403）**的条目：写的时候说"存在"，读的时候被属主校验拦掉。
     # 同仓库的兄弟端点（mark-listened 等）都用 _get_owned，口径要一致。
-    await _get_owned(article_id, uid, db)
+    await _get_readable(article_id, uid, db)
+    # 订阅授权：属主或订阅者都可个人收藏（见 _get_readable 的说明）
 
     # 检查是否已存在
     existing = await db.scalar(
@@ -1865,7 +1987,8 @@ async def snooze_article(
     uid = _uid(user)
     # 同加收藏：校验存在**且属于当前用户**（原来只查存在性，
     # 会让别人的文章出现在自己的「稍后听」里，点进去又是 403）。
-    await _get_owned(article_id, uid, db)
+    await _get_readable(article_id, uid, db)
+    # 订阅授权：属主或订阅者都可个人稍后听（见 _get_readable 的说明）
 
     snooze_until = body.get("snooze_until")
     if snooze_until:
@@ -1987,7 +2110,8 @@ async def listen_complete(
     故 listened_at 取 feedback.created_at —— 同一事务里 DB 侧 NOW()，语义等价。
     """
     uid = _uid(user)
-    await _get_owned(article_id, uid, db)
+    await _get_readable(article_id, uid, db)
+    # 订阅授权：属主或订阅者都可个人收听状态（见 _get_readable 的说明）
     meta = {"duration_sec": req.duration_sec} if req.duration_sec is not None else {}
     fb = await _write_feedback(db, uid, article_id, "listen_complete", metadata=meta)
     await db.commit()
@@ -2017,7 +2141,8 @@ async def rate(
         raise InvalidRequest(message="rating must be between 1 and 5", code=4001)
 
     uid = _uid(user)
-    await _get_owned(article_id, uid, db)
+    await _get_readable(article_id, uid, db)
+    # 订阅授权：属主或订阅者都可个人评分（见 _get_readable 的说明）
     meta = {"comment": req.comment} if req.comment else {}
     fb = await _write_feedback(db, uid, article_id, "rate", rating=req.rating, metadata=meta)
     await db.commit()
@@ -2226,7 +2351,8 @@ async def article_status(
     article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
 ):
     """文章 + 蒸馏任务聚合状态（v1 §11.4 CP1.7）：客户端轮询这个端点等 ready。"""
-    art, task = await _get_owned_with_task(article_id, _uid(user), db)
+    art, task = await _get_readable_with_task(article_id, _uid(user), db)
+    # 订阅授权：属主或订阅者都可读（见 _get_readable 的说明）
     return ArticleStatusResponse(
         article_id=art.id,
         status=_derive_status(art, task),
@@ -2270,7 +2396,8 @@ async def article_audio_url(
     否则 ExoPlayer 按后缀选 MP3/M4A/PCM 解码器会失败。
     兜底策略：本地模式下扫描 LOCAL_AUDIO_DIR 下 /audio/{article_id}.{ext} 实际存在的扩展名。
     """
-    art, task = await _get_owned_with_task(article_id, _uid(user), db)
+    art, task = await _get_readable_with_task(article_id, _uid(user), db)
+    # 订阅授权：属主或订阅者都可读（见 _get_readable 的说明）
     if _derive_status(art, task) != "ready":
         raise NotFound(message=f"audio not ready for article {article_id}")
 
@@ -2409,7 +2536,8 @@ async def update_progress(
     #
     # 2026-10-22：这里原来只查存在性，注释却写着「（归属校验）」——
     # 注释声称的归属校验并不存在。已改成真的 _get_owned。
-    await _get_owned(article_id, uid, db)
+    await _get_readable(article_id, uid, db)
+    # 订阅授权：属主或订阅者都可个人播放进度（见 _get_readable 的说明）
 
     # upsert
     existing = await db.scalar(
