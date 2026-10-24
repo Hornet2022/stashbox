@@ -209,6 +209,46 @@ _TRUNCATION_CHARS_PER_SEC = 6.5
 # 二分自愈的最大递归深度（2^6 = 64 段，兜底防无限递归）。
 _MAX_SPLIT_DEPTH = 6
 
+# ── 克隆路径的块长上限（字）────────────────────────────────────────────
+#
+# ⚠️ **克隆路径必须用比普通路径小得多的块**（实测 2026-10-24，tertu.cn）：
+#
+#    同样 700 字：
+#        不克隆 → 音频 185.8s（3.77 字/秒）✅ 完整
+#        克隆   → 音频 112.2s（6.24 字/秒）✅ 完整，但**慢 1.66 倍**
+#
+#    上游克隆时要额外处理参考音频 → 同样字数**墙钟更长** → 更容易撞上
+#    它那个 60s 墙钟。而撞墙钟的后果是**静默截断**：HTTP 200、音频合法，
+#    但只生成了前面一部分 —— **那一块的结尾凭空消失**，
+#    而状态是「成功」（用户听到的稿子少了一截，最难查）。
+#
+#    实测（克隆）：150/200/250/400 字 → 音频 26.5 / 34.1 / 43.7 / 68.9s，
+#    语速稳定在 5.65~5.87 字/秒。同一段 250 字连发 3 次 → 40.2 / 43.7 / 40.0s
+#    （±4.5% 的波动）。
+#
+#    取 250 字：音频 40~44s（占 60s 墙钟的 2/3），留出 ~35% 余量给负载波动。
+#    400 字（68.9s）已经贴着墙钟 → 负载一高就被砍尾巴，不能取。
+#
+#    代价：块多了 → 请求次数多（1600 字的稿子从 3 块变 7 块）。
+#    但**上游是串行处理的**，总耗时不变；而块多换来的「每块都完整」，
+#    正是「内容不缺」的前提。内容缺失比慢一点严重得多。
+#
+#    不克隆的路径保持原样（700 字）：音色本来就是随机的，块多块少都一样糟，
+#    而块少能少几次请求、少几次接缝。
+_CLONE_CHUNK_CHARS_DEFAULT = 250
+
+# 语速判据在**短文本**上不成立（见 _assert_not_truncated）。
+# 低于这个字数，语速比值没有意义 —— 改用绝对缺失量判据。
+_MIN_CHARS_FOR_RATE_CHECK = 40
+
+# 最慢的正常语速（字/秒）。实测正常播报 3.77~4.61 字/秒，
+# 保守取 4.0：短文本的期望时长 = 字数 / 4.0。
+_SLOWEST_CPS = 4.0
+
+# 短文本的「绝对缺失」判据：实际时长低于期望的这个比例才算截断。
+# 取 0.5 —— 缺一半以上才算「内容真的少了」。
+_SHORT_TEXT_MISSING_RATIO = 0.5
+
 
 class _TruncatedOutput(RuntimeError):
     """端点返回了 HTTP 200 但内容被静默截断（只念了开头）。"""
@@ -316,6 +356,7 @@ class OpenAITTSClient(TTSClient):
         min_chunk_chars: int | None = None,
         instructions: str | None = None,
         language: str | None = None,
+        clone_chunk_chars: int | None = None,
     ):
         # 优先入参；入参缺省时从环境变量读（pydantic Settings 不会接管 .env 加载到这里）
         self.api_key = api_key if api_key is not None else os.getenv("OPENAI_TTS_API_KEY", "")
@@ -403,6 +444,14 @@ class OpenAITTSClient(TTSClient):
             chunk_chars
             if chunk_chars is not None
             else int(os.getenv("OPENAI_TTS_CHUNK_CHARS", "700"))
+        )
+        # 克隆路径的块长上限（**单独一套**：见 _CLONE_CHUNK_CHARS_DEFAULT 的实测）。
+        #
+        # 取 min(普通块长, 这个值) —— 所以普通块长配得更小也依然生效。
+        self.clone_chunk_chars = (
+            clone_chunk_chars
+            if clone_chunk_chars is not None
+            else int(os.getenv("OPENAI_TTS_CLONE_CHUNK_CHARS", str(_CLONE_CHUNK_CHARS_DEFAULT)))
         )
         # 分段并行度。**默认 1（串行）** —— 不是为了性能，是为了让每一段的
         # 计时器从「真正开始被上游处理」起算。
@@ -501,7 +550,14 @@ class OpenAITTSClient(TTSClient):
 
         clone = await self._resolve_clone(ref_audio, ref_text)
 
-        if self.chunk_chars <= 0 or len(text) <= self.chunk_chars:
+        # ⚠️ 克隆时块长要**另算**（见 _CLONE_CHUNK_CHARS_DEFAULT）：
+        #    克隆路径慢 1.66 倍 → 更容易撞上游 60s 墙钟 → 撞了就静默截断，
+        #    那一块的结尾会凭空消失。块小一点，把「内容缺失」挡在门外。
+        chunk_chars = self.chunk_chars
+        if clone is not None and self.clone_chunk_chars > 0:
+            chunk_chars = min(chunk_chars, self.clone_chunk_chars)
+
+        if chunk_chars <= 0 or len(text) <= chunk_chars:
             return await self._synthesize_chunk(text, voice, output_format, clone=clone)
 
         # ── 长稿：切块 → 逐块合成 → 拼接 ──────────────────────────────
@@ -514,12 +570,12 @@ class OpenAITTSClient(TTSClient):
         #
         # ⚠️ concurrency 默认 1（串行），原因见 __init__ 里的实测记录：
         # 上游串行处理，并发零收益，却会让末段在队列里等到逼近超时。
-        chunks = split_into_chunks(text, self.chunk_chars)
+        chunks = split_into_chunks(text, chunk_chars)
         log.info(
             "OpenAITTS 分段合成: total_chars=%d chunks=%d chunk_chars<=%d concurrency=%d clone=%s",
             len(text),
             len(chunks),
-            self.chunk_chars,
+            chunk_chars,
             self.chunk_concurrency,
             "on" if clone else "off",
         )
@@ -715,6 +771,20 @@ class OpenAITTSClient(TTSClient):
         时长被首尾留白与句读停顿主导），所以别拿它当短句的绝对真值。
         调用方要保证送进来的文本**足够长**（admin 的 TTS 测试句已经加长到
         100+ 字），否则测出来的语速会横跨正常与真截断两个区间。
+
+        ## 为什么短文本要另走一条判据（2026-10-24 实测踩到）
+
+        实测：上游对 **8 个字**返回了 **1.0s** 音频 → 8.00 字/秒 → 超阈值。
+        单看这一条它「像截断」，但其实不是 —— 8 个字本来也就 1~2 秒。
+
+        后果不是「多报一次」这么轻：超阈值会触发**二分自愈**，
+        而二分会把块越切越小（700 → 350 → 175 → … → 8），
+        每一次都在同一个噪声判据上继续超阈值 → 一路钻到
+        `min_chunk_chars` 仍报错 → **整篇蒸馏直接失败**。
+        （实测：700 字触发截断 → 二分到 8 字 → 抛 _TruncatedOutput → 整篇挂掉。）
+
+        所以：语速超阈值**且文本足够长**，才判定为截断；
+        文本短时改用**绝对缺失量**（缺一半以上才算内容真的少了）。
         """
         from stashbox.backend.app.services.tts.audio_duration import audio_duration_sec
 
@@ -723,11 +793,28 @@ class OpenAITTSClient(TTSClient):
             log.warning("OpenAITTS 音频时长不可解析，跳过截断校验")
             return
         cps = len(text) / dur
-        if cps > _TRUNCATION_CHARS_PER_SEC:
+        if cps <= _TRUNCATION_CHARS_PER_SEC:
+            return
+
+        if len(text) >= _MIN_CHARS_FOR_RATE_CHECK:
             raise _TruncatedOutput(
                 f"OpenAITTS 输出疑似被截断：{len(text)} 字只产出 {dur:.1f}s 音频"
                 f"（{cps:.2f} 字/秒，正常应 < {_TRUNCATION_CHARS_PER_SEC}）"
             )
+
+        # 短文本：语速比值不可信 → 看**绝对缺失量**
+        expected = len(text) / _SLOWEST_CPS
+        if dur < expected * _SHORT_TEXT_MISSING_RATIO:
+            raise _TruncatedOutput(
+                f"OpenAITTS 输出疑似被截断：{len(text)} 字只产出 {dur:.1f}s 音频"
+                f"（期望约 {expected:.1f}s，缺了 {dur / expected * 100:.0f}%）"
+            )
+        log.info(
+            "OpenAITTS 短文本语速偏高但缺失不明显，按正常处理: chars=%d dur=%.1fs cps=%.2f",
+            len(text),
+            dur,
+            cps,
+        )
 
     async def _synthesize_once(
         self,

@@ -314,3 +314,75 @@ async def test_clone_and_voice_are_both_sent(concat_stub, tmp_path):
 
     assert bodies[0]["voice"] == "uncle_fu"
     assert bodies[0]["ref_audio"].startswith("data:")
+
+
+# ==========================================================================
+# 3. 克隆路径的块长单独算（上游克隆慢 1.66 倍 → 更容易撞 60s 墙钟）
+# ==========================================================================
+
+
+async def test_clone_uses_smaller_chunks_than_plain_path(tmp_path, concat_stub):
+    """克隆时块长必须**另算**（默认 250 字），不能沿用普通路径的 700。
+
+    实测（2026-10-24，tertu.cn）：同样 700 字，
+        不克隆 → 音频 185.8s（3.77 字/秒）
+        克隆   → 音频 112.2s（6.24 字/秒）—— **慢 1.66 倍**
+    上游克隆时要额外处理参考音频 → 更容易撞它 60s 的墙钟，
+    而撞墙钟的后果是**静默截断**（HTTP 200 + 音频变短）→ 内容缺失。
+    """
+    p = tmp_path / "ref.wav"
+    p.write_bytes(FAKE_WAV)
+    text = "这是一段用来测试分块的中文文本。" * 20  # 280 字
+
+    plain = _client(chunk_chars=700)
+    plain_bodies = _install_post(plain, lambda body: _Resp(200, b"x" * 2000))
+    await plain.synthesize(text)
+    plain_chunks = len(plain_bodies)
+
+    cloned = _client(chunk_chars=700)
+    clone_bodies = _install_post(cloned, lambda body: _Resp(200, b"x" * 2000))
+    await cloned.synthesize(text, ref_audio=str(p), ref_text=REF_TEXT)
+    clone_chunks = len(clone_bodies)
+
+    assert plain_chunks == 1, "280 字在普通路径（700）下应该是 1 块"
+    assert clone_chunks > plain_chunks, (
+        f"克隆路径用了和普通路径一样的块长（{clone_chunks} 块）—— "
+        f"克隆慢 1.66 倍，更容易撞上游 60s 墙钟 → 静默截断 → 内容缺失"
+    )
+    assert all(
+        len(b["input"]) <= 250 for b in clone_bodies
+    ), "克隆块长应 ≤ 250 字（实测 250 字 → 音频 40~44s，离 60s 墙钟有 35% 余量）"
+
+
+def test_short_text_is_not_flagged_as_truncated():
+    """短文本的高语速**不能**判成截断 —— 会把二分自愈一路带到 8 字。
+
+    实测：上游对 8 个字返回 1.0s 音频 → 8.00 字/秒 → 超阈值。
+    按老判据这会触发二分 → 700→350→175→…→8 每一次都超阈值 →
+    一路钻到 min_chunk_chars 仍报错 → **整篇蒸馏失败**。
+    """
+    client = _client()
+    # 8 个字 / 1 秒 → 8 字/秒（超阈值），但只缺了 8/4.0=2.0s 期望里的一半边缘
+    client._assert_not_truncated("八个字而已哦", _fake_mp3_of_seconds(1))
+    # 严重缺失（1 秒 vs 期望 5 秒）仍然要判成截断
+    with pytest.raises(openai_module._TruncatedOutput):
+        client._assert_not_truncated("这" * 20, _fake_mp3_of_seconds(1))
+
+
+def test_long_text_truncation_is_still_detected():
+    """长文本的截断检测不能因为上面的放宽而失效。"""
+    client = _client()
+    with pytest.raises(openai_module._TruncatedOutput):
+        client._assert_not_truncated("这" * 290, _fake_mp3_of_seconds(40))
+
+
+def _fake_mp3_of_seconds(seconds: int) -> bytes:
+    """造一段指定时长的假 mp3（够解析出帧数即可）。"""
+    from app.services.tts.audio_duration import _SAMPLE_RATES
+
+    header = bytes([0xFF, 0xF3, 0x40, 0xC0])
+    frame_len = (72 * 64000) // 24000  # = 192
+    rate = _SAMPLE_RATES[2][1]  # 24000
+    samples = 576
+    frames = int(seconds * rate / samples)
+    return (header + b"\x00" * (frame_len - 4)) * frames
