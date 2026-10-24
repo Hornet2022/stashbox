@@ -26,6 +26,7 @@ step4 的每段带**各自的停顿**（hook 后 700ms / 节间 500ms / 段内 2
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -109,3 +110,35 @@ def test_流水线拼接前调用了对齐():
     assert align_at > concat_at, "对齐要在 step4 里做"
     # 拼接实现（_concat_wavs_with_per_segment_gaps / ffmpeg concat）在 step4 里更靠后
     assert align_at < src.index("_concat_wavs_with_per_segment_gaps(", concat_at)
+
+
+# ---------------------------------------------------------------------------
+# 锚点选择：最小化**最大位移**，不是位移之和
+# ---------------------------------------------------------------------------
+def test_锚点取几何中点_让所有段都落在封顶内():
+    """生产实测的形状：102.5 / 117.6 / 150.1 Hz。
+
+    · 中位数 117.6 → 段3 要 -4.22 半音，**超封顶 → 被放弃** ⇒ 换人感还在；
+    · 几何中点 124.0 → 段1 +3.29 / 段2 +0.92 / 段3 -3.25 ⇒ **全部在封顶内**。
+
+    这条护的是「所有段都被对齐」，不是「锚点是某个具体值」。
+    """
+    from app.services.tts import voice_align
+
+    segs = [102.54269200884082, 117.63148331427722, 150.12124373848383]
+    cap = voice_align._MAX_SHIFT_SEMITONES
+
+    def _semitones_to(target: float) -> list[float]:
+        return [12.0 * math.log2(target / f) for f in segs]
+
+    # 几何中点（当前实现）
+    anchor = math.sqrt(min(segs) * max(segs))
+    shifts = _semitones_to(anchor)
+    assert max(abs(s) for s in shifts) <= cap, f"几何中点下仍有段超封顶：{shifts}（cap={cap}）"
+
+    # 而中位数做不到（这正是要换锚点的原因）
+    median = sorted(segs)[len(segs) // 2]
+    median_shifts = _semitones_to(median)
+    assert (
+        max(abs(s) for s in median_shifts) > cap
+    ), "中位数在这个样本上不该超封顶 —— 若变了说明测试样本口径变了"
