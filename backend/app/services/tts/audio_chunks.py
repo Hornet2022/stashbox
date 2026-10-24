@@ -242,30 +242,8 @@ def concat_mp3(pieces: list[bytes], gap_sec: float = 0.3) -> bytes:
     if len(pieces) == 1:
         return pieces[0]
 
-    # ① 音域对齐（默认开启；OPENAI_TTS_ALIGN_PITCH=0 可关）
-    #
-    # 实测依据（2026-10-22，art_e044b3b1bd6c4fbe90d4c628 的 3 段真实渲染件）：
-    #     段1 p25=152.1Hz  段2 p25=169.2Hz  段3 p25=133.2Hz   ← 音域差一档
-    #     位移后 → 152.1 / 152.7 / 149.5Hz（误差 ≤1.8%）
-    # 这就是用户听到的「换人」：两次独立渲染的**音域**差了一档，
-    # crossfade 磨不掉（它只磨咔哒声）。
-    if os.getenv("OPENAI_TTS_ALIGN_PITCH", "1").strip().lower() not in ("0", "false", "no", "off"):
-        try:
-            from .voice_align import align_pitch
-
-            aligned, details = align_pitch(pieces)
-            if any(d.get("semitones") for d in details):
-                log.info("TTS 音高对齐: %s", details)
-            pieces = aligned
-        except Exception as exc:  # noqa: BLE001 - 对齐失败不能影响主流程
-            log.warning("TTS 音高对齐异常，保留原音频: %s", exc)
-
-    # ② 响度归一（逐段）
-    normalized: list[bytes] = []
-    for piece in pieces:
-        norm = normalize_loudness(piece)
-        normalized.append(norm if norm else piece)
-    pieces = normalized
+    # ① ② 音域对齐 + 响度归一（抽成共享函数，见 align_and_normalize）
+    pieces = align_and_normalize(pieces)
 
     # ③ 交叉淡化（失败则退回）
     faded = crossfade_concat(pieces)
@@ -363,6 +341,63 @@ def silence_mp3(
     except subprocess.SubprocessError as exc:
         log.warning("TTS 生成段间静音失败：%s", exc)
     return None
+
+
+def align_and_normalize(pieces: list[bytes]) -> list[bytes]:
+    """**跨段音域对齐 + 逐段响度归一**（返回新的段列表）。
+
+    ## 为什么单独抽出来
+
+    这套处理原先只长在 [concat_audio] 里，而 [concat_audio] 只在
+    **provider 内部**（单次请求 >700 字时自己切段）被调用。
+
+    ⇒ **流水线级的段之间完全没做** —— 而那正是内测听到
+    「一篇音频能明显听出来有三种音色」的地方：
+
+        流水线：稿子 → 按 hook/小节/句子切成 N 段 → 每段**一次独立请求**
+                → step4 用**静音拼接**（mp3 路径是 ffmpeg concat demuxer，硬拼）
+
+    每段是一次独立采样 ⇒ 音域各飘各的（实测 段1 p25=152.1Hz / 段2=169.2Hz /
+    段3=133.2Hz，**差一档**）⇒ 听着就是「换人」。
+    而 crossfade 磨不掉它（crossfade 只磨咔哒声，不磨音域）。
+
+    ⇒ 流水线拼接前也要跑这一遍。**一份实现**（这里），
+    两处调用（provider 内部 + 流水线拼接），不各写一遍。
+
+    ## 失败时的行为
+
+    音高对齐 / 响度归一失败 → **保留原音频**（宁可音色不齐，也不能丢内容）。
+    """
+    if not pieces:
+        return pieces
+
+    # ① 音域对齐（默认开启；OPENAI_TTS_ALIGN_PITCH=0 可关）
+    #
+    # 实测依据（2026-10-22，art_e044b3b1bd6c4fbe90d4c628 的 3 段真实渲染件）：
+    #     段1 p25=152.1Hz  段2 p25=169.2Hz  段3 p25=133.2Hz   ← 音域差一档
+    #     位移后 → 152.1 / 152.7 / 149.5Hz（误差 ≤1.8%）
+    # 这就是用户听到的「换人」：两次独立渲染的**音域**差了一档，
+    # crossfade 磨不掉（它只磨咔哒声）。
+    if os.getenv("OPENAI_TTS_ALIGN_PITCH", "1").strip().lower() not in ("0", "false", "no", "off"):
+        try:
+            from .voice_align import align_pitch
+
+            aligned, details = align_pitch(pieces)
+            if any(d.get("semitones") for d in details):
+                log.info("TTS 音高对齐: %s", details)
+            pieces = aligned
+        except Exception as exc:  # noqa: BLE001 - 对齐失败不能影响主流程
+            log.warning("TTS 音高对齐异常，保留原音频: %s", exc)
+
+    # ② 响度归一（逐段）
+    #
+    # 实测（2026-10-22，同一段文字合成两次）：-26.0 / -22.5 LUFS ——
+    # **同一句话都能差 3.9 LU**。整体归一不会改变段与段的相对差异，必须逐段做。
+    normalized: list[bytes] = []
+    for piece in pieces:
+        norm = normalize_loudness(piece)
+        normalized.append(norm if norm else piece)
+    return normalized
 
 
 def crossfade_concat(
@@ -537,12 +572,27 @@ def normalize_loudness(
     - 每段两次 ffmpeg 调用（一次测量、一次施加），但都很便宜
     - ffmpeg 不可用 / 失败 → 返回 None，调用方退回原音频（宁可不统一，
       也不能丢内容）
+
+    ## ⚠️ **保持输入格式**（2026-10-24 补）
+
+    原来输出**恒为 mp3**。但这套归一现在也被**流水线级拼接**调用
+    （见 `align_and_normalize`），而流水线有两条拼接路径：
+    WAV 路径（IndexTTS，主路径，靠 `b"RIFF"` 判定）与 mp3 路径。
+
+    ⇒ 若把 WAV 段转成 mp3，`all_wav` 判定就假了 ⇒ 掉进 ffmpeg concat 兜底
+    ⇒ 纯 Python WAV 拼接（**刻意不依赖 ffmpeg** 的那条路）被绕开，
+    而且产物格式从 wav 变 m4a。
+
+    ⇒ 现在**按输入格式输出**：WAV 进 → WAV 出（pcm_s16le），
+    其它（mp3）→ mp3 出。格式不变 ⇒ 拼接路径的判定与产物格式都不受影响。
     """
     ffmpeg = ffmpeg_bin or os.getenv("FFMPEG_BIN", "ffmpeg")
+    # 输入是 WAV 就输出 WAV（保持格式，见上面的说明）
+    is_wav = piece[:4] == b"RIFF"
     try:
         with tempfile.TemporaryDirectory(prefix="tts_loud_") as tmp:
-            src = os.path.join(tmp, "in.mp3")
-            out = os.path.join(tmp, "out.mp3")
+            src = os.path.join(tmp, "in.wav" if is_wav else "in.mp3")
+            out = os.path.join(tmp, "out.wav" if is_wav else "out.mp3")
             Path(src).write_bytes(piece)
 
             mean_db = _measure_mean_db(ffmpeg, src, timeout)
@@ -567,10 +617,8 @@ def normalize_loudness(
                     src,
                     "-af",
                     f"volume={gain_db:.2f}dB,alimiter=limit={limit:.4f}:level=disabled",
-                    "-c:a",
-                    "libmp3lame",
-                    "-b:a",
-                    "64k",
+                    # ⚠️ 编码跟着**输入格式**走（见上面的说明）
+                    *(["-c:a", "pcm_s16le"] if is_wav else ["-c:a", "libmp3lame", "-b:a", "64k"]),
                     out,
                 ],
                 capture_output=True,

@@ -722,6 +722,47 @@ async def step4_concat(ctx: DistillContext) -> None:
         )
         return
 
+    # ── 跨段音域对齐 + 响度归一（2026-10-24）─────────────────────────
+    #
+    # 为什么在这里加（这是内测「一篇音频明显听出三种音色」的真正修法）：
+    #
+    # step3 把稿子按 hook / 小节 / 句子切成 N 段，**每段是一次独立请求**
+    # ⇒ 上游每次独立采样 ⇒ 各段音域各飘各的
+    # （实测 段1 p25=152.1Hz / 段2=169.2Hz / 段3=133.2Hz，**差一档**）。
+    #
+    # 而 `app/services/tts/audio_chunks.py::align_and_normalize`
+    # （音高对齐 + 逐段响度归一）原先**只长在 provider 内部的 concat_audio 里**，
+    # 只在「单次请求 >700 字自己切段」时才生效 ——
+    # **流水线级的段之间完全没做**，而那正是听感上「换人」的地方。
+    #
+    # ⚠️ 这里只做「对齐 + 响度」，**不做 crossfade**：
+    # step4 的每段带**各自的停顿**（hook 后 700ms / 节间 500ms / 段内 200ms /
+    # 末段 600ms 收尾）—— 那是听感的呼吸感，crossfade 会把它吃掉。
+    # 而「换人感」的根因是**音域差一档**，对齐正好治它。
+    #
+    # 失败时不阻断：align_and_normalize 内部对每一步都做了兜底
+    # （对齐/归一失败就保留原音频），这里再兜一层。
+    try:
+        # ⚠️ 导入放在函数内 + 用完整包路径：
+        #   · 顶层 import `app.services.tts.xxx` 会连带执行那个包的 __init__
+        #     （里面有 Redis/限流初始化），改变导入副作用顺序
+        #     —— 见 ai-service/agent/tools.py 里同一条说明；
+        #   · 共享包的规范路径是 `stashbox.backend.app.…`（不是 `app.…`）。
+        from stashbox.backend.app.services.tts.audio_chunks import align_and_normalize
+
+        aligned = align_and_normalize(real_bytes)
+        if len(aligned) == len(real_bytes):
+            real_bytes = aligned
+        else:
+            log.warning(
+                "tts_align_normalize_skipped article=%s 段数变了（%d→%d）",
+                ctx.article_id,
+                len(real_bytes),
+                len(aligned),
+            )
+    except Exception as exc:  # noqa: BLE001 - 对齐失败不能影响主流程
+        log.warning("tts_align_normalize_failed article=%s: %s", ctx.article_id, exc)
+
     # -- 路径 1：单段直接落盘 -------------------------------------------
     if len(real_bytes) == 1:
         only = real_bytes[0]

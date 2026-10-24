@@ -365,9 +365,18 @@ def _shift_pitch(piece: bytes, semitones: float, ffmpeg_bin: str | None = None) 
     ffmpeg = ffmpeg_bin or os.getenv("FFMPEG_BIN", "ffmpeg")
     ratio = 2.0 ** (semitones / 12.0)
 
+    # ⚠️ **保持输入格式**（2026-10-24 补）。
+    #
+    # 原来输出**恒为 mp3**。但音高对齐现在也被**流水线级拼接**调用
+    # （`audio_chunks.align_and_normalize`），而流水线的 WAV 路径靠
+    # `b"RIFF"` 判定「所有段都是 WAV」⇒ 若被转成 mp3，判定就假了，
+    # 会掉进 ffmpeg concat 兜底，绕开「刻意不依赖 ffmpeg」的纯 Python WAV 拼接。
+    is_wav = piece[:4] == b"RIFF"
+    codec = ["-c:a", "pcm_s16le"] if is_wav else ["-c:a", "libmp3lame", "-b:a", "64k"]
+
     with tempfile.TemporaryDirectory(prefix="tts_pitch_") as tmp:
-        src = os.path.join(tmp, "in.mp3")
-        out = os.path.join(tmp, "out.mp3")
+        src = os.path.join(tmp, "in.wav" if is_wav else "in.mp3")
+        out = os.path.join(tmp, "out.wav" if is_wav else "out.mp3")
         Path(src).write_bytes(piece)
 
         # ── 方案 1：rubberband ────────────────────────────────────
@@ -387,10 +396,7 @@ def _shift_pitch(piece: bytes, semitones: float, ffmpeg_bin: str | None = None) 
                     src,
                     "-af",
                     f"rubberband=pitch={ratio:.6f}",
-                    "-c:a",
-                    "libmp3lame",
-                    "-b:a",
-                    "64k",
+                    *codec,
                     out,
                 ],
                 capture_output=True,
@@ -424,10 +430,7 @@ def _shift_pitch(piece: bytes, semitones: float, ffmpeg_bin: str | None = None) 
                     src,
                     "-af",
                     f"asetrate={shifted_rate},atempo={tempo:.6f}",
-                    "-c:a",
-                    "libmp3lame",
-                    "-b:a",
-                    "64k",
+                    *codec,
                     out,
                 ],
                 capture_output=True,
