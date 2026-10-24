@@ -304,20 +304,27 @@ async def test_upstream_504_body_is_recognised(openai_mod):
 
 
 def test_truncation_threshold_is_tight_enough(openai_mod):
-    """截断阈值必须 6.5 —— **实测正常上界 5.52，真截断 7.14**。
+    """截断阈值必须 6.8 —— **自然上界 6.45，真截断 7.14**。
 
-    ⚠️ 原值 5.5 是错的：它**比实测正常样本还低**（134 字实测 5.52 字/秒，
-    文档里就标成「正常」）。后果不只是误报 ——
+    ⚠️ 历史包袱：原值 5.5 是错的 —— 它**比实测正常样本还低**
+    （134 字实测 5.52 字/秒，文档里就标成「正常」）。后果不只是误报 ——
       · 短块（≤ min_chunk_chars）→ 异常直接上抛，**admin 的「TTS 测试」
         按钮对 openai provider 永远是红的**；
       · 长块 → 触发重试与二分 = 把这一段**重新采样**，
         分段音色离散度被推高，还平白多出新的接缝。
     「宁可误报」的前提是误报代价低，而这里代价是白烧一次合成。
 
+    ⚠️ 6.5 也不够好（2026-10-24 实测）：它离自然上界只有 0.8%
+    → 正常的 190 字块会被判成截断 → 每次多一次渲染（生产实测 15 分钟内 8 次）。
+    实测自然带（生产真实分块，工具 scripts/calibrate_tts_chunk_rate.py）：
+        40~150 字 → 4.80~6.12    182~199 字 → 5.35~6.45    250 字 → 5.65~6.25
+    真截断样本：7.14 / 7.29 / 7.50 / 8.00 / 8.67
+    ⇒ 6.8 落在自然上界与真截断下界之间，两侧各留约 5%。
+
     阈值太松（比如 8.0）会让真截断漏判，内容缺失照样写进库；
     太紧（比如 5.5）会把正常段误判成截断。
     """
-    assert openai_mod._TRUNCATION_CHARS_PER_SEC == 6.5
+    assert openai_mod._TRUNCATION_CHARS_PER_SEC == 6.8
 
 
 def test_admin_测试句足够长_语速判据才有意义(openai_mod):
@@ -423,11 +430,20 @@ async def test_truncated_chunk_is_detected_and_split(openai_mod):
 
 
 def _fake_mp3_of_seconds(seconds: int) -> bytes:
-    """造一段指定时长的假 mp3（够解析出帧数即可）。"""
+    """造一段指定时长的假 mp3（够解析出帧数即可）。
+
+    ⚠️ **帧头必须与生成逻辑自洽**（2026-10-24 修）：
+    原写法用 `[0xFF, 0xF3, 0x40, 0xC0]` —— 那声明的是 MPEG2/22050Hz/32kbps，
+    而下面按 24000/64kbps 算帧长 → **解析器失步** → 多算 8.8% 的帧 → 时长偏大。
+    整秒时长把它盖住了（26 秒量成 28 秒），精确时长下就露了出来
+    （语速偏低 → 真截断样本不再被报出来）。
+
+    正确写法：byte2 = (bitrate_idx 8 = 64kbps)<<4 | (sr_idx 1 = 24000Hz)<<2 = 0x84。
+    """
     from app.services.tts.audio_duration import _SAMPLE_RATES
 
     # MPEG2 Layer III / 24kHz / 64kbps
-    header = bytes([0xFF, 0xF3, 0x40, 0xC0])
+    header = bytes([0xFF, 0xF3, 0x84, 0xC0])
     frame_len = (72 * 64000) // 24000  # = 192
     rate = _SAMPLE_RATES[2][1]  # 24000
     samples = 576

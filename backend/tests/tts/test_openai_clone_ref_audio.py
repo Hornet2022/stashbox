@@ -471,6 +471,23 @@ def test_短块的明确缺失仍然被抓():
         client._assert_not_truncated("这" * 20, _fake_mp3_of_seconds(1))
 
 
+def test_长块在实测自然上界不误判():
+    """长块的自然上界（6.45 字/秒）**不能**被判成截断（2026-10-24 阈值回归）。
+
+    实测（生产真实分块，scripts/calibrate_tts_chunk_rate.py）：
+        182~199 字 → 天然 cps 5.35 ~ 6.45
+    阈值取 6.8（离上界 5.4%，离真截断 7.14 约 4.8%）。
+    曾经的 6.5 离上界只有 0.8% → 正常的 190 字块每次都被判成截断
+    → 每次多一次自愈重渲（生产实测 15 分钟内 8 次）。
+    """
+    client = _client()
+    # 190 字 / 29 秒 → 6.55 字/秒（自然带内）
+    client._assert_not_truncated("这" * 190, _fake_mp3_of_seconds(29))
+    # 190 字 / 26 秒 → 7.31 字/秒（超出真截断带）→ 必须报出来
+    with pytest.raises(openai_module._TruncatedOutput):
+        client._assert_not_truncated("这" * 190, _fake_mp3_of_seconds(26))
+
+
 @pytest.mark.asyncio
 async def test_自愈切不动时就停():
     """自愈的地板是「切不动了」，不是 min_chunk_chars。
@@ -502,10 +519,22 @@ async def test_自愈切不动时就停():
 
 
 def _fake_mp3_of_seconds(seconds: int) -> bytes:
-    """造一段指定时长的假 mp3（够解析出帧数即可）。"""
+    """造一段指定时长的假 mp3（够解析出帧数即可）。
+
+    ⚠️ **帧头必须与生成逻辑自洽**（2026-10-24 修）：
+    原写法用 `[0xFF, 0xF3, 0x40, 0xC0]` —— 那声明的是 MPEG2/22050Hz/32kbps，
+    而下面按 24000/64kbps 算帧长 → **解析器失步**（它按 104 字节跳，
+    实际帧是 192 字节）→ 多算 8.8% 的帧 → 时长偏大。
+
+    整秒时长把这个偏差盖住了（26 秒的假音频量成 28 秒，2 秒误差没人发现）；
+    换成精确时长后暴露出来：语速算出来偏低 → **真截断样本不再被报出来**
+    （三条判据用例同时挂掉）。
+
+    正确写法：byte2 = (bitrate_idx 8 = 64kbps)<<4 | (sr_idx 1 = 24000Hz)<<2 = 0x84。
+    """
     from app.services.tts.audio_duration import _SAMPLE_RATES
 
-    header = bytes([0xFF, 0xF3, 0x40, 0xC0])
+    header = bytes([0xFF, 0xF3, 0x84, 0xC0])
     frame_len = (72 * 64000) // 24000  # = 192
     rate = _SAMPLE_RATES[2][1]  # 24000
     samples = 576
