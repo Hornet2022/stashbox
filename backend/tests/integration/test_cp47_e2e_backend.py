@@ -99,8 +99,14 @@ async def test_wechat_url_full_distill_pipeline():
     auth = {"Authorization": f"Bearer {token}"}
 
     async with httpx.AsyncClient(base_url=GATEWAY_URL, timeout=60.0) as client:
-        # Step 1: 创建文章（用真实可达的 example.com）
-        url = "https://example.com/article-1"
+        # Step 1: 创建文章
+        #
+        # ⚠️ 夹具 URL 必须是 **example.org 的根路径**，不能是 example.com 的子路径：
+        # `https://example.com/article-1` 返回**硬 404**（example.com 只服务 `/`），
+        # 而抓取失败在 2026-10-03 之后是**当场报错**（2002，不建库不计费）⇒
+        # 用例在建文章那一步就断了，断言「文章创建成功」永远到不了。
+        # example.org 的根页面是 IANA 保留的文档用域名，正文长度过下限，能剪藏成功。
+        url = "https://example.org/"
         create_resp = await client.post(
             "/api/v1/articles",
             json={"url": url, "source": "web"},
@@ -227,7 +233,7 @@ async def test_distill_failure_refund_quota():
         # 创建一篇文章（content-service，消耗配额）
         create_resp = await client.post(
             "/api/v1/articles",
-            json={"url": "https://example.com/fail-test", "source": "web"},
+            json={"url": "https://example.org/", "source": "web"},
             headers=auth,
         )
         assert create_resp.status_code in (200, 201), create_resp.text
@@ -265,33 +271,42 @@ async def test_distill_failure_refund_quota():
 
 @pytest.mark.asyncio
 @skip_in_ci
-async def test_unsupported_url_creates_pending_article():
+async def test_unsupported_url_returns_envelope_without_creating_article():
     """
-    不支持的 URL 格式 → 文章创建成功（pending），后续 distill 时处理。
+    抓不到正文 → **当场报错，不建文章也不扣配额**（2026-10-03 起的契约）。
 
-    content-service 对 URL 格式不设限，fetch 失败会留下 pending 状态。
-    这是已知的当前行为（CP2.7 结论：lobste.rs 类首页抓不到正文是已知现象）。
+    ⚠️ 这条断言**被推翻过**：原用例断言「URL 不支持 → 200 + 文章入库(pending)」
+    （CP2.7 的结论）。2026-10-03 改成「先抓后扣」：抓取失败当场返回 2001/2002，
+    既不建库也不计费 —— 因为建一条无正文的文章会派一个**注定失败**的蒸馏任务
+    （白烧 LLM token），而用户要等 12 分钟后才看到失败。
+
+    所以这里断言的是**业务信封**（安卓的 `isCaptureFetchFailed(2001|2002)`
+    靠它区分「抓不到」与「服务坏了」），而不是「返回 200 就行」。
+
+    实测（2026-10-25，隔离栈 18100）：
+      https://lobste.rs/        → 502 {"code":2002,"message":"没能提取出文章正文…"}
+      https://example.com/article-1 → 502 {"code":2002,"message":"这篇文章已被删除或链接已失效"}
+      （example.com 的**子路径**是硬 404；只有 example.org 的根路径能剪藏成功）
     """
     token, _ = await _login_via_wechat(f"cp47_unsupported_{uuid.uuid4().hex[:8]}")
     auth = {"Authorization": f"Bearer {token}"}
 
     async with httpx.AsyncClient(base_url=GATEWAY_URL, timeout=30.0) as client:
-        # 用一个已知的"不支持"URL：lobste.rs 首页
+        # 用一个已知的"抓不到正文"URL：lobste.rs 首页（正文长度不达下限）
         url = "https://lobste.rs/"
         create_resp = await client.post(
             "/api/v1/articles",
             json={"url": url, "source": "web"},
             headers=auth,
         )
-        # URL 不被 fetcher 支持 → 返回 200（文章入库，pending）
-        # 实际行为以 content-service 返回为准
-        assert create_resp.status_code in (
-            200,
-            201,
-            400,
-            422,
-        ), f"unexpected status: {create_resp.status_code} {create_resp.text}"
-        print(f"[CP4.7] unsupported URL 处理: status={create_resp.status_code}")
+
+        # 抓不到正文 → 当场报错（不是 200，也不是裸 500）
+        assert create_resp.status_code == 502, create_resp.text
+        body = create_resp.json()
+        # 业务信封：安卓靠 bizCode 走「链接失效」分支；裸 500 会让它误报「服务暂不可用」
+        assert body.get("code") in (2001, 2002), create_resp.text
+        assert body.get("message"), create_resp.text
+        print(f"[CP4.7] 抓不到正文 → 业务信封: code={body.get('code')}")
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +329,7 @@ async def test_get_audio_before_distill_returns_404():
         # 创建文章（不蒸馏）
         create_resp = await client.post(
             "/api/v1/articles",
-            json={"url": "https://example.com/not-distilled", "source": "web"},
+            json={"url": "https://example.org/", "source": "web"},
             headers=auth,
         )
         assert create_resp.status_code in (200, 201), create_resp.text
