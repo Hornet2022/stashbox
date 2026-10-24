@@ -3656,7 +3656,7 @@
       },
       "post": {
         "summary": "Submit Article",
-        "description": "提交链接（v1 §3.1）：扣 1 次配额 → 建文章 → 自动派蒸馏 → 配额/待听缓存失效。\n\n扣减走 quota_service 乐观锁（含 Redis Lua 原子失效），配额用尽抛 3001。\n\nCP9.x fix：B1 修复 —— submit_article 必须自动调 trigger_distill，否则安卓/管理后台\n剪藏后文章永远 pending，arq 队列空跑。原 `add_article`（deprecated）调了 trigger_distill，\n新端点漏调，现补上。",
+        "description": "提交链接（v1 §3.1）：扣 1 次配额 → 建文章 → 自动派蒸馏 → 配额/待听缓存失效。\n\n扣减走 quota_service 乐观锁（含 Redis Lua 原子失效），配额用尽抛 3001。\n\nCP9.x fix：B1 修复 —— submit_article 必须自动调 trigger_distill，否则安卓/管理后台\n剪藏后文章永远 pending，arq 队列空跑。原 `add_article`（deprecated）调了 trigger_distill，\n新端点漏调，现补上。\n\n2026-10-25：链接剪藏的**完整流程**（早查重 → 先抓后扣 → 公共后半程）抽到 `_clip_link`，\n与旧版 `POST /api/v1/articles/add` 共用同一份实现 —— 旧版那个端点曾经**整段绕过后半程**，\n成了不扣配额的免费剪藏口子（见 add_article 的说明）。\n\n响应体是**提交回执**（`article_id` / `quota_used` / `reused` …），不是文章本体；\n重复剪藏走的也是同一个形状（2026-10-25 之前重复时返回文章本体、新建时返回回执，\n同一个端点两种形状，客户端得靠\"读哪个字段\"来区分）。",
         "operationId": "submit_article_api_v1_articles_post",
         "parameters": [
           {
@@ -3715,7 +3715,7 @@
     "/api/v1/articles/add": {
       "post": {
         "summary": "Add Article",
-        "description": "⚠️ Deprecated（CP11.x 走查 P2-2 标记）。\n\n与 POST /api/v1/articles 行为不一致：\n  - 本端点：不扣配额，CP1.4 风格历史行为\n  - 新端点：扣配额、cache_service 标记、ARTICLE_SUBMIT 埋点\n\n为兼容老版本 iOS/Android 客户端暂时保留入口，响应头加 Deprecation 提示客户端迁移。\n下个主版本（CP12+）移除，并同步下掉 api-gateway/config.py:57 路由。",
+        "description": "⚠️ Deprecated（CP11.x 走查 P2-2 标记）。\n\n为兼容老版本 iOS/Android 客户端暂时保留入口，响应头加 Deprecation 提示客户端迁移。\n下个主版本（CP12+）移除，并同步下掉 api-gateway/config.py 对应路由。\n\n## 配额口径（2026-10-25 修）\n\n原来这个端点**整段绕过了剪藏公共后半程**（自己调 `_create_article`），\n于是**不扣配额、不打 ARTICLE_SUBMIT 埋点、不做 `mark_article_quota` 标记**。\n\n后果不是\"老接口宽松一点\"：\n\n  - 每次调用都会派一次**真实**蒸馏（LLM + IndexTTS，项目自测单篇约 23 分钟 GPU），\n    而配额一次都不扣 ⇒ 任何持 token 的用户可以无限免费剪藏不同 URL；\n  - 剪藏路径**没有任何速率限制**（网关 `_CAPTURE_PATHS` 只影响超时文案，不是限流）；\n  - 配额是运营侧唯一的用量口径 ⇒ 这条链上的消耗在账上看不见。\n\n现在它与 `POST /api/v1/articles` 走**同一份**实现（`_clip_link` → `_clip_after_fetch`），\n配额口径完全一致：**先抓后扣**（抓不到正文 → 不建库不计费）、\n重复剪藏同一 URL 复用旧文章且**不重复扣费**。\n\n⚠️ 行为变化：老客户端从这里剪藏**从现在起会消耗配额**。\n这是有意为之 —— 不扣配额的那条路本身就是漏洞。弃用提示照发，客户端应尽快迁到\n`POST /api/v1/articles`。",
         "operationId": "add_article_api_v1_articles_add_post",
         "parameters": [
           {
