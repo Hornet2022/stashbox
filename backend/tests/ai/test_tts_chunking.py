@@ -66,7 +66,7 @@ def _make_recorder(openai_mod, **kwargs):
             super().__init__(api_key="k", base_url="http://x", model="m", **kwargs)
             self.calls: list[str] = []
 
-        async def _synthesize_once(self, text, voice=None, output_format="mp3"):
+        async def _synthesize_once(self, text, voice=None, output_format="mp3", *, clone=None):
             self.calls.append(text)
             # 每段给一个可区分的头，方便断言拼接顺序
             return b"SEG" + str(len(self.calls)).encode() + b"\x00" * byte_size
@@ -252,7 +252,7 @@ async def test_upstream_504_triggers_bisect(openai_mod):
     )
     calls: list[str] = []
 
-    async def _wall_clock(text, voice=None, output_format="mp3"):
+    async def _wall_clock(text, voice=None, output_format="mp3", *, clone=None):
         calls.append(text)
         if len(calls) == 1:
             raise openai_mod._UpstreamTimeout("上游语音合成超时 (60s)")
@@ -376,7 +376,7 @@ async def test_truncated_chunk_is_detected_and_split(openai_mod):
     )
     calls: list[str] = []
 
-    async def _truncating(text, voice=None, output_format="mp3"):
+    async def _truncating(text, voice=None, output_format="mp3", *, clone=None):
         calls.append(text)
         # 造一段「时长固定 1 秒」的假音频 → 文本越长语速越高
         return _fake_mp3_of_seconds(1)
@@ -426,7 +426,7 @@ async def test_flaky_chunk_is_retried_without_redoing_other_chunks(openai_mod):
     state = {"calls": 0}
     seen: list[str] = []
 
-    async def _flaky(text, voice=None, output_format="mp3"):
+    async def _flaky(text, voice=None, output_format="mp3", *, clone=None):
         state["calls"] += 1
         seen.append(text)
         if state["calls"] == 1:
@@ -456,7 +456,7 @@ async def test_chunk_retry_exhausted_raises(openai_mod):
     """重试用尽 → 照常抛错（不能静默吞掉，任务必须判失败）。"""
     recorder = _make_recorder(openai_mod, chunk_chars=50, chunk_concurrency=1)
 
-    async def _always_fail(text, voice=None, output_format="mp3"):
+    async def _always_fail(text, voice=None, output_format="mp3", *, clone=None):
         raise RuntimeError("一直失败")
 
     recorder._synthesize_once = _always_fail  # type: ignore[assignment]
