@@ -249,6 +249,35 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
             len(parts.outro),
             parts.degraded,
         )
+
+        # ── 条目里的数字必须能在**原文**里找到（2026-10-24）────────────
+        #
+        # 三类再创作内容允许写「原文之外」的判断（这正是产品要的），
+        # 代价是模型有机会顺手编一个**具体数字**。
+        # 实测：GitHub README 的延伸判断里写了「命令数量超过 **20 个**后收益才明显」，
+        # 而 README 里根本没有 20（只有 "lazy"）⇒ 听众会以为那是原文里的事实。
+        #
+        # 这类编造**最伤信任**：稿子其他部分都可以是「我们的看法」，
+        # 但一个看起来像原文事实的数字是**事实层面的造假**。
+        #
+        # ⚠️ **只记不丢**（与既有的质量画像口径一致）：告警 + 抽查，
+        # 不自动删内容 —— 原文被截断时会有误判（见 unsourced_numbers 的说明）。
+        if not parts.degraded:
+            for _name, _items in (
+                ("insights", parts.insights),
+                ("related", parts.related),
+                ("follow_ups", parts.follow_ups),
+            ):
+                for _item in _items:
+                    _bad = recreation_quality.unsourced_numbers(_item, fetched_content)
+                    if _bad:
+                        log.warning(
+                            "agent_rewrite_unsourced_number group=%s numbers=%s item=%r",
+                            _name,
+                            ",".join(_bad),
+                            _item[:200],
+                        )
+
         if not parts.script.strip():
             return _error_update(
                 state,

@@ -135,3 +135,37 @@ def test_缺段会打warning而不是静默():
     assert "recreation_quality.missing_parts(" in src, "runner 必须调用共享的缺段判据"
     # 判据**只有一份**：runner 里不许自己再实现一遍「哪些段是必段」
     assert src.count("REQUIRED_PARTS") == 0, "必段清单只在 recreation_quality 里定义一份"
+
+
+# ---------------------------------------------------------------------------
+# 3. 延伸判断里的数字必须有出处
+# ---------------------------------------------------------------------------
+def test_编造的数字能被查出来():
+    """实测过的形状：README 里没有「20」，延伸判断里写了「20 个」。"""
+    src = "Click is a Python package for creating beautiful command line interfaces. lazy loading"
+    item = "运行时懒加载子命令这个设计，在命令数量超过 20 个后收益才明显"
+    bad = recreation_quality.unsourced_numbers(item, src)
+    assert "20" in bad, f"应查出编造的数字，实际 {bad}"
+
+
+def test_原文里有的数字不算编造():
+    src = "文档剪藏的正文长度低于 200 字会被判为没解析出正文"
+    item = "两百字符这个阈值卡在解析层，意味着格式再花哨也会被判无效"
+    assert recreation_quality.unsourced_numbers(item, src) == []
+
+
+def test_数值相等就算有出处():
+    """原文写 3.5，条目写 3.50% —— 按数值相等判，不按字面。"""
+    src = "速度提升 3.5 倍"
+    assert recreation_quality.unsourced_numbers("大约快了 3.50%", src) == []
+
+
+def test_没有原文时不下结论():
+    """原文被截断/为空时不能判「编造」—— 否则全是误报。"""
+    assert recreation_quality.unsourced_numbers("20 个命令", "") == []
+
+
+def test_runner接上了出处检查():
+    src = (AI_SERVICE_DIR / "agent" / "runner.py").read_text(encoding="utf-8")
+    assert "agent_rewrite_unsourced_number" in src, "编造的数字必须有一条可检索的告警"
+    assert "unsourced_numbers(" in src

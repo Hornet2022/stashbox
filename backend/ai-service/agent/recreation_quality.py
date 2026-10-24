@@ -245,3 +245,53 @@ def missing_parts(parts: dict[str, list[str]]) -> list[str]:
     ⇒ 缺段必须**出声**：这是可检测的缺陷，不是「内容质量」问题。
     """
     return [name for name in REQUIRED_PARTS if not (parts.get(name) or [])]
+
+
+#: 条目里的数字（整数 / 小数 / 百分数）。
+_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?%?")
+
+
+def unsourced_numbers(item: str, source_text: str) -> list[str]:
+    """条目里出现、但**原文里找不到**的数字。
+
+    ## 为什么需要它
+
+    关联思考 / 延伸判断 / 拓展方向允许写「**原文之外**」的判断 ——
+    这正是产品要的东西。但代价是：模型有机会顺手编一个**具体数字**。
+
+    实测（2026-10-24，GitHub README 的稿子）：延伸判断里写了
+    「命令数量超过 **20 个**后收益才明显」，而 README 里**根本没有 20**
+    （只有 "lazy"）。⇒ 听众会以为那是原文里的事实。
+
+    这类编造**最伤信任**：稿子的其他部分都可以是「我们的看法」，
+    但一个看起来像原文事实的数字，是**事实层面的造假**。
+
+    ## 判据（机械、可复现）
+
+    数字在原文里出现过就算有出处。匹配宽松：原文写「3.5」，
+    条目写「3.50%」也算对上（只比数字部分，不比百分号，且按数值相等判）。
+
+    ⚠️ 已知误差：**原文被截断**时（抓取侧有长度上限），落在截断处的数字
+    会被误判为「没有出处」。所以它只是**信号**，用来告警与抽查，
+    不能当判决 —— 定位具体哪一条有问题，仍然要人读一眼。
+    """
+    if not source_text:
+        return []
+    # ⚠️ 原文里**一个数字都没有**时，条目里的任何数字都是没出处的
+    # （早先这里写成了 `if not src_raw: return []`，等于「原文没数字就放过」——
+    #  而那正是最容易编造的具体数字场景：README 里根本没有「20」）。
+    src_nums = {_to_num(n) for n in _NUMBER_RE.findall(source_text)}
+    out: list[str] = []
+    for num in _NUMBER_RE.findall(item or ""):
+        if _to_num(num) in src_nums:
+            continue
+        out.append(num)
+    return out
+
+
+def _to_num(text: str) -> float | None:
+    """「3.50%」→ 3.5；解析不了就返回 None（None 永不等于任何数字）。"""
+    try:
+        return float(text.rstrip("%"))
+    except ValueError:
+        return None
