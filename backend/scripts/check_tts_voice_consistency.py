@@ -16,19 +16,27 @@
 
 ## 判据
 
-    各块基频中位数，相对全篇中位数的最大偏差 < 5%
+    参与比较的块之间，基频中位数的最大相对偏差 < 5%
 
-⚠️ **这个 5% 是校准过的，不是拍脑袋**（实测 2026-10-24）：
+⚠️ **这个 5% 是标定过的，不是拍脑袋**（实测 2026-10-24，两类已知真值）：
 
-    同文连发 3 次的噪声底（同一段文本、同一份参考音）：
-        7s 短文本  → 散布 7.8%   ← 太短，是**度量噪声**不是音色漂移
-        65s 块长   → 散布 1.6%   ← 生产块长（700 字 ≈ 65s 音频）
+    同一人（同一份参考音的克隆渲染）：
+        7s 片段  → 基频中位数散布 7.5%   ← 片段太短，噪声大
+        44s 片段 → 散布 2.2%             ← 生产块长（250 字 ≈ 40s）
+    换了人（没带克隆的两次渲染 / 真实旧音频的 3 个块）：
+        散布 33.7%
 
-    修好之前（随机音色）块间差异是 **30~50%**；修好之后是 **1~3%**。
-    5% ≈ 3 倍噪声底，既有区分度，又不会被上游的正常抖动误伤。
+    ⇒ 5% 门禁成立的前提是**参与比较的片段足够长**：
+      帧数 ≥ 100（20s @ 0.2s/帧）且时长 ≥ 15s
+      （见 `voice_align.MIN_FRAMES_FOR_COMPARISON`）
 
-    ⚠️ 度量用的是 `app/services/tts/voice_align.py:median_f0`（YIN 估计，纯 Python）：
-       自相关法会犯**八度错误**（真实 170Hz 报成 85Hz），用它当判据等于没有判据。
+    ⚠️ **不够长的块不参与门禁，但要在报告里列出来** ——
+      「不可判」不等于「一致」。硬判就是拿噪声当结论：
+      实测那次 4 块的稿子里，第 4 块只有 13s → 基频中位数跳到 224.9Hz
+      （其余三块 207.5/207.3/204.7，差 0.7%）→ 判成「不一致」是**误报**。
+
+    ⚠️ 度量用 `voice_align:f0_profile`（YIN 估计，纯 Python）：
+      自相关法会犯**八度错误**（真实 170Hz 报成 85Hz），用它当判据等于没有判据。
 
 ## 用法
 
@@ -98,11 +106,11 @@ def _fmt_hz(v: float | None) -> str:
     return "—" if v is None else f"{v:.1f}Hz"
 
 
-def measure(pieces: list[bytes]) -> list[float | None]:
-    """逐块测基频中位数。"""
-    from stashbox.backend.app.services.tts.voice_align import median_f0
+def measure(pieces: list[bytes]) -> list:
+    """逐块测基频画像（中位数 + 帧数 + 时长）。"""
+    from stashbox.backend.app.services.tts.voice_align import f0_profile
 
-    return [median_f0(p) for p in pieces]
+    return [f0_profile(p) for p in pieces]
 
 
 def spread(values: list[float]) -> tuple[float, float]:
@@ -188,39 +196,65 @@ async def _run(args) -> int:
     )
 
     # ── 噪声底：同一段文本连发 3 次 ────────────────────────────────
+    #
+    # ⚠️ 必须用**克隆路径的块长**（不是普通块长）：噪声底要在
+    #    「和实际块一样的长度」上测，否则不可比。
     if args.baseline_only or not args.skip_baseline:
-        probe_text = text[: getattr(client, "chunk_chars", 700)]
-        same: list[float | None] = []
-        for i in range(3):
+        probe_len = (
+            getattr(client, "clone_chunk_chars", 250)
+            if ref_audio
+            else getattr(client, "chunk_chars", 700)
+        )
+        probe_text = text[:probe_len]
+        same = []
+        for _ in range(3):
             _, pieces = await _capture_chunks(client, probe_text, ref_audio, ref_text)
             same.append(measure(pieces)[0])
-        vals = [v for v in same if v]
+        vals = [v.median for v in same if v and v.median]
         if len(vals) >= 2:
             dev, rng = spread(vals)
             print(
-                f"[噪声底] 同一段文本连发 3 次："
-                f"{' / '.join(_fmt_hz(v) for v in same)}"
+                f"[噪声底] 同一段文本（{len(probe_text)} 字）连发 3 次："
+                f"{' / '.join(_fmt_hz(v.median) for v in same)}"
                 f" → 最大偏差 {dev * 100:.1f}%（极差 {rng * 100:.1f}%）"
+                f"  ← 5% 门禁要比这个噪声底高，才算有区分度"
             )
         else:
             print("[噪声底] 测不出基频（音频太短或 ffmpeg 不可用）")
 
     # ── 主体：整篇分块合成，看块间一致性 ───────────────────────────
     audio, pieces = await _capture_chunks(client, text, ref_audio, ref_text)
-    f0s = measure(pieces)
+    profiles = measure(pieces)
     print(f"\n[整篇] {len(text)} 字 → {len(pieces)} 块，合计 {len(audio)} 字节")
-    for i, (p, f0) in enumerate(zip(pieces, f0s), 1):
-        print(f"  块{i}: {len(p):>8d}B  基频中位数 {_fmt_hz(f0)}")
 
-    vals = [v for v in f0s if v]
-    if len(vals) < 2:
-        print("\n❌ 测不出足够的基频样本，无法判定")
+    comparable: list[float] = []
+    skipped: list[str] = []
+    for i, (p, prof) in enumerate(zip(pieces, profiles), 1):
+        mark = ""
+        if prof.comparable:
+            comparable.append(prof.median)
+            mark = "（参与判定）"
+        else:
+            skipped.append(
+                f"块{i}（{prof.duration_sec:.0f}s / {prof.frame_count} 帧 —— 片段太短，"
+                f"基频中位数的噪声大于判据本身，不参与判定）"
+            )
+        print(
+            f"  块{i}: {len(p):>8d}B  {prof.duration_sec:5.1f}s  帧数 {prof.frame_count:4d}  "
+            f"基频中位数 {_fmt_hz(prof.median)} {mark}"
+        )
+    for line in skipped:
+        print(f"  ⚠️  {line}")
+
+    if len(comparable) < 2:
+        print("\n❌ 可比较的块不足 2 个，无法判定")
         return 2
 
-    dev, rng = spread(vals)
-    print(f"\n全篇基频中位数 = {_fmt_hz(statistics.median(vals))}")
+    dev, rng = spread(comparable)
+    print(f"\n全篇基频中位数 = {_fmt_hz(statistics.median(comparable))}")
     print(
-        f"块间最大偏差 = {dev * 100:.1f}%（极差 {rng * 100:.1f}%）  判据 < {MAX_SPREAD * 100:.0f}%"
+        f"块间最大偏差 = {dev * 100:.1f}%（极差 {rng * 100:.1f}%，{len(comparable)} 块参与判定）"
+        f"  判据 < {MAX_SPREAD * 100:.0f}%"
     )
 
     if dev < MAX_SPREAD:

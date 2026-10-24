@@ -48,6 +48,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -228,12 +229,68 @@ def _frame_f0(frame: list[float]) -> float | None:
 
 def median_f0(audio: bytes, ffmpeg_bin: str | None = None) -> float | None:
     """一段音频的中位基频（Hz）。测不出返回 None。"""
+    profile = f0_profile(audio, ffmpeg_bin)
+    return profile.median
+
+
+@dataclass(frozen=True)
+class F0Profile:
+    """一段音频的基频画像。
+
+    ⚠️ **带 frame_count 是为了「能不能拿来判」**：
+    基频中位数的噪声**随片段长度变化**（实测 2026-10-24）：
+
+        7s 片段  → 同一人连发 3 次，散布 7.5%
+        44s 片段 → 同一人连发 3 次，散布 2.2%
+
+    片段太短时，中位数被尾部的上拉/下拉带跑 —— 拿它当判据，
+    测的是「度量噪声」不是「音色差异」。
+    所以要判「这块是不是同一个人」时，先看 `frame_count` 够不够
+    （见 `MIN_FRAMES_FOR_COMPARISON`）。
+    """
+
+    median: float | None
+    frame_count: int
+    duration_sec: float
+    p25: float | None = None
+
+    @property
+    def comparable(self) -> bool:
+        """这个片段的基频中位数够不够可信到能参与「是不是同一个人」的判断。"""
+        return (
+            self.median is not None
+            and self.frame_count >= MIN_FRAMES_FOR_COMPARISON
+            and self.duration_sec >= MIN_SECONDS_FOR_COMPARISON
+        )
+
+
+# 参与「块间音色一致性」判断所需的最小帧数 / 时长。
+#
+# 标定（2026-10-24，实测两类已知真值）：
+#     同一人（克隆，同一份参考音）：
+#         7s 片段  → 基频中位数散布 7.5%
+#         44s 片段 → 散布 2.2%
+#     换了人（无克隆的不同渲染）：
+#         散布 33.7%
+#
+# ⇒ 5% 的门禁要成立，参与比较的片段必须长到让噪声落到 2~3%：
+#     帧数 ≥ 100（= 20s @ 0.2s/帧）且 时长 ≥ 15s
+#
+# ⚠️ 低于这个长度的片段**不参与门禁**（但要在报告里标出来）：
+#     「不可判」不等于「一致」—— 硬判就是在拿噪声当结论。
+MIN_FRAMES_FOR_COMPARISON = 100
+MIN_SECONDS_FOR_COMPARISON = 15.0
+
+
+def f0_profile(audio: bytes, ffmpeg_bin: str | None = None) -> F0Profile:
+    """一段音频的基频画像（中位数 / 帧数 / 时长 / p25）。"""
     samples = _decode_pcm(audio, ffmpeg_bin)
     if not samples:
-        return None
+        return F0Profile(median=None, frame_count=0, duration_sec=0.0)
     frame_len = int(_ANALYSIS_RATE * _FRAME_SEC)
+    duration = len(samples) / _ANALYSIS_RATE
     if len(samples) < frame_len:
-        return None
+        return F0Profile(median=None, frame_count=0, duration_sec=duration)
 
     values: list[float] = []
     for start in range(0, len(samples) - frame_len + 1, frame_len):
@@ -241,12 +298,18 @@ def median_f0(audio: bytes, ffmpeg_bin: str | None = None) -> float | None:
         if f0:
             values.append(f0)
     if len(values) < 3:
-        return None
+        return F0Profile(median=None, frame_count=len(values), duration_sec=duration)
+
     values.sort()
     mid = len(values) // 2
-    if len(values) % 2:
-        return values[mid]
-    return (values[mid - 1] + values[mid]) / 2
+    median = values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+    p25 = values[max(0, int(len(values) * 0.25) - 1)]
+    return F0Profile(
+        median=median,
+        frame_count=len(values),
+        duration_sec=duration,
+        p25=p25,
+    )
 
 
 def _probe_rate(path: str, ffmpeg_bin: str | None = None) -> int:
