@@ -86,9 +86,21 @@ MAX_CONTENT_CHARS = 200_000
 
 #: 正文字数下限（低于此判为「没解析出正文」）。
 #:
-#: 与网页的 `MIN_ARTICLE_CHARS=200` 同量级：一个空文件 / 一个只有图片的
-#: docx 都不该被当成「有内容」建库。
-MIN_CONTENT_CHARS = 200
+#: ⚠️ **2026-10-24：从 200 放宽到 80**（原来与网页的 `MIN_ARTICLE_CHARS=200` 同值）。
+#:
+#: 为什么改：那个 200 是给**网页文章**定的（网页太短多半是导航页/付费墙残页）。
+#: 但文档是用户**特意**提交的，天然就比文章短 —— 而且**扫描件**更短：
+#: 一页扫描件 OCR 出来实测 161 字（内容完全正确、连标点都对），
+#: 按 200 判就被拒了，用户看到的是「没能从这个文档里读出文字」——
+#: **明明读出来了却说没读出来**。
+#:
+#: 80 字是「至少是一段完整的话」的下限：空白页 / 纯图页 OCR 出来是页眉页脚
+#: 或乱码，通常远低于 80；而一句备忘录、一张便签是 100~200 字。
+#:
+#: ⚠️ 配套：文档的**篇幅**本来就由内容决定（见改写 prompt 的文档段：
+#: 「篇幅由文档实际结构决定，但不要为了凑字数注水」），
+#: 所以短文档不会被硬撑成一篇长稿。
+MIN_CONTENT_CHARS = 80
 
 #: 支持的扩展名 → 解析器。
 _EXT_PDF = {".pdf"}
@@ -223,12 +235,15 @@ def parse_document(
     content_type: str = "",
     url: str = "",
     pdf_text: str | None = None,
+    pdf_meta: dict | None = None,
 ) -> FetchResult:
     """上传的文档字节 → [FetchResult]（与抓取同形）。
 
     Args:
         pdf_text: **扫描件 PDF 的 OCR 文本**（由 `parse_document_async` 先识图拿到）。
             为 None 时按普通 PDF 处理（只有文本层）。
+        pdf_meta: OCR 的可观测信息（模型名/识了几张图/错误）⇒ 落进
+            `raw_metadata`。**没有它就查不到「为什么这篇没正文」**。
 
     Raises:
         FetcherError: 解析不出来（格式不支持 / 扫描件 / 加密 / 正文过短）。
@@ -270,6 +285,9 @@ def parse_document(
             raw_metadata["parser"] = "pdf"
         raw_metadata["page_count"] = len(page_texts)
         raw_metadata["pdf_metadata"] = pdf_metadata
+        if pdf_meta:
+            # OCR 的可观测信息（模型/图数/错误）—— 缺了它就查不到原因
+            raw_metadata.update(pdf_meta)
 
     elif ext in _EXT_DOCX or content_type in (
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -369,6 +387,7 @@ async def parse_document_async(
     from .ocr import OCRUnavailableError, ocr_pdf
 
     pdf_text: str | None = None
+    pdf_meta: dict | None = None
     if _is_pdf(filename=filename, content_type=content_type):
         try:
             page_texts, _meta = _pdf_mod.extract_pdf_text(data)
@@ -379,8 +398,13 @@ async def parse_document_async(
         if not has_text_layer:
             # 扫描件 → 识图
             try:
-                pdf_text, _ocr_meta = await ocr_pdf(data)
-                log.info("document_ocr_done chars=%d", len(pdf_text or ""))
+                pdf_text, pdf_meta = await ocr_pdf(data)
+                log.info(
+                    "document_ocr_done chars=%d model=%s images=%s",
+                    len(pdf_text or ""),
+                    (pdf_meta or {}).get("ocr_model"),
+                    (pdf_meta or {}).get("ocr_ok_images"),
+                )
             except OCRUnavailableError as exc:
                 log.warning("document_ocr_unavailable: %s", exc)
             except Exception as exc:
@@ -392,6 +416,7 @@ async def parse_document_async(
         content_type=content_type,
         url=url,
         pdf_text=pdf_text,
+        pdf_meta=pdf_meta,
     )
 
 
