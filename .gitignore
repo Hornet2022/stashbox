@@ -119,3 +119,8 @@ backend/data/audio/
 # 每次换备案号都会变。它是构建输出，不进版本库
 # （进了就等于把「某一时刻的备案号」固化进历史）。
 infra/web/dist/
+
+# graphify(engram) 知识图谱产物 —— 由 tree-sitter AST 从源码生成的可重建派生物，
+# 单仓就有 1.5–9.4MB 文本，进版本库只会让 diff 失焦；
+# 重建脚本见同级目录 stashbox-graph/build.sh
+.engram/
