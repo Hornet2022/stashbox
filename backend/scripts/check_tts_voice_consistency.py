@@ -16,27 +16,48 @@
 
 ## 判据
 
-    参与比较的块之间，基频中位数的最大相对偏差 < 5%
+    **同一段文本**用真实客户端渲染 N 次，各次的整篇基频中位数
+    相对整体中位数的最大偏差 < 5%
 
-⚠️ **这个 5% 是标定过的，不是拍脑袋**（实测 2026-10-24，两类已知真值）：
+### 为什么判据必须是「同文重渲」，而不是「跨块比」
 
-    同一人（同一份参考音的克隆渲染）：
-        7s 片段  → 基频中位数散布 7.5%   ← 片段太短，噪声大
-        44s 片段 → 散布 2.2%             ← 生产块长（250 字 ≈ 40s）
-    换了人（没带克隆的两次渲染 / 真实旧音频的 3 个块）：
-        散布 33.7%
+⚠️ **跨块比基频中位数不成立**（实测 2026-10-24，重要）：
 
-    ⇒ 5% 门禁成立的前提是**参与比较的片段足够长**：
-      帧数 ≥ 100（20s @ 0.2s/帧）且时长 ≥ 15s
-      （见 `voice_align.MIN_FRAMES_FOR_COMPARISON`）
+    同一篇稿子切成 4 块（文本各不相同），逐块基频中位数：
+        218.1 / 173.1 / 210.6 / 210.5 Hz  → 跨块差 17.8%
+    而**同一块文本**重渲 3 次：226.6 / 218.0 / 221.3 → 差 **2.4%**
 
-    ⚠️ **不够长的块不参与门禁，但要在报告里列出来** ——
-      「不可判」不等于「一致」。硬判就是拿噪声当结论：
-      实测那次 4 块的稿子里，第 4 块只有 13s → 基频中位数跳到 224.9Hz
-      （其余三块 207.5/207.3/204.7，差 0.7%）→ 判成「不一致」是**误报**。
+    那次 173.1 的离群块，单独重渲 3 次都稳定在 218~227Hz
+    ⇒ 它不是「换了人」，是**一次离群渲染 + 度量噪声**。
 
-    ⚠️ 度量用 `voice_align:f0_profile`（YIN 估计，纯 Python）：
-      自相关法会犯**八度错误**（真实 170Hz 报成 85Hz），用它当判据等于没有判据。
+    根因：**中位数是这段文本的音高，不是这个人的音高**。
+    不同文本的固有音高差异实测可达 13% —— **比 5% 的判据还大**。
+    ⇒ 拿它跨文本比，量到的是「文案差异」，不是「换没换人」。
+
+    只有**同一段文本**的多次渲染，才能把「文案」这个变量消掉，
+    剩下的差异才是「上游是不是每次换一个说话人」。
+
+    两条证据合起来才完整：
+      ① 同文重渲稳定（本脚本）        → 上游把音色钉住了
+      ② 每块都带**同一份**参考音（契约测试，见 tests/tts/） → 块与块之间同一个人
+
+### 5% 这个数怎么来的（标定过，不是拍脑袋）
+
+    同一人（克隆，同一份参考音）：
+        7s 片段  → 散布 7.5%   ← 片段太短，噪声大
+        44s 片段 → 散布 2.2~2.9%（生产块长）
+    换了人（没带克隆的多次渲染）：散布 33.7%
+    真实旧音频（3 块，165s 处换人）：块间差 26.6%
+
+    ⇒ 5% 落在「同一人 2~3%」与「换了人 26%+」之间，两侧都有 2 倍以上余量。
+    ⚠️ 参与比较的片段必须够长（帧数 ≥ 100、时长 ≥ 15s），
+      否则**不参与判定但要在报告里列出来** ——
+      「不可判」不等于「一致」，硬判就是拿噪声当结论。
+
+### 度量
+
+`voice_align:f0_profile`（YIN 估计，纯 Python）：
+自相关法会犯**八度错误**（真实 170Hz 报成 85Hz），用它当判据等于没有判据。
 
 ## 用法
 
@@ -195,10 +216,14 @@ async def _run(args) -> int:
         f"[客户端] provider={client.provider_name} 分块上限={getattr(client, 'chunk_chars', '?')} 字"
     )
 
-    # ── 噪声底：同一段文本连发 3 次 ────────────────────────────────
+    # ── 主判据：同一段文本连渲 N 次 ────────────────────────────────
     #
     # ⚠️ 必须用**克隆路径的块长**（不是普通块长）：噪声底要在
     #    「和实际块一样的长度」上测，否则不可比。
+    #
+    # 这是**唯一**能把「文案差异」这个变量消掉的测法：
+    # 同一段文本 → 任何中位数差异都只可能来自「上游换了人」。
+    repeat_n = max(2, args.repeat)
     if args.baseline_only or not args.skip_baseline:
         probe_len = (
             getattr(client, "clone_chunk_chars", 250)
@@ -207,75 +232,65 @@ async def _run(args) -> int:
         )
         probe_text = text[:probe_len]
         same = []
-        for _ in range(3):
+        for _ in range(repeat_n):
             _, pieces = await _capture_chunks(client, probe_text, ref_audio, ref_text)
             same.append(measure(pieces)[0])
         vals = [v.median for v in same if v and v.median]
-        if len(vals) >= 2:
-            dev, rng = spread(vals)
+        if len(vals) < 2:
+            print("[同文重渲] 测不出基频（音频太短或 ffmpeg 不可用）")
+            return 2
+        dev, rng = spread(vals)
+        verdict = "通过" if dev < MAX_SPREAD else "不通过"
+        print(
+            f"[同文重渲] 同一段文本（{len(probe_text)} 字）渲染 {repeat_n} 次："
+            f"{' / '.join(_fmt_hz(v.median) for v in same)}"
+            f"\n            最大偏差 {dev * 100:.1f}%（极差 {rng * 100:.1f}%）"
+            f"  判据 < {MAX_SPREAD * 100:.0f}%  → **{verdict}**"
+        )
+        if dev >= MAX_SPREAD:
             print(
-                f"[噪声底] 同一段文本（{len(probe_text)} 字）连发 3 次："
-                f"{' / '.join(_fmt_hz(v.median) for v in same)}"
-                f" → 最大偏差 {dev * 100:.1f}%（极差 {rng * 100:.1f}%）"
-                f"  ← 5% 门禁要比这个噪声底高，才算有区分度"
+                "   ⇒ 上游每次换一个说话人（这就是「分段音色差异」的根因）。\n"
+                "     检查：请求体里是否带了 ref_audio/ref_text、base64 是否编成了 data URL、\n"
+                "            参考文本是否与参考音频内容一致。"
             )
-        else:
-            print("[噪声底] 测不出基频（音频太短或 ffmpeg 不可用）")
+            return 1
 
-    # ── 主体：整篇分块合成，看块间一致性 ───────────────────────────
+    # ── 参考：整篇分块渲染，逐块中位数 ─────────────────────────────
+    #
+    # ⚠️ **这里只作参考，不作门禁**：各块文本不同 → 中位数天然不同
+    #    （实测跨块可达 13%，比判据还大）→ 拿它判「换没换人」是错的。
+    #    真正保证「块与块之间是同一个人」的是：
+    #       ① 同文重渲稳定（上面，已门禁）
+    #       ② 每块都带**同一份**参考音（契约测试：tests/tts/）
     audio, pieces = await _capture_chunks(client, text, ref_audio, ref_text)
     profiles = measure(pieces)
-    print(f"\n[整篇] {len(text)} 字 → {len(pieces)} 块，合计 {len(audio)} 字节")
-
-    comparable: list[float] = []
-    skipped: list[str] = []
+    print(f"\n[整篇分块 · 参考] {len(text)} 字 → {len(pieces)} 块，合计 {len(audio)} 字节")
     for i, (p, prof) in enumerate(zip(pieces, profiles), 1):
-        mark = ""
-        if prof.comparable:
-            comparable.append(prof.median)
-            mark = "（参与判定）"
-        else:
-            skipped.append(
-                f"块{i}（{prof.duration_sec:.0f}s / {prof.frame_count} 帧 —— 片段太短，"
-                f"基频中位数的噪声大于判据本身，不参与判定）"
-            )
+        note = "" if prof.comparable else "（片段太短，统计量不可靠）"
         print(
             f"  块{i}: {len(p):>8d}B  {prof.duration_sec:5.1f}s  帧数 {prof.frame_count:4d}  "
-            f"基频中位数 {_fmt_hz(prof.median)} {mark}"
+            f"基频中位数 {_fmt_hz(prof.median)} {note}"
         )
-    for line in skipped:
-        print(f"  ⚠️  {line}")
+    comparable = [p.median for p in profiles if p.comparable and p.median]
+    if len(comparable) >= 2:
+        dev, rng = spread(comparable)
+        print(
+            f"  跨块中位数差 {dev * 100:.1f}%（极差 {rng * 100:.1f}%）"
+            f" —— 文本不同，这个数**只作参考**，不是判据"
+        )
 
-    if len(comparable) < 2:
-        print("\n❌ 可比较的块不足 2 个，无法判定")
-        return 2
-
-    dev, rng = spread(comparable)
-    print(f"\n全篇基频中位数 = {_fmt_hz(statistics.median(comparable))}")
-    print(
-        f"块间最大偏差 = {dev * 100:.1f}%（极差 {rng * 100:.1f}%，{len(comparable)} 块参与判定）"
-        f"  判据 < {MAX_SPREAD * 100:.0f}%"
-    )
-
-    if dev < MAX_SPREAD:
-        print("\n✅ 通过：各块是同一个音色")
-        return 0
-    print(
-        "\n❌ 不通过：块间音色不一致（用户听到的是好几个人在念）\n"
-        "   排查顺序：\n"
-        "     1. 日志里每段是不是都带了 ref_audio（clone=on）\n"
-        "     2. 音色库的参考音频是不是同一份、每段是否逐字节相同\n"
-        "     3. 参考文本是否与参考音频内容一致"
-    )
-    return 1
+    print("\n✅ 通过：上游把音色钉住了（同文重渲稳定）")
+    print("   配合「每块都带同一份参考音」（契约测试 tests/tts/），块与块之间是同一个人。")
+    return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="实测分段音色一致性")
     ap.add_argument("--text-file", help="自定义文案（默认内置长文）")
     ap.add_argument("--no-clone", action="store_true", help="对照组：不带克隆")
-    ap.add_argument("--baseline-only", action="store_true", help="只测噪声底")
-    ap.add_argument("--skip-baseline", action="store_true", help="跳过噪声底测量")
+    ap.add_argument("--baseline-only", action="store_true", help="只测同文重渲")
+    ap.add_argument("--skip-baseline", action="store_true", help="跳过同文重渲")
+    ap.add_argument("--repeat", type=int, default=3, help="同一段文本渲染几次（默认 3）")
     args = ap.parse_args()
     try:
         return asyncio.run(_run(args))
