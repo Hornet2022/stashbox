@@ -1116,11 +1116,13 @@ async def _persist_agent_final(
             da.status = "done" if status == "done" else "failed"
             if final.get("rewritten_script"):
                 da.script_text = final["rewritten_script"]
-            # 旧音频 URL（本次覆盖前的值）—— 覆盖后要删掉旧文件，否则每次重跑
-            # 都在磁盘 / OSS 上留一份孤儿。key 现在带内容 hash，所以旧 URL 与
-            # 新 URL 必然不同（见 app/services/storage/base.py:versioned_audio_key）。
+            # 旧音频 URL（本次覆盖前的值）—— **只有在真的被新音频替换掉时**
+            # 才删旧文件，否则每次重跑都在磁盘 / OSS 上留一份孤儿。
+            # key 现在带内容 hash，所以旧 URL 与新 URL 必然不同
+            # （见 app/services/storage/base.py:versioned_audio_key）。
             previous_audio_url = da.audio_url
-            if final.get("tts_audio_url"):
+            has_new_audio = bool(final.get("tts_audio_url"))
+            if has_new_audio:
                 # 音频字段**整体**来自本次尝试（有 URL 才有时长，不留上一轮的）
                 da.audio_url = final["tts_audio_url"]
                 da.duration_sec = (
@@ -1256,7 +1258,19 @@ async def _persist_agent_final(
             # 删掉被覆盖掉的旧音频文件（重跑 → 旧版本成孤儿）。
             # best-effort：删不掉只记日志，不影响本次产物（宁可留孤儿文件
             # 等 GC，不可音频没了文章还在 —— 与 article_purge 的取舍一致）。
-            if previous_audio_url and previous_audio_url != da.audio_url:
+            #
+            # ⚠️ **只在「真的产出了新音频」时才删**（2026-10-24 实测踩到）：
+            #   本次失败时 da.audio_url 被清成 None，而 articles.audio_url
+            #   还指着旧文件 —— 那一瞬间是「指针还在、文件没了」→
+            #   用户侧立刻 404，且**不可逆**（文件已被删）。
+            #
+            #   实测：存量重跑第 1 篇 TTS 判据误伤 → 整篇失败 →
+            #   旧音频文件被删 → articles.audio_url 指向 404 → Arq 重试
+            #   成功前用户是听不到这篇的。
+            #
+            #   失败时**旧文件必须留着**（这一行不再指向它，但文件在 →
+            #   可回滚、可人工恢复）；这正是上面那句取舍的本意。
+            if has_new_audio and previous_audio_url and previous_audio_url != da.audio_url:
                 await _delete_superseded_audio(article_id, previous_audio_url)
         except Exception as exc:
             log.warning(

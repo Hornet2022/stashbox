@@ -209,6 +209,21 @@ _TRUNCATION_CHARS_PER_SEC = 6.5
 # 二分自愈的最大递归深度（2^6 = 64 段，兜底防无限递归）。
 _MAX_SPLIT_DEPTH = 6
 
+# 二分自愈能切到的**绝对下限**（字）：文本本身比它还小，就不再切了。
+#
+# ⚠️ 与 `min_chunk_chars`（60）是两回事：
+#   min_chunk_chars = 「自愈的最小粒度」，是**给长块**用的软约束；
+#   _MIN_SPLIT_CHARS = 「再切就没意义了」的硬地板。
+#
+# ⚠️ **地板是「被切的文本」的下限，不是「切出来的块」的下限**：
+#   硬切会留下 1 字的余块（47 字切成 23/23/1），
+#   若拿「最小切块」当条件，整次切分会被否掉 → 自愈根本不会发生。
+#
+# 取 12 的依据：上游对 8 个字能正常返回 1.0s 音频（不报错），
+# 说明 ~10 字量级的请求上游接得住；而再小就只是产生更多块、
+# 在同一个噪声判据上继续打转。
+_MIN_SPLIT_CHARS = 12
+
 # ── 克隆路径的块长上限（字）────────────────────────────────────────────
 #
 # ⚠️ **克隆路径必须用比普通路径小得多的块**（实测 2026-10-24，tertu.cn）：
@@ -239,15 +254,45 @@ _CLONE_CHUNK_CHARS_DEFAULT = 250
 
 # 语速判据在**短文本**上不成立（见 _assert_not_truncated）。
 # 低于这个字数，语速比值没有意义 —— 改用绝对缺失量判据。
-_MIN_CHARS_FOR_RATE_CHECK = 40
+#
+# ⚠️ **这个值是量出来的，不是拍的**（2026-10-24，生产实测）：
+#   同一段文本、同一份参考音，连渲 3 次，看每块的 cps 带宽：
+#
+#     块长   天然 cps 带宽        波动      6.5 阈值
+#      47 字  5.88 ~ 6.71        14.3%    ✗ 误伤
+#      52 字  5.20 ~ 6.50        25.0%    ✗ 误伤
+#      53 字  5.30 ~ 5.89        11.1%    ✓
+#      55 字  5.50 ~ 6.88        25.0%    ✗ 误伤
+#     114 字  5.70 ~ 6.71        17.6%    ✗ 误伤
+#     118 字  5.32 ~ 6.71        15.8%    ✗ 误伤
+#     250 字  5.72 ~ 6.25         4.5%    ✓ 有余量
+#
+#   ⇒ 语速比值**只在足够长的块上**才分得开「正常」与「真截断」。
+#     短块的带宽把阈值整个盖住 —— 阈值 6.5 就落在噪声带里，
+#     于是「正常渲染」被判成截断 → 触发二分自愈 → 而自愈又被
+#     `min_chunk_chars` 挡住 → **整篇蒸馏失败**。
+#     （实测：47 字的块被判 9.40 字/秒 → 整篇挂掉，Arq 重试才救回来。）
+#
+#   150 字这个下限还有一条**物理**理由：上游有 60s 墙钟，
+#   只有「期望时长能接近 60s」的块才可能被墙钟砍掉（150 字 ≈ 26s，
+#   上游慢 2 倍才够得着）。更短的块**不可能**是墙钟截断，
+#   对它用语速判据只会产生噪声。
+_MIN_CHARS_FOR_RATE_CHECK = 150
 
-# 最慢的正常语速（字/秒）。实测正常播报 3.77~4.61 字/秒，
-# 保守取 4.0：短文本的期望时长 = 字数 / 4.0。
-_SLOWEST_CPS = 4.0
-
-# 短文本的「绝对缺失」判据：实际时长低于期望的这个比例才算截断。
-# 取 0.5 —— 缺一半以上才算「内容真的少了」。
-_SHORT_TEXT_MISSING_RATIO = 0.5
+# 短文本的**语速上限**（字/秒）—— 语速判据在短文本上要用**自己的阈值**。
+#
+# 实测自然带（47~118 字的块，同一段文本连渲 3 次）：5.20 ~ 6.88 字/秒。
+# 取 8.0：
+#   · 对自然上界 6.88 有 16% 余量 → 正常渲染不会误伤；
+#   · 生产实测的异常值 **9.40**（47 字只产出 5.0s）高于它 → 会被抓出来。
+#
+# ⚠️ 为什么不用长文本那个 6.5：短文本的带宽（5.20~6.88）把 6.5 **整个盖住**
+#   —— 用同一个阈值，正常渲染必然误伤。**那正是生产事故的成因**：
+#   47 字的正常块被判 9.40 字/秒 → 触发二分 → 而二分又被 min_chunk_chars
+#   挡住 → 整篇蒸馏失败。
+#
+#   ⇒ 阈值必须按「这一长度的自然带宽」定，不能全局长一个值。
+_SHORT_TEXT_MAX_CPS = 8.0
 
 
 class _TruncatedOutput(RuntimeError):
@@ -743,11 +788,23 @@ class OpenAITTSClient(TTSClient):
             ]
             return concat_audio(pieces)
         except _TruncatedOutput:
-            if len(text) <= self.min_chunk_chars or depth >= _MAX_SPLIT_DEPTH:
+            # ⚠️ **这里不能拿 min_chunk_chars 当地板**（2026-10-24 实测踩到）：
+            #   块**本来就可能比它小** —— 250 字分块的最后一块常常只剩 40~60 字。
+            #   老写法 `len(text) <= self.min_chunk_chars → raise` 于是变成：
+            #   短块一旦误判截断 → **直接放弃自愈** → 整篇蒸馏失败。
+            #   （实测：47 字的块被判 9.40 字/秒 → 整篇挂掉，靠 Arq 重试才救回来。）
+            #
+            #   截断路径的真正地板是「**还切不切得动**」：
+            #   · 切出来的块必须比原来小（否则这次切分没有进展）
+            #   · 文本本身不能小到再切也没意义
+            #   ⚠️ 注意：**不能用「所有切块都 ≥ 某下限」当条件** ——
+            #   硬切会留下 1 字的余块（比如 47 字切成 23/23/1），
+            #   用「最小块」判会把**整次切分**否掉 → 自愈根本不会发生。
+            if depth >= _MAX_SPLIT_DEPTH or len(text) < _MIN_SPLIT_CHARS:
                 raise
             # 按句读边界二分（复用切块工具，不把词切两半）
             parts = split_into_chunks(text, max(1, len(text) // 2))
-            if len(parts) < 2:
+            if len(parts) < 2 or max(len(p) for p in parts) >= len(text):
                 raise
             log.info(
                 "OpenAITTS 分块被截断，二分重来: depth=%s chars=%d → %d 块",
@@ -765,56 +822,55 @@ class OpenAITTSClient(TTSClient):
         """语速校验：识别「HTTP 200 但内容被静默截断」。
 
         判据与 IndexTTS 的 _assert_not_truncated 同源（语速），
-        但这里用的是 mp3，所以用 audio_duration.mp3_duration_sec 算时长。
+        但这里用的是 mp3，所以用 audio_duration 的时长算。
 
-        ⚠️ **短文本的这个判据本身噪声大**（语速 = 字数 / 音频时长，而短文本的
-        时长被首尾留白与句读停顿主导），所以别拿它当短句的绝对真值。
-        调用方要保证送进来的文本**足够长**（admin 的 TTS 测试句已经加长到
-        100+ 字），否则测出来的语速会横跨正常与真截断两个区间。
+        ## 两条分支，各按各自的长度尺度（2026-10-24 实测标定）
 
-        ## 为什么短文本要另走一条判据（2026-10-24 实测踩到）
+        **长文本（≥ 150 字）→ 语速判据，阈值 6.5**：
+        语速 = 字数 / 时长，超过 `_TRUNCATION_CHARS_PER_SEC` 判截断。
+        这个区间实测带宽够窄（250 字块 5.72~6.25，波动 4.5%），
+        阈值 6.5 与真截断样本（7.14~8.67）分得开。
+        而且**上游 60s 墙钟只可能砍到这一档的块**（150 字 ≈ 26s）。
 
-        实测：上游对 **8 个字**返回了 **1.0s** 音频 → 8.00 字/秒 → 超阈值。
-        单看这一条它「像截断」，但其实不是 —— 8 个字本来也就 1~2 秒。
+        **短文本（< 150 字）→ 语速判据，阈值 8.0**：
+        实测自然带是 5.20~6.88（波动最高 25%），比长文本宽得多 ——
+        所以阈值必须**按这一档的自然带上界另定**，不能用 6.5
+        （用 6.5 会把正常渲染判成截断，那就是生产事故的成因）。
+        8.0 对自然上界有 16% 余量，同时高于生产实测的异常值 9.40 的反面 ——
+        即 9.40 那个异常**会被抓出来**（然后交给自愈重渲）。
 
-        后果不是「多报一次」这么轻：超阈值会触发**二分自愈**，
-        而二分会把块越切越小（700 → 350 → 175 → … → 8），
-        每一次都在同一个噪声判据上继续超阈值 → 一路钻到
-        `min_chunk_chars` 仍报错 → **整篇蒸馏直接失败**。
-        （实测：700 字触发截断 → 二分到 8 字 → 抛 _TruncatedOutput → 整篇挂掉。）
+        ## 判据抓出来之后呢：自愈必须能救短块
 
-        所以：语速超阈值**且文本足够长**，才判定为截断；
-        文本短时改用**绝对缺失量**（缺一半以上才算内容真的少了）。
+        短块判据**必然**会误伤（带宽就是这么宽），所以真正的修复不在判据，
+        在于**误伤之后不能拖死整篇**：块本来就可能比 `min_chunk_chars` 小
+        （250 字分块的最后一块常常只剩 40~60 字），
+        老写法在那里直接放弃自愈 → 整篇蒸馏失败。
         """
-        from stashbox.backend.app.services.tts.audio_duration import audio_duration_sec
+        from stashbox.backend.app.services.tts.audio_duration import audio_duration_exact_sec
 
-        dur = audio_duration_sec(audio)
+        dur = audio_duration_exact_sec(audio)
         if not dur or dur <= 0:
             log.warning("OpenAITTS 音频时长不可解析，跳过截断校验")
             return
         cps = len(text) / dur
-        if cps <= _TRUNCATION_CHARS_PER_SEC:
-            return
 
-        if len(text) >= _MIN_CHARS_FOR_RATE_CHECK:
-            raise _TruncatedOutput(
-                f"OpenAITTS 输出疑似被截断：{len(text)} 字只产出 {dur:.1f}s 音频"
-                f"（{cps:.2f} 字/秒，正常应 < {_TRUNCATION_CHARS_PER_SEC}）"
-            )
-
-        # 短文本：语速比值不可信 → 看**绝对缺失量**
-        expected = len(text) / _SLOWEST_CPS
-        if dur < expected * _SHORT_TEXT_MISSING_RATIO:
-            raise _TruncatedOutput(
-                f"OpenAITTS 输出疑似被截断：{len(text)} 字只产出 {dur:.1f}s 音频"
-                f"（期望约 {expected:.1f}s，缺了 {dur / expected * 100:.0f}%）"
-            )
-        log.info(
-            "OpenAITTS 短文本语速偏高但缺失不明显，按正常处理: chars=%d dur=%.1fs cps=%.2f",
-            len(text),
-            dur,
-            cps,
+        limit = (
+            _TRUNCATION_CHARS_PER_SEC
+            if len(text) >= _MIN_CHARS_FOR_RATE_CHECK
+            else _SHORT_TEXT_MAX_CPS
         )
+        if cps > limit:
+            raise _TruncatedOutput(
+                f"OpenAITTS 输出疑似被截断：{len(text)} 字只产出 {dur:.1f}s 音频"
+                f"（{cps:.2f} 字/秒，正常应 < {limit}）"
+            )
+        if len(text) < _MIN_CHARS_FOR_RATE_CHECK:
+            log.info(
+                "OpenAITTS 短文本语速偏高但未超阈值，按正常处理: chars=%d dur=%.2fs cps=%.2f",
+                len(text),
+                dur,
+                cps,
+            )
 
     async def _synthesize_once(
         self,

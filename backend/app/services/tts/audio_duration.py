@@ -94,16 +94,31 @@ _BITRATES_V2: list[int | None] = [
 
 def wav_duration_sec(audio: bytes) -> int | None:
     """从 RIFF/WAV 头读时长（秒）；非 WAV 返回 None。"""
+    d = wav_duration_exact_sec(audio)
+    return int(d) if d is not None else None
+
+
+def wav_duration_exact_sec(audio: bytes) -> float | None:
+    """WAV 精确时长（秒，保留小数）。
+
+    ⚠️ **为什么要「精确版」**（2026-10-24 实测）：
+    截断判据用「字数 / 时长」算语速，时长被取整到整秒时，
+    一个 17s 的块有 ±0.5s 的量化误差 → 语速误差 ±3%，17s 上就是 ±0.2 字/秒 ——
+    而 250 字块的正常上界是 6.25 字/秒、阈值是 6.5，**余量只有 0.25**：
+    量化误差和余量同量级，判据就成了掷骰子。
+    """
     try:
         with wave.open(io.BytesIO(audio), "rb") as w:
             rate = w.getframerate()
-            return int(w.getnframes() / rate) if rate else None
+            return (w.getnframes() / rate) if rate else None
     except Exception:
         return None
 
 
-def mp3_info(audio: bytes) -> tuple[int, int, int] | None:
+def mp3_info(audio: bytes) -> tuple[float, int, int] | None:
     """解析 MP3 → (时长秒, 采样率, 声道数)；不是合法 MP3 返回 None。
+
+    ⚠️ 时长是**小数**（不取整）—— 判据要用，见 `audio_duration_exact_sec`。
 
     声道数从**第一帧**的声道模式读（00=单声道, 01=双声道, 10/11=单声道）。
 
@@ -175,24 +190,52 @@ def mp3_info(audio: bytes) -> tuple[int, int, int] | None:
 
     if not frames:
         return None
-    return int(total_sec), sample_rate, channels
+    # ⚠️ 时长保留小数（不再 int()）：截断判据拿它算语速，
+    # 取整到整秒会让 17s 的块有 ±3% 的语速误差 —— 而判据余量只有 ±4%。
+    return total_sec, sample_rate, channels
 
 
 def mp3_duration_sec(audio: bytes) -> int | None:
-    """逐帧解析 MP3 帧头，累加得到时长（秒）；不是合法 MP3 返回 None。"""
+    """逐帧解析 MP3 帧头，累加得到时长（**整秒**）；不是合法 MP3 返回 None。
+
+    整秒是给「展示 / 落库」用的（DB 列是 int，客户端也按整秒算）。
+    要小数请用 `mp3_duration_exact_sec`。
+    """
+    d = mp3_duration_exact_sec(audio)
+    return int(d) if d is not None else None
+
+
+def mp3_duration_exact_sec(audio: bytes) -> float | None:
+    """逐帧解析 MP3 帧头，累加得到时长（秒，保留小数）；不是合法 MP3 返回 None。"""
     info = mp3_info(audio)
     return info[0] if info else None
 
 
 def audio_duration_sec(audio: bytes) -> int | None:
-    """按格式算音频时长（秒）；无法解析返回 None。
+    """按格式算音频时长（**整秒**）；无法解析返回 None。
 
     调用方需要自己决定兜底值 —— 宁可不写，也不要写一个错的。
+    """
+    d = audio_duration_exact_sec(audio)
+    return int(d) if d is not None else None
+
+
+def audio_duration_exact_sec(audio: bytes) -> float | None:
+    """按格式算音频时长（秒，保留小数）；无法解析返回 None。
+
+    ## 谁该用哪个
+
+    - **落库 / 展示**（`duration_sec` 列、客户端时长）→ `audio_duration_sec`（整秒）。
+    - **判据**（语速/截断）→ `audio_duration_exact_sec`（小数）。
+
+    为什么判据必须用小数：语速 = 字数 / 时长，时长取整到整秒时，
+    17s 的块有 ±0.5s 量化误差 → 语速误差 ±3%；250 字块的正常上界是
+    6.25 字/秒、阈值 6.5，**余量只有 0.25 字/秒** —— 与量化误差同量级。
     """
     if not audio:
         return None
     if audio[:4] == b"RIFF":
-        return wav_duration_sec(audio)
+        return wav_duration_exact_sec(audio)
     if audio[:3] == b"ID3" or (audio[0] == 0xFF and (audio[1] & 0xE0) == 0xE0):
-        return mp3_duration_sec(audio)
+        return mp3_duration_exact_sec(audio)
     return None
