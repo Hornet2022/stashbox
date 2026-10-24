@@ -253,6 +253,87 @@ _CAPTURE_PATHS = frozenset(
 )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 下游响应头透传
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 2026-10-25 修：原来 `proxy()` 只把下游的 `content-type` 拿过来，
+# **其余响应头全丢**。后果不是"少几个头无所谓"：
+#
+#   · content-service 的 `POST /api/v1/articles/add` 会发
+#     `Deprecation: true` / `Sunset: CP12` / `Link: rel="successor-version"`
+#     —— 这三个头是**弃用契约本身**，丢掉它等于「告诉客户端去迁移」这句话
+#     根本到不了客户端，于是老客户端永远不迁，弃用机制在生产完全失效；
+#   · 与「旧端点不扣配额」那个缺陷互为因果：不扣配额 ⇒ 没人有理由迁 ⇒
+#     弃用提示又传不出去 ⇒ 缺口永远开着。
+#
+# 为什么用**白名单**而不是「黑名单排除几个」
+#
+#   · `Content-Encoding` / `Content-Length` 必须排除：httpx 已经把 body
+#     解压过了，再把 `content-encoding: gzip` 转发出去，客户端会去解
+#     一份**已经解压过**的 body ⇒ 整段乱码/解析失败；
+#   · `Location` 必须排除：一旦下游开始返回 302（它现在不返回），
+#     里面很可能是**内网地址**（如 http://content-service:8102/...），
+#     透传 = 把内部拓扑暴露给外部客户端；
+#   · `Set-Cookie` 必须排除：cookie 的 Domain/Path 是按下游域写的，
+#     转发到网关域上会让作用域错乱。
+#
+# 白名单只放「端到端语义头」—— 它们描述的是**这条响应本身**，
+# 转一手不会失真。
+#
+# 目前下游实际会设的业务头就三个（Deprecation / Sunset / Link）+ X-Request-ID
+# （X-Request-ID 由网关自己的 RequestIDMiddleware 设，值与下游一致，不在此列）。
+_PASSTHROUGH_RESPONSE_HEADERS = (
+    # 弃用契约（`POST /api/v1/articles/add`）
+    "deprecation",
+    "sunset",
+    "link",
+    # HTTP 缓存语义
+    "etag",
+    "last-modified",
+    "cache-control",
+    "vary",
+    "expires",
+    # 重试语义
+    "retry-after",
+    # 下载语义（文件名）
+    "content-disposition",
+)
+
+
+def _passthrough_response_headers(upstream_headers: httpx.Headers) -> dict[str, str]:
+    """挑出要转发给客户端的下游响应头（见上面白名单的说明）。
+
+    同一个头出现多次时按 HTTP 语义用 ", " 合并（RFC 9110 §5.3）：
+    `Link` 就是这么用的（一个响应里可以有多条 Link）。
+    """
+    out: dict[str, str] = {}
+    for name in _PASSTHROUGH_RESPONSE_HEADERS:
+        values = upstream_headers.get_list(name)
+        if values:
+            out[name] = ", ".join(values)
+    return out
+
+
+def _upstream_response(upstream: httpx.Response) -> Response:
+    """把下游响应转成给客户端的响应（body / 状态码 / 业务响应头）。
+
+    显式路由（`proxy`）与兜底路由（`proxy_fallback`）**共用这一份** ——
+    两处各写一份的话，改了一边另一边就会漂。
+
+    ⚠️ 这正是本缺陷的成因：两处**都**只透传 `content-type`，
+    于是下游的弃用契约头（Deprecation / Sunset / Link）一次都没到过客户端。
+    """
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type"),
+        # 下游的业务响应头（弃用契约 / 缓存 / 重试）要送到客户端，
+        # 见 _PASSTHROUGH_RESPONSE_HEADERS 的说明。
+        headers=_passthrough_response_headers(upstream.headers),
+    )
+
+
 def _client_ip(request: Request) -> str:
     """解析真实客户端 IP（见 common/ip.py 的说明）。
 
@@ -358,11 +439,7 @@ async def proxy(request: Request, route: Route) -> Response:
         # 超时 / 连不上 / 下游崩了 → 业务信封，不是裸 500。
         # 注意 httpx.TimeoutException 是 RequestError 的子类，这里靠 isinstance 区分。
         return _upstream_error_response(request.url.path, exc)
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        media_type=upstream.headers.get("content-type"),
-    )
+    return _upstream_response(upstream)
 
 
 async def proxy_d9(request: Request) -> Response:
@@ -492,11 +569,9 @@ async def proxy_fallback(request: Request, path: str):
         # path 形如 "articles" / "articles/add"（没有前导 /api/v1），
         # 所以这里拼回完整路径再判是不是剪藏。
         return _upstream_error_response(f"/api/v1/{path}", exc)
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        media_type=upstream.headers.get("content-type"),
-    )
+    # 与 proxy() 共用同一份响应构造（含业务响应头透传）——
+    # 两处各写一份的话，改了一边另一边就会漂。
+    return _upstream_response(upstream)
 
 
 if __name__ == "__main__":

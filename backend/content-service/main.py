@@ -33,7 +33,7 @@ import re
 import sys
 import time
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
@@ -750,19 +750,40 @@ async def add_article(
 ):
     """⚠️ Deprecated（CP11.x 走查 P2-2 标记）。
 
-    与 POST /api/v1/articles 行为不一致：
-      - 本端点：不扣配额，CP1.4 风格历史行为
-      - 新端点：扣配额、cache_service 标记、ARTICLE_SUBMIT 埋点
-
     为兼容老版本 iOS/Android 客户端暂时保留入口，响应头加 Deprecation 提示客户端迁移。
-    下个主版本（CP12+）移除，并同步下掉 api-gateway/config.py:57 路由。
+    下个主版本（CP12+）移除，并同步下掉 api-gateway/config.py 对应路由。
+
+    ## 配额口径（2026-10-25 修）
+
+    原来这个端点**整段绕过了剪藏公共后半程**（自己调 `_create_article`），
+    于是**不扣配额、不打 ARTICLE_SUBMIT 埋点、不做 `mark_article_quota` 标记**。
+
+    后果不是"老接口宽松一点"：
+
+      - 每次调用都会派一次**真实**蒸馏（LLM + IndexTTS，项目自测单篇约 23 分钟 GPU），
+        而配额一次都不扣 ⇒ 任何持 token 的用户可以无限免费剪藏不同 URL；
+      - 剪藏路径**没有任何速率限制**（网关 `_CAPTURE_PATHS` 只影响超时文案，不是限流）；
+      - 配额是运营侧唯一的用量口径 ⇒ 这条链上的消耗在账上看不见。
+
+    现在它与 `POST /api/v1/articles` 走**同一份**实现（`_clip_link` → `_clip_after_fetch`），
+    配额口径完全一致：**先抓后扣**（抓不到正文 → 不建库不计费）、
+    重复剪藏同一 URL 复用旧文章且**不重复扣费**。
+
+    ⚠️ 行为变化：老客户端从这里剪藏**从现在起会消耗配额**。
+    这是有意为之 —— 不扣配额的那条路本身就是漏洞。弃用提示照发，客户端应尽快迁到
+    `POST /api/v1/articles`。
     """
     response.headers["Deprecation"] = "true"
     response.headers["Sunset"] = "CP12"
     response.headers["Link"] = '</api/v1/articles>; rel="successor-version"'
-    art = await _create_article(req.url, _uid(user), req.source, None, db)
-    await get_ai_client().trigger_distill(art.id, auth_token=create_access_token(str(art.user_id)))
-    return _to_response(art)
+    result = await _clip_link(
+        url=req.url,
+        uid=_uid(user),
+        source=req.source,
+        title=req.title,
+        db=db,
+    )
+    return _to_response(result.article)
 
 
 @app.post("/api/v1/articles")
@@ -776,55 +797,23 @@ async def submit_article(
     CP9.x fix：B1 修复 —— submit_article 必须自动调 trigger_distill，否则安卓/管理后台
     剪藏后文章永远 pending，arq 队列空跑。原 `add_article`（deprecated）调了 trigger_distill，
     新端点漏调，现补上。
+
+    2026-10-25：链接剪藏的**完整流程**（早查重 → 先抓后扣 → 公共后半程）抽到 `_clip_link`，
+    与旧版 `POST /api/v1/articles/add` 共用同一份实现 —— 旧版那个端点曾经**整段绕过后半程**，
+    成了不扣配额的免费剪藏口子（见 add_article 的说明）。
+
+    响应体是**提交回执**（`article_id` / `quota_used` / `reused` …），不是文章本体；
+    重复剪藏走的也是同一个形状（2026-10-25 之前重复时返回文章本体、新建时返回回执，
+    同一个端点两种形状，客户端得靠"读哪个字段"来区分）。
     """
-    uid = _uid(user)
-    # CP-DUPLICATE-CLIP：先查重再扣费，重复提交同一链接不重复计费。
-    dup = await _find_existing_clip(req.url, uid, db)
-    if dup is not None:
-        log.info(
-            "submit_duplicate_reuse",
-            extra={"url": req.url, "user_id": uid, "article_id": dup.id},
-        )
-        try:
-            await get_ai_client().trigger_distill(
-                article_id=dup.id, auth_token=create_access_token(str(uid))
-            )
-        except Exception as exc:
-            log.warning(f"auto_distill_trigger_failed (dup): article={dup.id} error={exc}")
-        return _to_response(dup)
-
-    # 2026-10-03：**先抓后扣**。
-    #
-    # 原来是「先扣配额 → 再建库（内部抓取）」，而抓取失败是软降级的，于是
-    # 一次网络抖动 = 扣掉 1 次配额 + 建一条无正文的文章 + 派一个注定失败的
-    # 蒸馏任务，而接口返回 200。用户什么都没得到，还少了配额。
-    #
-    # 现在先做一次纯读的抓取：失败直接 2001/2002 返回，既不建库也不计费。
-    # 抓到了再扣配额建库 —— 这时建库只差一次 DB insert。
-    fr = await _prefetch_for_capture(req.url)
-
-    # 2026-10-23：GitHub 走**专属 fetcher** 时，来源要用**真实来源**。
-    #
-    # 为什么只改这一个：`articles.source` 落的是**请求体里传的** source
-    # （默认 "web"），而真正解析它的是 fetcher（`raw_content["source"]`）。
-    # 剪藏一个 GitHub 仓库若存 "web"，列表里就显示「通用」—— 用户分不清
-    # 自己剪的是网页还是代码库，admin 的来源筛选也跟着失真。
-    #
-    # ⚠️ 只对**新增的**专属来源改，不动既有映射（wechat/wechat_mp/douyin/pdf
-    # 的既有口径保持不变）—— 那几个的历史数据里两种写法都存在，
-    # 现在统一会让老数据的来源显示突变。
-    source = "github" if fr.source == "github" else req.source
-
-    # 后半程（去重 → 扣配额 → 建库 → 派蒸馏 → 失效缓存）与文档剪藏**共用一份**
-    # 实现，见 _clip_after_fetch 的说明。
-    return await _clip_after_fetch(
+    result = await _clip_link(
         url=req.url,
-        uid=uid,
-        source=source,
-        title=req.title or fr.title or None,
-        raw_content=_to_raw_content(fr),
+        uid=_uid(user),
+        source=req.source,
+        title=req.title,
         db=db,
     )
+    return result.to_payload()
 
 
 async def _read_document_upload(
@@ -940,7 +929,7 @@ async def submit_document(
     doc_url = fr.url
     final_title = (title or "").strip() or fr.title
 
-    result = await _clip_after_fetch(
+    clip = await _clip_after_fetch(
         url=doc_url,
         uid=uid,
         source=DOCUMENT_SOURCE,
@@ -948,10 +937,130 @@ async def submit_document(
         raw_content=_to_raw_content(fr),
         db=db,
     )
+    result = clip.to_payload()
     result["filename"] = filename
     result["content_type"] = content_type
     result["text_length"] = len(fr.content_text)
     return result
+
+
+@dataclass
+class ClipResult:
+    """剪藏公共后半程的结果。
+
+    ## 为什么是对象而不是 dict
+
+    三个入口的**响应形状不同**：旧版 `POST /api/v1/articles/add` 返回文章本体
+    （`ArticleResponse`），新入口返回提交回执（`article_id` / `quota_used` …）。
+    但「扣配额 / 建库 / 派蒸馏 / 失效缓存」必须只有**一份**实现 ——
+    行为一份，形状由各入口自己决定，这样改行为时不会漏掉某个入口。
+    """
+
+    article: Article
+    task_id: str | None = None
+    quota_used: int = 0
+    monthly_quota: int = 0
+    remaining: int = 0
+    reused: bool = False
+
+    def to_payload(self) -> dict:
+        """提交回执（`POST /api/v1/articles` 与 `/api/v1/articles/document` 同形）。
+
+        `id` 与 `article_id` **都给**：CP10.5 之前这个端点返回的是文章本体（读 `id`），
+        CP10.5 改成了回执（读 `article_id`），而同一时刻重复剪藏走的却是「文章本体」
+        分支 —— 同一个端点两种形状，客户端只能靠"读哪个字段"来区分。两个都给，
+        客户端读哪个都对，不必猜。
+        """
+        return {
+            "id": self.article.id,
+            "article_id": self.article.id,
+            "url": self.article.url,
+            "status": self.article.status,
+            "task_id": self.task_id,
+            "quota_used": self.quota_used,
+            "monthly_quota": self.monthly_quota,
+            "remaining": self.remaining,
+            "reused": self.reused,
+        }
+
+
+async def _clip_link(
+    *,
+    url: str,
+    uid: int,
+    source: str,
+    title: str | None,
+    db: AsyncSession,
+) -> ClipResult:
+    """**链接**剪藏的完整流程：早查重 → 抓取 → 公共后半程。
+
+    ## 为什么要有「早查重」这一步
+
+    抓取一次要几秒到几十秒，而重复剪藏同一链接是**用户自己会做的事**
+    （没看到结果就再点一次）。早查重 = 命中重复时**不抓、不扣费**，
+    只把已有文章再派一次蒸馏。
+
+    ## 为什么它和 `_clip_after_fetch` 里那次查重不是重复
+
+    两次查重看的都是「同用户 + 同 URL + 未删除」，但**时点不同**：
+
+      · 这里在**抓取之前** —— 目的是**省掉一次抓取**（抓取有外部成本）；
+      · `_clip_after_fetch` 里那次在**扣配额之前** —— 目的是**不重复计费**。
+
+    中间可能隔了几十秒（抓取耗时），期间别人（或同一个用户的另一个端）
+    可能已经建了同一篇 —— 所以**两次都要查**。第一次省抓取，第二次保计费。
+
+    ⚠️ 这段逻辑曾经**只写在 `submit_article` 里**，而旧版 `POST /api/v1/articles/add`
+    绕过了整条链（自己调 `_create_article`）⇒ 那个端点不扣配额、不埋点、
+    不打缓存标记，是一条免费剪藏的口子。现在两个入口共用这一份实现。
+    """
+    # CP-DUPLICATE-CLIP：先查重再抓，重复提交同一链接不重复计费。
+    dup = await _find_existing_clip(url, uid, db)
+    if dup is not None:
+        log.info(
+            "clip_duplicate_reuse",
+            extra={"url": url, "user_id": uid, "article_id": dup.id},
+        )
+        try:
+            await get_ai_client().trigger_distill(
+                article_id=dup.id, auth_token=create_access_token(str(uid))
+            )
+        except Exception as exc:
+            log.warning("auto_distill_trigger_failed (dup): article=%s error=%s", dup.id, exc)
+        return ClipResult(article=dup, reused=True)
+
+    # 2026-10-03：**先抓后扣**。
+    #
+    # 原来是「先扣配额 → 再建库（内部抓取）」，而抓取失败是软降级的，于是
+    # 一次网络抖动 = 扣掉 1 次配额 + 建一条无正文的文章 + 派一个注定失败的
+    # 蒸馏任务，而接口返回 200。用户什么都没得到，还少了配额。
+    #
+    # 现在先做一次纯读的抓取：失败直接 2001/2002 返回，既不建库也不计费。
+    # 抓到了再扣配额建库 —— 这时建库只差一次 DB insert。
+    fr = await _prefetch_for_capture(url)
+
+    # 2026-10-23：GitHub 走**专属 fetcher** 时，来源要用**真实来源**。
+    #
+    # 为什么只改这一个：`articles.source` 落的是**请求体里传的** source
+    # （默认 "web"），而真正解析它的是 fetcher（`raw_content["source"]`）。
+    # 剪藏一个 GitHub 仓库若存 "web"，列表里就显示「通用」—— 用户分不清
+    # 自己剪的是网页还是代码库，admin 的来源筛选也跟着失真。
+    #
+    # ⚠️ 只对**新增的**专属来源改，不动既有映射（wechat/wechat_mp/douyin/pdf
+    # 的既有口径保持不变）—— 那几个的历史数据里两种写法都存在，
+    # 现在统一会让老数据的来源显示突变。
+    source = "github" if fr.source == "github" else source
+
+    # 后半程（去重 → 扣配额 → 建库 → 派蒸馏 → 失效缓存）与文档剪藏**共用一份**
+    # 实现，见 _clip_after_fetch 的说明。
+    return await _clip_after_fetch(
+        url=url,
+        uid=uid,
+        source=source,
+        title=title or fr.title or None,
+        raw_content=_to_raw_content(fr),
+        db=db,
+    )
 
 
 async def _clip_after_fetch(
@@ -962,18 +1071,23 @@ async def _clip_after_fetch(
     title: str | None,
     raw_content: dict,
     db: AsyncSession,
-) -> dict:
+) -> ClipResult:
     """**剪藏拿到正文之后**的公共后半程（建库 → 扣配额 → 派蒸馏 → 失效缓存）。
 
     ## 为什么要抽出来
 
-    链接剪藏（`POST /api/v1/articles`）与文档剪藏（`POST /api/v1/articles/document`）
-    的**后半程完全一样**：去重 → 扣配额 → 建库 → 派蒸馏 → 失效缓存。
-    差别只在「正文从哪来」。
+    链接剪藏（`POST /api/v1/articles`）、文档剪藏（`POST /api/v1/articles/document`）
+    与旧版链接剪藏（`POST /api/v1/articles/add`）的**后半程完全一样**：
+    去重 → 扣配额 → 建库 → 派蒸馏 → 失效缓存。差别只在「正文从哪来」。
 
-    这两段一旦各写一份，就会各自漂移 —— 而漂移的方向恰恰是**扣费与幂等**：
+    这几段一旦各写一份，就会各自漂移 —— 而漂移的方向恰恰是**扣费与幂等**：
     文档路径漏了「先抓后扣」就会变成「解析失败也扣配额」，
     漏了 `mark_article_quota` 就会二次扣费。
+
+    ⚠️ 旧版 `POST /api/v1/articles/add` 曾经**整段漏掉**这条链
+    （自己调 `_create_article`，不扣配额、不埋点、不打缓存标记）——
+    那是一个持 token 的用户可以无限免费剪藏的口子（每次还派一次真实蒸馏）。
+    现在它也走这里，配额口径与新端点**完全一致**。
 
     ⚠️ 扣配额在**建库之前**，但**解析在扣配额之前**（见调用方）——
     顺序是「先拿到正文 → 再扣钱 → 再建库」，与链接剪藏同口径
@@ -992,18 +1106,7 @@ async def _clip_after_fetch(
             )
         except Exception as exc:
             log.warning("auto_distill_trigger_failed (dup): article=%s error=%s", dup.id, exc)
-        return {
-            "article_id": dup.id,
-            "url": dup.url,
-            "status": dup.status,
-            # 复用旧文章：没有新的 task_id（trigger_distill 内部会判断
-            # 「已在跑就不再入队」），返回 None 表示「没有新 task_id」而非失败。
-            "task_id": None,
-            "quota_used": 0,
-            "monthly_quota": 0,
-            "remaining": 0,
-            "reused": True,
-        }
+        return ClipResult(article=dup, reused=True)
 
     quota = await quota_service.consume(db, uid)  # 用尽抛 QuotaExceededError(3001)
     art = await _create_article(
@@ -1036,16 +1139,14 @@ async def _clip_after_fetch(
             extra={"article_id": art.id, "error": str(exc)},
         )
 
-    return {
-        "article_id": art.id,
-        "url": art.url,
-        "status": art.status,
-        "task_id": (trigger_result or {}).get("task_id"),
-        "quota_used": quota["quota_used"],
-        "monthly_quota": quota["monthly_quota"],
-        "remaining": quota["monthly_quota"] - quota["quota_used"],
-        "reused": False,
-    }
+    return ClipResult(
+        article=art,
+        task_id=(trigger_result or {}).get("task_id"),
+        quota_used=quota["quota_used"],
+        monthly_quota=quota["monthly_quota"],
+        remaining=quota["monthly_quota"] - quota["quota_used"],
+        reused=False,
+    )
 
 
 @app.post("/api/v1/admin/articles")
