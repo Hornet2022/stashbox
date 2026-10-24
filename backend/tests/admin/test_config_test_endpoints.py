@@ -146,6 +146,95 @@ async def test_llm_test_uses_request_body_not_saved_config(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_llm_test_qwen_vl_键名必须与build_client一致(monkeypatch):
+    """provider=qwen_vl 时，端点交给 client 的键名必须与 `build_client` 读的一致。
+
+    ## 这是哪个 bug 的回归
+
+    端点原来手拼 `f"{provider}_llm_*"` 当键名：
+
+      · provider=openai → "openai_llm_api_key"  ✅ 恰好对
+      · provider=qwen_vl → "qwen_vl_llm_api_key" ❌ 而 `build_client` 读的是
+                            **"qwen_vl_api_key"**（不带 _llm）
+
+    ⇒ 读出来是空 ⇒ `QwenVLClient` 抛 "api_key required"
+    ⇒ 运营在后台选 qwen_vl 点「测试调用」**永远报「缺 key」**，哪怕 key 已填；
+       而同一页面的 GET 版（读已存配置）却是绿的。
+
+    原来没被发现，是因为既有用例只覆盖 provider=openai —— 恰好是键名对的那个。
+    """
+    uid = await _make_admin()
+    created: dict = {}
+
+    def _fake_create(config):
+        created.update(config)
+        return _FakeLLMClient(config)
+
+    monkeypatch.setitem(_admin_router.build_adhoc_client.__globals__, "build_client", _fake_create)
+
+    payload = {
+        "provider": "qwen_vl",
+        "model": "qwen3.6-flash",
+        "api_key": "sk-from-form",
+        "base_url": "https://form-value.invalid/v1",
+    }
+    async with _client(_token(uid)) as c:
+        r = await c.post("/api/v1/admin/llm/test", json=payload)
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True, body
+    # build_client 读的就是这三个键
+    assert created["qwen_vl_api_key"] == "sk-from-form"
+    assert created["qwen_vl_model"] == "qwen3.6-flash"
+    assert created["qwen_vl_base_url"] == "https://form-value.invalid/v1"
+    # 旧的手拼键名不能出现 —— 出现就说明又有人自己拼键名了
+    assert "qwen_vl_llm_api_key" not in created
+
+
+@pytest.mark.asyncio
+async def test_llm_test_qwen_vl_真能建出client(monkeypatch):
+    """把端点交给 client 的那份 cfg 喂给**真的** build_client，必须建得出、
+    而且参数就是运营填的值。
+
+    这一条锁的是**两端对齐**这个契约本身：端点给的键名 ↔ build_client 读的键名。
+    任何一边单独改键名，这一条都会红 —— 比起只断言 cfg 里某个键，前一种写法
+    在「键名改了」时是端点侧先崩（建不出 client），症状更接近真实故障。
+    """
+    from stashbox.backend.app.services.llm import build_client as real_build_client
+
+    uid = await _make_admin()
+    created: dict = {}
+
+    def _fake_create(config):
+        created.update(config)
+        return _FakeLLMClient(config)
+
+    monkeypatch.setitem(_admin_router.build_adhoc_client.__globals__, "build_client", _fake_create)
+
+    payload = {
+        "provider": "qwen_vl",
+        "model": "qwen3.6-flash",
+        "api_key": "sk-from-form",
+        "base_url": "https://form-value.invalid/v1",
+    }
+    async with _client(_token(uid)) as c:
+        r = await c.post("/api/v1/admin/llm/test", json=payload)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is True, r.json()
+
+    # 真 client：建不出来就说明键名对不上（旧的 bug 就在这里炸）
+    client = real_build_client(created)
+    try:
+        assert client.api_key == "sk-from-form"
+        assert client.model == "qwen3.6-flash"
+        assert client.base_url == "https://form-value.invalid/v1"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_llm_test_rejects_unknown_provider(monkeypatch):
     """非法 provider 直接 400，不要等建 client 才炸。"""
     uid = await _make_admin()

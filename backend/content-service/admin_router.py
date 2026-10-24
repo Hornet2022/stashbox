@@ -784,9 +784,7 @@ async def admin_llm_test_with_config(
             message=f"provider 必须是 {list(SUPPORTED_PROVIDERS)} 之一，当前 {provider!r}"
         )
 
-    # app/services/llm 用 provider 前缀式键名，这里从请求体映射过去
-    #
-    # ⚠️ **空值要沿用已存的那把 key**（前端约定）：
+    # **空值要沿用已存的那把 key**（前端约定）：
     #    前端在用户**没有重新输入** key 时传 api_key: ''（不是不传），
     #    意图是"用我已保存的那把"。但这里原来直接把 req.api_key 塞进 cfg，
     #    空串 → build_adhoc_client 抛 "api_key required for OpenAIClient"
@@ -808,17 +806,32 @@ async def admin_llm_test_with_config(
                 else os.getenv("DASHSCOPE_API_KEY", "") or os.getenv("QWEN_VL_API_KEY", "")
             )
 
-    cfg: dict[str, Any] = {
-        "provider": provider,
-        f"{provider}_llm_model": req.model,
-        f"{provider}_llm_api_key": effective_key,
-        f"{provider}_llm_base_url": req.base_url,
-    }
-    if provider == "qwen_vl":
-        # qwen_vl 的 provider 名带 _vl，键名是 qwen_vl_llm_*（与 build_client 一致）
-        cfg["qwen_vl_llm_model"] = req.model
-        cfg["qwen_vl_llm_api_key"] = effective_key
-        cfg["qwen_vl_llm_base_url"] = req.base_url
+    # cfg 的键名必须与 `build_client` 读的**完全一致** ——
+    # 这里直接用**规范解析器** `resolve_config`，不再自己拼键名。
+    #
+    # ⚠️ 原来这里是手拼 `f"{provider}_llm_*"`：
+    #   · provider=openai  → "openai_llm_api_key"  ✅ 恰好对
+    #   · provider=qwen_vl  → "qwen_vl_llm_api_key" ❌ 而 build_client 读的是
+    #                          **"qwen_vl_api_key"**（不带 _llm，见 app/services/llm）
+    # ⇒ 读出来是空 ⇒ `QwenVLClient` 抛 "api_key required"
+    # ⇒ 运营在后台选 qwen_vl 点「测试调用」**永远报「缺 key」**，
+    #    哪怕 key 已经填好；而同一页面的 GET 版（读已存配置）却是绿的。
+    #
+    # 为什么原来没被发现：现有用例只覆盖 provider=openai（键名恰好对的那个），
+    # 而 qwen_vl 是 `SUPPORTED_PROVIDERS` 里白名单支持的合法选项。
+    #
+    # 修法不是把键名补对（那还是第二份拼键名的实现），而是**不拼**：
+    # `resolve_config` 就是 GET 版用的那个解析器（generic 字段 → provider 专属字段），
+    # 用它之后「表单值怎么变成 client 参数」全仓只有一份实现，
+    # 键名对不上这件事**在结构上不可能再发生**。
+    cfg: dict[str, Any] = resolve_config(
+        {
+            "provider": provider,
+            "model": req.model,
+            "api_key": effective_key,
+            "base_url": req.base_url,
+        }
+    )
 
     result: dict[str, Any] = {"provider": provider, "model": req.model}
     client = None
