@@ -218,3 +218,30 @@ def check_group(items: list[str], body_text: str = "") -> dict:
 def summarize(groups: dict[str, list[str]], body_text: str = "") -> dict:
     """三组一起出画像：{"insights": {...}, "related": {...}, "follow_ups": {...}}"""
     return {name: check_group(items, body_text) for name, items in groups.items()}
+
+
+#: 播客稿的**四个必备部分**（2026-10-24 产品拍板）。
+#:
+#: 产品的定义是：「稿子不该是原文的压缩，而该是
+#: **原文核心要点 + 关联思考 + 延伸判断 + 拓展方向**」。
+#:
+#: ⇒ 四段是稿子的**结构**，不是可选的加分项 —— 缺一段，稿子就不完整。
+#: 这条之所以要写成常量，是因为它同时是**判据**（下面）与**文档口径**。
+REQUIRED_PARTS: tuple[str, ...] = ("sections", "insights", "related", "follow_ups")
+
+
+def missing_parts(parts: dict[str, list[str]]) -> list[str]:
+    """返回**空缺**的部分名（空列表 = 四段齐备）。
+
+    ## 为什么需要它
+
+    原来的质量检查只判**单条**是否合格（`check_group`），而空组被
+    `if not q["total"]: continue` **直接跳过** ⇒
+    「延伸判断整段为 0」这件事在日志里**完全静默**。
+
+    后果实测过：文档剪藏与 GitHub 剪藏产出的稿子 `insights` 都是 0，
+    而那两篇看上去「挺完整」—— 少了四分之一的内容，没人发现。
+
+    ⇒ 缺段必须**出声**：这是可检测的缺陷，不是「内容质量」问题。
+    """
+    return [name for name in REQUIRED_PARTS if not (parts.get(name) or [])]

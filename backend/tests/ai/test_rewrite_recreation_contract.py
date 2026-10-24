@@ -108,7 +108,14 @@ def test_prompt_says_extra_fields_are_part_of_the_script(runner):
     """prompt 必须说清这三类内容**会被念给听众听**。
 
     否则 LLM 会把它们写成"关联：xxx"这种标签式的内容，念出来很怪。
+
+    ⚠️ 2026-10-24：末条断言的措辞跟着产品口径改了 ——
+    原来断言「不要硬编」，现在断言「不许编造具体事实」。
+    **意图没变**（都禁止编造），变的是「依据」的定义：
+    延伸判断的依据是「原文事实 + 一般规律」，不是「原文明说了这句话」；
+    而**具体事实**（数字/版本/事件）仍然一律不许编。
+    口径见 `docs/技术方案_v2.md` 的 2026-10-24 边界澄清。
     """
     system = runner._REWRITE_SYSTEM
     assert "会被念给听众听" in system
-    assert "不要硬编" in system
+    assert "不许编造具体事实" in system
