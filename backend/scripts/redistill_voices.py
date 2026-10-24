@@ -108,7 +108,21 @@ def _rows(sql: str) -> list[list[str]]:
 
 
 def candidates(only: list[str] | None) -> list[dict]:
-    """要重跑的存量文章（tts_voice_id 为空 = 不是用音色库音色合成的）。"""
+    """要重跑的存量文章。
+
+    默认清单 = `tts_voice_id` 为空的（不是用音色库音色合成的）那些。
+
+    ⚠️ **显式指定的文章要绕过这个筛选**（2026-10-24 修）：
+    原来筛选在 SQL 里、`--article` 在之后才过滤 ⇒ 指定的文章若**已经**
+    有 `tts_voice_id`（比如批量重跑之后、或本来就用音色库合成的），
+    就会被 SQL 筛掉 → `--article` 静默失效、报「待重跑 0 篇」。
+    显式指定的意思就是「就重跑这一篇」，不该被默认清单的条件拦下。
+    """
+    if only:
+        ids = ",".join("'" + a.replace("'", "") + "'" for a in only)
+        where = f"d.article_id in ({ids}) and d.status='done' and d.audio_url is not null"
+    else:
+        where = "d.status='done' and d.audio_url is not null and d.tts_voice_id is null"
     sql = (
         "select d.article_id, a.user_id, coalesce(d.duration_sec,0), "
         "length(coalesce(d.script_text,'')), "
@@ -117,7 +131,7 @@ def candidates(only: list[str] | None) -> list[dict]:
         "replace(replace(coalesce(a.title,''), chr(10), ' '), chr(13), ' '), "
         "d.audio_url, a.created_at::text "
         "from distilled_articles d join articles a on a.id = d.article_id "
-        "where d.status='done' and d.audio_url is not null and d.tts_voice_id is null "
+        f"where {where} "
         "order by a.created_at"
     )
     out = []
@@ -220,8 +234,11 @@ def main() -> int:
                 print(f"      状态 → {cur}")
                 last = cur
             # ⚠️ **终态是外部 5 态枚举里的 `ready`，不是内部态 `done`**（2026-10-24 实测踩到）：
-            #   `GET /api/v1/distill/{task_id}` 走 `_external_distill_status()` 映射：
-            #       queued → pending / step1-4 → distilling / **done → ready** / failed → failed
+            #   `GET /api/v1/distill/{task_id}` 走 `common/distill_status.py` 的
+            #   `derive_distill_status()` 派生（内容服务侧的文章状态端点用的是
+            #   **同一个函数** ⇒ 两端口径必然一致）：
+            #       产物表 done → ready / 产物表 failed + 还在重试 → distilling
+            #       产物表 queued / step1-4 → articles.status（pending 或 distilling）
             #   老写法等 `("done", "failed", "skipped")` —— `done` 永远不会出现
             #   ⇒ 每篇都要空等到 900s 超时（25 篇 = 6 小时）。
             if cur in ("ready", "failed"):
