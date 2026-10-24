@@ -60,6 +60,7 @@ from fetchers import (  # noqa: E402
     map_fetcher_error,
 )
 from fetchers.document import (  # noqa: E402
+    parse_document_async,
     DOCUMENT_SOURCE,
     MAX_DOCUMENT_BYTES,
     parse_document,
@@ -925,7 +926,8 @@ async def submit_document(
 
     # -- 解析（失败 → 不建库不计费）----------------------------------
     try:
-        fr = parse_document(
+        # ⚠️ 用**异步版**：扫描件 PDF 会先 OCR 识图（网络请求，不能在同步函数里做）。
+        fr = await parse_document_async(
             filename=filename,
             data=data,
             content_type=content_type,
@@ -1155,7 +1157,8 @@ async def admin_create_article_document(
 
     # -- 解析（失败 → 不建库）----------------------------------------
     try:
-        fr = parse_document(
+        # ⚠️ 异步版：扫描件 PDF 先 OCR 识图
+        fr = await parse_document_async(
             filename=filename,
             data=data,
             content_type=content_type,

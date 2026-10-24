@@ -6342,6 +6342,64 @@
         ]
       }
     },
+    "/api/v1/notifications/{notification_id}/delivered": {
+      "post": {
+        "summary": "Mark Notification Delivered",
+        "description": "回报「这条通知已经到达用户设备」（2026-10-24）。\n\n## 为什么需要这个端点\n\n没有厂商通道（APNs/FCM/个推/极光全仓零命中）时，\n`STASHBOX_PUSH_WEBHOOK_URL` 没配 → `NullPushProvider` 如实报「未配置推送通道」\n→ 通知行是 `failed`。**通知本身是好的**（它进了通知中心、进了订阅流），\n只是「弹到手机通知栏」这一步没人做。\n\n⇒ 那一步由 **App 侧做**：安卓端周期性拉通知中心（`GET /api/v1/notifications`）\n→ 对没通知过的发**本地系统通知** → 通知真的出现在手机通知栏 → **回报本端点**。\n\n## 为什么「投递」与「已读」是两个端点\n\n· `delivered` = **已经到达设备**（通知弹出来了）；\n· `mark-read` = **用户看过了**（他点开了通知中心里的那一条）。\n\n两件事不能合并：合并的话，App 一发出本地通知就把 `read_at` 置上 ⇒\n**铃铛的未读角标会被清零**，而用户根本还没看到 ⇒\n「有更新」这件事又变成了没人知道。\n\n⇒ 本端点只动 `status` / `sent_at`，**不动 `read_at`**。\n\n幂等：重复回报不报错。",
+        "operationId": "mark_notification_delivered_api_v1_notifications__notification_id__delivered_post",
+        "parameters": [
+          {
+            "name": "notification_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Notification Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "user-service",
+          "api-gateway"
+        ]
+      }
+    },
     "/api/v1/notifications/{notification_id}/mark-read": {
       "post": {
         "summary": "Mark Notification Read",

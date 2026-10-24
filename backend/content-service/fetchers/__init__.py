@@ -98,14 +98,18 @@ def fetch_error_user_message(code: FetcherErrorCode, source: str = "") -> str:
     # 文档剪藏（2026-10-23）：同一套错误码，文档的成因与链接**完全不同**。
     #
     # 链接剪藏的 PARSE 多是「页面需要登录/渲染不出来」；文档剪藏的 PARSE
-    # 主要是**扫描件 PDF**（没有文本层）、加密 PDF、空文档。
+    # 主要是**加密 PDF**、空文档，或**扫描件 PDF 但 OCR 也没认出字**。
     # 沿用链接那句「页面可能需要登录后才能查看」会让人以为要去登录 ——
     # 而文档根本没有「登录」这回事，用户会白找不存在的原因。
     if source == "document":
         if code is FetcherErrorCode.PARSE:
+            # ⚠️ 2026-10-24：扫描件 PDF **已经支持 OCR 了**（见 fetchers/ocr.py）。
+            # 能走到这句话，说明「OCR 也没认出字」—— 可能是加密文件、
+            # 也可能是图片质量太差/文字太少。所以话术要改：
+            # 再说「扫描件我们读不了」就是**说假话**（它现在能读，只是这次没读出来）。
             return (
                 "没能从这个文档里读出文字。"
-                "如果是扫描件（图片版 PDF）或加密文件，我们暂时读不了，"
+                "如果是加密文件，或者图片太模糊认不出字，"
                 "可以换个文件或直接粘贴文本试试"
             )
         if code is FetcherErrorCode.UNSUPPORTED:

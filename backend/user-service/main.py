@@ -1287,6 +1287,58 @@ async def mark_notification_read(
     return {"ok": True, "read_at": notif.read_at.isoformat()}
 
 
+@app.post("/api/v1/notifications/{notification_id}/delivered")
+async def mark_notification_delivered(
+    notification_id: int,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """回报「这条通知已经到达用户设备」（2026-10-24）。
+
+    ## 为什么需要这个端点
+
+    没有厂商通道（APNs/FCM/个推/极光全仓零命中）时，
+    `STASHBOX_PUSH_WEBHOOK_URL` 没配 → `NullPushProvider` 如实报「未配置推送通道」
+    → 通知行是 `failed`。**通知本身是好的**（它进了通知中心、进了订阅流），
+    只是「弹到手机通知栏」这一步没人做。
+
+    ⇒ 那一步由 **App 侧做**：安卓端周期性拉通知中心（`GET /api/v1/notifications`）
+    → 对没通知过的发**本地系统通知** → 通知真的出现在手机通知栏 → **回报本端点**。
+
+    ## 为什么「投递」与「已读」是两个端点
+
+    · `delivered` = **已经到达设备**（通知弹出来了）；
+    · `mark-read` = **用户看过了**（他点开了通知中心里的那一条）。
+
+    两件事不能合并：合并的话，App 一发出本地通知就把 `read_at` 置上 ⇒
+    **铃铛的未读角标会被清零**，而用户根本还没看到 ⇒
+    「有更新」这件事又变成了没人知道。
+
+    ⇒ 本端点只动 `status` / `sent_at`，**不动 `read_at`**。
+
+    幂等：重复回报不报错。
+    """
+    from datetime import datetime
+
+    notif = await db.get(PushNotification, notification_id)
+    if not notif:
+        raise HTTPException(status_code=404, detail=f"notification {notification_id} 不存在")
+    if notif.user_id != int(user["sub"]):
+        # 不能回报别人的推送（防越权）
+        raise HTTPException(status_code=403, detail="无权操作他人推送")
+    if notif.status != "sent" or notif.sent_at is None:
+        notif.status = "sent"
+        notif.sent_at = datetime.now()
+        notif.error = None
+        await db.commit()
+        await db.refresh(notif)
+    return {
+        "ok": True,
+        "status": notif.status,
+        "sent_at": notif.sent_at.isoformat() if notif.sent_at else None,
+    }
+
+
 # ===== CP5.4a-ADMIN：admin 推送队列端点（v1 §端点需求_admin推送队列_v1 §2.1） =====
 _ADMIN_PUSH_STATUS_VALUES = {"pending", "sent", "failed"}
 

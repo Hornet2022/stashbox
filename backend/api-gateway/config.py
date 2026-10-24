@@ -387,6 +387,16 @@ ROUTES += [
         "user-service",
         _url("user-service"),
     ),
+    # 2026-10-24：回报「已投递到设备」。安卓端在没有厂商推送通道时，
+    # 由 App 自己拉通知中心 → 发本地系统通知 → 回报本端点
+    # （user-service 的 POST /api/v1/notifications/{id}/delivered）。
+    # 与 mark-read 是**两件事**（投递 ≠ 用户看过），所以角标不会被清零。
+    Route(
+        "POST",
+        "/api/v1/notifications/{notification_id}/delivered",
+        "user-service",
+        _url("user-service"),
+    ),
     # CP5.4a-ADMIN：admin 全量推送队列端点（v1 §端点需求_admin推送队列_v1）。
     # admin 段不在 fallback 第一段前缀匹配里，必须显式注册，漏注册 = 8100 返 404。
     Route("GET", "/api/v1/admin/push-notifications", "user-service", _url("user-service")),

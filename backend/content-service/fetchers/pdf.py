@@ -6,8 +6,10 @@
 3. Title 启发式：第一页第一行非空文本 / Content-Disposition filename / URL basename
 4. 返回 FetchResult，source="pdf"
 
-为什么不重 PDF OCR（图片版 PDF）：本期只支持文本型 PDF。图片版由 ai-service
-蒸馏阶段兜底（多模态 LLM 直接吃图片），不增加 fetcher 复杂度。
+OCR（图片版 PDF）：**2026-10-24 起支持**。
+原先这里写着「本期只支持文本型 PDF，图片版由 ai-service 蒸馏阶段兜底」——
+但那个兜底**从来没发生过**（蒸馏阶段只拿到文本，抽不到就是空的）。
+现在文本层为空时直接抽内嵌图 → 调 provider 的 OCR 模型（见 fetchers/ocr.py）。
 """
 
 from __future__ import annotations
@@ -210,11 +212,26 @@ class PdfFetcher(Fetcher):
             ) from exc
 
         content_text = "\n\n".join(t for t in page_texts if t).strip()
+        ocr_metadata: dict[str, Any] = {}
+
+        if not content_text:
+            # 扫描件 PDF：文本层是空的 ⇒ 抽内嵌图 → OCR 识图（2026-10-24）。
+            #
+            # 为什么现在能做：provider 侧有能认字的模型，且**不引入光栅化依赖**
+            # （扫描件的图本来就在 PDF 里，pypdf 能原样抽出来）。
+            # 详见 fetchers/ocr.py 的说明（含实测结论）。
+            try:
+                from .ocr import OCRUnavailableError, ocr_pdf
+
+                content_text, ocr_metadata = await ocr_pdf(body)
+            except Exception as exc:
+                log.warning("[pdf] ocr failed: %s", exc)
+                content_text = ""
 
         if not content_text:
             raise FetcherError(
                 code=FetcherErrorCode.PARSE,
-                message="no text extracted (可能为图片型 PDF,本期不支持 OCR)",
+                message="no text extracted (可能为图片型 PDF，且 OCR 通道不可用)",
                 source=self.name,
             )
 
@@ -233,6 +250,7 @@ class PdfFetcher(Fetcher):
             "page_count": len(page_texts),
             "text_length": len(content_text),
             "pdf_metadata": pdf_metadata,
+            **ocr_metadata,
         }
 
         # 6. 构造 FetchResult（PDF 无 HTML，正文段落转 <p>）

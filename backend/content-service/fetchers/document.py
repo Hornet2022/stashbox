@@ -48,7 +48,12 @@ from io import BytesIO
 from typing import Any
 
 from .base import FetchResult, FetcherError, FetcherErrorCode
-from .pdf import extract_pdf_text
+
+# ⚠️ 用**模块属性**而不是 `from .pdf import extract_pdf_text`：
+# 后者在 import 时就把函数**绑定**到本模块的命名空间 ⇒
+# 之后 monkeypatch `fetchers.pdf.extract_pdf_text` 改不动这里（打补丁打不到）。
+# 改成 `_pdf_mod.extract_pdf_text(...)` 就是**调用时**解析 ⇒ 单一打补丁点。
+from . import pdf as _pdf_mod
 
 log = logging.getLogger("stashbox.fetch.document")
 
@@ -217,8 +222,13 @@ def parse_document(
     data: bytes,
     content_type: str = "",
     url: str = "",
+    pdf_text: str | None = None,
 ) -> FetchResult:
     """上传的文档字节 → [FetchResult]（与抓取同形）。
+
+    Args:
+        pdf_text: **扫描件 PDF 的 OCR 文本**（由 `parse_document_async` 先识图拿到）。
+            为 None 时按普通 PDF 处理（只有文本层）。
 
     Raises:
         FetcherError: 解析不出来（格式不支持 / 扫描件 / 加密 / 正文过短）。
@@ -238,7 +248,7 @@ def parse_document(
         from pypdf.errors import PdfReadError
 
         try:
-            page_texts, pdf_metadata = extract_pdf_text(data)
+            page_texts, pdf_metadata = _pdf_mod.extract_pdf_text(data)
         except PdfReadError as exc:
             raise FetcherError(
                 code=FetcherErrorCode.PARSE,
@@ -251,8 +261,13 @@ def parse_document(
                 message=f"pdf parse failed: {type(exc).__name__}: {exc}",
                 source=SOURCE,
             ) from exc
-        text = "\n\n".join(t for t in page_texts if t).strip()
-        raw_metadata["parser"] = "pdf"
+        if pdf_text and pdf_text.strip():
+            # 扫描件：文本层是空的，用 OCR 识出来的文字
+            text = pdf_text.strip()
+            raw_metadata["parser"] = "pdf_ocr"
+        else:
+            text = "\n\n".join(t for t in page_texts if t).strip()
+            raw_metadata["parser"] = "pdf"
         raw_metadata["page_count"] = len(page_texts)
         raw_metadata["pdf_metadata"] = pdf_metadata
 
@@ -319,9 +334,69 @@ def parse_document(
 
 __all__ = [
     "DOCUMENT_SOURCE",
+    "parse_document_async",
     "MAX_CONTENT_CHARS",
     "MAX_DOCUMENT_BYTES",
     "MIN_CONTENT_CHARS",
     "SOURCE",
     "parse_document",
 ]
+
+
+async def parse_document_async(
+    *,
+    filename: str,
+    data: bytes,
+    content_type: str = "",
+    url: str = "",
+) -> FetchResult:
+    """**异步版**解析：扫描件 PDF 会先 OCR 识图，再走同步解析。
+
+    ## 为什么需要异步版
+
+    同步的 [parse_document] 只做**纯计算**（pypdf 抽文本），所以能在任何地方调。
+    但 OCR 要**发网络请求** ⇒ 不能在同步函数里做（会把事件循环卡住）。
+
+    ⇒ 拆成「异步壳 + 同步核」：壳负责「判断要不要 OCR + 拿 OCR 文本」，
+    核仍然是 [parse_document]（**唯一的解析实现**，不会两处漂移）。
+
+    ## 什么时候会 OCR
+
+    仅当：**是 PDF** 且 **文本层是空的**（扫描件的判定）且 **OCR 通道可用**。
+    OCR 不可用时**不报错** —— 退回「读不出正文」的既有报错路径
+    （错误话术由上层统一处理），不让 OCR 的问题变成一个更 confusing 的错误。
+    """
+    from .ocr import OCRUnavailableError, ocr_pdf
+
+    pdf_text: str | None = None
+    if _is_pdf(filename=filename, content_type=content_type):
+        try:
+            page_texts, _meta = _pdf_mod.extract_pdf_text(data)
+            has_text_layer = any((t or "").strip() for t in page_texts)
+        except Exception:
+            has_text_layer = False
+
+        if not has_text_layer:
+            # 扫描件 → 识图
+            try:
+                pdf_text, _ocr_meta = await ocr_pdf(data)
+                log.info("document_ocr_done chars=%d", len(pdf_text or ""))
+            except OCRUnavailableError as exc:
+                log.warning("document_ocr_unavailable: %s", exc)
+            except Exception as exc:
+                log.warning("document_ocr_failed: %s", exc)
+
+    return parse_document(
+        filename=filename,
+        data=data,
+        content_type=content_type,
+        url=url,
+        pdf_text=pdf_text,
+    )
+
+
+def _is_pdf(*, filename: str, content_type: str) -> bool:
+    """是不是 PDF（按扩展名或 content-type）。"""
+    ext = ("." + filename.rsplit(".", 1)[-1].lower()) if "." in filename else ""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    return ext == ".pdf" or ct == "application/pdf"
