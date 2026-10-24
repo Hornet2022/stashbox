@@ -106,16 +106,68 @@ def test_median_f0_is_repeatable(voice_align):
     assert abs(a - b) / a < 0.01, f"两次测量不一致：{a} vs {b}"
 
 
-def test_register_f0_uses_p25_and_is_stable(voice_align):
-    """`register_f0` 是**音域锚点**，用 p25 而不是中位数。
+def test_register_f0_uses_median_not_p25(voice_align):
+    """`register_f0` 是**音域锚点**，用**中位数**而不是 p25（2026-10-24 改）。
 
-    为什么：中位数会被真实语音 F0 分布的上尾带跑（同一段文字两次
-    合成，中位数能从 121 跳到 167 —— 纯随机采样）。p25 落在说话人
-    音域的下缘，才是身份特征。
+    ## 为什么要改
 
-    这里的断言就是锁住「用 p25」这个选择：合成一段基频 150Hz、
-    但叠了强高次谐波（把中位数往上拉）的信号，
-    `register_f0` 应该仍报 ~150Hz。
+    原来是 p25，理由是「中位数会被真实语音 F0 分布的上尾带跑」。
+    **这条理由在克隆打通之后不成立了** —— 而 p25 本身是个坏用的锚点：
+    它是**尾部统计量**，对「这一块里有多少帧落在低频区」极敏感
+    （气声、句尾下沉、辅音间隙），同一说话人的不同块就能差 26%
+    （实测：生产的 5 块真实渲染件，p25 散布 26.0% vs 中位数散布 5.6%）。
+    拿它当锚点 → 各块算出的位移量都是错的 → 对齐完反而把本来
+    一致的块**推散**（散布 5.6% → 14.3%，相邻块音色距离 0.0085 → 0.0641）。
+
+    ## 这里的断言就是锁住「用中位数」这个选择
+
+    造一段**前半 150Hz、后半 300Hz** 的信号：
+      · p25   → 150 Hz（落在低的那一半）
+      · 中位数 → 225 Hz（两半的中间）
+    ⇒ `register_f0` 必须报 ~225Hz。报 150 就说明又退回 p25 了。
+    """
+    import shutil
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("环境没有 ffmpeg，跳过")
+
+    def _synth_two_halves(
+        f0_low: float, f0_high: float, seconds: float = 4.0, rate: int = 16000
+    ) -> bytes:
+        import io
+        import struct
+        import wave
+
+        n = int(rate * seconds)
+        samples = []
+        for i in range(n):
+            t = i / rate
+            f = f0_low if t < seconds / 2 else f0_high
+            v = sum(math.sin(2 * math.pi * f * k * t) / k for k in range(1, 11))
+            samples.append(int(max(-1.0, min(1.0, v / 2.0)) * 32767))
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(struct.pack(f"<{n}h", *samples))
+        return buf.getvalue()
+
+    audio = _synth_two_halves(150.0, 300.0)
+    measured = voice_align.register_f0(audio)
+    assert measured is not None
+    # 中位数 ≈ 225（p25 会给 150）
+    assert 195 <= measured <= 255, f"锚点实测 {measured:.1f}Hz，应接近中位数 225Hz（p25 会给 150）"
+
+
+def test_register_f0_survives_strong_harmonics(voice_align):
+    """锚点不能被强高次谐波带跑（真值 150Hz 的信号仍应报 ~150Hz）。
+
+    ⚠️ 这条曾经是「必须用 p25」的理由，但实测**中位数口径也过**（150.0Hz）
+    —— 自相关估计器对这类信号不会把中位数带跑。
+    当年的对照样本是「同一段文字两次合成」—— 那是**换了说话人**，
+    不是「表达把中位数带跑」，两件事被混为一谈了。
+    留着这条用例：它守住的是**估计器不被谐波污染**，与用哪个分位无关。
     """
     import shutil
 
@@ -131,7 +183,7 @@ def test_register_f0_uses_p25_and_is_stable(voice_align):
         samples = []
         for i in range(n):
             t = i / rate
-            # 第 3、5、7 次谐波压过基波 → 中位数会被拉高
+            # 第 3、5、7 次谐波压过基波
             v = (
                 0.6 * math.sin(2 * math.pi * f0 * t)
                 + 1.0 * math.sin(2 * math.pi * f0 * 3 * t)
@@ -151,6 +203,103 @@ def test_register_f0_uses_p25_and_is_stable(voice_align):
     assert measured is not None
     error = abs(measured - 150.0) / 150.0
     assert error <= 0.05, f"音域锚点实测 {measured:.1f}Hz vs 真值 150Hz，误差 {error:.1%}"
+
+
+def _synth_wav_with_low_frames(
+    f0: float, low_f0: float, low_ratio: float, seconds: float = 4.0, rate: int = 16000
+) -> bytes:
+    """造一段基频 f0、但有一部分帧掉到 low_f0 的 WAV。
+
+    模拟真实语音里的**气声 / 句尾下沉 / 辅音间隙**：
+    它们把 F0 分布的**下缘**拉低，但**中位数不变** ——
+    也就是说，这一段的「说话人音域」没变，只是分布的尾巴变了。
+
+    ⇒ 用 p25 当锚点时，这段会被误判成「音域低一档」（实测 p25 差 25%）。
+    """
+    import io
+    import struct
+    import wave
+
+    n = int(rate * seconds)
+    samples = []
+    n_low = int(n * low_ratio)
+    for i in range(n):
+        t = i / rate
+        f = low_f0 if i < n_low else f0
+        v = sum(math.sin(2 * math.pi * f * k * t) / k for k in range(1, 11))
+        samples.append(int(max(-1.0, min(1.0, v / 2.0)) * 32767))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(struct.pack(f"<{n}h", *samples))
+    return buf.getvalue()
+
+
+def _median_spread(mod, pieces: list[bytes]) -> float:
+    """各段中位基频的散布（%）。"""
+    medians = [mod.median_f0(p) for p in pieces]
+    vals = [m for m in medians if m]
+    if len(vals) < 2:
+        return 0.0
+    return (max(vals) - min(vals)) / min(vals) * 100
+
+
+def test_align_pitch_never_increases_measured_spread(voice_align):
+    """**不变式：对齐不得让各段的基频散布变大。**
+
+    这条锁的是 2026-10-24 定位到的真 bug：
+    锚点用 p25 时，同一个说话人的三块（气声比例不同）被算成三个不同音域
+    ⇒ 位移量各自不同 ⇒ **把本来一致的块推散**（实测散布 0% → 33%）。
+
+    合成信号刻意复刻那个形状：基频一样，只有低频帧的比例不同
+    （= 气声 / 句尾下沉）。此时
+      · 中位数三块几乎相同（说话人没变）
+      · p25 三块差一档（尾巴变了）
+    ⇒ 用中位数当锚点就不会动它们；用 p25 就会把它们推散。
+    """
+    import shutil
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("环境没有 ffmpeg，跳过")
+
+    pieces = [
+        _synth_wav_with_low_frames(200.0, 150.0, 0.10),
+        _synth_wav_with_low_frames(200.0, 150.0, 0.30),
+        _synth_wav_with_low_frames(200.0, 150.0, 0.05),
+    ]
+
+    before = _median_spread(voice_align, pieces)
+    out, _ = voice_align.align_pitch(pieces)
+    after = _median_spread(voice_align, out)
+
+    assert (
+        after <= before + 1.0
+    ), f"对齐把一致性搞坏了：散布 {before:.1f}% → {after:.1f}%（对齐不得让散布变大）"
+
+
+def test_align_pitch_still_fixes_a_real_register_difference(voice_align):
+    """改用中位数锚点后，**真正的音域差仍然要被对齐掉**。
+
+    上一条守住「不许弄坏」，这条守住「还得管用」——
+    上游返回不同说话人时（那正是本步骤存在的理由），两段要被拉到同一音域。
+    """
+    import shutil
+
+    if not shutil.which("ffmpeg"):
+        pytest.skip("环境没有 ffmpeg，跳过")
+
+    low = _synth_wav(150.0)
+    high = _synth_wav(170.0)
+
+    before = _median_spread(voice_align, [low, high])
+    out, details = voice_align.align_pitch([low, high])
+    after = _median_spread(voice_align, out)
+
+    assert before > 5.0, f"构造的样本本身应差一档（实测 {before:.1f}%）"
+    assert after <= before, f"音域差没有被对齐掉：{before:.1f}% → {after:.1f}%"
+    assert any(d["semitones"] for d in details), "应当真的发生了位移"
 
 
 def test_align_pitch_moves_segment_towards_target(voice_align, tmp_path):

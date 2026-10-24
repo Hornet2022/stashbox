@@ -366,39 +366,45 @@ def _probe_rate(path: str, ffmpeg_bin: str | None = None) -> int:
 
 
 def register_f0(audio: bytes, ffmpeg_bin: str | None = None) -> float | None:
-    """一段音频的「音域锚点」= 全部浊音帧基频的 **p25**（稳健分位）。
+    """一段音频的「音域锚点」= 全部浊音帧基频的**中位数**。
 
-    ## 为什么用 p25 而不是中位数
+    ## 为什么是中位数（2026-10-24 改：原来是 p25）
 
-    实测（2026-10-22，tertu.cn 的 Qwen3-TTS 真实渲染件）：
+    原来是 p25，理由是「真实语音的 F0 分布很宽（94~570Hz），中位数会被
+    上尾带跑，p25 落在说话人音域的下缘」。**这条理由在克隆打通之后不成立了**，
+    而且 p25 本身是个坏用的锚点：
 
-        段1  p25=152.1Hz  中位=215.5Hz
-        段2  p25=169.2Hz  中位=224.6Hz
-        段3  p25=133.2Hz  中位=180.9Hz
+    实测（2026-10-24，生产的真实渲染块，5 块不同文本、同一个参考音）：
 
-    同一段文字合成两次，中位数能从 121 跳到 167（**纯随机采样**），
-    而 p25 稳定 —— 因为真实语音的 F0 分布很宽（94~570Hz），
-    中位数被上尾带跑，p25 落在「说话人音域的下缘」，那才是身份特征。
+        每块  p25（= 原锚点）     每块 中位数
+        00    180.3 Hz           221.6 Hz
+        01    151.9 Hz           213.4 Hz
+        02    191.3 Hz           219.0 Hz
+        03    167.2 Hz           209.8 Hz
+        04    167.2 Hz           212.1 Hz
+        ─────────────────────────────
+        散布   **26.0%**          **5.6%**
 
-    实测对照：同一段 118Hz 的音频，用中位数做度量时位移后测出 304Hz
-    （预期 ~188Hz）—— 方向完全错。改用 p25 后，3 段的位移误差 ≤1.8%。
+    ⇒ p25 是**尾部统计量**，它对「这一块里有多少帧落在低频区」极敏感
+      （气声、句尾下沉、辅音间隙）—— 同一说话人的不同块就能差 26%，
+      **噪声比信号还大**。拿它当锚点，各块算出的位移量都是错的
+      （实测位移 -0.97 / +2.00 / -2.00 半音，而块与块的中位数本来只差 5.6%）
+      ⇒ 对齐完反而把本来一致的块**推散了**：中位数散布 5.6% → 14.3%，
+      音色距离（相邻块）0.0085 → 0.0641（**7.5 倍**）——
+      这就是用户听到的「分段音色差异」。
+
+    中位数没有这个问题，且**已经被本文件校准过**（见 `F0Profile`）：
+    同一人（克隆）44s 片段的散布 2.2%，换了人 33.7% ——
+    信噪比足够区分「同一个人」与「换人」。
+
+    ⚠️ 那条老理由（p25 抗上尾）在本估计器上**不成立**：
+    合成一段真值 150Hz、叠了强 3/5 次谐波的信号，
+    p25 口径测 150.0Hz、**中位数口径也测 150.0Hz** ——
+    自相关估计器对这类信号并不会把中位数带跑。
+    （当年的对照样本是「同一段文字两次合成」—— 那是**换了说话人**，
+    不是「表达把中位数带跑」。两件事当时被混为一谈了。）
     """
-    samples = _decode_pcm(audio, ffmpeg_bin)
-    if not samples:
-        return None
-    frame_len = int(_ANALYSIS_RATE * _FRAME_SEC)
-    if len(samples) < frame_len:
-        return None
-
-    values: list[float] = []
-    for start in range(0, len(samples) - frame_len + 1, frame_len):
-        f0 = _frame_f0(samples[start : start + frame_len])
-        if f0:
-            values.append(f0)
-    if len(values) < 10:
-        return None
-    values.sort()
-    return values[int(len(values) * 0.25)]
+    return median_f0(audio, ffmpeg_bin)
 
 
 def _shift_pitch(piece: bytes, semitones: float, ffmpeg_bin: str | None = None) -> bytes | None:
@@ -509,6 +515,29 @@ def _shift_pitch(piece: bytes, semitones: float, ffmpeg_bin: str | None = None) 
     return None
 
 
+def _spread(values: list[float | None]) -> float:
+    """各段基频的**散布** = (max - min) / min（测不出来的段忽略）。
+
+    ## 为什么要有这个量
+
+    「各段是不是同一个人」这件事，判的不是**某一个数**，而是**段与段之间的差**。
+    之前只用「文章级中位数 vs 参考音」来判（实测重跑后 7 篇的中位数
+    全落在参考音 ±5% 内），那个口径**看不见段间的跳变** ——
+    中位数对了，段与段照样可以差一档。
+
+    ⇒ 「有没有分段音色差异」的判据必须是**段间散布**，
+      而「对齐有没有帮上忙」的判据是**散布有没有变小**。
+      两件事都用同一个量（同一个统计量、同一段长度），才可比。
+    """
+    vals = [v for v in values if v]
+    if len(vals) < 2:
+        return 0.0
+    lo = min(vals)
+    if lo <= 0:
+        return 0.0
+    return (max(vals) - lo) / lo
+
+
 def align_pitch(
     pieces: list[bytes],
     target_f0: float | None = None,
@@ -520,7 +549,7 @@ def align_pitch(
 
     Args:
         pieces: 各段音频（顺序即拼接顺序）
-        target_f0: 目标基频；None 则取各段基频的**中位数**
+        target_f0: 目标基频；None 则取各段基频的**几何中点**
         max_semitones: 位移封顶（半音），超过则不动
         deadband_ratio: 死区比例，偏离在它以内不动
         ffmpeg_bin: ffmpeg 路径（默认取环境变量 FFMPEG_BIN）
@@ -529,6 +558,16 @@ def align_pitch(
         (对齐后的各段, 每段的处理明细)
         明细里记着 before/after/半音数 —— 这是**唯一**能证明
         「对齐确实生效」的证据，调用方应该把它记进日志。
+
+    ## 不变式：对齐**不得让散布变大**
+
+    对齐的前提是「每段测得的基频可信」。若某段测歪了，算出的位移量就是
+    错的，对齐反而把本来一致的段**推散**（实测：5 块同一人，散布 5.6% →
+    14.3%，相邻块音色距离 0.0085 → 0.0641）。
+
+    ⇒ 位移是乘性的，**对齐后的散布可以事先算出来**；算出来发现会变大，
+      就把位移整体缩小（α = 1 → 0.75 → 0.5 → 0.25 → 0）。
+      这个护栏是本函数**必须**满足的契约（见 `tests/ai/test_voice_align.py`）。
     """
     if len(pieces) < 2:
         return pieces, []
@@ -548,7 +587,8 @@ def align_pitch(
         # 于是真正的约束是「**最大位移**」——
         # 一段超封顶就被**放弃不动**，而它继续差一档 ⇒ 换人感还在。
         #
-        # 生产实测（art_6d0d007edf3b4bc59def36c9，3 段真实渲染件）：
+        # 生产实测（art_6d0d007edf3b4bc59def36c9，3 段真实渲染件；
+        # 当时的锚点是 p25，现在换成中位数，但**这条结论与统计量无关**）：
         #     段1 p25=102.5Hz   段2 p25=117.6Hz   段3 p25=150.1Hz
         #     锚点=中位数 117.6 → 段1 +2.38 ✓（在封顶内）
         #                        段2  0     ✓
@@ -563,17 +603,18 @@ def align_pitch(
         target_f0 = math.sqrt(lo * hi)
         # ⚠️ 兜底：全篇只有一种音域时 lo==hi ⇒ 锚点=它自己（不产生位移）✓
 
-    out: list[bytes] = []
-    details: list[dict] = []
+    # ── 第一步：只**算**每段该移多少，暂时不动音频 ──────────────
+    #
+    # ⚠️ 分两步走是为了能插进**护栏**（见下）：护栏要比较「对齐前后的
+    # 散布」，而对齐后的基频**可以事先算出来**（位移是乘性的）。
+    plan: list[tuple[bytes, float | None, float, str | None]] = []
     for piece, f0 in zip(pieces, f0s):
         if not f0:
-            out.append(piece)
-            details.append({"f0_before": None, "f0_after": None, "semitones": 0.0})
+            plan.append((piece, None, 0.0, "no_f0"))
             continue
         ratio = f0 / target_f0
         if abs(ratio - 1.0) <= deadband_ratio:
-            out.append(piece)
-            details.append({"f0_before": f0, "f0_after": f0, "semitones": 0.0})
+            plan.append((piece, f0, 0.0, None))
             continue
         # ⚠️ 符号：要把 f0 移到 target，需要 target = f0 · 2^(s/12)
         #    → s = 12·log2(target/f0)。写成 log2(f0/target) 会**反向**移动
@@ -581,17 +622,85 @@ def align_pitch(
         semitones = 12.0 * math.log2(target_f0 / f0)
         if abs(semitones) > max_semitones:
             # 超出封顶 → 保持原样（人工感比不同人更糟）
-            out.append(piece)
-            details.append(
-                {"f0_before": f0, "f0_after": f0, "semitones": 0.0, "skipped": "over_cap"}
-            )
+            plan.append((piece, f0, 0.0, "over_cap"))
             continue
-        shifted = _shift_pitch(piece, semitones, ffmpeg_bin)
+        plan.append((piece, f0, semitones, None))
+
+    # ── 护栏（2026-10-24 加）：**对齐不得让散布变大** ─────────────
+    #
+    # 为什么需要：对齐是「把每段移到共同锚点」，前提是**每段测得的基频
+    # 是可信的**。若某一段的基频测歪了（表达把它拉高、气声把它拉低），
+    # 算出的位移量就是错的 —— 于是对齐不是把段拉齐，而是**把本来一致的
+    # 段推散**（实测：5 块同一人、散布 5.6% → 对齐后 14.3%，
+    # 相邻块音色距离 0.0085 → 0.0641，7.5 倍）。
+    #
+    # 怎么防：位移是乘性的（f0 → f0 · 2^(s/12)），所以「对齐后每段的
+    # 基频」可以**事先算出来**。算出来发现散布会变大，就把位移整体
+    # 缩小（α = 1 → 0.75 → 0.5 → 0.25 → 0），取第一个不让散布变大的 α。
+    #
+    # ⚠️ 护栏必须与锚点**用同一个统计量**来判：拿 p25 对齐却拿中位数
+    #   判散布，等于没写护栏（实测：照样恶化）。「对齐依据」与
+    #   「判断依据」必须是同一个量，否则护栏自欺欺人。
+    #
+    # ⚠️ **诚实说明**：以当前的锚点（各段基频的几何中点），
+    #   对齐到共同锚点在数学上**必然收窄**被移动各段之间的散布
+    #   ⇒ 这段护栏在当前实现下**不会触发**。
+    #   它的价值是**把这条不变式写进代码**：将来有人换锚点统计量、
+    #   换死区、或把位移换成非乘性的（例如只移共振峰），
+    #   护栏会立刻拦住「对齐让一致性变差」的那类改动。
+    #   （对应契约测试：tests/ai/test_voice_align.py）
+    base_spread = _spread([f0 for _, f0, _, _ in plan])
+    scale = 1.0
+    for cand in (1.0, 0.75, 0.5, 0.25, 0.0):
+        predicted = [
+            (f0 * (2 ** (cand * s / 12)) if (f0 and abs(s) > 1e-9) else f0) for _, f0, s, _ in plan
+        ]
+        if _spread(predicted) <= base_spread:
+            scale = cand
+            break
+    if scale < 1.0:
+        log.info(
+            "TTS 音高对齐：按护栏缩小位移（对齐会加大散布）alpha=%s 散布 %.1f%% → %.1f%%",
+            scale,
+            base_spread * 100,
+            _spread(
+                [
+                    (f0 * (2 ** (scale * s / 12)) if (f0 and abs(s) > 1e-9) else f0)
+                    for _, f0, s, _ in plan
+                ]
+            )
+            * 100,
+        )
+
+    # ── 第二步：真的移 ──────────────────────────────────────────
+    out: list[bytes] = []
+    details: list[dict] = []
+    for piece, f0, semitones, skip in plan:
+        if f0 is None:
+            out.append(piece)
+            details.append({"f0_before": None, "f0_after": None, "semitones": 0.0})
+            continue
+        if skip is not None:
+            out.append(piece)
+            details.append({"f0_before": f0, "f0_after": f0, "semitones": 0.0, "skipped": skip})
+            continue
+        if abs(semitones) < 1e-3:
+            out.append(piece)
+            details.append({"f0_before": f0, "f0_after": f0, "semitones": 0.0})
+            continue
+        applied = semitones * scale
+        shifted = _shift_pitch(piece, applied, ffmpeg_bin)
         if shifted is None:
             out.append(piece)
             details.append({"f0_before": f0, "f0_after": f0, "semitones": 0.0, "skipped": "ffmpeg"})
             continue
         out.append(shifted)
-        details.append({"f0_before": f0, "f0_after": target_f0, "semitones": round(semitones, 2)})
+        details.append(
+            {
+                "f0_before": f0,
+                "f0_after": f0 * (2 ** (applied / 12)),
+                "semitones": round(applied, 2),
+            }
+        )
 
     return out, details
