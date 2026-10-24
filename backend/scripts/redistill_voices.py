@@ -203,7 +203,12 @@ def main() -> int:
             if cur != last:
                 print(f"      状态 → {cur}")
                 last = cur
-            if cur in ("done", "failed", "skipped"):
+            # ⚠️ **终态是外部 5 态枚举里的 `ready`，不是内部态 `done`**（2026-10-24 实测踩到）：
+            #   `GET /api/v1/distill/{task_id}` 走 `_external_distill_status()` 映射：
+            #       queued → pending / step1-4 → distilling / **done → ready** / failed → failed
+            #   老写法等 `("done", "failed", "skipped")` —— `done` 永远不会出现
+            #   ⇒ 每篇都要空等到 900s 超时（25 篇 = 6 小时）。
+            if cur in ("ready", "failed"):
                 break
         else:
             print("      ⚠️ 超时未完成")
