@@ -187,9 +187,16 @@ def main() -> int:
     print("\n开始重跑：")
     for n, item in enumerate(items, 1):
         token = _token(item["user_id"])
-        status, resp = _http(
-            "POST", f"{AI_SERVICE}/api/v1/articles/{item['article_id']}/distill", token
-        )
+        try:
+            status, resp = _http(
+                "POST", f"{AI_SERVICE}/api/v1/articles/{item['article_id']}/distill", token
+            )
+        except Exception as exc:  # noqa: BLE001 —— 连接类错误不该终止整批
+            print(
+                f"[{n}/{len(items)}] {item['article_id']} 触发失败"
+                f"（{type(exc).__name__}: {exc}）—— 跳过这一篇，继续下一篇"
+            )
+            continue
         print(f"[{n}/{len(items)}] {item['article_id']} 触发 HTTP {status} {str(resp)[:120]}")
         if status != 200:
             continue
@@ -198,7 +205,16 @@ def main() -> int:
         last = ""
         while time.time() < deadline:
             time.sleep(15)
-            st, body = _http("GET", f"{AI_SERVICE}/api/v1/distill/{task_id}", token)
+            # ⚠️ **轮询必须容忍瞬时断连**（2026-10-24 实测踩到）：
+            #   轮询期间服务重启（部署 / systemctl restart）会让这一请求
+            #   `Connection refused` —— 老写法让它直接抛出去，
+            #   **整个批量脚本当场崩掉**（实测：跑到第 5 篇就没了）。
+            #   这里把连接错误当成「还没好」，继续轮询到超时。
+            try:
+                st, body = _http("GET", f"{AI_SERVICE}/api/v1/distill/{task_id}", token)
+            except Exception as exc:  # noqa: BLE001 —— 连接类错误一律重试
+                print(f"      轮询失败（{type(exc).__name__}），继续等：{exc}")
+                continue
             cur = body.get("status") if isinstance(body, dict) else str(body)
             if cur != last:
                 print(f"      状态 → {cur}")
