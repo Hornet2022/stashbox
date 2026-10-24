@@ -21,10 +21,13 @@ import weakref
 from typing import TYPE_CHECKING
 
 from config_llm import llm_settings
+from stashbox.backend.common.logging import get_logger
 
 from .base import LLMClient
 from .openai import OpenAIClient
 from .qwen_vl import QwenVLClient
+
+log = get_logger(__name__)
 
 if TYPE_CHECKING:
     pass
@@ -119,6 +122,26 @@ def _create_cached_client(
 
     设 `_shared=True` → close() 变 no-op，避免破坏其他任务的 httpx 连接池。
     """
+    # 生效配置**打一条日志**（2026-10-24 补）。
+    #
+    # 为什么必须有：配置来源是「DB 覆盖 > env」，而 **env 里可能是过期的值**
+    # （实测生产 env 里 TTS_PROVIDER=edge、OPENAI_LLM_BASE_URL=api.openai.com
+    # 都与 DB 不一致）。一旦 DB 读失败（Redis/PG 抖动）就会**静默回落**到 env：
+    #   · LLM → 拿着空 key 打 api.openai.com（国内不可达）⇒ 症状是 401/连接失败，
+    #     **完全看不出是「配置没读到」** ⇒ 排查方向被带偏；
+    #   · TTS → 变成 edge-tts ⇒ 音色从 uncle_fu 换成 zh-CN-XiaoxiaoNeural，
+    #     **已发布的稿子突然变声**，而且没有任何报错。
+    #
+    # 所以**每次真正建 client** 都把「指向哪个端点、用的哪个模型、key 有没有」
+    # 记下来（**不记 key 本身**）。回落一眼可见。
+    log.info(
+        "llm_effective_config provider=%s base_url=%s model=%s api_key_set=%s source=%s",
+        provider,
+        base_url,
+        model,
+        bool(api_key),
+        "db" if _db_config is not None else "env",
+    )
     if provider == "openai":
         client = OpenAIClient(
             api_key=api_key,
