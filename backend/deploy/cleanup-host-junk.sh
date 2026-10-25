@@ -175,7 +175,27 @@ EOF
   say "  env 凭据备份：${env_backup_n} 份 → 留 ${ENV_BACKUP_KEEP} 份，删 ${env_removed} 份"
 fi
 
-# ── 6. 开发机整树复制带来的凭据/调试残留 ─────────────────────────────────
+# ── 6. 调试脚本的固定去处 ───────────────────────────────────────────────
+#
+# 为什么专门给它一个目录：调试脚本（探针 / 验证 / 临时比对）是**一次性的**，
+# 但它们的寿命只有几小时，而 /tmp 的清理规则是「>7 天」⇒
+# 调试脚本会赖在 /tmp 里直到下周（实测积了 12 个）。
+#
+# 用泛化规则去猜「哪个文件像调试脚本」不靠谱（误删正常的临时文件）。
+# ⇒ 给它们一个**专名目录**：调试脚本一律写进 ${DEBUG_TMP}，
+# 清理规则直接清空这个目录 —— 既不会误伤，又保证「调试完不留痕」。
+DEBUG_TMP="${DEBUG_TMP:-/tmp/stashbox-debug}"
+if [ -d "$DEBUG_TMP" ]; then
+  dbg_n=$(find "$DEBUG_TMP" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  [dry-run] 清空调试目录 ${DEBUG_TMP}（${dbg_n} 项）"
+  else
+    find "$DEBUG_TMP" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null
+  fi
+  say "  调试目录：${DEBUG_TMP} 清掉 ${dbg_n} 项"
+fi
+
+# ── 7. 开发机整树复制带来的凭据/调试残留 ─────────────────────────────────
 #
 # 2026-10-25 实测：生产 `/opt/stashbox/stashbox/backend/` 下有
 # `.env.bak` / `.env.bak2`（各含一整套 OSS/ARK/ANTHROPIC 密钥）
@@ -200,7 +220,7 @@ if [ "$stale_n" -gt 0 ]; then
   say "  开发残留（.env.bak* / _diag_repro.py）：清掉 ${stale_n} 个"
 fi
 
-# ── 7. 收尾体检：确认该活着的都还活着 ─────────────────────────────────
+# ── 8. 收尾体检：确认该活着的都还活着 ─────────────────────────────────
 if [ "$DRY_RUN" -eq 0 ]; then
   sp=$(find /tmp -maxdepth 1 -name 'systemd-private-*' 2>/dev/null | wc -l)
   say "  自检：systemd-private 目录 ${sp} 个（必须 ≥ 2）"

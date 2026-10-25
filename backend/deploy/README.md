@@ -857,7 +857,8 @@ systemctl daemon-reload && systemctl restart stashbox-content-service
 
 **清理脚本**：`backend/deploy/cleanup-host-junk.sh`（**版本可控**，
 部署到 `/opt/stashbox/stashbox/backend/deploy/`，cron 每周日凌晨 04:17 跑）。
-清四样：`/tmp` 里超 7 天的条目、apt 缓存、journal 压到 100M、部署目录的 `__pycache__`。
+清六样：`/tmp` 里超 7 天的条目、apt 缓存、journal 压到 100M、部署目录的 `__pycache__`、
+**env 凭据备份（只留最新 1 份）**、**调试脚本目录（清空）**。
 支持 `--dry-run`。
 
 ⚠️ **它绝不碰的东西**（每条都有理由，脚本头部有完整清单）：
@@ -868,6 +869,41 @@ systemctl daemon-reload && systemctl restart stashbox-content-service
 | `/tmp/aliyun_assist_service.sock` | 阿里云监控 agent 的活动套接字 |
 | `/var/lib/stashbox/data` | **生产音频存储**（`STORAGE_PROVIDER=local`），文章的 `audio_url` 指的就是这里的文件 |
 | `/root/*backup*` | 历次维护的回滚保险，删了不可逆 |
+| `/etc/stashbox/stashbox.env` | **当前**正在用的 env（`EnvironmentFile` 指的就是它） |
+
+#### 凭据备份：为什么只留 1 份（2026-10-25 实测）
+
+清理时发现 `/etc/stashbox/` 下堆了 **16 份** `stashbox.env.bak*`，
+每一份都是 env 的**完整副本**。逐份比对密钥哈希后确认：
+
+> **16/16 份都含当前仍然有效的** `JWT_SECRET` / `POSTGRES_PASSWORD` /
+> `REDIS_PASSWORD` / `CALLBACK_SHARED_SECRET` / `ADMIN_BOOTSTRAP_PASSWORD`。
+
+⇒ 不是「旧密钥已轮换、留着无害」，而是 **16 份活凭据的副本**。
+
+这些文件是 `root:stashbox 0640` ⇒ **stashbox 组内任何进程可读**，
+而 5 个服务单元正是以 `stashbox` 用户跑的 ⇒ 任何一处服务被攻破，
+攻击者拿到的不是「一个数据库密码」，而是「**能签任意账号 JWT 的密钥**」
++「能直连 PG/Redis 的密码」。
+
+处置：**保留最新 1 份**（env 改坏了要能回滚），其余由清理脚本删掉。
+为什么不用「备份时把密钥掩码」：那样回滚出来的配置带着占位密钥，
+看着能回滚、实际起不来 —— 比没有备份更危险。
+
+⚠️ 同时清掉 `backend/` 下的 `.env.bak*` 与 `_diag_repro.py`：
+生产的真 env 是 `/etc/stashbox/stashbox.env`（systemd `EnvironmentFile`），
+`backend/.env*` **根本不会被加载** ⇒ 纯冗余，且冗余得很有害。
+`_diag_repro.py` 则是一个**能读 JWT_SECRET 签任意账号 token** 的调试脚本，
+生产上没有正当用途。
+
+#### 调试脚本：给它们一个专名目录
+
+调试脚本（探针 / 验证 / 临时比对）寿命只有几小时，
+而 `/tmp` 的清理规则是「>7 天」⇒ 它们会赖到下周（实测积了 12 个）。
+
+用泛化规则去猜「哪个文件像调试脚本」不靠谱（误删正常的临时文件）⇒
+给它们一个**专名目录** `/tmp/stashbox-debug`：调试脚本一律写进去，
+清理规则直接清空这个目录 —— 既不误伤，又保证「调试完不留痕」。
 
 #### ⚠️ 别用 `systemd-tmpfiles` 来清 `/tmp`（实测踩过的坑）
 
