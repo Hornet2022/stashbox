@@ -24,7 +24,14 @@
   （`user_id = 0` 是匿名上报的约定，见 `common/event_collect.py`）。
 - **月留存** = 上月活跃用户里，本月仍然活跃的比例。
   分母 = 上月活跃用户数；分子 = 上月活跃 ∩ 本月活跃。
-- 自然月按 **UTC** 切，与库里 `created_at` 的时区口径一致。
+- 自然月按**库里那个钟**切 —— 不是 UTC。
+  ⚠️ 生产 PG 的 `TimeZone` 是 **Asia/Shanghai**，`feedback.created_at` 存的是
+  **本地墙上时间**（2026-10-25 实测 `SHOW TimeZone`）。
+  ⇒ 窗口边界统一走 `common/timebase.db_now()`（从库里取 `now()`），
+  与被查的列同一个钟。
+  （原先这里写的是「按 UTC 切，与库里口径一致」——**那个断言是错的**，
+   它让人以为可以用 `datetime.now(timezone.utc)` 当上界：
+   实测那样会**漏掉最近 8 小时**的数据。）
 
 ## 为什么要单独成模块
 
@@ -34,30 +41,19 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from stashbox.backend.common.models import Feedback
-
-
-def _to_naive_utc(moment: datetime) -> datetime:
-    """统一成 **naive UTC**。
-
-    为什么必须统一：埋点表的 `created_at` 列是 `TIMESTAMP`（**不带时区**，
-    server_default 是 `func.now()`）。⇒ 比较时必须用同一种口径，
-    否则 PG 直接报 `can't compare offset-naive and offset-aware datetimes`。
-    """
-    if moment.tzinfo is None:
-        return moment
-    return moment.astimezone(timezone.utc).replace(tzinfo=None)
+from stashbox.backend.common.timebase import db_now
 
 
 def _month_start(moment: datetime) -> datetime:
-    """所在自然月的起点（UTC，闭区间起点）。"""
-    return _to_naive_utc(moment).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    """所在自然月的起点（库里那个钟，闭区间起点）。"""
+    return moment.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
 async def monthly_retention(
@@ -79,18 +75,20 @@ async def monthly_retention(
     ⚠️ 分母为 0（没人活跃）时 `rate` 是 **None** 而不是 0 ——
     「0% 留存」和「没有样本」是两回事，混成 0 会让看板显示一个假的坏消息。
     """
-    moment = now or datetime.now(timezone.utc)
-    # ⚠️ 必须先统一成 naive UTC 再往下传。
+    # ⚠️ 窗口边界必须与库里 `created_at` **同一个钟** ⇒ 从库里取 `now()`。
     #
-    # 埋点表的 `created_at` 是 `TIMESTAMP`（**不带时区**），而 `now` 的默认值
-    # 是 `datetime.now(timezone.utc)`（**带时区**）。
-    # ⇒ 直接把带时区的值当查询上界传给 asyncpg，会报
-    #    "can't subtract offset-naive and offset-aware datetimes"
-    # （实测：整个 admin stats 端点 500，8 条 stats 测试全红）。
+    # 为什么不能用 `datetime.now(timezone.utc)`：
+    #   · 埋点表的 `created_at` 是 `TIMESTAMP`（**不带时区**），存的是
+    #     PG session 时区的**墙上时间**（生产 Asia/Shanghai，2026-10-25 实测）；
+    #   · UTC now 比库里的钟**慢 8 小时** ⇒ 「本月至今」会漏掉最近 8 小时，
+    #     而且**不报任何错**（只是数字偏小）。
+    #   · 带时区的值直接传给 asyncpg 还会报
+    #     "can't subtract offset-naive and offset-aware datetimes"
+    #     （实测：整个 admin stats 端点 500，8 条 stats 测试全红）。
     #
-    # 注意 `_month_start()` 内部也做了同样的归一，但那只覆盖了**月份起点**；
-    # 「本月至今」的上界用的还是原始 `moment` —— 这里必须自己先归一。
-    naive_now = _to_naive_utc(moment)
+    # ⇒ 统一走 `common/timebase.db_now()`：naive 传入按库里钟用，
+    #   带时区传入交给数据库换算到它自己的钟。
+    naive_now = await db_now(db, now=now)
     current_start = _month_start(naive_now)
     prev_start = _month_start(current_start - timedelta(seconds=1))
 

@@ -24,7 +24,7 @@ mock 掉 session 就等于把要验的东西 mock 掉了。
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import delete
@@ -33,10 +33,15 @@ from stashbox.backend.common.database import AsyncSessionLocal, engine
 from stashbox.backend.common.models import Feedback
 from stashbox.backend.common.models.base import Base
 from stashbox.backend.common.retention import monthly_retention
+from stashbox.backend.common.timebase import db_now
 
 #: 测试窗口：上月 = 2021-03，本月 = 2021-04（`now` 落在 2021-04-20）
 PREV_YEAR, PREV_MONTH = 2021, 3
 CUR_YEAR, CUR_MONTH = 2021, 4
+
+#: 本文件专用的 user_id —— 用来隔离「往**当前月**插的行」，
+#: 免得污染共享测试库里的其它用例（也免得自己下次的用例被污染）。
+LIVE_TEST_USER_ID = 900001
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +53,8 @@ async def _ensure_table():
         await s.execute(
             delete(Feedback).where(Feedback.created_at < datetime(2022, 1, 1)),
         )
+        # 本文件往当前月插的行（走「当前月」那条路径）—— 只删自己的
+        await s.execute(delete(Feedback).where(Feedback.user_id == LIVE_TEST_USER_ID))
         await s.commit()
     yield
     # 用完再清一次：别的用例的窗口是「当前月」，不会碰 2021 年的行，
@@ -56,6 +63,7 @@ async def _ensure_table():
         await s.execute(
             delete(Feedback).where(Feedback.created_at < datetime(2022, 1, 1)),
         )
+        await s.execute(delete(Feedback).where(Feedback.user_id == LIVE_TEST_USER_ID))
         await s.commit()
 
 
@@ -195,3 +203,62 @@ async def test_不传_now_走生产默认路径也不炸():
 
     assert r["current_month"] == datetime.now(timezone.utc).strftime("%Y-%m")
     assert r["rate"] is None or 0.0 <= r["rate"] <= 1.0
+
+
+async def test_不传now时_窗口上界用库里的钟而不是UTC():
+    """**回归**（2026-10-25 生产实测）：窗口上界必须取**库里的钟**。
+
+    背景：库里 `feedback.created_at` 存的是 PG session 时区（生产 Asia/Shanghai）
+    的**墙上时间**。而 `datetime.now(timezone.utc)` 比它**慢 8 小时**
+    ⇒ 用它当「本月至今」的上界 ⇒ **最近 8 小时的活跃记录被漏掉**，
+    而且**不报任何错**（留存被系统性低估）。
+
+    ⇒ 判据用**两个调用对比**（而不是绝对值）：同一个用户，
+      一行在上月、一行在「库里的现在」；
+      只有当上界取自**库里的钟**时，那一行才被算进「本月仍活跃」。
+
+    ⚠️ 写成 `>=` 而不是 `==`：共享测试库里别的用例也会往当前月插行
+    （`test_export_csv.py` 不给 created_at ⇒ PG 用 now() 填），
+    它们的行可能正好落在这 8 小时里 ⇒ 差值可能是 1 也可能更大。
+    """
+    async with AsyncSessionLocal() as s:
+        now_local = await db_now(s)
+        # 上个月的 15 号（naive，库里的钟）
+        # ⚠️ `replace(day=1)` **保留时分秒** ⇒ 只减 1 秒跨不到上个月
+        #    （2026-10-01 23:18 - 1s 还是 10-01）⇒ 必须先把时分清零再减。
+        #    （第一版就栽在这儿：行插到了**本月**，分母里根本没这个人，
+        #     两个调用自然一样，断言看着像"实现没生效"。）
+        first_of_this_month = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        prev_month = first_of_this_month - timedelta(seconds=1)
+        last_month_day = prev_month.replace(day=15, hour=12, minute=0, second=0, microsecond=0)
+        assert last_month_day < first_of_this_month  # 防止再算错月
+        s.add(
+            Feedback(
+                user_id=LIVE_TEST_USER_ID,
+                article_id=f"art_{uuid.uuid4().hex[:24]}",
+                type="audio_play_start",
+                metadata_={"src": "retention_clock_test"},
+                created_at=last_month_day,
+            )
+        )
+        # 本月的一行：created_at = 库里的现在（naive，库里的钟）
+        s.add(
+            Feedback(
+                user_id=LIVE_TEST_USER_ID,
+                article_id=f"art_{uuid.uuid4().hex[:24]}",
+                type="audio_play_start",
+                metadata_={"src": "retention_clock_test"},
+                created_at=now_local,
+            )
+        )
+        await s.commit()
+
+    # ① 生产路径：不传 now ⇒ 上界取自库里的钟
+    async with AsyncSessionLocal() as s:
+        r_db_clock = await monthly_retention(s)
+        # ② 旧写法：上界用 Python 的 UTC now（比库里的钟慢 8 小时）
+        utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        r_utc_clock = await monthly_retention(s, now=utc_naive)
+
+    # 我的用户上月活跃 ⇒ 在分母里；只有 ① 会把它算成「本月仍活跃」
+    assert r_db_clock["retained"] >= r_utc_clock["retained"] + 1

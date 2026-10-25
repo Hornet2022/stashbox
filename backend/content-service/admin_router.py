@@ -42,6 +42,7 @@ from clients.ai_client import get_ai_client  # noqa: E402
 from stashbox.backend.common import cache_service, system_config
 from stashbox.backend.common.auth import create_access_token
 from stashbox.backend.common.auth_admin import require_admin_or_operator
+from stashbox.backend.common.client_perf import client_perf_stats
 from stashbox.backend.common.database import AsyncSessionLocal, get_db
 from stashbox.backend.common.exceptions import InvalidRequest, NotFound
 from stashbox.backend.common.logging import get_logger
@@ -2401,6 +2402,18 @@ async def admin_stats(
     # 所以这个字段也会被缓存 30s —— 留存是月度指标，30s 的陈旧完全无所谓。
     retention = await monthly_retention(db)
 
+    # --- 客户端性能（首屏 / 音频启动）---
+    #
+    # 为什么以前看不到：数据**早就在库里**（客户端上报的 duration_ms 落在
+    # feedback.metadata），但没有聚合端点 ⇒ 运营只能手写 SQL 看 feedback 表。
+    #
+    # 口径见 common/client_perf.py：P50 + P95 + 样本量 + 目标线，
+    # 目标线（首屏 1500ms / 音频启动 500ms）来自仓内既有定义，不另造常量。
+    #
+    # ⚠️ 与 retention 一样，整个 stats 走 Redis 缓存（TTL 30s）——
+    # 7 天窗口的指标，30s 陈旧完全无所谓。
+    client_perf = await client_perf_stats(db)
+
     result = {
         "total_users": int(total_users or 0),
         "total_articles": int(total_articles or 0),
@@ -2416,6 +2429,7 @@ async def admin_stats(
         "trends": trends,
         "comparison": comparison,
         "retention": retention,
+        "client_perf": client_perf,
         "warning": warning,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
