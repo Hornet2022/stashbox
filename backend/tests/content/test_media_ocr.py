@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.util
 import json
@@ -218,25 +219,106 @@ async def test_识图返回空_占位符被删干净(fake_provider):
 
 
 # ---------------------------------------------------------------------------
-# 4. 限量生效：8 张图只识 5 张，其余占位符被删除
+# 4. 限量生效：超过上限的图不识，占位符被删除
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_限量生效_只识五张其余占位符删除(fake_provider):
+async def test_限量生效_超过上限的占位符被删除(fake_provider):
+    """上限**仍然生效**（显式传 limit=3 来测，不依赖默认值）。
+
+    超出的图：不下载、不识图，图注记失败，占位符**删干净**。
+    """
     seen: dict[str, httpx.Headers] = {}
     refs = _refs(8)
-    captions = await media_ocr.caption_media(refs, transport=_transport(seen=seen))
+    captions = await media_ocr.caption_media(refs, transport=_transport(seen=seen), limit=3)
 
     assert len(captions) == 8
     ok = [c for c in captions if c["ok"]]
-    assert len(ok) == media_ocr.MAX_MEDIA_CAPTIONS == 5
-    # 只下载了 5 张图（多下的就是白烧流量 + 白烧图床的耐心）
+    assert len(ok) == 3
+    # 只下载了 3 张图（多下的就是白烧流量 + 白烧图床的耐心）
     image_requests = [u for u in seen if not u.endswith("/chat/completions")]
-    assert len(image_requests) == 5
+    assert len(image_requests) == 3
+    # 落选的那几张要说清为什么（"为什么没有图表信息"查得到原因）
+    skipped = [c for c in captions if not c["ok"]]
+    assert len(skipped) == 5
+    assert all("超出单篇识图上限" in (c["error"] or "") for c in skipped)
 
     text = "\n\n".join(f"\x00IMG{i}\x00" for i in range(1, 9))
     out = media_ocr.apply_captions(text, captions)
     assert "\x00" not in out
-    assert out.count("图表：") == 5
+    assert out.count("图表：") == 3
+
+
+def test_默认上限不许退回旧值():
+    """上限是 12 —— 改小**不报错**，只是让 67% 的文章白白丢图 ⇒ 必须挡住。
+
+    依据（2026-10-25 生产实测）：OCR 并发 3 时 30s 预算内能识完 12 张；
+    生产 33 篇里 22 篇图数 > 5，旧上限 5 让三分之二的文章丢图。
+    """
+    assert media_ocr.MAX_MEDIA_CAPTIONS == 12
+
+
+# ---------------------------------------------------------------------------
+# 4b. 并发：并发度有上限、结果顺序不变、每张图的图注挂在自己身上
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_识图并发不超过单篇上限(monkeypatch, fake_provider):
+    """并发是**有闸门**的：不能因为改成并发就把 provider 打穿。
+
+    同时断言「并发真的生效了」—— 否则这个改造等于没做。
+    """
+    state = {"now": 0, "peak": 0}
+
+    async def _fake_ocr(blob, mime, *, prompt=None, timeout=None, transport=None):
+        state["now"] += 1
+        state["peak"] = max(state["peak"], state["now"])
+        await asyncio.sleep(0.01)
+        state["now"] -= 1
+        return DEFAULT_CAPTION
+
+    monkeypatch.setattr(media_ocr, "ocr_image_bytes", _fake_ocr)
+
+    refs = _refs(10)
+    captions = await media_ocr.caption_media(refs, transport=_transport())
+
+    assert all(c["ok"] for c in captions)
+    assert state["peak"] <= media_ocr.MEDIA_OCR_CONCURRENCY, f"并发峰值 {state['peak']} 超了闸门"
+    assert state["peak"] > 1, "并发没生效（串行的话这次改造就没意义了）"
+
+
+@pytest.mark.asyncio
+async def test_并发下每张图的图注挂在自己身上(monkeypatch, fake_provider):
+    """并发最容易出的错：图 A 的图注挂到图 B 的占位符上（正文直接串位）。
+
+    做法：每张图给**不同的字节**，假识图从字节里认出自己的编号；
+    并让靠后的图先返回（逼出「谁先完成谁先写」的那类 bug）。
+    """
+    bodies = {
+        f"https://cdn.example.com/fig{i}.png": PNG_BYTES + f"FIG{i}".encode() for i in range(1, 7)
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/chat/completions"):
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": DEFAULT_CAPTION}}]}
+            )
+        body = bodies.get(str(request.url))
+        return httpx.Response(200, content=body or PNG_BYTES)
+
+    async def _fake_ocr(blob, mime, *, prompt=None, timeout=None, transport=None):
+        raw = blob.decode("latin-1")
+        digits = "".join(ch for ch in raw.split("FIG", 1)[-1] if ch.isdigit())
+        n = int(digits or 0)
+        await asyncio.sleep(0.01 * (6 - n))  # 编号大的先返回
+        return f"图 {n} 的内容"
+
+    monkeypatch.setattr(media_ocr, "ocr_image_bytes", _fake_ocr)
+
+    refs = _refs(6)
+    captions = await media_ocr.caption_media(refs, transport=httpx.MockTransport(handler))
+
+    for i, cap in enumerate(captions, 1):
+        assert cap["ok"], cap
+        assert cap["caption"] == f"图 {i} 的内容", f"第 {i} 张图的图注串位了：{cap}"
 
 
 # ---------------------------------------------------------------------------

@@ -35,9 +35,12 @@
   天然进不了正文；封面/头图同理（判断依据就是"解析正文 HTML 时拿到的
   `<img src>` / `<img data-src>`"）；
 * **每篇最多识 `MAX_MEDIA_CAPTIONS` 张图** —— 识图是**真金白银**的 token，
-  而一篇长文可能有几十张图；
-* **下载并发（≤4）、识图串行** —— 图片 CDN 扛得住并发，
-  但 provider 侧要限流、也要省钱；
+  而一篇长文可能有几十张图；上限的取值与实测依据见该常量的注释；
+* **下载并发（≤4）、识图并发（≤3，全进程 ≤6）** —— 实测 provider 在并发 6 下
+  零失败零限流（详见 `MEDIA_OCR_CONCURRENCY` 的注释），
+  而串行会让剪藏从 ~10s 变成 22.8s；
+* **下载与识图走有界队列流水线** —— 两者重叠（总耗时 ≈ max 而非相加），
+  且内存里的图片张数有闸门（见 `MEDIA_OCR_QUEUE_SIZE`）；
 * **失败不阻断**：下载失败 / 超时 / 识图失败 / 图注为空
   ⇒ 该图 `ok=False`，正文里对应的占位符**直接删掉**，
   原因记进 `raw_metadata["media_captions"]`
@@ -51,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import weakref
 from typing import TypedDict
 from urllib.parse import urljoin
 
@@ -72,26 +76,92 @@ log = logging.getLogger("stashbox.fetch.media")
 
 #: 每篇最多识几张图。
 #:
-#: 为什么是 5：识图是真金白银的 token（一张图 ≈ 数百~上千 token），
-#: 而一篇长文可能有几十张图。5 张足够覆盖"开头一张概览图 +
-#: 几张关键数据图"的典型形态，再多就属于**烧钱换边际信息**。
-MAX_MEDIA_CAPTIONS = 5
+#: ## 为什么从 5 提到 12（2026-10-25 实测）
+#:
+#: 旧值 5 的理由是"识图是真金白银的 token，再多就是烧钱换边际信息"。
+#: 这个理由**方向对，但归因错了** —— 真正的约束不是 token，是**时间**：
+#!
+#: 实测（生产 8.148.9.151，14 张正文图的公众号文章）：
+#!   · 单张 OCR 均值 3.4s（范围 2.3~5.7s），**串行** ⇒ 5 张 = 17s；
+#:   · 下载 14 张（并发 4）只要 4.0s；
+#!   · 现状（串行 + 30s 预算）实测整篇 22.8s，**只能识 5 张**。
+#!
+#: 而把 OCR 改成并发 3 之后（见 `MEDIA_OCR_CONCURRENCY`）：
+#!   · 14 张全识完只要 17.4s（provider 实测零失败、零限流）；
+#:   · ⇒ **条数上限才是那个真正卡人的旋钮**，时间已经不是了。
+#:
+#: 12 是「覆盖绝大多数文章的图数」与「token 成本」之间的折中：
+#: 生产 33 篇里 22 篇（67%）图数 > 5，上限 5 让**三分之二的文章白白丢了图**。
+#:
+#: ⚠️ **上限不是「越多越好」的承诺**（2026-10-25 实测）：
+#: 多识出来的图里有很多是装饰插画 —— 实测一篇 14 图的文章，图 7~13 的 OCR
+#: 结果是"一个男孩正在操作一台机器"这种纯画面描述，图 14 是作者名片。
+#:
+#: 但**实测它对稿子没有可测影响**：把上限从 5 提到 12（正文里多 7 条图注、
+#: 多 700 字噪音）后，同一篇的稿子 2167 → 2144 字，装饰描述**一条都没进稿子**
+#: （新旧 prompt 各 2 次调用，8 次里 0 次命中）。
+#:
+#: ⇒ 提上限的理由是**覆盖率**，不是"稿子更好"：
+#: 生产 33 篇里 22 篇（67%）图数 > 5，而旧上限 5 还会让
+#: 「前 5 张全是图标」的文章（实测 sspai 一篇）**一张都拿不到**。
+#: ⇒ 代价是 token 成本线性上涨（识 N 张 ≈ N 份 VLM token）。
+#:
+#: 上限最终定多少由 `tests/content/test_media_ocr.py` 里的判据锁住，
+#: 不是拍脑袋 —— 改这个数之前先跑一次同口径的产出对照。
+MAX_MEDIA_CAPTIONS = 12
 
 #: 单图下载超时（秒）。
 MEDIA_DOWNLOAD_TIMEOUT = 15.0
 
 #: 单图识图超时（秒）。
 #:
-#: 比扫描件 OCR 的 `ocr.OCR_TIMEOUT`（90s）短：这里最多 5 张且**串行**，
-#: 而剪藏是**同步接口**，用户盯着转圈等 —— 单张图认不出来就丢掉它，
+#: 比扫描件 OCR 的 `ocr.OCR_TIMEOUT`（90s）短：单张图认不出来就丢掉它，
 #: 不值得为它把整篇的等待时间拖长。
 MEDIA_OCR_TIMEOUT = 15.0
 
 #: 单图大小上限（字节）。超了直接跳过，别把内存吃穿。
 MAX_MEDIA_BYTES = 5 * 1024 * 1024
 
-#: 图片下载并发上限（识图仍然是串行的）。
+#: 图片下载并发上限。
 MEDIA_DOWNLOAD_CONCURRENCY = 4
+
+#: 单篇的**识图并发**上限。
+#:
+#: ## 为什么要并发（2026-10-25 实测）
+#:
+#: 原来是**串行**的，理由写的是"provider 侧要限流、也要省钱"。实测下来：
+#! 同一篇 14 张图，只改并发度（同一批图、同一 provider）：
+#!
+#:     并发 1 → OCR 阶段 49.3s      并发 4 → 14.1s
+#:     并发 2 → 26.4s               并发 6 → 11.0s
+#!     并发 3 → 17.4s
+#!
+#: **全部 14/14 成功，零限流、零失败** ⇒ 串行不是 provider 的硬约束，
+#: 只是一个**保守的默认**。串行的代价是实打实的：剪藏从 ~10s 变成 22.8s。
+#!
+#: 取 3 而不是 6：并发越高，provider 侧的瞬时压力越大，
+#! 而剪藏是**同步接口**、用户盯着转圈 —— 3 已经能让「识完 12 张」落进 30s 预算。
+MEDIA_OCR_CONCURRENCY = 3
+
+#: **全进程**同时在跑的识图请求数上限。
+#:
+#: 单篇并发是「一篇之内」的闸门；这个是「整台机器」的闸门 ——
+#: 多个用户同时剪藏时，provider 侧看到的并发是 `单篇并发 × 同时剪藏数`。
+#: 内测阶段同时剪藏的人不多，但**万一**来了 5 个人，就是 15 个并发打过去。
+#:
+#: 跨 loop 安全：信号量按 **event loop** 分开存（见 `_global_ocr_semaphore`），
+#: 因为 `asyncio.Semaphore` 会绑定 loop，而测试里每个用例一个新 loop。
+MEDIA_OCR_GLOBAL_CONCURRENCY = 6
+
+#: 下载→识图之间那道**有界队列**的长度。
+#:
+#: 它是**内存的闸门**：队列满了，生产者（下载）就得等着 ⇒
+#: 内存里待识图的图片张数有上限，而不是「N 张 5MB 全堆在内存里」
+#: （服务 MemoryMax=176M，12 张 5MB = 60MB，不设闸门就贴着上限跑）。
+MEDIA_OCR_QUEUE_SIZE = 3
+
+#: 全进程识图信号量，**按 event loop** 分开存（理由见 `_global_ocr_semaphore`）。
+_GLOBAL_OCR_SEMAPHORES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 #: 图注前缀（**普通文字**）。
 #:
@@ -281,6 +351,26 @@ async def _download_one(
     return blob, mime, None
 
 
+def _global_ocr_semaphore() -> asyncio.Semaphore:
+    """全进程同时在跑的识图请求数上限（见 `MEDIA_OCR_GLOBAL_CONCURRENCY`）。
+
+    ## 为什么不能是模块级单例
+
+    `asyncio.Semaphore` 通过 `_LoopBoundMixin` **绑定第一次 await 它的那个 loop**，
+    换到别的 loop 再用就抛 `is bound to a different event loop`。
+    而 pytest-asyncio **每个用例一个新 loop** ⇒ 模块级单例在第二个用例里必炸。
+
+    ⇒ 按 loop 分别存；用 `WeakKeyDictionary` 是为了 loop 回收时信号量也跟着走
+    （否则测试跑久了会攒下一堆没人用的信号量）。
+    """
+    loop = asyncio.get_running_loop()
+    sem = _GLOBAL_OCR_SEMAPHORES.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(MEDIA_OCR_GLOBAL_CONCURRENCY)
+        _GLOBAL_OCR_SEMAPHORES[loop] = sem
+    return sem
+
+
 async def caption_media(
     images: list[ImageRef],
     *,
@@ -332,6 +422,18 @@ async def caption_media(
     client = acquire_client(profile, **client_kwargs)
     semaphore = asyncio.Semaphore(MEDIA_DOWNLOAD_CONCURRENCY)
 
+    # ── 下载 → 识图：**有界队列流水线** ─────────────────────────────────
+    #
+    # 为什么不是「全部下完再开始识」（原来的写法）：
+    #   ① 慢：下载的 4s 和识图的 17s **串行相加**；
+    #   ② 内存：N 张图（每张上限 5MB）**同时**堆在内存里
+    #      —— 12 张就是 60MB，而服务 MemoryMax=176M。
+    #
+    # 流水线：下载完的图**立刻**进队列等识图，队列有界 ⇒ 队列满时下载得停下
+    # ⇒ ① 下载与识图重叠（总耗时 ≈ max(下载, 识图)）；
+    #   ② 内存里的图片张数有闸门（队列长度 + 在识的并发数）。
+    queue: asyncio.Queue = asyncio.Queue(maxsize=MEDIA_OCR_QUEUE_SIZE)
+
     async def _download(ref: ImageRef) -> tuple[bytes | None, str | None, str | None]:
         # ⚠️ 超时取 **抓取总预算的剩余**，不是固定的 15s：
         # 剪藏是同步接口，用户盯着转圈等，总时限（30s）是硬约束（见 net.Deadline）。
@@ -344,48 +446,71 @@ async def caption_media(
         async with semaphore:
             return await _download_one(client, ref["url"], timeout=timeout)
 
+    async def _producer(ref: ImageRef) -> None:
+        """下载一张图 → 放进队列。**任何异常都要进队列**（否则消费者会等一辈子）。"""
+        try:
+            blob, mime, error = await _download(ref)
+        except Exception as exc:  # noqa: BLE001 —— 一张图下载炸了不该拖死整篇
+            blob, mime, error = None, None, f"下载失败: {type(exc).__name__}: {exc}"
+        await queue.put((ref, blob, mime, error))
+
+    async def _consumer() -> None:
+        """从队列取图 → 识图 → 写结果。"""
+        while True:
+            item = await queue.get()
+            if item is None:  # 结束哨兵
+                return
+            ref, blob, mime, error = item
+            try:
+                if error or not blob or not mime:
+                    results[ref["token"]] = _failed(ref, error or "下载失败")
+                    continue
+                # ⚠️ 预算耗尽 ⇒ 剩下的图**直接放弃**（占位符随后被删掉，正文完整）。
+                # 宁可这一篇没有图注，也不能让用户多等 —— 剪藏总时限是硬约束。
+                timeout = MEDIA_OCR_TIMEOUT
+                if deadline is not None:
+                    if deadline.expired():
+                        results[ref["token"]] = _failed(ref, "抓取预算已耗尽（没时间识图了）")
+                        continue
+                    timeout = deadline.slice(MEDIA_OCR_TIMEOUT) or MEDIA_OCR_TIMEOUT
+                try:
+                    async with _global_ocr_semaphore():
+                        text = await ocr_image_bytes(
+                            blob,
+                            mime,
+                            prompt=_MEDIA_OCR_PROMPT,
+                            timeout=timeout,
+                            transport=transport,
+                        )
+                except Exception as exc:  # noqa: BLE001 —— 一张图认不出来不该炸掉整篇
+                    results[ref["token"]] = _failed(ref, f"识图失败: {type(exc).__name__}: {exc}")
+                    continue
+                text = (text or "").strip()
+                if not text:
+                    results[ref["token"]] = _failed(ref, "识图结果为空")
+                    continue
+                results[ref["token"]] = {
+                    "url": ref["url"],
+                    "token": ref["token"],
+                    "caption": text,
+                    "ok": True,
+                    "error": None,
+                }
+            except Exception as exc:  # noqa: BLE001 —— 兜底：消费者绝不能死
+                results[ref["token"]] = _failed(ref, f"识图流程异常: {type(exc).__name__}: {exc}")
+
+    consumers = [asyncio.create_task(_consumer()) for _ in range(MEDIA_OCR_CONCURRENCY)]
+    producers = [asyncio.create_task(_producer(ref)) for ref in attempted]
     try:
-        downloaded = await asyncio.gather(*[_download(ref) for ref in attempted])
+        await asyncio.gather(*producers)
     finally:
+        # 放结束哨兵，消费者逐个退出。
+        for _ in consumers:
+            await queue.put(None)
+        await asyncio.gather(*consumers, return_exceptions=True)
         # 只有自己建的 client 才关（池里的 client 关了会连累别的 fetcher）。
         if transport is not None:
             await client.aclose()
-
-    # 识图**串行**：provider 侧要限流、要省钱。
-    for ref, (blob, mime, error) in zip(attempted, downloaded):
-        if error or not blob or not mime:
-            results[ref["token"]] = _failed(ref, error or "下载失败")
-            continue
-        # ⚠️ 预算耗尽 ⇒ 剩下的图**直接放弃**（占位符随后被删掉，正文完整）。
-        # 宁可这一篇没有图注，也不能让用户多等 —— 剪藏总时限是硬约束。
-        timeout = MEDIA_OCR_TIMEOUT
-        if deadline is not None:
-            if deadline.expired():
-                results[ref["token"]] = _failed(ref, "抓取预算已耗尽（没时间识图了）")
-                continue
-            timeout = deadline.slice(MEDIA_OCR_TIMEOUT) or MEDIA_OCR_TIMEOUT
-        try:
-            text = await ocr_image_bytes(
-                blob,
-                mime,
-                prompt=_MEDIA_OCR_PROMPT,
-                timeout=timeout,
-                transport=transport,
-            )
-        except Exception as exc:  # noqa: BLE001 —— 一张图认不出来不该炸掉整篇
-            results[ref["token"]] = _failed(ref, f"识图失败: {type(exc).__name__}: {exc}")
-            continue
-        text = (text or "").strip()
-        if not text:
-            results[ref["token"]] = _failed(ref, "识图结果为空")
-            continue
-        results[ref["token"]] = {
-            "url": ref["url"],
-            "token": ref["token"],
-            "caption": text,
-            "ok": True,
-            "error": None,
-        }
 
     for ref in attempted:
         caption = results.get(ref["token"])
@@ -498,7 +623,11 @@ __all__ = [
     "CAPTION_PREFIX",
     "MAX_MEDIA_BYTES",
     "MAX_MEDIA_CAPTIONS",
+    "MEDIA_DOWNLOAD_CONCURRENCY",
     "MEDIA_DOWNLOAD_TIMEOUT",
+    "MEDIA_OCR_CONCURRENCY",
+    "MEDIA_OCR_GLOBAL_CONCURRENCY",
+    "MEDIA_OCR_QUEUE_SIZE",
     "MEDIA_OCR_TIMEOUT",
     "ImageRef",
     "MediaCaption",
