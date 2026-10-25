@@ -78,6 +78,18 @@ edge-tts = "^7.3.1"
 playwright = "^1.63"
 # ai-service/agent/mcp_client.py：agent 的 MCP 工具接入
 mcp = "^2.2"
+# content-service/fetchers/media_ocr.py：图片缩放 / 透明底贴白底。
+#
+# ⚠️ 2026-10-25 补记：**这是生产必需依赖，却从未在本文件里声明**，
+# 只存在于 `requirements-deploy.txt`（pip freeze 的产物）和各台机器的 venv 里。
+# 后果与上面 langgraph / aiofiles 那一批**完全同类**：
+# 按本文件装依赖的新环境，识图路径一 import 就 ModuleNotFoundError，
+# 而 CI 的 `tests/content/test_media_ocr_memory.py` 三条用例直接 FAILED
+# （CI 红了 5 次没人看 ⇒ 信号失效，见安卓 CI 的同类问题）。
+#
+# 为什么它是主依赖而不是 extras：缩图是**剪藏链路的必经环节**
+# （正文里的配图要缩到 VLM 用得上的尺寸），不是可选功能。
+pillow = "^12.3.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.1.1"
