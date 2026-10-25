@@ -37,9 +37,20 @@
 #   · /tmp/aliyun_assist_service.sock ← 阿里云监控 agent 的活动套接字。
 #   · /var/lib/stashbox/data   ← **生产音频存储**（STORAGE_PROVIDER=local），
 #     文章的 audio_url 指的就是这里的文件 ⇒ 删了老文章没声音。
-#   · /root/*backup*           ← 历次维护的回滚保险（删了不可逆）。
+#   · /etc/nginx/backup/       ← nginx/logrotate 配置的**回滚保险**
+#     （2026-10-25 归位到这里；install-log-policy.sh 每次写策略前备份一份，
+#      并限量只留最近 5 份 —— 备份没有淘汰机制就会自己长成垃圾堆）。
+#   · /root/retired-certs/     ← 已退役的子域名证书（回滚到旧域名布局时要用）。
 #   · /var/log/journal         ← 只按容量压到上限，**不删**（journald 自带
 #     SystemMaxUse=200M 策略，超过它自己会回收）。
+#
+# ⚠️ 2026-10-25：`/root/*backup*` **从「绝不碰」里移除了** ——
+#   当时 /root 下堆了 17 个历史备份目录（797MB，其中
+#   `/root/.cache/ms-playwright` 一家占 658M），已按用户指示清空。
+#   逐个核对过：里面的音频在生产存储里**一个都不存在**（早被新产物替代），
+#   其余是代码/配置/构建产物快照（可重建，代码已 push 到 origin）。
+#   ⇒ 「回滚保险」不该是一堆没人知道过期时间的快照：
+#     真正可依赖的回滚手段是 git + deploy 脚本，不是 /root 下的一堆文件夹。
 set -uo pipefail
 
 DRY_RUN=0

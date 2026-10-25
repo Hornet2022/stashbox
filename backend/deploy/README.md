@@ -868,7 +868,49 @@ systemctl daemon-reload && systemctl restart stashbox-content-service
 | `/tmp/systemd-private-*` | systemd 给 `PrivateTmp=true` 单元建的**私有** /tmp。五个服务单元全是 PrivateTmp ⇒ 删了服务当场挂 |
 | `/tmp/aliyun_assist_service.sock` | 阿里云监控 agent 的活动套接字 |
 | `/var/lib/stashbox/data` | **生产音频存储**（`STORAGE_PROVIDER=local`），文章的 `audio_url` 指的就是这里的文件 |
-| `/root/*backup*` | 历次维护的回滚保险，删了不可逆 |
+| `/etc/nginx/backup/` | nginx / logrotate 配置的**回滚保险**（`install-log-policy.sh` 每次写策略前备份一份，限量留最近 5 份） |
+| `/root/retired-certs/` | 已退役的子域名证书，回滚到旧域名布局时要用 |
+
+#### 2026-10-25：`/root/*backup*` 已清空（783MB）
+
+`/root` 下当时堆了 **17 个**历史备份目录，共 797MB（`/root` 总量 797M），
+外加 `/root/.cache/ms-playwright` **658M** —— 后者才是大头。
+
+逐个核对后按用户指示清空：
+
+| 备份 | 大小 | 为什么可删 |
+|---|---|---|
+| `.cache/ms-playwright` | **658M** | 生产 `STASHBOX_FETCH_BROWSER_TIER=0`（chromium RSS 300MB+ vs content-service 的 MemoryMax 224MB，开浏览器通道等于埋 OOM）⇒ **这 658M 装了根本用不上** |
+| `redistill-backup-*` | 74M | 里面的 35 个音频在生产存储里**一个都不存在**（已被新产物替代） |
+| `audio-duplicates-backup` | 41M | 同上，生产里 0 个存在 |
+| `admin-assets-backup` | 8M | admin-web 的构建产物，可重建 |
+| 其余 14 个 | ~2.5M | 代码/配置快照；代码已 push 到 origin，可 `git checkout` 回来 |
+
+⇒ **磁盘回收 783MB，可用内存 +50MB**（4 个系统服务一并禁用，见下）。
+
+⚠️ **教训**：「备份」如果没有淘汰机制，攒着攒着就比它要保护的东西还大。
+现在回滚保险改由两处承担：
+① **git**（代码，已 push origin）—— 正规、可审计；
+② `/etc/nginx/backup/`（配置，限量 5 份）—— 从此不再往 `/root` 堆。
+
+#### 2026-10-25：禁用了 4 个这台机用不上的系统服务
+
+| 服务 | RSS | 为什么在这台机上没用 |
+|---|---|---|
+| `multipathd` | 19.3MB | 多路径设备管理 —— 云主机单路径 |
+| `tuned` | 15.5MB | 动态性能调优 —— `tune-host.sh` 已做静态调优（sysctl / limits） |
+| `fwupd` | 7.0MB | 固件升级 —— 云主机没有可刷的固件 |
+| `ModemManager` | 2.9MB | 蜂窝调制解调器 —— 云主机没有蜂窝模块 |
+
+⇒ 合计回收 **~45MB** 可用内存。
+
+⚠️ 用的是 `systemctl disable --now`（**可逆**：`systemctl enable` 就能恢复），
+**没有用 `mask`** —— mask 把 unit 链接到 `/dev/null` 是不可逆的，
+而「不自启 + 现在不跑」已经把内存与开机开销都拿掉了，
+mask 的额外收益（防手动起）不值那个不可逆。
+
+⚠️ 若将来要开 browser 抓取通道，需要重新 `playwright install chromium`（~650M 下载）。
+那是「开通道」那个决定该付的代价，不该由一台 2 GiB 的机器常年替它预付。
 | `/etc/stashbox/stashbox.env` | **当前**正在用的 env（`EnvironmentFile` 指的就是它） |
 
 #### 凭据备份：为什么只留 1 份（2026-10-25 实测）

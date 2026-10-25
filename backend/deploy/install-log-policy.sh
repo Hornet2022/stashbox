@@ -68,6 +68,29 @@ for arg in "$@"; do
 done
 
 say() { printf '%s\n' "$*"; }
+
+# ── 备份目录限量 ───────────────────────────────────────────────────────
+#
+# 2026-10-25：备份目录原先是 `/root/nginx-config-backups/`（一次性堆到 480K），
+# 而 README 写明的规范位置是 `/etc/nginx/backup/` —— 两处不一致，已归位。
+#
+# ⚠️ **归位还不够**：这个脚本每跑一次就多一份 `.bak`，所以必须限量。
+# 之前 `/root` 下 17 个 `*backup*` 目录、797MB 就是这么攒出来的
+# （其中 `/root/.cache/ms-playwright` 一家就占 658M）——
+# 「备份」如果没有淘汰机制，攒着攒着就比它要保护的东西还大。
+#
+# 保留最近 5 份：够回滚最近几次改动，又不会无限长。
+BACKUP_DIR="${BACKUP_DIR:-/etc/nginx/backup}"
+BACKUP_KEEP="${BACKUP_KEEP:-5}"
+
+# 备份目录按 mtime 从新到旧排，只留最近 N 份。
+prune_backups() {
+  local dir="${1:-$BACKUP_DIR}" keep="${2:-$BACKUP_KEEP}"
+  [ -d "$dir" ] || return 0
+  ls -1t "$dir" 2>/dev/null | tail -n "+$((keep + 1))" | while IFS= read -r f; do
+    [ -n "$f" ] && rm -f -- "$dir/$f"
+  done
+}
 run() {
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '    [dry-run] %s\n' "$*"
@@ -99,7 +122,7 @@ fi
 
 # ── 2. 我们自己的文件日志策略 ────────────────────────────────────────
 say "logrotate 策略 $LOGROTATE_OURS"
-mkdir -p /root/nginx-config-backups
+mkdir -p /etc/nginx/backup
 cat > /tmp/stashbox-logrotate.$$ <<EOF
 # 听匣自己的文件日志（应用日志实际走 journald，这里是给文件日志兜底）。
 # 由 backend/deploy/install-log-policy.sh 生成 —— 别手改，改脚本。
@@ -127,7 +150,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
   say "    [dry-run] 写 $LOGROTATE_OURS"
 else
   if [ -f "$LOGROTATE_OURS" ] && ! cmp -s /tmp/stashbox-logrotate.$$ "$LOGROTATE_OURS"; then
-    cp -a "$LOGROTATE_OURS" "/root/nginx-config-backups/$(basename "$LOGROTATE_OURS").bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    cp -a "$LOGROTATE_OURS" "/etc/nginx/backup/$(basename "$LOGROTATE_OURS").bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
   fi
   install -m 0644 /tmp/stashbox-logrotate.$$ "$LOGROTATE_OURS"
 fi
@@ -143,8 +166,8 @@ else
   if [ "$DRY_RUN" -eq 1 ]; then
     say "    [dry-run] 在 nginx 策略里补 maxsize $NGINX_MAXSIZE"
   else
-    mkdir -p /root/nginx-config-backups
-    cp -a "$LOGROTATE_NGINX" "/root/nginx-config-backups/$(basename "$LOGROTATE_NGINX").bak.$(date +%Y%m%d%H%M%S)"
+    mkdir -p /etc/nginx/backup
+    cp -a "$LOGROTATE_NGINX" "/etc/nginx/backup/$(basename "$LOGROTATE_NGINX").bak.$(date +%Y%m%d%H%M%S)"
     # 在第一段（/var/log/nginx/*.log）里、daily 之后插一行 maxsize。
     #
     # 用 awk 而不是 sed：BSD sed（macOS）不支持替换串里的 \n，
@@ -154,7 +177,7 @@ else
       { print }
     ' "$LOGROTATE_NGINX" > /tmp/nginx-logrotate.$$ && cat /tmp/nginx-logrotate.$$ > "$LOGROTATE_NGINX"
     rm -f /tmp/nginx-logrotate.$$
-    say "  ✓ 已补 maxsize $NGINX_MAXSIZE（备份在 /root/nginx-config-backups/）"
+    say "  ✓ 已补 maxsize $NGINX_MAXSIZE（备份在 /etc/nginx/backup/）"
   fi
 fi
 
@@ -178,8 +201,11 @@ if [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 say "完成。"
+# 备份目录限量：只留最近 N 份（少了它，备份目录会自己长成垃圾堆 —— 见 prune_backups 的注释）
+prune_backups
+say "  备份目录 $BACKUP_DIR：保留最近 ${BACKUP_KEEP} 份"
 cat <<'EOF'
 回滚：
   rm -f /etc/logrotate.d/stashbox
-  # nginx 那段：从 /root/nginx-config-backups/nginx.bak.* 恢复
+  # nginx 那段：从 /etc/nginx/backup/nginx.bak.* 恢复
 EOF
