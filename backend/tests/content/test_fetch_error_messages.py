@@ -110,3 +110,57 @@ def test_auth_通用话术不含误导指引():
     msg = fetch_error_user_message(FetcherErrorCode.AUTH, "generic_url")
     for bad in ("微信", "换个网站"):
         assert bad not in msg, f"通用 AUTH 话术不该出现「{bad}」：{msg}"
+
+
+# ── PARSE（链接剪藏）：不能只说「需要登录」（2026-10-25） ────────────────
+#
+# 背景（实测，不是推测）：生产上 `STASHBOX_FETCH_BROWSER_TIER=0`
+# —— chromium RSS 300MB+ 而 content-service 的 MemoryMax 只有 224MB，
+# 开浏览器通道等于埋 OOM ⇒ **生产剪藏只走 http 通道**。
+#
+# 而 http 通道提不出正文的真实成因有**两类**：
+#   ① 页面要登录；
+#   ② 内容由网页脚本动态加载（SPA / 前端渲染站）。
+# 实测 `https://example.org/` 就是第 ②类：http 通道报
+# `no article content extracted`，靠升级 browser 才成功
+# —— 而 browser 通道在生产是关的 ⇒ 这类页面**生产必然剪不动**。
+#
+# 旧文案「没能提取出文章正文，页面可能需要登录后才能查看」把 ①说成了唯一可能：
+# 对 ② 的用户是**误导** —— 他会以为自己漏了登录动作，去登录、再重试，
+# 而结果永远不会变（这正是上一轮内测反馈「剪藏不成功」的一类来源）。
+#
+# 所以这里锁四件事：
+#   1. 不能只提「登录」；
+#   2. 要提到「网页加载/脚本」这一类真实成因；
+#   3. 要让用户知道这类页面**暂时读不了**（别干等、别反复重试）；
+#   4. 长度有上限 —— 安卓端是 `Toast.LENGTH_SHORT`（CaptureScreen.kt），
+#      太长会被截断，反而什么都读不到。
+#
+# 文档剪藏的 PARSE 是**独立分支**（加密 PDF / OCR 认不出字），
+# 不能混进链接这句 —— 文档根本没有「登录」这回事。
+
+
+def test_parse_链接剪藏话术不只说登录():
+    """只说「需要登录」对 JS 渲染页面是误导 ⇒ 回归即失败。"""
+    msg = fetch_error_user_message(FetcherErrorCode.PARSE, "generic_url")
+    assert "网页" in msg or "加载" in msg, f"PARSE 话术该提到网页加载这一类成因：{msg}"
+
+
+def test_parse_链接剪藏话术点明暂时读不了():
+    """要让用户知道等与重试都没用 ⇒ 引导他换个链接。"""
+    msg = fetch_error_user_message(FetcherErrorCode.PARSE, "generic_url")
+    assert "暂时" in msg or "读不了" in msg, f"PARSE 话术该点明这类页面暂时读不了：{msg}"
+
+
+def test_parse_链接剪藏话术长度在_toast_装得下的范围():
+    """安卓端是 Toast.LENGTH_SHORT ⇒ 超过 ~45 字会被截断。"""
+    msg = fetch_error_user_message(FetcherErrorCode.PARSE, "generic_url")
+    assert len(msg) <= 45, f"PARSE 话术过长（{len(msg)} 字），Toast 装不下：{msg}"
+
+
+def test_parse_文档剪藏仍是独立分支():
+    """文档没有「登录」这回事 ⇒ 不能沿用链接那句。"""
+    doc = fetch_error_user_message(FetcherErrorCode.PARSE, "document")
+    link = fetch_error_user_message(FetcherErrorCode.PARSE, "generic_url")
+    assert doc != link, "文档剪藏的 PARSE 话术必须与链接剪藏分开"
+    assert "网页" not in doc, f"文档话术不该提网页加载：{doc}"

@@ -76,7 +76,25 @@ _FETCH_ERROR_USER_MESSAGE: dict[FetcherErrorCode, str] = {
     # （实测 adobe.com 的 PDF 返回 403，用户看到的就是这句）。
     FetcherErrorCode.AUTH: "对方网站限制了非官方客户端访问，换个来源试试",
     FetcherErrorCode.NOT_FOUND: "这篇文章已被删除或链接已失效",
-    FetcherErrorCode.PARSE: "没能提取出文章正文，页面可能需要登录后才能查看",
+    # ⚠️ 2026-10-25 改写：旧文案「页面可能需要登录后才能查看」把
+    # 「需要登录」说成了**唯一**可能，而实测真实成因有**两类**：
+    #   ① 页面要登录；
+    #   ② 内容由网页脚本动态加载（SPA / 前端渲染站）。
+    #
+    # ② 这类在**生产上必然剪不动**：`STASHBOX_FETCH_BROWSER_TIER=0`
+    # （chromium RSS 300MB+ vs content-service 的 MemoryMax 224MB，
+    # 开浏览器通道等于埋 OOM）⇒ 生产剪藏只走 http 通道。
+    # 实测 `https://example.org/` 就是 ②类：http 通道报
+    # `no article content extracted`，靠升级 browser 才成功
+    # —— 而 browser 通道在生产是关的。
+    #
+    # 只说「需要登录」对 ② 的用户是**误导**：他会以为自己漏了登录动作，
+    # 去登录、再重试，而结果永远不会变（上一轮内测反馈「剪藏不成功」的一类来源）。
+    #
+    # 新文案要点：① 两类成因都点到；② 明确「暂时读不了」——
+    # 让用户知道等与重试都没用，直接换链接，而不是反复试。
+    # ③ 长度 ≤45 字：安卓端是 `Toast.LENGTH_SHORT`（CaptureScreen.kt），太长会被截断。
+    FetcherErrorCode.PARSE: "没能读出文章正文，可能页面要登录，或内容要等网页加载完，这类页面暂时读不了",
     # 单独成句，不复用 PARSE 的"可能需要登录"：对方要的是人机验证，不是登录。
     # 复用会让用户以为自己漏了登录动作，白花时间找不存在的原因。
     # 也不承诺"我们能过" —— 事实上多数情况下不能（实测百度 5 种浏览器姿态全被拦）。
