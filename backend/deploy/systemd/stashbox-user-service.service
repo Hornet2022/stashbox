@@ -34,13 +34,20 @@ OOMPolicy=stop
 # ── 内存 / CPU 上限 ────────────────────────────────────────────────────
 # 实测：空闲 17-40 MB，80 并发下 60-90 MB（它是 5 个服务里连接池最大的之一：
 # POSTGRES_POOL_SIZE 条常驻连接 + JWT 签发缓冲）。
-#   MemoryHigh=96M  —— 正常峰值（90MB）之上，正常流量不会误触发回收。
-#   MemoryMax=128M  —— 约 1.4× 实测峰值。超额即视为异常，被 OOM kill 后自动重启。
 #
-# ⚠️ 物理内存实测只有 1613MB（标称 2 GiB），原 128M/160M 是按 2048MB 算的，
-#    五个单元 + PG + Redis + nginx 的硬上限之和必须 ≤ 物理内存，
-#    否则同时顶满会触发 cgroup OOM killer（可能杀掉 PG → 整机掉线）。
-MemoryHigh=96M
+# ⚠️⚠️ **MemoryHigh 必须 == MemoryMax**（2026-10-25 实测判定，全机统一）：
+# memory.high 是**节流** —— 跨过它 ⇒ 进程进 D 状态 ⇒ 请求永不返回、
+# 整个服务不响应、且 SIGKILL 都杀不掉（不会自愈、不会告警）。
+# 生产机对照实验：high<max ⇒ 退出码 124（卡死，events: high 1477 / oom 0）；
+# high==max ⇒ 退出码 137（被 OOM 杀掉，events: high 0 / oom 1）⇒ 可被
+# `Restart=always` 拉起来。**宁可被杀，不要挂死。** 硬上限不变。
+#
+#   MemoryMax=128M —— 约 1.4× 实测峰值。超额即视为异常，被 OOM kill 后自动重启。
+#
+# ⚠️ 物理内存实测只有 1613MB（标称 2 GiB），五个单元 + PG + Redis + nginx
+#    的硬上限之和必须 ≤ 物理内存，否则同时顶满会触发 cgroup OOM killer
+#    （可能杀掉 PG → 整机掉线）。
+MemoryHigh=128M
 MemoryMax=128M
 # 40%（高于网关）：登录要算 bcrypt（cost 12 约 200-300ms CPU），
 # 给低了登录接口会明显变慢。40% ≈ 0.4 核 ≈ 每秒 1.6 次 bcrypt，

@@ -42,14 +42,21 @@ OOMPolicy=stop
 #   fork ffmpeg 做多码率 m4a 转码，子进程被算进**同一个 cgroup**。
 #   实测：4MB WAV → 64kbps AAC 的 ffmpeg 峰值 RSS 只有 18 MB（可忽略），
 #   但 0.35s 的墙钟时间说明 CPU 才是它真正吃的东西。
-#   MemoryHigh=168M —— 音频在解码态的瞬时峰值。
-#   MemoryMax=224M —— 约 2.5× 实测峰值；留出的余量覆盖
-#                      「agent 跑图 + 音频拼接 + ffmpeg 子进程」同时发生。
 #
-# ⚠️ 物理内存实测只有 1613MB（标称 2 GiB），原 224M/288M 是按 2048MB 算的，
-#    五个单元 + PG + Redis + nginx 的硬上限之和必须 ≤ 物理内存，
-#    否则同时顶满会触发 cgroup OOM killer（可能杀掉 PG → 整机掉线）。
-MemoryHigh=168M
+# ⚠️⚠️ **MemoryHigh 必须 == MemoryMax**（2026-10-25 实测判定，全机统一）：
+# memory.high 是**节流** —— 跨过它 ⇒ 进程进 D 状态 ⇒ 请求永不返回、
+# 整个服务不响应、且 SIGKILL 都杀不掉（不会自愈、不会告警）。
+# 生产机对照实验：high<max ⇒ 退出码 124（卡死，events: high 1477 / oom 0）；
+# high==max ⇒ 退出码 137（被 OOM 杀掉，events: high 0 / oom 1）⇒ 可被
+# `Restart=always` 拉起来。**宁可被杀，不要挂死。** 硬上限不变。
+#
+#   MemoryMax=224M —— 约 2.5× 实测峰值；留出的余量覆盖
+#                     「agent 跑图 + 音频拼接 + ffmpeg 子进程」同时发生。
+#
+# ⚠️ 物理内存实测只有 1613MB（标称 2 GiB），五个单元 + PG + Redis + nginx
+#    的硬上限之和必须 ≤ 物理内存，否则同时顶满会触发 cgroup OOM killer
+#    （可能杀掉 PG → 整机掉线）。
+MemoryHigh=224M
 MemoryMax=224M
 # 60%（全场最高）：worker 是唯一做重活（ffmpeg 转码 + agent 推理循环）的单元。
 # 五个单元的 CPUQuota 之和 = 25+40+35+40+60 = 200% = 2 vCPU，

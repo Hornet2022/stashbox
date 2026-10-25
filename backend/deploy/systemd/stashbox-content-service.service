@@ -32,26 +32,44 @@ TimeoutStopSec=30
 OOMPolicy=stop
 
 # ── 内存 / CPU 上限 ────────────────────────────────────────────────────
-# 实测：空闲 17-40 MB，80 并发下 60-90 MB。它比别的服务多一样东西：
-# 整页 HTML + 解析出来的正文**同时**在内存里（几 MB 的页面会变成几十 MB 的
-# Python 对象），所以上限给得比网关/用户服务宽一点。
+# 实测（2026-10-25，修复后，生产连剪 4 次同一篇 17 图微信文）：
+#   静息 cgroup current ≈ 93 MiB（其中 anon ≈ 86、file ≈ 10）
+#   剪藏峰值     ≈ 127-138 MiB
+#   memory.events 的 `high` 增量 = 0（完全不节流）
+# 它比别的服务多一样东西：整页 HTML + 解析出来的正文**同时**在内存里
+# （几 MB 的页面会变成几十 MB 的 Python 对象）。
 #
-# ⚠️ **2026-10-25 改过（生产事故逼的）**：原来的 128M/176M 是按
-# 「空闲 17-40MB、80 并发 60-90MB」算的，**没把剪藏路径算进去**。
-# 实测一篇 17 图的微信文：稳态边际成本 +48MB（RSS 从 83MB 冲到 166MB）
-# ⇒ **一次剪藏就顶穿 128M 的水位线**。
+# ⚠️⚠️ **为什么 MemoryHigh 必须 == MemoryMax（2026-10-25 实测判定）**
 #
-# ⚠️⚠️ **MemoryHigh 触发的不是「回收压力」，是「永久冻死」**（实测）：
-# cgroup v2 的 memory.high 是**节流**——越过水位线的分配会被内核
-# 挡在回收路径上（进程进入 D 状态，`wchan=mem_cgroup_handle_over_high`）。
-# 此时：① 请求永不返回；② **整个服务都不响应**（连列表查询也一起超时）；
-# ③ 进程在 D 状态 ⇒ **SIGKILL 都杀不掉** ⇒ 不会自愈、不会告警。
-# `memory.events` 里 `high 19414`（超水位 19414 次）、`oom 0`（压根没到
-# OOM killer）—— 所以"没 OOM"不等于"没事"。
+# cgroup v2 的 memory.high 是**节流**：越过水位线的分配会被内核挡在回收
+# 路径上（进程进 D 状态，`wchan=mem_cgroup_handle_over_high`）。后果：
+#   ① 请求永不返回；② **整个服务都不响应**（连列表查询也一起超时）；
+#   ③ 进程在 D 状态 ⇒ **SIGKILL 都杀不掉** ⇒ 不会自愈、不会告警。
+# `memory.events` 里 `high 19414`、`oom 0` ⇒ 「没 OOM」不等于「没事」。
 #
-# ⇒ 现在的数：**High 160M / Max 224M**（High 留 56MB 余量给更大的文章，
-# Max 仍是实测峰值的 ~2 倍）。代码侧同时加了内存闸门
-# （识图前缩图 + 单篇配图总字节预算，见 fetchers/ocr.py 与 media_ocr.py）。
+# ⇒ 在生产机上用一次性 cgroup 做的对照实验（两种配置各跑一个持续分配的进程）：
+#   high=64M  max=128M → 退出码 **124（超时卡死）**，events: high 1477 / oom 0
+#                          ⇒ 跨过 high 就**永久冻死**，连 OOM killer 都到不了
+#   high=128M max=128M → 退出码 **137（SIGKILL）**，events: high 0 / oom 1
+#                          ⇒ high==max 时内核**直接走 OOM 路径**，不节流、不冻死
+#
+# ⇒ 所以「high < max」那个区间在本机是**死亡陷阱**：跨进去就是挂死，
+#   而跨过 max 只是被杀 —— 本单元有 `Restart=always`，被杀会被 systemd
+#   拉起来（自愈）。**宁可被杀，不要挂死。**
+#
+# ⇒ 于是：**High 224M == Max 224M**，把节流区间整个去掉。
+#   硬上限没变（还是 224M）⇒ 内存预算表不受影响（MemoryMax 之和仍是 904M）。
+#
+# ⚠️ 这个数是按「实测峰值」定的，不是拍脑袋：
+#   修前（没缩图、没总字节闸）稳态边际成本 +48MB，峰值 181MiB ⇒ 224M 够用；
+#   修后峰值 127-138MiB，离 224M 还有 ~90MiB 余量。
+#   更大的文章（页更大 / 图更多）会抬高峰值，但再高就是 OOM kill + 自愈，
+#   **不会**变成整服务挂死。
+#
+# 代码侧同时加了内存闸门（识图前缩图 + 单篇配图总字节预算 + 请求后
+# malloc_trim 归还碎片，见 fetchers/ocr.py、media_ocr.py 与
+# common/middleware/memory_trim.py）—— 闸门是为了**别频繁被杀**，
+# 而 high==max 是为了**被杀时能活过来**。
 #
 # ⚠️ 这里的 224M 之所以够用，是因为**浏览器通道关掉了**
 #   （2 GiB 模板里 STASHBOX_FETCH_BROWSER_TIER=0）。
@@ -62,12 +80,12 @@ OOMPolicy=stop
 #   再把 MemoryMax 提到 640M，同时从别处（见 deploy/README.md 内存预算表）
 #   腾出 400 MB —— 这台机器（物理内存实测 1613MB）上这笔账不成立。
 #
-# ⚠️ 物理内存实测只有 1613MB（标称 2 GiB），原 160M/224M 是按 2048MB 算的，
-#    五个单元 + PG + Redis + nginx 的硬上限之和必须 ≤ 物理内存，
-#    否则同时顶满会触发 cgroup OOM killer（可能杀掉 PG → 整机掉线）。
-#    ⇒ 抬到 224M 的同时把 PG 的 MemoryMax 从 320M 收到 288M
-#    （见 tune-host.sh），总和仍在 0.85×1613M 以内。
-MemoryHigh=160M
+# ⚠️ 物理内存实测只有 1613MB（标称 2 GiB），五个单元 + PG + Redis + nginx
+#   的**硬上限（MemoryMax）**之和必须 ≤ 物理内存，否则同时顶满会触发
+#   cgroup OOM killer（可能杀掉 PG → 整机掉线）。
+#   ⇒ 抬到 224M 的同时把 PG 的 MemoryMax 从 320M 收到 288M
+#   （见 tune-host.sh），总和仍在 0.85×1613M 以内。
+MemoryHigh=224M
 MemoryMax=224M
 # 35%：抓取 + HTML 解析是纯 CPU 的，但实测剪藏最坏 ~40.6s 里大头是网络等待，
 # 不是解析。35% 足够，也保证不跟蒸馏任务抢核。

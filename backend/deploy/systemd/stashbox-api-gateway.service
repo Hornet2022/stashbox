@@ -53,21 +53,32 @@ TimeoutStopSec=30
 # 而不是让单元停在一个半死不活的状态。
 OOMPolicy=stop
 
-# ── 内存 / CPU 上限（2 GiB 机器的分配账，见 deploy/README.md 的内存预算表）──
+# ── 内存 / CPU 上限（1613MB 实测机器的分配账，见 deploy/README.md 的内存预算表）──
 # 实测：网关空闲 17-40 MB，80 并发下 60-90 MB（它只做转发 + JWT 校验，
-# 不做重活）。所以：
-#   MemoryHigh=96M  —— 比实测峰值（90MB）略高，正常流量不会触发回收压力；
-#   MemoryMax=128M  —— 约 1.4× 实测峰值。真的顶到 128MB，说明有连接或
-#                      缓冲在泄漏；被 OOM kill 后自动重启，比悄悄吃掉整台机器好。
+# 不做重活）。
+#
+# ⚠️⚠️ **MemoryHigh 必须 == MemoryMax**（2026-10-25 实测判定，全机统一）：
+# cgroup v2 的 memory.high 是**节流**：跨过它 ⇒ 进程进 D 状态
+# （`wchan=mem_cgroup_handle_over_high`）⇒ 请求永不返回、整个服务不响应、
+# 且 SIGKILL 都杀不掉 ⇒ 不会自愈、不会告警。
+# 生产机对照实验（一次性 cgroup，进程持续分配）：
+#   high=64M  max=128M → 退出码 124（超时卡死），events: high 1477 / oom 0
+#   high=128M max=128M → 退出码 137（SIGKILL），   events: high 0 / oom 1
+# ⇒ 「high < max」那个区间是**死亡陷阱**：跨进去就挂死；跨过 max 只是被杀，
+#   而本单元有 `Restart=always` ⇒ 被 systemd 拉起来（自愈）。
+#   **宁可被杀，不要挂死。** 硬上限（MemoryMax）没变 ⇒ 内存预算表不受影响。
+#
+#   MemoryMax=128M —— 约 1.4× 实测峰值。真的顶到 128MB，说明有连接或
+#                     缓冲在泄漏；被 OOM kill 后自动重启，比悄悄吃掉整台机器好。
 #
 #   ⚠️ 这台机器**物理内存只有 1613MB**（轻量标称 2 GiB，但 guest 实测
 #      1613MB —— 云厂商划走了一部分给 hypervisor / 缓存）。
-#      原值 128M/160M 是按 2048MB 算的；五个单元 + PG + Redis + nginx
-#      的硬上限之和必须 ≤ 物理内存，否则五个单元同时顶满会触发
-#      cgroup 内的 OOM killer —— 被杀的可能是 PostgreSQL，整机数据面掉线。
-#      新的五单元 MemoryMax 合计 856M，与 PG 320M + Redis 128M +
-#      nginx 48M = 1352M ≤ 1613M × 0.85 ✓
-MemoryHigh=96M
+#      五个单元 + PG + Redis + nginx 的硬上限之和必须 ≤ 物理内存，
+#      否则五个单元同时顶满会触发 cgroup 内的 OOM killer —— 被杀的可能是
+#      PostgreSQL，整机数据面掉线。
+#      五单元 MemoryMax 合计 904M，与 PG 288M + Redis 128M +
+#      nginx 48M = 1368M ≤ 1613M × 0.85 ✓
+MemoryHigh=128M
 MemoryMax=128M
 # CPUQuota 之和 = 25+40+35+40+60 = 200% = 这台机器的 2 vCPU。
 # 网关只做转发与 HMAC 校验，25% 足够，且不会跟别的服务抢核。

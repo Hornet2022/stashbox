@@ -579,6 +579,14 @@ say "cgroup 内存上限"
 #    真不够用时先降 max_connections，别直接抬这个值。
 #    2026-10-25 从 320M 收到 288M：给 content-service 的 MemoryMax
 #    176M→224M 腾位置（它要装得下一次剪藏的峰值，见 deploy/README.md 9.3）。
+#
+# ⚠️ 为什么 PG 保留 high(224M) < max(288M) 这个「节流区」，而五个 Python
+#    单元都改成了 high == max（见 deploy/README.md §9.3.2 的对照实验）：
+#    memory.high 是节流，跨过去进程会**永久冻死**（D 状态，杀不掉）。
+#    Python 单元有 Restart=always ⇒ 宁可被 OOM 杀掉也不冻死（high==max）。
+#    但 PG 的 Restart=no ⇒ 被 OOM kill 就**没人拉起**（数据面直接掉线），
+#    而 PG 的实际用量（23MB）离 high 线还差 200MB ⇒ 那个区间够不着。
+#    ⇒ 真要统一之前，先单独给 PG 做一次「跨 high 会怎样」的实测。
 write_cgroup_cap() {
   local unit="$1" high="$2" max="$3" comment="$4"
   # ⚠️ drop-in 目录名必须是**完整单元名 + .d**（`redis-server.service.d`），

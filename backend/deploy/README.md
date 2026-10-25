@@ -631,18 +631,30 @@ cd backend/deploy && ./preflight.sh /etc/stashbox/stashbox.env
 
 | 组件 | 空闲实测 | 80 并发实测 | 本方案上限 | 依据 |
 |---|---|---|---|---|
-| api-gateway | 17–40 MB | 60–90 MB | High 96M / **Max 128M** | 只做转发 + JWT 校验；上限 ≈1.4× 实测峰值 |
-| user-service | 17–40 MB | 60–90 MB | High 96M / **Max 128M** | bcrypt + PG 连接池 |
-| content-service | 17–40 MB | 60–90 MB | High 160M / **Max 224M** | **剪藏路径的稳态峰值**：整页 HTML + 配图下载 + VLM 请求体（见下「剪藏路径」） |
-| ai-service | 17–40 MB | 60–90 MB | High 144M / **Max 200M** | LLM 响应 JSON + 音频缓冲 |
-| ai-worker | 17–40 MB | 60–90 MB | High 168M / **Max 224M** | 唯一会 fork ffmpeg 的（子进程同 cgroup） |
+| api-gateway | 17–40 MB | 60–90 MB | **High = Max 128M** | 只做转发 + JWT 校验；上限 ≈1.4× 实测峰值 |
+| user-service | 17–40 MB | 60–90 MB | **High = Max 128M** | bcrypt + PG 连接池 |
+| content-service | 17–40 MB | 60–90 MB | **High = Max 224M** | **剪藏路径的稳态峰值**：整页 HTML + 配图下载 + VLM 请求体（见下「剪藏路径」） |
+| ai-service | 17–40 MB | 60–90 MB | **High = Max 200M** | LLM 响应 JSON + 音频缓冲 |
+| ai-worker | 17–40 MB | 60–90 MB | **High = Max 224M** | 唯一会 fork ffmpeg 的（子进程同 cgroup） |
 | **五个常驻进程合计** | **~90 MB** | **~400 MB** | **904M** | MemoryMax 之和 |
-| PostgreSQL | 200–300 MB | — | cgroup **288M** | shared_buffers 64MB + ≤30 连接 × ~6MB（实测 RSS 23MB） |
+| PostgreSQL | 200–300 MB | — | cgroup High 224M / **Max 288M** | shared_buffers 64MB + ≤30 连接 × ~6MB（实测 RSS 23MB） |
 | Redis | ~50 MB | — | cgroup **128M** | maxmemory 64mb + 开销 |
 | nginx | ~10 MB | — | cgroup **48M** | TLS + 反代 |
 | OS + systemd + journald | ~150 MB | — | journald `SystemMaxUse=200M` | 实测 |
 | ffmpeg 峰值（转码中） | 18 MB | 18 MB | 计入 ai-worker 的 cgroup | 实测 4MB WAV→64kbps AAC，墙钟 0.35s |
 | **合计（硬上限）** | **~550 MB** | **~860 MB** | **1368M / 1613M** | **余量 245M** + 2 GiB swap 兜底 |
+
+> ⚠️ **五个 Python 单元的 `MemoryHigh` 一律 == `MemoryMax`** —— 这不是笔误，
+> 是 2026-10-25 用对照实验定下来的（见 §9.3.2）：`high < max` 那个区间是
+> **死亡陷阱**，跨进去进程就永久挂死；而跨过 `max` 只是被 OOM 杀掉，
+> 有 `Restart=always` ⇒ systemd 拉起来（自愈）。**宁可被杀，不要挂死。**
+> 硬上限（MemoryMax）没动 ⇒ 这张预算表不受影响。
+>
+> ⚠️ PG / Redis / nginx **保留 high < max**：它们的实际用量离 high 线还很远
+> （PG 实测 RSS 23MB vs high 224MB；Redis 5MB vs 96MB），而且 PG 一旦被
+> OOM kill **没人拉起**（`Restart=no`）—— 对数据面来说那是整机掉线。
+> 这三个的冻结风险因此远低于 Python 单元；要改之前先单独实测。
+> （已知隐患：PG 若真的被 OOM kill，得手动 `systemctl start postgresql@16-main`。）
 
 ### 9.3.1 剪藏路径：content-service 的峰值从哪来（2026-10-25 生产事故）
 
@@ -660,15 +672,43 @@ cd backend/deploy && ./preflight.sh /etc/stashbox/stashbox.env
 每张图的字节被复制 4~5 遍（原始 → base64 串 → JSON 串 → utf-8 字节 → 请求体）。
 12 张图 ⇒ 瞬时几十 MB。**顺带一提：VLM 的视觉 token 按图面积算 ⇒ 图小了 token 也少。**
 
-⇒ 现在的两道闸门（都在 `backend/content-service/fetchers/`）：
+⇒ 现在的三道闸门：
 1. **识图前缩图**（`ocr.shrink_image_for_vlm`，Pillow）—— 收口在**唯一**拼请求体的那一处；
 2. **单篇配图总字节预算**（`media_ocr.MAX_MEDIA_TOTAL_BYTES`）——
-   只限张数限不住内存（12×5MB 与 12×50KB 内存差 10 倍）。
+   只限张数限不住内存（12×5MB 与 12×50KB 内存差 10 倍）；
+3. **请求后归还分配器碎片**（`common/middleware/memory_trim.py`）—— 见下。
 
-### 9.3.2 ⚠️ `MemoryHigh` 触发的是**永久冻死**，不是「回收压力」
+**第 3 道闸门是被「静息内存爬升」逼出来的**（实测，同进程连抓 4 次同一篇）：
+
+```
+抓取后（gc 跑过）  anon  97 → 103 → 104 → 104 MiB   ← 每次剪藏留一层碎片
+malloc_trim 之后   anon  77 →  77 →  77 →  77 MiB   ← 每次都精确回到同一数
+```
+
+`gc.collect()` 收不掉（**不是活对象**，是 glibc 手里已 free 的页），
+`malloc_trim(0)` 能全部收回 ⇒ 装成中间件，请求结束按阈值还一次。
+
+**生产实测（修复后，连剪 4 次同一篇 17 图微信文）**：
+
+| 指标 | 修前（有缩图、无 trim、High 160M） | 修后（缩图 + 字节闸 + trim，High=Max 224M） |
+|---|---|---|
+| 静息 cgroup current | 149.7 MiB | **92.6 → 97.0 → 99.3 → 102.5 MiB** |
+| 剪藏峰值 | 159.6 MiB | **127.2 → 137.6 → 138.4 MiB** |
+| `memory.events` 的 `high` 增量 | **46**（每次剪藏都被节流） | **0**（完全不节流） |
+| 剪藏结果 | 200，但过程被节流 | **200 / 30.5s** |
+
+⚠️ 静息值仍有 **+2.5 MiB/次** 的缓慢爬升（探针里不建库、不派蒸馏时是**完全持平**的
+⇒ 多出来的那点在「写库 + 派蒸馏」那段，还没定位到）。这正是**不能再把
+MemoryHigh 设得比峰值低**的原因：峰值会随剪藏次数漂移，固定的水位线迟早被跨过，
+而跨过 `high` 就是挂死（§9.3.2）。⇒ `high == max` 让它变成「被杀 + 自愈」。
+
+
+### 9.3.2 ⚠️ `MemoryHigh` 是**永久冻死**区，`high == max` 才是可自愈的配置
 
 原预算表里写的是「`MemoryHigh`（软限）触发的是回收压力，不是杀进程；正常流量不会碰到」。
-**2026-10-25 实测推翻了后半句，也纠正了前半句的措辞**：
+**2026-10-25 的生产事故 + 对照实验把这句话彻底推翻了。**
+
+#### 现象：跨过 `memory.high` ⇒ 永久冻死
 
 cgroup v2 的 `memory.high` 是**节流**——越过水位线的分配会被内核挡在回收路径上，
 进程进入 **D 状态**（`wchan=mem_cgroup_handle_over_high`）。后果：
@@ -679,9 +719,26 @@ cgroup v2 的 `memory.high` 是**节流**——越过水位线的分配会被内
 4. `memory.events` 里 `high 19414`（超水位被节流 19414 次）、`oom 0`
    —— **「没 OOM」不等于「没事」**（压根没走到 OOM killer 那一步）。
 
-⇒ 判据要改成「**稳态峰值 + 余量**」，而不是「空闲/并发实测」。
+#### 对照实验：两种配置各跑一个「持续分配」的进程（生产机，一次性 cgroup）
 
-**处置（卡住了怎么办）**：
+| 配置 | 进程结局 | `memory.events` | 含义 |
+|---|---|---|---|
+| `high=64M  max=128M` | 退出码 **124（超时卡死）** | `high 1477` / `max 0` / `oom 0` | 跨过 high ⇒ **永久挂死**，连 OOM killer 都到不了 |
+| `high=128M max=128M` | 退出码 **137（SIGKILL）** | `high 0` / `max 19` / `oom 1` / `oom_kill 1` | high==max ⇒ 内核**直接走 OOM 路径** ⇒ 被干净杀掉 |
+
+⇒ **`high < max` 那个区间是死亡陷阱**：跨进去就是挂死；跨过 `max` 只是被杀，
+而所有常驻单元都有 `Restart=always` ⇒ 被 systemd 拉起来（**自愈**）。
+
+⇒ **所以本机五个 Python 单元一律 `MemoryHigh == MemoryMax`**：
+**宁可被杀，不要挂死。** 硬上限（`MemoryMax`）一个数没改 ⇒ 内存预算表不受影响。
+
+⇒ 判据也要跟着改：
+- ❌ 旧判据：「`MemoryHigh` 是软限，触发的是回收压力，不是杀进程」。
+- ✅ 新判据：「**`MemoryHigh` 是挂死线**。要么把它设到峰值之上（但峰值会漂移，
+  迟早被跨过），要么直接设成等于 `MemoryMax`，让它变成「被杀 + 自愈」」。
+  ⇒ **峰值会漂移**这件事本身，就是不该留节流区的理由。
+
+#### 处置（已经卡住了怎么办）
 
 ```bash
 # ① 确认是不是被节流冻死了
@@ -701,7 +758,9 @@ systemctl daemon-reload && systemctl restart stashbox-content-service
 ```
 
 ⚠️ 第 ② 步的抬水位是**急救**，不是修复：只要稳态峰值还是超过水位线，
-下一次剪藏会重新冻死 ⇒ 必须同时把代码侧的内存闸门补上。
+下一次剪藏会重新冻死 ⇒ 必须同时把代码侧的内存闸门补上（§9.3.1 的三道闸门）。
+⚠️ 新的配置下（high==max）这类事故**不该再发生**；真发生了说明有新路径
+把内存吃穿了 —— 查 `memory.events` 的 `oom_kill` 与 `memory.peak`，而不是抬水位。
 
 要点：
 
@@ -712,7 +771,7 @@ systemctl daemon-reload && systemctl restart stashbox-content-service
   |---|---|---|
   | api-gateway | 75 MB | 128 MB |
   | user-service | 79 MB | 128 MB |
-  | content-service | 83 MB | 224 MB |
+  | content-service | 83 MB（剪藏后 ~103 MB，见 §9.3.1） | 224 MB |
   | ai-service | 72 MB | 200 MB |
   | ai-worker | 89 MB | 224 MB |
   | **合计** | **398 MB** | **904 MB** |

@@ -104,26 +104,30 @@
 # ── 内存 / CPU 上限（1613MB 实测机器的分配账）────────────────────────────
 #
 #   单元                    MemoryHigh  MemoryMax  CPUQuota
-#   api-gateway              96M        128M       25%
-#   user-service             96M        128M       40%
-#   content-service         160M        224M       35%
-#   ai-service              144M        200M       40%
-#   ai-worker               168M        224M       60%
-#   ── 合计                  664M        904M      200%
+#   api-gateway              128M        128M       25%
+#   user-service             128M        128M       40%
+#   content-service          224M        224M       35%
+#   ai-service               200M        200M       40%
+#   ai-worker                224M        224M       60%
+#   ── 合计                  904M        904M      200%
 #
 #   ⚠️ 上限**按部署机实测值填**，不要按「标称 2 GiB」算 ——
 #   生产机 `free -m` 实测物理内存只有 **1613MB**。
 #   （这张表 2026-10-25 之前写的是 128M/160M…合计 1088M，那是按 2 GiB 算的
 #   旧账，与实际部署值对不上；本表已与 /etc/systemd/system 下的实际文件核对。）
 #
-#   · MemoryHigh 之和 664M。
-#   ⚠️⚠️ **MemoryHigh 触发的不是「回收压力」，是「永久冻死」**（2026-10-25 实测）：
+#   ⚠️⚠️ **MemoryHigh 一律 == MemoryMax —— 这不是笔误**（2026-10-25 实测判定）：
 #     cgroup v2 的 memory.high 是**节流** —— 越过水位线的分配被内核挡在回收
 #     路径上，进程进入 **D 状态**（wchan=mem_cgroup_handle_over_high）。
 #     后果：请求永不返回、**整个服务都不响应**（连列表查询也超时）、
 #     且 D 状态**杀不掉**（SIGKILL 无效）⇒ 不会自愈、不会告警。
 #     `memory.events` 里 `high` 计数在涨、`oom 0` ——「没 OOM」≠「没事」。
-#     判据要按「**该路径的稳态峰值 + 余量**」算，不是按空闲/并发算。
+#     生产机对照实验（一次性 cgroup，进程持续分配）：
+#       high=64M  max=128M → 退出码 124（**卡死**），events: high 1477 / oom 0
+#       high=128M max=128M → 退出码 137（**被 OOM 杀掉**），events: high 0 / oom 1
+#     ⇒ 「high < max」那个区间是**死亡陷阱**；跨过 max 只是被杀，
+#       而这些单元都有 `Restart=always` ⇒ systemd 拉起来（自愈）。
+#       **宁可被杀，不要挂死。** 硬上限没动 ⇒ 内存预算表不受影响。
 #     处置步骤见 deploy/README.md §9.3.2（含急救 runbook）。
 #   · MemoryMax 之和 904M：硬上限，触顶被 OOM kill，Restart=always 拉起。
 #     904M + PG 288M + Redis 128M + nginx 48M + OS/journald ~150M

@@ -35,17 +35,24 @@ OOMPolicy=stop
 # 实测：空闲 17-40 MB，80 并发下 60-90 MB。它比网关多两样占内存的东西：
 #   1) LLM 响应体（蒸馏 Step1/Step2 的 JSON 可以很大）；
 #   2) 音频缓冲（ffmpeg 中间文件虽然落盘，但解码后的 PCM 在内存里）。
-#   MemoryHigh=144M —— 给音频/LLM 峰值留出余量。
-#   MemoryMax=200M —— 约 2.2× 实测峰值。
+#
+# ⚠️⚠️ **MemoryHigh 必须 == MemoryMax**（2026-10-25 实测判定，全机统一）：
+# memory.high 是**节流** —— 跨过它 ⇒ 进程进 D 状态 ⇒ 请求永不返回、
+# 整个服务不响应、且 SIGKILL 都杀不掉（不会自愈、不会告警）。
+# 生产机对照实验：high<max ⇒ 退出码 124（卡死，events: high 1477 / oom 0）；
+# high==max ⇒ 退出码 137（被 OOM 杀掉，events: high 0 / oom 1）⇒ 可被
+# `Restart=always` 拉起来。**宁可被杀，不要挂死。** 硬上限不变。
+#
+#   MemoryMax=200M —— 约 2.2× 实测峰值，给音频/LLM 峰值留出余量。
 #
 # ⚠️ 本机没有 torch / transformers / onnx，蒸馏不加载任何模型，
 #    所以这 200M 是**服务进程的**上限，不含模型权重。
 #    （langgraph / langfuse / mcp 是惰性 import，只占磁盘不占 RAM。）
 #
-# ⚠️ 物理内存实测只有 1613MB（标称 2 GiB），原 192M/256M 是按 2048MB 算的，
-#    五个单元 + PG + Redis + nginx 的硬上限之和必须 ≤ 物理内存，
-#    否则同时顶满会触发 cgroup OOM killer（可能杀掉 PG → 整机掉线）。
-MemoryHigh=144M
+# ⚠️ 物理内存实测只有 1613MB（标称 2 GiB），五个单元 + PG + Redis + nginx
+#    的硬上限之和必须 ≤ 物理内存，否则同时顶满会触发 cgroup OOM killer
+#    （可能杀掉 PG → 整机掉线）。
+MemoryHigh=200M
 MemoryMax=200M
 # 40%：LLM 响应的 JSON 解析 + 音频拼接过渡，CPU 用量比网关/用户服务高。
 CPUQuota=40%
