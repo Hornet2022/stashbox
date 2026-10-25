@@ -139,3 +139,52 @@ def test_环境变量不会泄漏到测试之间(monkeypatch):
     monkeypatch.delenv("OPENAI_TTS_CROSSFADE_SEC", raising=False)
     assert audio_chunks._crossfade_sec() == audio_chunks._CROSSFADE_SEC_DEFAULT
     assert "OPENAI_TTS_CROSSFADE_SEC" not in os.environ
+
+
+# ── 上游请求闸门 ─────────────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_上游请求不并发():
+    """闸门：同一进程里**不能**有两个 TTS 请求同时打向上游。
+
+    ## 为什么这是硬要求
+
+    上游**串行处理**（实测：并发 1/2/4 的总耗时 54.2/51.1/53.4s ——
+    并发对它零吞吐贡献），而它那条 **60s 墙钟包含它在队列里等的时间**
+    （实测：把上游打满后，**80 字**的请求连续 504 —— 80 字推理只要 ~4s）。
+
+    ⇒ 两个请求同时打过去，后一个会在**上游**排到超时；
+    ⇒ 在我们这边排队就不计入它的墙钟（我们的 timeout 是 300s）。
+    """
+    import asyncio
+
+    from stashbox.backend.app.services.tts.openai import OpenAITTSClient
+
+    inflight = 0
+    peak = 0
+
+    class _Resp:
+        status_code = 200
+        content = b"x" * 200
+        headers: dict = {}
+
+        def json(self):
+            return {}
+
+    async def _post(url, json=None, **kw):
+        nonlocal inflight, peak
+        inflight += 1
+        peak = max(peak, inflight)
+        await asyncio.sleep(0.05)
+        inflight -= 1
+        return _Resp()
+
+    client = OpenAITTSClient(api_key="k", base_url="http://x", model="m")
+    client._client.post = _post  # type: ignore[method-assign]
+
+    await asyncio.gather(
+        client._synthesize_once("甲" * 20),
+        client._synthesize_once("乙" * 20),
+        client._synthesize_once("丙" * 20),
+    )
+
+    assert peak == 1, f"上游同时收到了 {peak} 个请求 —— 闸门没生效"

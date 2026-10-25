@@ -144,6 +144,7 @@ import asyncio
 import logging
 import os
 import time
+import weakref
 from dataclasses import dataclass
 from typing import Any
 
@@ -330,6 +331,56 @@ _CIRCUIT_FAIL_THRESHOLD = 3
 _CIRCUIT_OPEN_SECONDS = 60.0
 
 _circuit_state = {"consecutive_failures": 0, "opened_at": 0.0}
+
+
+# ── 上游请求闸门（进程内，容量 1）────────────────────────────────────────
+#
+# ## 为什么要有
+#
+# 上游是**串行处理**的（实测 2026-10-21，3 段 × ~280 字）：
+#     并发=1 → 总耗时 54.2s    并发=2 → 51.1s    并发=4 → 53.4s
+# ⇒ **并发对它零吞吐贡献**，只会让后面的请求**排队**。
+#
+# 而上游那条 60s 墙钟**包含它在队列里等的时间**：
+# 实测把上游打满之后，**80 字**的请求连续 504 ——
+# 80 字的推理只要 ~4s，不可能自己算到 60s ⇒ 它是**排队排到超时**的。
+#
+# ⇒ 所以排队应该发生在**我们这边**，不是上游那边：
+#   · 我们等 → 不计入上游的 60s 墙钟（我们的 httpx timeout 是 300s）
+#   · 上游等 → 计入它那条 60s（直接变成 504）
+#
+# ## 容量为什么是 1
+#
+# 上游一次只处理一个 ⇒ 并发只增加排队时间、不增加吞吐（上面实测）。
+# 容量 1 = 把「在上游排队」换成「在我们排队」，墙钟损失一样，风险归零。
+#
+# ⚠️ 闸门是**进程内**的：生产上批量 TTS 全在 ai-worker 一个进程里
+#   ⇒ 它的闸门覆盖了所有蒸馏作业。ai-service 进程（admin 的 TTS 测试）
+#   有自己的一份 ⇒ 那个进程最多再加 1 个并发请求（人工流量，量级很小）。
+#
+# ## 墙钟预算（为什么 800 字是安全的）
+#
+#   上游单请求墙钟 = 字数 × 48ms/字 × 负载系数（实测 1.4）
+#   800 字 → 32s × 1.4 = **45s < 60s** ✓
+#   （没有闸门时，2 个并发作业会让第二个请求在上游排 45s ⇒ 90s ⇒ 必 504。
+#     2026-10-25 实测：探针与生产同时打上游，781 字的块就 504 了。）
+_upstream_slots: "weakref.WeakKeyDictionary[Any, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+
+
+def _upstream_slot() -> asyncio.Semaphore:
+    """当前事件循环的上游请求闸门（容量 1）。
+
+    每个事件循环一份：`asyncio.Semaphore` 在**首次使用**时绑定循环，
+    跨循环复用会抛 `is bound to a different event loop`
+    （生产里 ai-service 与 ai-worker 是两个进程、两个循环；测试里每个用例
+    也可能是新循环）。
+    """
+    loop = asyncio.get_running_loop()
+    slot = _upstream_slots.get(loop)
+    if slot is None:
+        slot = asyncio.Semaphore(1)
+        _upstream_slots[loop] = slot
+    return slot
 
 
 class _CircuitOpen(RuntimeError):
@@ -962,7 +1013,13 @@ class OpenAITTSClient(TTSClient):
         )
 
         try:
-            resp = await self._client.post(self._endpoint(), json=body)
+            # ⚠️ **上游请求闸门**（容量 1，见 _upstream_slot 的说明）：
+            #   上游串行处理，且它那条 60s 墙钟**含排队时间** ⇒
+            #   两个请求同时打过去，后一个会在**上游**排到 504。
+            #   在我们这边排队就不计入它的墙钟（我们的 timeout 是 300s）。
+            #   吞吐不变（上游一次只处理一个），风险归零。
+            async with _upstream_slot():
+                resp = await self._client.post(self._endpoint(), json=body)
         except httpx.TimeoutException as e:
             _circuit_record_failure()
             raise RuntimeError(f"OpenAITTS 超时: {e}") from e
