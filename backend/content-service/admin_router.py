@@ -45,6 +45,7 @@ from stashbox.backend.common.auth_admin import require_admin_or_operator
 from stashbox.backend.common.database import AsyncSessionLocal, get_db
 from stashbox.backend.common.exceptions import InvalidRequest, NotFound
 from stashbox.backend.common.logging import get_logger
+from stashbox.backend.common.retention import monthly_retention
 from stashbox.backend.common.models import (
     AdminOperationLog,
     Article,
@@ -2150,6 +2151,9 @@ async def admin_stats(
         comparison.new_articles_24h     {today, yesterday, delta_pct}
         comparison.new_users_24h        同上
         comparison.distill_completed_24h 同上
+      留存
+        retention                     {month, cohort_size, retained, rate, current_month}
+                                       rate=None 表示上月**没有活跃样本**（不是 0%）
       告警
         warning                    None 或 {code, message}（failed > N 时填）
       元
@@ -2387,6 +2391,16 @@ async def admin_stats(
             "actual": int(failed_distillations_24h),
         }
 
+    # --- 月留存（2026-10-25 补）---
+    #
+    # 为什么以前没有这个数：没有「活跃」的来源（users 表**没建** last_active_at 列，
+    # 见本文件 1789 行的说明）⇒ 只能从**埋点表**算。
+    # 口径见 common/retention.py 的模块说明（从仓内既有定义 import）。
+    #
+    # ⚠️ 放在**缓存之外**的部分要注意：admin_stats 整体走 Redis 缓存（TTL 30s），
+    # 所以这个字段也会被缓存 30s —— 留存是月度指标，30s 的陈旧完全无所谓。
+    retention = await monthly_retention(db)
+
     result = {
         "total_users": int(total_users or 0),
         "total_articles": int(total_articles or 0),
@@ -2401,6 +2415,7 @@ async def admin_stats(
         "by_source": by_source,
         "trends": trends,
         "comparison": comparison,
+        "retention": retention,
         "warning": warning,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }

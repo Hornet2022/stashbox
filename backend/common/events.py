@@ -61,6 +61,17 @@ class EventName(str, Enum):
     AUDIO_SKIP = "audio_skip"  # CP6.2.2
     AUDIO_30S_REACHED = "audio_30s_reached"  # CP6.2.2（客户端埋，独立仓做）
 
+    # === 客户端性能（2026-10-25 补）===
+    #
+    # 「7 大指标」里两个**客户端**指标的落点（cp10.9-product-audit.md §4）：
+    #   · 首屏加载 < 1.5s  → APP_FIRST_FRAME，properties.duration_ms
+    #   · 音频启动 < 500ms → 复用 AUDIO_PLAY_START，properties.duration_ms
+    #
+    # 为什么音频启动**复用** AUDIO_PLAY_START 而不新加一个事件：
+    # 「用户点了播放」与「声音真的出来了」是**同一个动作的两端**，
+    # 拆成两个事件就要对账（两次上报可能只到一次）⇒ 同一个事件带时长更准。
+    APP_FIRST_FRAME = "app_first_frame"
+
     # === 互动反馈（CP6.2.2 全做：客户端）===
     FAVORITE_ADD = "favorite_add"
     FAVORITE_REMOVE = "favorite_remove"
