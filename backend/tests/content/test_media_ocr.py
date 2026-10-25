@@ -1,5 +1,13 @@
 """正文配图识图（2026-10-25）。
 
+## 识图现在分**两段**（2026-10-25 改：挪出剪藏请求）
+
+    ① 抓取（fetch）  → 正文里留**占位符**，图清单进 raw_metadata["media_refs"]
+    ② 补图注（蒸馏前）→ 占位符换成图注文字，清单换成 raw_metadata["media_captions"]
+
+⚠️ 用例也按这两段写：**fetch 之后不该再有任何"图表："**——
+那正是这次改造要保证的（识图不许再占剪藏请求的时间）。
+
 ## 为什么要有这些用例
 
 配图识图这条链路横跨**三段**，每一段都能安静地坏掉：
@@ -54,6 +62,7 @@ ocr_mod = importlib.import_module("cs_media_fetchers.ocr")
 generic_mod = importlib.import_module("cs_media_fetchers.generic_url")
 wechat_mod = importlib.import_module("cs_media_fetchers.wechat")
 
+from stashbox.backend.common import media_placeholders as placeholders  # noqa: E402
 from stashbox.backend.common.ssrf import (  # noqa: E402
     SsrfBlocked,
     assert_public_url,
@@ -136,6 +145,24 @@ def _refs(count: int = 1, host: str = "https://cdn.example.com") -> list[dict]:
     return [{"url": f"{host}/fig{i}.png", "token": f"\x00IMG{i}\x00"} for i in range(1, count + 1)]
 
 
+def _stored(result) -> dict:
+    """FetchResult → **落库形态**的 raw_content（占位符转成可见记法）。
+
+    为什么手写而不复用 content-service 的 `_to_raw_content`：
+    那个函数住在 `content-service/main.py` 里，import 它会把整个服务的依赖
+    （DB / Redis / 全部 router）拖进这个**纯单测**。
+
+    契约本身在 `common/media_placeholders.py`（两个服务共用一份），
+    这里复用的就是它的 `to_storage_text` ⇒ 不会与实现漂移。
+    """
+    return {
+        "url": result.url,
+        "source": result.source,
+        "content_text": placeholders.to_storage_text(result.content_text),
+        "raw_metadata": json.loads(json.dumps(result.raw_metadata, ensure_ascii=False)),
+    }
+
+
 # ---------------------------------------------------------------------------
 # 1 + 3. 识图成功 ⇒ 占位符被替换成图注文本（且在原位）
 # ---------------------------------------------------------------------------
@@ -161,7 +188,10 @@ async def test_图被下载并识图_占位符被替换成图注文本(fake_prov
 
 @pytest.mark.asyncio
 async def test_普通网页_图注回到图在正文里的原位(fake_provider):
-    """通用网页：两张图分别插在第 1 段后、第 2 段后。"""
+    """通用网页：两张图分别插在第 1 段后、第 2 段后。
+
+    ⚠️ 两段式（2026-10-25）：① 抓取只留占位符；② 补图注后图注回原位。
+    """
     html = (
         "<!DOCTYPE html><html><head>"
         '<meta property="og:image" content="https://cdn.example.com/og-cover.jpg">'
@@ -177,9 +207,19 @@ async def test_普通网页_图注回到图在正文里的原位(fake_provider):
     fetcher = generic_mod.GenericURLFetcher(transport=transport)
     result = await fetcher.fetch(GENERIC_URL)
 
-    assert "\x00" not in result.content_text
-    assert result.content_text.count("图表：") == 2
-    body = result.content_text
+    # ── ① 抓取阶段：只留占位符，**不识图** ──────────────────────────
+    assert "图表：" not in result.content_text, "识图不在抓取阶段做（2026-10-25 改）"
+    assert result.content_text.count("\x00IMG") == 2
+    assert len(result.raw_metadata["media_refs"]) == 2
+
+    # ── ② 补图注（蒸馏前那一步）────────────────────────────────────
+    raw, stats = await media_ocr.caption_stored_content(_stored(result), transport=transport)
+
+    assert stats["images"] == 2
+    assert stats["captions"] == 2
+    body = raw["content_text"]
+    assert "\x00" not in body
+    assert body.count("图表：") == 2
     assert body.index("第一段") < body.index("图表") < body.index("第二段")
     assert body.index("第二段") < body.index("图表", body.index("第二段")) < body.index("第三段")
 
@@ -343,10 +383,10 @@ async def test_封面图_og_image_不进正文占位符(fake_provider):
     # 封面 URL 在 media_urls 里（那是封面资源），但正文里没有它的位置
     assert "https://cdn.example.com/og-cover.jpg" in result.media_urls
     assert "og-cover" not in result.content_text
-    # 只识了正文里那一张图 —— 封面压根没进配图清单
-    records = result.raw_metadata["media_captions"]
-    assert len(records) == 1
-    assert records[0]["url"] == "https://cdn.example.com/fig1.png"
+    # 只登记了正文里那一张图 —— 封面压根没进配图清单
+    refs = result.raw_metadata["media_refs"]
+    assert len(refs) == 1
+    assert refs[0]["url"] == "https://cdn.example.com/fig1.png"
 
 
 @pytest.mark.asyncio
@@ -362,18 +402,19 @@ async def test_公众号_封面图_不进正文占位符(fake_provider):
         "<p>" + "第二段公众号正文。" * 20 + "</p>"
         "</div></body></html>"
     )
-    fetcher = wechat_mod.WechatFetcher(
-        transport=_transport(article_html=html, article_url=ARTICLE_URL)
-    )
+    transport = _transport(article_html=html, article_url=ARTICLE_URL)
+    fetcher = wechat_mod.WechatFetcher(transport=transport)
     result = await fetcher.fetch(ARTICLE_URL)
 
     assert "https://mmbiz.qpic.cn/mmbiz_jpg/cover.jpg" in result.media_urls
     assert "cover.jpg" not in result.content_text
-    # 只识了正文里那一张（封面没进配图清单）
-    records = result.raw_metadata["media_captions"]
-    assert len(records) == 1
-    assert records[0]["url"] == "https://mmbiz.qpic.cn/mmbiz_jpg/body1.jpg?wx_fmt=jpeg"
-    assert result.content_text.count("图表：") == 1
+    # 只登记了正文里那一张（封面没进配图清单）
+    refs = result.raw_metadata["media_refs"]
+    assert len(refs) == 1
+    assert refs[0]["url"] == "https://mmbiz.qpic.cn/mmbiz_jpg/body1.jpg?wx_fmt=jpeg"
+
+    raw, _ = await media_ocr.caption_stored_content(_stored(result), transport=transport)
+    assert raw["content_text"].count("图表：") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -452,15 +493,19 @@ async def test_raw_metadata_里有成功和失败的图注记录(fake_provider):
     fetcher = generic_mod.GenericURLFetcher(transport=httpx.MockTransport(handler))
     result = await fetcher.fetch(GENERIC_URL)
 
-    records = result.raw_metadata["media_captions"]
+    raw, stats = await media_ocr.caption_stored_content(
+        _stored(result), transport=httpx.MockTransport(handler)
+    )
+    records = raw["raw_metadata"]["media_captions"]
     assert len(records) == 2
+    assert stats["captions"] == 1, "只有认出来的那张算数"
     ok = [r for r in records if r["ok"]]
     bad = [r for r in records if not r["ok"]]
     assert len(ok) == 1 and len(bad) == 1
     assert ok[0]["caption"] == DEFAULT_CAPTION
     assert bad[0]["error"], "失败的那张必须能查到原因"
     # 内部中间态不能漏到落库的 raw_metadata 里
-    assert "media_refs" not in result.raw_metadata
+    assert "media_refs" not in raw["raw_metadata"]
 
 
 # ---------------------------------------------------------------------------
@@ -507,9 +552,12 @@ async def test_公众号抓取_图片请求带原文_referer(fake_provider):
     fetcher = wechat_mod.WechatFetcher(transport=httpx.MockTransport(handler))
     result = await fetcher.fetch(ARTICLE_URL)
 
+    raw, _ = await media_ocr.caption_stored_content(
+        _stored(result), transport=httpx.MockTransport(handler)
+    )
     img_headers = seen["https://mmbiz.qpic.cn/mmbiz_jpg/body1.jpg?wx_fmt=jpeg"]
     assert img_headers["referer"] == ARTICLE_URL
-    assert result.content_text.count("图表：") == 1
+    assert raw["content_text"].count("图表：") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -528,13 +576,18 @@ async def test_识图流程整体炸掉_抓取不失败且不留占位符(monkey
         '<img src="https://cdn.example.com/fig1.png" alt="图">'
         "</article></body></html>"
     )
-    fetcher = generic_mod.GenericURLFetcher(
-        transport=_transport(article_html=html, article_url=GENERIC_URL)
-    )
+    transport = _transport(article_html=html, article_url=GENERIC_URL)
+    fetcher = generic_mod.GenericURLFetcher(transport=transport)
     result = await fetcher.fetch(GENERIC_URL)
 
-    assert "\x00" not in result.content_text, "占位符必须被清干净"
-    assert "这是正文" in result.content_text, "正文本身必须完好"
+    # 抓取阶段不受影响（识图本来就不在这里做）
+    assert "这是正文" in result.content_text
+
+    # 补图注阶段炸了 ⇒ 占位符必须被清干净，正文本身必须完好
+    raw, stats = await media_ocr.caption_stored_content(_stored(result), transport=transport)
+    assert stats["captions"] == 0
+    assert "\x00" not in raw["content_text"], "占位符必须被清干净"
+    assert "这是正文" in raw["content_text"], "正文本身必须完好"
 
 
 # ---------------------------------------------------------------------------
@@ -550,17 +603,25 @@ async def test_落库的_raw_metadata_里没有_nul(fake_provider):
         '<img src="https://cdn.example.com/fig1.png" alt="图">'
         "</article></body></html>"
     )
-    fetcher = generic_mod.GenericURLFetcher(
-        transport=_transport(article_html=html, article_url=GENERIC_URL)
-    )
+    transport = _transport(article_html=html, article_url=GENERIC_URL)
+    fetcher = generic_mod.GenericURLFetcher(transport=transport)
     result = await fetcher.fetch(GENERIC_URL)
 
-    dumped = json.dumps(result.raw_metadata, ensure_ascii=False)
+    # 落库形态：正文里的占位符是**可见记法**（JSONB 能存），不是裸 NUL
+    stored = _stored(result)
+    assert "\\x00IMG1\\x00" in stored["content_text"]
+    assert "\x00" not in stored["content_text"]
+
+    raw, _ = await media_ocr.caption_stored_content(stored, transport=transport)
+
+    dumped = json.dumps(raw["raw_metadata"], ensure_ascii=False)
     assert "\x00" not in dumped
     assert "\\u0000" not in dumped
     # 占位符以**可见记法**落库（信息不丢，也能对上号）
-    records = result.raw_metadata["media_captions"]
+    records = raw["raw_metadata"]["media_captions"]
     assert records[0]["token"] == "\\x00IMG1\\x00"
+    # 补完图注后正文里不再有占位符（已被图注替掉）
+    assert "\x00" not in raw["content_text"]
 
 
 @pytest.mark.asyncio

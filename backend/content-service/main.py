@@ -64,6 +64,8 @@ from fetchers.document import (  # noqa: E402
     DOCUMENT_SOURCE,
     MAX_DOCUMENT_BYTES,
 )
+from fetchers.media_ocr import caption_stored_content  # noqa: E402
+from fetchers.net import Deadline  # noqa: E402
 from schemas import (  # noqa: E402
     AddArticleRequest,
     AdminArticleRequest,
@@ -78,6 +80,7 @@ from schemas import (  # noqa: E402
 )
 
 from stashbox.backend.common import cache_service, quota_service
+from stashbox.backend.common import media_placeholders as placeholders
 from stashbox.backend.common.distill_stage import get_stage
 from stashbox.backend.common.config import settings
 from stashbox.backend.common.tts_voice_service import get_voice_briefs
@@ -546,8 +549,17 @@ def _to_raw_content(result) -> dict:
 
     asdict 只重建 dict/list/tuple，datetime 会原样保留（不会自动转 ISO 字符串），
     直接写 JSONB 会在序列化时炸，故再走一次 json 归一化。
+
+    ⚠️ 正文里的**配图占位符**必须先换成**可见记法**再剥 NUL：
+    识图挪出剪藏请求后，正文是**带着占位符**落库的（等蒸馏前再补图注），
+    而 `_strip_nul` 会把所有 NUL 直接删掉 ⇒ 占位符会退化成裸的 `IMG3`，
+    **再也认不回来** ⇒ 补图注时找不到位置。
     """
-    return json.loads(json.dumps(_strip_nul(asdict(result)), default=_json_default))
+    data = asdict(result)
+    content_text = data.get("content_text")
+    if isinstance(content_text, str):
+        data["content_text"] = placeholders.to_storage_text(content_text)
+    return json.loads(json.dumps(_strip_nul(data), default=_json_default))
 
 
 #: 剪藏抓取的总时限预算（秒），覆盖「HTTP 退避重试 + 无头浏览器兜底」整条降级链。
@@ -1158,6 +1170,100 @@ async def _clip_after_fetch(
         remaining=quota["monthly_quota"] - quota["quota_used"],
         reused=False,
     )
+
+
+#: 补图注的**总预算**（秒）。
+#:
+#: 为什么比剪藏抓取预算（30s）宽：剪藏是**同步接口**、用户盯着转圈，
+#: 而补图注发生在**蒸馏任务里**（后台跑，用户只看进度）⇒ 可以慢慢认。
+#:
+#: 取 90s 的依据：实测 12 张图 = 下载 ~4s（并发 4）+ 认图 ~17s（并发 3）
+#: + 补位轮一轮 ⇒ 典型 20~40s；90s 留了 2 倍余量，
+#: 而 AI 服务的 arq 任务墙钟有上限（见 arq_settings），不能再宽。
+_ENV_CAPTION_FILL_BUDGET = "STASHBOX_CAPTION_FILL_BUDGET"
+_CAPTION_FILL_BUDGET_DEFAULT = 90.0
+
+
+def _caption_fill_budget() -> float:
+    try:
+        return max(
+            10.0,
+            float(os.environ.get(_ENV_CAPTION_FILL_BUDGET) or "") or _CAPTION_FILL_BUDGET_DEFAULT,
+        )
+    except ValueError:
+        return _CAPTION_FILL_BUDGET_DEFAULT
+
+
+@app.post("/api/v1/internal/articles/{article_id}/captions")
+async def fill_article_captions(
+    article_id: str,
+    callback_secret: str = Depends(require_callback_secret),
+    db: AsyncSession = Depends(get_db),
+):
+    """给**已落库**的文章补配图图注（识图挪出剪藏请求后的补图注入口）。
+
+    ## 谁调它
+
+    ai-service 的蒸馏任务，在**读正文之前**调一次（见
+    `ai-service/tasks/distill_task.py`）。识图是「下载图片 + 调 VLM」，
+    实测一篇 12 张图要 20~30s ⇒ 放在剪藏请求里会让用户盯着转圈
+    （内测反馈的「剪藏不成功」一半来自这里）⇒ 挪到这里，蒸馏前再补。
+
+    ## 鉴权
+
+    共享密钥（`X-Callback-Secret`，见 `common/callback_auth.py`）——
+    **fail-closed**：没配密钥就是 503，而不是放行。
+    理由：未鉴权的话，任意匿名请求就能让本服务去下载任意图片、
+    调任意次数的 VLM ⇒ 直接烧钱。
+
+    ## 幂等
+
+    补完就把 `media_refs` 删掉 ⇒ 再调一次是 no-op（不会重复烧 token）。
+
+    ## 失败怎么办
+
+    任何异常都不返回 5xx 给调用方去重试 —— 识图失败只意味着"这篇没有图表信息"，
+    正文照常蒸馏。调用方（ai-service）也做了兜底：占位符会被剥掉。
+    """
+    art = await db.get(Article, article_id)
+    if art is None:
+        raise NotFound(message=f"article {article_id} not found")
+
+    raw = art.raw_content
+    if not isinstance(raw, dict):
+        return {
+            "article_id": article_id,
+            "images": 0,
+            "captions": 0,
+            "changed": False,
+        }
+
+    try:
+        new_raw, stats = await caption_stored_content(
+            raw,
+            deadline=Deadline(_caption_fill_budget()),
+        )
+    except Exception as exc:  # noqa: BLE001 —— 补图注失败不该让整篇蒸馏失败
+        log.warning(
+            "caption_fill_failed",
+            extra={"article_id": article_id, "error": f"{type(exc).__name__}: {exc}"},
+        )
+        return {
+            "article_id": article_id,
+            "images": 0,
+            "captions": 0,
+            "changed": False,
+        }
+
+    if stats.get("changed"):
+        art.raw_content = new_raw
+        await db.commit()
+    return {
+        "article_id": article_id,
+        "images": stats.get("images", 0),
+        "captions": stats.get("captions", 0),
+        "changed": bool(stats.get("changed")),
+    }
 
 
 @app.post("/api/v1/admin/articles")

@@ -59,7 +59,7 @@ from .base import (
     FetcherError,
     FetcherErrorCode,
 )
-from .media_ocr import MediaImageCollector, caption_media_into, pick_image_src
+from .media_ocr import MediaImageCollector, pick_image_src
 from .net import (
     Deadline,
     HeaderProfile,
@@ -341,14 +341,17 @@ class WechatFetcher(Fetcher):
                 with_browser=self._transport is None,
             ),
         )
-        # 正文配图识图：把正文里的图注注回原位（失败不阻断，见 media_ocr）。
+        # ⚠️ 这里**不做**正文配图识图（2026-10-25 改）。
         #
-        # 为什么放在 `fetch()` 而不是 `parse()`：识图是**网络 + 模型**调用，
-        # 而 `parse()` 是给降级链用的**纯函数**（浏览器通道也要走它，
-        # 在那里做网络调用会让降级链的语义变脏）。
-        await caption_media_into(
-            result, profile=self.PROFILE, transport=self._transport, deadline=deadline
-        )
+        # 为什么：识图是「下载图片 + 调 VLM」，实测一篇 12 张图要 20~30s，
+        # 而剪藏是**同步接口**、用户盯着转圈 —— 内测反馈的「剪藏不成功」
+        # 一半就来自这里。⇒ 改成：抓取只留占位符（`media_refs`），
+        # 识图挪到**蒸馏任务前**由 content-service 的内部端点补
+        # （见 `media_ocr.caption_stored_content`）。
+        #
+        # ⚠️ 刻意**不留开关**（没有 `with_captions=True` 这种参数）：
+        # 留开关就意味着「哪天有人忘了传 False，30s 又回来了」，
+        # 而这条链路上只有「不识图」这一个正确默认值。
         return result
 
     def parse(self, acq: Acquired) -> FetchResult:
@@ -358,7 +361,7 @@ class WechatFetcher(Fetcher):
         否则渲染出来的风控页会被当成正文页建库。
 
         正文里的图在这里留下**占位符**（`images` 收集器），
-        由 `fetch()` 里的识图步骤替换成图注文字。
+        由**蒸馏前**的补图注步骤替换成图注文字。
         """
         _check_wechat_block(acq.html)
         images = MediaImageCollector(base_url=acq.final_url or acq.url)
@@ -480,7 +483,8 @@ class WechatFetcher(Fetcher):
 
         `images`：可选的正文配图收集器。传入时，正文里的 `<img>` 会在
         `content_text` 里留下占位符，图清单进 `raw_metadata["media_refs"]`
-        （由 `fetch()` 的识图步骤消费）。**不传就是从前那个行为。**
+        （由**蒸馏前**的补图注步骤消费，见 `media_ocr.caption_stored_content`）。
+        **不传就是从前那个行为。**
         """
         try:
             title_ex = TitleExtractor().parse(html)
@@ -557,7 +561,7 @@ class WechatFetcher(Fetcher):
         }
         if images is not None and images.storage_refs:
             # 正文配图清单（url + 序号，**不含带 NUL 的占位符** —— JSONB 不接受
-            # \u0000）。`fetch()` 的识图步骤会取走它，换成 `media_captions`。
+            # \u0000）。由**蒸馏前**的补图注步骤取走，换成 `media_captions`。
             raw_metadata["media_refs"] = images.storage_refs
 
         return FetchResult(

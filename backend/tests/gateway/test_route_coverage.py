@@ -151,6 +151,12 @@ def test_every_downstream_endpoint_is_reachable_through_gateway(service_routes, 
     """B. 下游每个端点，网关都要路由得到（显式注册或前缀 fallback 猜得到）。
 
     这条才是真正防住那四次事故的断言。
+
+    ⚠️ 唯一例外是 `/api/v1/internal/` 前缀（**服务间**端点）：
+    那类端点的调用方是**另一个服务**（走 127.0.0.1 直连），
+    不是客户端 ⇒ 暴露到公网网关只会多一个攻击面。
+    这条不变量在内部端点上**反向**成立 —— 见
+    `test_internal_endpoints_are_not_exposed_through_gateway`。
     """
     unreachable: list[str] = []
     for service, impl in service_routes.items():
@@ -161,6 +167,8 @@ def test_every_downstream_endpoint_is_reachable_through_gateway(service_routes, 
                 continue  # FastAPI 的 GET 会自动带 HEAD
             if path in {"/api/v1/health", "/api/v1/healthz"}:
                 continue
+            if path.startswith("/api/v1/internal/"):
+                continue  # 服务间端点，见上面的说明与反向断言
             # 显式注册？
             if any(
                 r.method == method and _normalize(r.path) == _normalize(path)
@@ -189,3 +197,34 @@ def test_fallback_whitelist_covers_users_prefix(fallback_targets):
     漏注册就 404「接口不存在」，而实现就在 user-service 里。
     """
     assert fallback_targets("users/me/quota/reset-monthly") is not None
+
+
+def test_internal_endpoints_are_not_exposed_through_gateway(service_routes, fallback_targets):
+    """反向不变量：`/api/v1/internal/` 的端点**不许**被网关暴露。
+
+    为什么要有这条：内部端点的调用方是**另一个服务**（走 127.0.0.1 直连），
+    不是客户端。暴露到公网网关只会多一个攻击面 —— 哪怕它有共享密钥兜底，
+    也是「本来不需要暴露的东西不要暴露」。
+
+    两条路都堵死：
+    ① 显式路由表里不许有 internal；
+    ② 兜底白名单不许猜得到 `internal/...`
+       （`proxy_fallback` 按第一段路径猜下游，`internal` 不在白名单里
+       ⇒ 猜不到 ⇒ 网关自己答 404「接口不存在」）。
+    """
+    internal = {
+        (method, path)
+        for impl in service_routes.values()
+        for method, path in impl
+        if path.startswith("/api/v1/internal/")
+    }
+    assert internal, "没有内部端点？这条断言就失去意义了（端点被改名/删掉了）"
+
+    for method, path in sorted(internal):
+        assert not any(
+            r.method == method and _normalize(r.path) == _normalize(path) for r in ROUTES
+        ), f"{method} {path} 被显式注册进网关路由表了 —— 内部端点不该暴露到公网"
+
+    assert (
+        fallback_targets("internal/articles/x/captions") is None
+    ), "兜底白名单能猜到 internal/... ⇒ 网关会把内部端点代理出去"

@@ -1,5 +1,22 @@
 """正文配图识图（2026-10-25）。
 
+## 识图在**什么时候**做（2026-10-25 改：挪出剪藏请求）
+
+原来识图是在**剪藏请求里**同步做的 ⇒ 剪藏要等图认完（实测 22.8~30.8s），
+而用户在手机上盯着转圈 —— 这是"剪藏不成功"投诉的一半来源。
+
+现在改成：
+
+    剪藏请求  → 只抓正文，正文里留**占位符** + 图清单进 raw_metadata
+                        ↓（先落库，用户立刻看到"剪藏成功"）
+    蒸馏任务  → 蒸馏前调 content-service 的内部端点补图注（这一步才认图）
+                        ↓
+                正文里的占位符被换成图注文字 → 喂给 LLM
+
+⇒ **识图只有一条路**：`caption_stored_content`（给已落库的文章补图注）。
+   抓取路径（`fetcher.fetch()`）里**不再有识图** —— 不是加个开关，
+   是把它整个拿掉：留着开关就意味着"哪天有人忘了传 False，30s 又回来了"。
+
 ## 为什么要有它（问题不是"锦上添花"，是数据在链路里被物理丢掉）
 
 剪藏一个链接时，网页正文里的**图表 / 配图**会被**整个丢掉**：
@@ -21,6 +38,9 @@
 2. 抓完正文后，把这些图**下载 + 识图**（复用 `fetchers/ocr.py` 的识图通道，
    不复制请求体拼装）；
 3. 把占位符**替换成图注文字**；失败的**直接删掉**，不留任何残迹。
+
+   ⚠️ 这一步现在发生在**蒸馏前**（`caption_stored_content`），
+   抓取阶段只负责留占位符。
 
 ### 为什么用 NUL 哨兵做占位符
 
@@ -51,7 +71,7 @@
   ⇒ 该图 `ok=False`，正文里对应的占位符**直接删掉**，
   原因记进 `raw_metadata["media_captions"]`
   （"这篇为什么没有图表信息"查得到原因）；
-* **整段流程的任何异常都不许让抓取失败**（见 `caption_media_into`）：
+* **整段流程的任何异常都不许让抓取失败**（见 `caption_stored_content`）：
   配图是锦上添花，正文抓不到才是硬伤。
 """
 
@@ -66,7 +86,8 @@ from urllib.parse import urljoin
 
 import httpx
 
-from .base import FetchResult
+from stashbox.backend.common import media_placeholders as placeholders
+
 from .net import (
     Deadline,
     HeaderProfile,
@@ -206,7 +227,33 @@ _GLOBAL_OCR_SEMAPHORES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 CAPTION_PREFIX = "图表："
 
 #: 占位符格式：NUL 哨兵 + 序号 + NUL 哨兵。
-TOKEN_RE = re.compile("\x00IMG(\\d+)\x00")
+#:
+#: ⚠️ 定义在 `common/media_placeholders.py`（**只有一份**）—— ai-service 也要用
+#: （补图注时要把落库态还原成内存态、兜底时要剥掉占位符），
+#: 两边各写一份正则就会只改到一半。
+TOKEN_RE = placeholders.TOKEN_RE
+
+#: 各来源对应的**下载画像**（识图下载图片时用）。
+#:
+#: 为什么不能一律用 DESKTOP：微信图床 `mmbiz.qpic.cn` 的 Referer 写在
+#: **画像**里（`HeaderProfile.WECHAT` ⇒ `Referer: https://mp.weixin.qq.com/`），
+#: 换成 DESKTOP 就带上了桌面 Referer ⇒ 防盗链 403。
+#:
+#: 通用网页反过来要 DESKTOP（桌面 UA + 文章页 Referer 走请求级）。
+#:
+#: ⚠️ 键是 **fetcher 的 source 名**（`wechat.py` 的 `SOURCE`），
+#: 也就是落库在 `raw_content["source"]` 里的那个值 ——
+#: 补图注时文章已经躺在库里了，只能靠它还原"当初是哪个 fetcher 抓的"。
+_SOURCE_PROFILES = {
+    "wechat_mp": HeaderProfile.WECHAT,
+    "generic_url": HeaderProfile.DESKTOP,
+}
+
+
+def profile_for_source(source: str | None) -> HeaderProfile:
+    """按来源选下载画像（认不出来的来源一律 DESKTOP）。"""
+    return _SOURCE_PROFILES.get(source or "", HeaderProfile.DESKTOP)
+
 
 #: 识图提示词（**单独一版**：图表不是纯文字段落）。
 #:
@@ -369,14 +416,16 @@ class MediaCaption(TypedDict):
 
 
 def make_token(index: int) -> str:
-    """第 index 张图的占位符（index 从 1 开始）。"""
-    return f"\x00IMG{index}\x00"
+    """第 index 张图的占位符（index 从 1 开始）。
+
+    ⚠️ 实现收在 `common/media_placeholders.py`（两个服务共用一份）。
+    """
+    return placeholders.make_token(index)
 
 
 def token_index(token: str) -> int | None:
     """占位符 → 序号；不是占位符返回 None。"""
-    match = TOKEN_RE.fullmatch(token)
-    return int(match.group(1)) if match else None
+    return placeholders.token_index(token)
 
 
 def json_safe_token(token: str) -> str:
@@ -389,7 +438,7 @@ def json_safe_token(token: str) -> str:
 
     ⇒ 内存里用 NUL 哨兵，落库前换成同名可见记法（可逆、信息不丢）。
     """
-    return token.replace("\x00", "\\x00")
+    return placeholders.to_storage_token(token)
 
 
 def refs_from_storage(items: list[dict]) -> list[ImageRef]:
@@ -837,53 +886,94 @@ def apply_captions(text: str, captions: list[MediaCaption]) -> str:
     return _tidy(TOKEN_RE.sub(_replace, text))
 
 
-def strip_media_tokens(text: str) -> str:
-    """把正文里所有占位符删掉（兜底：绝不让占位符进 LLM）。"""
-    if not TOKEN_RE.search(text):
-        return text
-    return _tidy(TOKEN_RE.sub("", text))
+class CaptionFillStats(TypedDict):
+    """补图注的结果（给调用方看"这篇补上了几张"）。
+
+    `changed=False` 表示 raw_content **一个字节都没动** ——
+    调用方据此判断"要不要写库"（写库是多余的写）。
+    """
+
+    images: int  # 正文里登记了几张图
+    captions: int  # 补上了几条**成功**的图注
+    changed: bool  # raw_content 有没有被改动
 
 
-async def caption_media_into(
-    result: FetchResult,
+async def caption_stored_content(
+    raw_content: dict,
     *,
     referer: str | None = None,
     limit: int = MAX_MEDIA_CAPTIONS,
-    profile: HeaderProfile = HeaderProfile.DESKTOP,
+    profile: HeaderProfile | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     deadline: Deadline | None = None,
-) -> None:
-    """把 `FetchResult` 正文里的配图占位符**就地**换成图注。
+) -> tuple[dict, CaptionFillStats]:
+    """给**已落库**的文章补配图图注。
 
-    - `raw_metadata["media_refs"]`（解析阶段留下的图清单）会被取走；
-    - 成功后 `raw_metadata["media_captions"]` 里有每张图的成功/失败记录；
-    - **任何异常都不许让抓取失败**（配图是锦上添花，正文才是硬伤）：
-      出错就把占位符删掉，保证正文里不留残迹。
+    ## 为什么吃的是 dict 而不是 FetchResult
 
-    ⚠️ 落库的记录里，占位符是**可见记法**（``\\x00IMG1\\x00``）而不是带 NUL 的
-    真占位符 —— JSONB 不接受 ``\\u0000``（见 `json_safe_token`）。
+    识图已经不在剪藏请求里做了 ⇒ 文章是**带着占位符**先落库的，
+    补图注时拿到的是 JSONB 里的 dict，不是内存里的 `FetchResult` ⇒
+    这里直接吃 dict。
+
+    ## 幂等（重要）
+
+    没有 `media_refs` ⇒ 原样返回（文章要么已经补过，要么本来就没有图）
+    ⇒ 同一个端点被重复调用**不会重复烧 token**。
+    补过之后 `media_refs` 被删掉、`media_captions` 就位 ⇒ 天然幂等。
+
+    ## 占位符的形态转换（容易踩的坑）
+
+    正文里存的是**落库态**占位符（可见记法 ``\\x00IMG3\\x00``，因为 JSONB
+    不接受 ``\\u0000``），而 `apply_captions` 匹配的是**内存态**（NUL 哨兵）
+    ⇒ 必须 `from_storage_text` → 替换 → `to_storage_text` 转回去。
+
+    返回 (新 raw_content, 统计)。
     """
-    stored = result.raw_metadata.pop("media_refs", None) or []
-    refs = refs_from_storage(stored)
-    if not refs:
-        return
+    stats: CaptionFillStats = {"images": 0, "captions": 0, "changed": False}
+    if not isinstance(raw_content, dict):
+        return raw_content, stats
+
+    raw_metadata = raw_content.get("raw_metadata")
+    if not isinstance(raw_metadata, dict):
+        raw_metadata = {}
+    stored = raw_metadata.get("media_refs") or []
+    if not stored:
+        # 没有待补的图 —— 原样返回（幂等）。
+        return raw_content, stats
+
+    refs = refs_from_storage(list(stored))
+    stats["images"] = len(refs)
+
+    # 正文里的占位符是**落库态** ⇒ 还原成内存态才能被 apply_captions 匹配。
+    memory_text = placeholders.from_storage_text(raw_content.get("content_text") or "")
+
     try:
         captions = await caption_media(
             refs,
-            referer=referer or result.raw_metadata.get("final_url") or result.url,
+            referer=referer or raw_metadata.get("final_url") or raw_content.get("url"),
             limit=limit,
-            profile=profile,
+            profile=profile or profile_for_source(raw_content.get("source")),
             transport=transport,
             deadline=deadline,
         )
-        result.content_text = apply_captions(result.content_text, captions)
-        result.raw_metadata["media_captions"] = [
-            {**caption, "token": json_safe_token(caption["token"])} for caption in captions
-        ]
-    except Exception as exc:  # noqa: BLE001 —— 整段流程不许让抓取失败
-        log.warning("media_caption_failed err=%s: %s", type(exc).__name__, exc)
-        result.content_text = strip_media_tokens(result.content_text)
-        result.raw_metadata["media_captions"] = []
+    except Exception as exc:  # noqa: BLE001 —— 整段流程不许让蒸馏失败
+        log.warning("media_caption_stored_failed err=%s: %s", type(exc).__name__, exc)
+        captions = []
+
+    # 失败的图占位符**直接删掉**（apply_captions 的既有语义），
+    # 正文里不留"（图片识别失败）"这种噪声。
+    new_text = apply_captions(memory_text, captions)
+    stats["captions"] = sum(1 for caption in captions if caption.get("ok"))
+
+    new_raw = dict(raw_content)
+    new_raw["content_text"] = placeholders.to_storage_text(new_text)
+    new_metadata = {key: value for key, value in raw_metadata.items() if key != "media_refs"}
+    new_metadata["media_captions"] = [
+        {**caption, "token": json_safe_token(caption["token"])} for caption in captions
+    ]
+    new_raw["raw_metadata"] = new_metadata
+    stats["changed"] = True
+    return new_raw, stats
 
 
 __all__ = [
@@ -898,16 +988,17 @@ __all__ = [
     "MEDIA_OCR_QUEUE_SIZE",
     "MEDIA_OCR_TIMEOUT",
     "ZERO_INFO_ERROR",
+    "CaptionFillStats",
     "ImageRef",
     "MediaCaption",
     "MediaImageCollector",
     "apply_captions",
     "caption_media",
-    "caption_media_into",
+    "caption_stored_content",
     "json_safe_token",
     "make_token",
     "pick_image_src",
+    "profile_for_source",
     "refs_from_storage",
-    "strip_media_tokens",
     "token_index",
 ]
