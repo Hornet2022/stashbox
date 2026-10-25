@@ -15,7 +15,7 @@
 # 三处各说各的，谁也不校验谁。
 #
 # 现在的分工：
-#   · **真相源 = env 里的三个版本变量**（服务重启后生效，版本接口读它）
+#   · **真相源 = env 里的五个版本变量**（服务重启后生效，版本接口读它）
 #   · /downloads/latest.apk 软链 → 指向当前版本的 APK（页面用它下载）
 #   · 营销页的版本号文字 → 运行时从 /api/v1/app/version 取，不写死
 # 本脚本一次做完：上传 → 软链 → env → 重启 → **校验**。
@@ -23,17 +23,32 @@
 # 校验不是装饰：软链指错、env 写错、上传了半个文件，
 # 这三种错在「页面上看起来一切正常」时最难发现，所以脚本最后会实际下载一次比对哈希。
 #
+# ─────────────────────────────────────────────────────────────────
+# 为什么「更新说明」是**必填**参数（2026-10-25 实测后改的）
+#
+# 原来这个脚本用 sed 改 3 个变量，漏了 STASHBOX_APP_RELEASE_NOTES（更新说明）
+# 和 STASHBOX_APP_PUBLISHED_AT（发布时间）。
+# 后果不是"报错"：0.4.2 发出去后，**更新弹窗里写着 0.4.1 的功能清单** ——
+# 安卓端 AppUpdateDialog.kt 会渲染这个字段，内测用户更新时读到的就是它。
+# 错的说明不会自己暴露，只会让用户读到别人的版本说明。
+#
+# ⇒ 现在更新说明是第 4 个必填参数：写不出来就别发版（脚本直接报错退出）。
+#   5 个变量的写入与回读校验交给 deploy/set_app_version_env.py
+#   （它还会拒绝会写坏 systemd EnvironmentFile 的值，比如说明里带换行）。
+#
 # 用法：
-#   ./release_apk.sh <apk 路径> <版本名> <versionCode>
+#   ./release_apk.sh <apk 路径> <版本名> <versionCode> <更新说明>
 # 例：
-#   ./release_apk.sh ~/work/stashbox-android/app/build/outputs/apk/release/app-release.apk 0.3.6 9
+#   ./release_apk.sh ~/work/stashbox-android/app/build/outputs/apk/release/app-release.apk 0.4.3 16 "本版功能没有变化：加了两个性能数据采集"
 #
 # 幂等：同样的参数重复跑，结果一样。
 set -euo pipefail
 
-APK_PATH="${1:?用法: release_apk.sh <apk 路径> <版本名> <versionCode>}"
-VERSION_NAME="${2:?用法: release_apk.sh <apk 路径> <版本名> <versionCode>}"
-VERSION_CODE="${3:?用法: release_apk.sh <apk 路径> <版本名> <versionCode>}"
+USAGE="用法: release_apk.sh <apk 路径> <版本名> <versionCode> <更新说明>"
+APK_PATH="${1:?${USAGE}}"
+VERSION_NAME="${2:?${USAGE}}"
+VERSION_CODE="${3:?${USAGE}}"
+RELEASE_NOTES="${4:?${USAGE}}"
 
 HOST="${STASHBOX_HOST:-8.148.9.151}"
 SSH_KEY="${STASHBOX_SSH_KEY:-$HOME/.ssh/stashbox_deploy}"
@@ -53,6 +68,10 @@ DOWNLOAD_BASE="${STASHBOX_DOWNLOAD_BASE:-https://stashbox.cn/downloads}"
 
 [[ -f "$APK_PATH" ]] || { echo "✗ 找不到 APK：$APK_PATH" >&2; exit 1; }
 [[ "$VERSION_CODE" =~ ^[0-9]+$ ]] || { echo "✗ versionCode 必须是整数：$VERSION_CODE" >&2; exit 1; }
+# 更新说明不能是空的：更新弹窗会把空说明显示成「服务端未提供更新说明。」
+[[ -n "${RELEASE_NOTES//[[:space:]]/}" ]] || { echo "✗ 更新说明不能为空（用户会在更新弹窗里看到它）" >&2; exit 1; }
+
+DOWNLOAD_URL="${DOWNLOAD_BASE}/tingxia-${VERSION_NAME}.apk"
 
 SSH=(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "root@${HOST}")
 SCP=(scp -i "$SSH_KEY" -o StrictHostKeyChecking=no)
@@ -65,12 +84,26 @@ echo "→ 更新 latest.apk 软链（营销页的下载入口指向它）"
 # 用相对软链（ln -sfn），别用绝对路径：目录整体搬走时软链不会烂。
 "${SSH[@]}" "cd '${REMOTE_DIR}' && ln -sfn 'tingxia-${VERSION_NAME}.apk' latest.apk && chown -h www-data:www-data latest.apk"
 
-echo "→ 更新 env 里的版本变量"
-"${SSH[@]}" "sed -i \\
-  -e 's|^STASHBOX_APP_DOWNLOAD_URL=.*|STASHBOX_APP_DOWNLOAD_URL=${DOWNLOAD_BASE}/tingxia-${VERSION_NAME}.apk|' \\
-  -e 's|^STASHBOX_APP_LATEST_VERSION_CODE=.*|STASHBOX_APP_LATEST_VERSION_CODE=${VERSION_CODE}|' \\
-  -e 's|^STASHBOX_APP_LATEST_VERSION_NAME=.*|STASHBOX_APP_LATEST_VERSION_NAME=${VERSION_NAME}|' \\
-  '${ENV_FILE}'"
+echo "→ 更新 env 里的版本变量（5 个，含用户看得见的更新说明与发布时间）"
+# 为什么不直接 sed 改 5 行：
+#   · 更新说明是中文用户文案，里面可能有 & | ' 等字符 ——
+#     sed 的替换串里 & 代表「整个匹配」、| 是分隔符、' 会闭合引号 ⇒ 静默写坏；
+#   · 少写的那两个键正是这次踩的坑（更新说明 / 发布时间）。
+# ⇒ 更新说明走 base64，脚本本体喂给远端 python3 的 stdin，
+#   真正的写入、备份、去重、原子替换、回读校验都在 set_app_version_env.py 里。
+NOTES_B64="$(printf '%s' "$RELEASE_NOTES" | base64 | tr -d '\n')"
+if ! ENV_OUT="$("${SSH[@]}" "NOTES_B64='${NOTES_B64}' python3 - --env-file '${ENV_FILE}' --version-name '${VERSION_NAME}' --version-code '${VERSION_CODE}' --download-url '${DOWNLOAD_URL}' --apk-path '${REMOTE_APK}'" \
+  < "$(dirname "$0")/set_app_version_env.py")"; then
+  echo "✗ 写 env 失败（上面是远端报错），env 未被改动" >&2
+  exit 1
+fi
+printf '%s\n' "$ENV_OUT" | sed 's/^/  /'
+
+# 从远端的回执里取出「这次写进去的发布时刻」与「说明的哈希」，
+# 后面拿它们跟版本接口对拍 —— 这样"接口说的"和"我们写的"必须是同一份。
+PUBLISHED_AT="$(printf '%s\n' "$ENV_OUT" | sed -n 's/^OK published_at=//p')"
+NOTES_SHA="$(printf '%s\n' "$ENV_OUT" | sed -n 's/^OK release_notes_sha256=//p')"
+[[ -n "$PUBLISHED_AT" && -n "$NOTES_SHA" ]] || { echo "✗ 远端回执里没有发布时刻/说明哈希：${ENV_OUT}" >&2; exit 1; }
 
 echo "→ 重启 user-service（版本接口由它提供）"
 "${SSH[@]}" "systemctl restart stashbox-user-service && sleep 6"
@@ -86,13 +119,54 @@ LINK_TARGET="$("${SSH[@]}" "readlink -f '${REMOTE_DIR}/latest.apk'" | tr -d '\r'
 [[ "$LINK_TARGET" == "$REMOTE_APK" ]] || { echo "✗ latest.apk 指向了 ${LINK_TARGET}，应为 ${REMOTE_APK}" >&2; exit 1; }
 echo "  ✓ latest.apk → ${LINK_TARGET##*/}"
 
-# 版本接口必须说出同一个版本
+# 版本接口必须说出同一个版本 —— 而且 5 个字段都要对上。
+#
+# 为什么改成用 python 解析 JSON 而不是 grep：
+#   · JSON 里的中文是 \uXXXX 转义，grep 比的是"出现过"，不是"就是它"；
+#   · 更新说明里可能有引号/反斜杠，grep 的模式会被它们带偏。
+# 判据是**逐字段相等**：接口说的必须就是我们刚写进 env 的那份。
 API_JSON="$("${SSH[@]}" "curl -s https://api.stashbox.cn/api/v1/app/version" | tr -d '\r')"
-echo "$API_JSON" | grep -q "\"latest_version_name\":\"${VERSION_NAME}\"" \
-  || { echo "✗ 版本接口没返回 ${VERSION_NAME}：${API_JSON}" >&2; exit 1; }
-echo "$API_JSON" | grep -q "\"latest_version_code\":${VERSION_CODE}" \
-  || { echo "✗ 版本接口的 code 不是 ${VERSION_CODE}：${API_JSON}" >&2; exit 1; }
-echo "  ✓ 版本接口 = ${VERSION_NAME} / code ${VERSION_CODE}"
+if ! printf '%s' "$API_JSON" | \
+  EXPECTED_NAME="$VERSION_NAME" \
+  EXPECTED_CODE="$VERSION_CODE" \
+  EXPECTED_URL="$DOWNLOAD_URL" \
+  EXPECTED_PUBLISHED_AT="$PUBLISHED_AT" \
+  EXPECTED_NOTES_SHA="$NOTES_SHA" \
+  python3 -c '
+import hashlib, json, os, sys
+
+data = json.load(sys.stdin)
+bad = []
+
+
+def check(key, want):
+    got = data.get(key)
+    if got != want:
+        bad.append("%s: 接口返回 %r，应为 %r" % (key, got, want))
+
+
+check("latest_version_name", os.environ["EXPECTED_NAME"])
+check("latest_version_code", int(os.environ["EXPECTED_CODE"]))
+check("download_url", os.environ["EXPECTED_URL"])
+check("published_at", os.environ["EXPECTED_PUBLISHED_AT"])
+
+# 更新说明按哈希比：逐字节一致，不受 JSON 转义/换行影响
+notes = data.get("release_notes") or ""
+sha = hashlib.sha256(notes.encode("utf-8")).hexdigest()
+if sha != os.environ["EXPECTED_NOTES_SHA"]:
+    bad.append(
+        "release_notes: 接口返回的说明哈希 %s… 与写入的 %s… 不符"
+        % (sha[:12], os.environ["EXPECTED_NOTES_SHA"][:12])
+    )
+
+if bad:
+    sys.stderr.write("\n".join(bad) + "\n")
+    sys.exit(1)
+'; then
+  echo "✗ 版本接口的 5 个字段与本次发版对不上（用户会读到错的说明）：${API_JSON}" >&2
+  exit 1
+fi
+echo "  ✓ 版本接口 5 个字段与本次发版一致（${VERSION_NAME} / code ${VERSION_CODE}，说明与发布时间已核对）"
 
 # 营销页的下载入口必须真的能下到东西（不是 HTML —— 那个坑踩过两次：
 # /downloads/ 路由漏掉时 try_files 会返回 index.html，状态码还是 200）

@@ -492,6 +492,20 @@ else
   else
     pass "STASHBOX_APP_DOWNLOAD_URL" "$app_dl"
   fi
+  # 更新说明与发布时间：2026-10-25 实测发 0.4.2 时这两个键被漏掉了，
+  # 后果不是报错 —— 用户点开更新弹窗看到的是**上一版**的说明。
+  # （安卓端 AppUpdateDialog.kt 会渲染 release_notes。）
+  # ⇒ 发了版却没有说明 ⇒ 判定为 fail：内测用户读到空白等于没发。
+  if [ -z "$(v STASHBOX_APP_RELEASE_NOTES)" ]; then
+    fail "STASHBOX_APP_RELEASE_NOTES" "未设置 —— 客户端更新弹窗会显示「服务端未提供更新说明。」，内测用户读不到这一版改了什么"
+  else
+    pass "STASHBOX_APP_RELEASE_NOTES" "已设置（$(printf '%s' "$(v STASHBOX_APP_RELEASE_NOTES)" | wc -c | tr -d ' ') 字节）"
+  fi
+  if [ -z "$(v STASHBOX_APP_PUBLISHED_AT)" ]; then
+    warn "STASHBOX_APP_PUBLISHED_AT" "未设置 —— 版本接口的 published_at 是 null，看不出这一版是什么时候发的（不影响用户更新）"
+  else
+    pass "STASHBOX_APP_PUBLISHED_AT" "$(v STASHBOX_APP_PUBLISHED_AT)"
+  fi
 fi
 
 # ═════════════════════════════════════════════════════════════════════

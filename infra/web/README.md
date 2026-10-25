@@ -94,9 +94,24 @@
 
 | 事实 | 唯一真相源 | 谁维护 |
 |---|---|---|
-| 当前版本号 | `stashbox.env` 的三个 `STASHBOX_APP_*` 变量 | `deploy/release_apk.sh` |
+| 当前版本号 | `stashbox.env` 的**五个** `STASHBOX_APP_*` 变量（见下） | `deploy/release_apk.sh` |
 | 最新 APK | `/var/www/stashbox-downloads/latest.apk` → 软链 | `deploy/release_apk.sh` |
 | 页面上的版本号文字 | 运行时从 `/api/v1/app/version` 取 | 无（自动） |
+
+**五个版本变量**（前 3 个决定「能不能下到对的包」，后 2 个决定「用户读到的说明对不对」）：
+
+| 变量 | 谁看得到 | 漏了会怎样 |
+|---|---|---|
+| `STASHBOX_APP_DOWNLOAD_URL` | 客户端 | 提示更新却没地方下载 |
+| `STASHBOX_APP_LATEST_VERSION_CODE` | 客户端 | 版本比较失灵 |
+| `STASHBOX_APP_LATEST_VERSION_NAME` | 客户端 | 显示空版本名 |
+| `STASHBOX_APP_RELEASE_NOTES` | **用户**（更新弹窗渲染它） | **用户读到上一版的说明**（实测 0.4.2 踩过） |
+| `STASHBOX_APP_PUBLISHED_AT` | API 消费方 | `published_at` 永远是 null，看不出这版什么时候发的 |
+
+后两个是 2026-10-25 发 0.4.2 时才发现漏掉的：脚本原来只改 3 个，
+而且改完**没有任何断言** ⇒ 错的说明能一直挂着，直到有人手动点开更新弹窗才发现。
+现在由 `deploy/set_app_version_env.py` 一次写 5 个并回读校验，
+`release_apk.sh` 再拿版本接口逐字段对拍（见下面「发版脚本」）。
 
 **下载链接不再随版本变**：页面指向稳定路径 `/downloads/latest.apk`，
 nginx 的 `/downloads/` 是 `alias /var/www/stashbox-downloads/`，
@@ -154,8 +169,27 @@ AndroidDownloadManager GET /downloads/…apk  200/206 ×5    ← 靠 Range 续�
 「页面上看起来一切正常」时最难发现。
 
 ```bash
-./backend/deploy/release_apk.sh <apk 路径> <版本名> <versionCode>
+./backend/deploy/release_apk.sh <apk 路径> <版本名> <versionCode> <更新说明>
 ```
+
+**更新说明是必填的**（第 4 个参数）：它就是用户在更新弹窗里看到的文字。
+不给就报错退出 —— 因为「忘了写说明」不会自己暴露，
+只会在内测用户更新后读到上一版的说明时才被发现（2026-10-25 实测）。
+
+脚本现在做的校验（每一项错了都会中止发版）：
+
+| 校验 | 挡的是什么 |
+|---|---|
+| 上传文件哈希 = 本地哈希 | 上传了半个文件 / 传错版本 |
+| `latest.apk` 软链指向当前版本 | 软链没更新（用户下到上一版） |
+| 版本接口 **5 个字段**逐字段相等 | env 写歪、说明没写、发布时间缺失 |
+| 域名入口可下载且大小一致 | nginx 路由漏了（返回 index.html 但状态码 200） |
+| 域名入口不 302 | 备案后 nginx 没切干净，语义与地址不一致 |
+
+写 env 的活儿在 `deploy/set_app_version_env.py`：备份（限量 3 份）、
+拒重复键、原子替换、写完回读比对，并拒绝会写坏 systemd `EnvironmentFile` 的值
+（说明里带换行、以 `\` 结尾、以引号开头 —— 这三种会把 env 文件解析坏）。
+它的守卫契约测试在 `backend/tests/infra/test_set_app_version_env.py`（17 例，逐条变异检验过）。
 
 ---
 
