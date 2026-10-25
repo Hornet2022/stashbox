@@ -35,6 +35,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from stashbox.backend.common.auth import require_user
@@ -42,7 +43,9 @@ from stashbox.backend.common.auth_admin import require_admin_or_operator
 from stashbox.backend.common.database import get_db
 from stashbox.backend.common.exceptions import InvalidRequest, NotFound
 from stashbox.backend.common.logging import get_logger
-from stashbox.backend.common.models import AdminOperationLog
+from stashbox.backend.common.models import AdminOperationLog, Article, DistilledArticle
+from clients.ai_client import get_ai_client  # noqa: E402
+
 from stashbox.backend.common.tts_voice_service import (
     MAX_REF_AUDIO_BYTES,
     UNSET,
@@ -57,6 +60,7 @@ from stashbox.backend.common.tts_voice_service import (
     resolve_voice_for_user,
     set_user_preference,
     update_voice,
+    voice_usage_counts,
 )
 
 log = get_logger(__name__)
@@ -123,13 +127,26 @@ class TTSPreferenceUpdate(BaseModel):
 
 
 class AdminVoiceOut(VoiceOut):
-    """管理端多吐几项：参考音频地址、参考文本、上下架、排序。"""
+    """管理端多吐几项：参考音频地址、参考文本、上下架、排序、**有没有人在用**。"""
 
     ref_audio_url: str
     ref_text: str
     is_active: bool = True
     sort_order: int = 0
     updated_at: Optional[str] = None
+    #: 被多少用户选中（`user_tts_preferences` 计数）。
+    #:
+    #: 为什么要有它：音色库页原来只能看到「这个音色存在」，看不到「**有人用吗**」。
+    #: 生产实测 1 条音色、2 行用户偏好但 `voice_id` 全为 NULL ——
+    #: 管理员完全看不出「用户其实没在选音色」。
+    selected_users: int = 0
+    #: 是否**真的**会用于新剪藏的文章：默认音色，或有用户选了它。
+    #:
+    #: ⚠️ 这条是「**新建音色默认不生效**」那个坑的显式化：
+    #: 新建时 `is_default` 默认 false、也没有用户选它 ⇒ 解析链回落到默认音色
+    #: ⇒ 这个音色建完**根本不会被用上**，而界面毫无提示。
+    #: 现在管理端能算出这个标记，列表里直接标「未启用」。
+    is_effective: bool = False
 
 
 class VoiceCreateIn(BaseModel):
@@ -194,7 +211,7 @@ def _to_out(v) -> VoiceOut:
     )
 
 
-def _to_admin_out(v) -> AdminVoiceOut:
+def _to_admin_out(v, selected_users: int = 0) -> AdminVoiceOut:
     return AdminVoiceOut(
         id=v.id,
         slug=v.slug,
@@ -206,6 +223,9 @@ def _to_admin_out(v) -> AdminVoiceOut:
         is_active=v.is_active,
         sort_order=v.sort_order,
         updated_at=v.updated_at.isoformat() if v.updated_at else None,
+        selected_users=selected_users,
+        # 「生效」= 默认音色 **或** 有用户选了它。两者都没有 ⇒ 建了但不会被用上。
+        is_effective=bool(v.is_default) or selected_users > 0,
     )
 
 
@@ -349,8 +369,15 @@ async def update_my_tts_preference(req: TTSPreferenceUpdate, user: dict = Depend
 # ---------------------------------------------------------------------------
 @router.get("/api/v1/admin/tts/voices")
 async def admin_list_voices(user: dict = Depends(require_admin_or_operator)):
+    """音色列表（含已下架）。
+
+    额外带 `selected_users`（被多少用户选中）与 `is_effective`
+    （是否**真的**会用于新剪藏）—— 见 `AdminVoiceOut` 的注释：
+    没有这两个字段时，「建了但没生效」与「没人选过音色」在界面上完全看不出来。
+    """
     rows = await list_voices(include_inactive=True)
-    return {"items": [_to_admin_out(v).model_dump() for v in rows]}
+    usage = await voice_usage_counts()
+    return {"items": [_to_admin_out(v, usage.get(v.id, 0)).model_dump() for v in rows]}
 
 
 @router.post("/api/v1/admin/tts/voices")
@@ -508,20 +535,38 @@ async def admin_preview_voice(
 async def admin_import_voice_from_config(
     user: dict = Depends(require_admin_or_operator),
 ):
-    """把当前全局 TTS 配置里的 indextts_ref_audio 收编成音色库第一条。
+    """把当前全局 TTS 配置里的参考音频收编成音色库第一条。
 
     存在的理由：迁移 0033 **刻意没有 seed 默认音色** —— 迁移里读 env 会把本机
     绝对路径固化进库，换台机器就是死路径。管理员点一次这个按钮，就能在不敲
     任何路径的前提下完成冷启动。
+
+    ⚠️ 2026-10-25：原先这里**只认** `indextts_ref_audio`，而生产的 provider 是
+    **openai**（托管端点）、配置里根本没有这个键 ⇒ 这个按钮在生产上**必然 400**
+    （死按钮）。现在两个 provider 的键都读，并给出可操作的提示。
     """
     from stashbox.backend.app.services.tts import current_config
 
     cfg = await current_config()
-    ref_audio = (cfg.get("indextts_ref_audio") or "").strip()
-    ref_text = (cfg.get("indextts_ref_text") or "").strip()
+    # ⚠️ 托管端点（openai）用的是 openai_ref_audio/openai_ref_text，
+    # 本地零样本克隆（indextts）用的是 indextts_ref_audio/indextts_ref_text。
+    ref_audio = (cfg.get("indextts_ref_audio") or "").strip() or (
+        cfg.get("openai_ref_audio") or ""
+    ).strip()
+    ref_text = (cfg.get("indextts_ref_text") or "").strip() or (
+        cfg.get("openai_ref_text") or ""
+    ).strip()
     if not ref_audio:
         raise InvalidRequest(
-            message="当前 TTS 配置没有 indextts_ref_audio，无法导入。请先在 TTS 配置页填参考音频"
+            message=(
+                "当前 TTS 配置没有参考音频，无法导入。"
+                "请先在「TTS 设置」页填「参考音频地址」与「参考文本」"
+                "（托管端点用 openai_*，本地零样本克隆用 indextts_*），再点一次导入。"
+            )
+        )
+    if not ref_text:
+        raise InvalidRequest(
+            message="当前 TTS 配置没有参考文本，无法导入。参考文本必须与参考音频内容逐字一致。"
         )
 
     existing = await list_voices(include_inactive=True)
@@ -530,9 +575,17 @@ async def admin_import_voice_from_config(
             # 已经收编过了 —— 幂等返回，别造重复行
             return ImportFromConfigOut(voice=_to_admin_out(v), created=False)
 
+    # ⚠️ slug 不能写死 "default"：第二次导入（参考音频换了、或第一次导的是别的源）
+    # 会撞「音色标识 'default' 已存在」⇒ **导入功能第二次就废了**。
+    # 这里取一个没被占用的 slug。
+    taken = {v.slug for v in existing}
+    slug = "default"
+    if slug in taken:
+        slug = f"default-{uuid.uuid4().hex[:6]}"
+
     try:
         voice = await create_voice(
-            slug="default",
+            slug=slug,
             display_name="默认音色",
             ref_audio=ref_audio,
             ref_text=ref_text,
@@ -543,3 +596,164 @@ async def admin_import_voice_from_config(
     except VoiceError as exc:
         raise InvalidRequest(message=str(exc)) from exc
     return ImportFromConfigOut(voice=_to_admin_out(voice), created=True)
+
+
+# ---------------------------------------------------------------------------
+# 存量文章换音色（补闭环的最后一环）
+# ---------------------------------------------------------------------------
+#
+# ## 为什么需要这个端点
+#
+# 音色是**合成期参数**：换了默认音色，已落盘的 32 段音频**不会变**。
+# 而重跑脚本 `backend/scripts/redistill_voices.py` 的默认筛选是
+# 「`tts_voice_id` 为空」⇒ 生产上 32 篇全非空 ⇒ 脚本默认跑 **0 篇**。
+# ⇒ 结果就是「后台能换音色，但没有任何一条路能把存量换成新音色」。
+#
+# 这个端点把最后一环补上：把目标音色**设为默认** + 把存量文章重新入队蒸馏。
+#
+# ## 为什么要「设为默认」而不是「这篇文章单独指定音色」
+#
+# 蒸馏链路解析音色的顺序是「用户偏好 → 默认音色 → 全局配置」
+# （`common/tts_voice_service.py::resolve_voice_for_user`），
+# **没有**「按文章指定音色」这一级。
+# ⇒ 要让存量文章换成某个音色，唯一自洽的做法就是让它成为默认音色
+# （这也正是管理员「换默认音色」这个动作本身的含义）。
+#
+# ⚠️ 代价要说清楚：设为默认会**改变之后所有新剪藏**的音色。
+# 这是「换默认音色」的固有语义，不是本端点引入的。
+
+
+class VoiceRedistillIn(BaseModel):
+    """换音色并重渲存量文章。"""
+
+    reason: str = Field(..., min_length=1, description="重渲原因，会写入审计日志")
+    #: 只重渲这几篇；不传 = 全部「当前音色 ≠ 目标音色」且已有音频的文章。
+    article_ids: Optional[list[str]] = None
+    #: 单次最多重渲多少篇（蒸馏是分钟级的，别让一个请求挂住）。
+    limit: int = 50
+
+
+class VoiceRedistillItem(BaseModel):
+    article_id: str
+    current_voice_id: Optional[str] = None
+    queued: bool = False
+
+
+class VoiceRedistillOut(BaseModel):
+    voice_id: str
+    #: 命中的存量文章数（不含 limit 截断）
+    matched: int = 0
+    #: 实际触发重渲的篇数
+    queued: int = 0
+    items: list[VoiceRedistillItem] = Field(default_factory=list)
+
+
+@router.post("/api/v1/admin/tts/voices/{voice_id}/re-distill", response_model=VoiceRedistillOut)
+async def admin_voice_redistill(
+    voice_id: str,
+    req: VoiceRedistillIn,
+    user: dict = Depends(require_admin_or_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """把目标音色设为默认，并重渲存量文章。
+
+    行为：
+      1. reason ≥5 字符校验（与其他破坏性/批量操作同口径）
+      2. 音色必须存在且在架
+      3. **设为默认音色**（`is_default`，至多一条 —— DB 有部分唯一索引兜底）
+      4. 找出「当前音色 ≠ 目标音色」且已有音频的存量文章，逐篇重新入队蒸馏
+      5. 同事务写 `admin_operation_logs`（action=voice_redistill）
+
+    ⚠️ 蒸馏是**分钟级**的（单篇约 3~6 分钟），所以这里只负责入队，
+    不等结果；进度看文章状态。
+    """
+    if len(req.reason.strip()) < 5:
+        raise InvalidRequest(message="reason 至少 5 个字符")
+
+    voice = await get_voice(voice_id)
+    if voice is None:
+        raise NotFound(message=f"音色不存在: {voice_id}")
+    if not voice.is_active:
+        raise InvalidRequest(message=f"音色「{voice.display_name}」已下架，不能设为默认")
+
+    # 1) 设为默认（先做，后面入队失败也不会留下「没换音色却重渲了」的错位）
+    try:
+        await update_voice(voice_id, is_default=True)
+    except VoiceError as exc:
+        raise InvalidRequest(message=str(exc)) from exc
+
+    # 2) 找存量文章
+    stmt = select(
+        DistilledArticle.id,
+        DistilledArticle.article_id,
+        DistilledArticle.tts_voice_id,
+    ).where(DistilledArticle.status == "done")
+    if req.article_ids:
+        stmt = stmt.where(DistilledArticle.article_id.in_(req.article_ids))
+    else:
+        stmt = stmt.where(
+            (DistilledArticle.tts_voice_id.is_(None)) | (DistilledArticle.tts_voice_id != voice_id)
+        )
+    rows = (await db.execute(stmt)).all()
+    matched = len(rows)
+    limit = max(1, min(int(req.limit or 50), 200))
+    rows = rows[:limit]
+
+    # 3) 逐篇重新入队
+    from stashbox.backend.common import cache_service
+    from stashbox.backend.common.auth import create_access_token
+
+    items: list[VoiceRedistillItem] = []
+    queued = 0
+    for _did, article_id, current_voice_id in rows:
+        art = await db.get(Article, article_id)
+        if art is None:
+            items.append(VoiceRedistillItem(article_id=article_id, queued=False))
+            continue
+        art.status = "pending"
+        try:
+            await db.commit()
+        except Exception:  # noqa: BLE001 —— 单篇失败不打断整批
+            await db.rollback()
+            items.append(VoiceRedistillItem(article_id=article_id, queued=False))
+            continue
+        await cache_service.invalidate_article(article_id)
+        triggered = await get_ai_client().trigger_distill(
+            article_id, auth_token=create_access_token(str(art.user_id))
+        )
+        if triggered is not None:
+            queued += 1
+        items.append(
+            VoiceRedistillItem(
+                article_id=article_id,
+                current_voice_id=current_voice_id,
+                queued=triggered is not None,
+            )
+        )
+
+    # 4) 审计
+    log_row = AdminOperationLog(
+        admin_id=_uid(user),
+        admin_tier=user.get("tier", "unknown"),
+        action="voice_redistill",
+        target_type="tts_voice",
+        target_id=voice_id,
+        reason=req.reason,
+        method="POST",
+        path=f"/api/v1/admin/tts/voices/{voice_id}/re-distill",
+        request_body={
+            "reason": req.reason,
+            "article_ids": req.article_ids,
+            "limit": req.limit,
+            "matched": matched,
+        },
+        response_status=200,
+    )
+    db.add(log_row)
+    try:
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 —— 审计写失败不掩盖已完成的入队
+        log.warning("voice_redistill 审计写入失败 voice_id=%s err=%s", voice_id, exc)
+        await db.rollback()
+
+    return VoiceRedistillOut(voice_id=voice_id, matched=matched, queued=queued, items=items)

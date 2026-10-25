@@ -107,7 +107,11 @@ def _rows(sql: str) -> list[list[str]]:
     return [row for row in csv.reader(io.StringIO(out.stdout)) if row]
 
 
-def candidates(only: list[str] | None) -> list[dict]:
+def candidates(
+    only: list[str] | None,
+    to_voice: str | None = None,
+    include_all: bool = False,
+) -> list[dict]:
     """要重跑的存量文章。
 
     默认清单 = `tts_voice_id` 为空的（不是用音色库音色合成的）那些。
@@ -117,10 +121,24 @@ def candidates(only: list[str] | None) -> list[dict]:
     有 `tts_voice_id`（比如批量重跑之后、或本来就用音色库合成的），
     就会被 SQL 筛掉 → `--article` 静默失效、报「待重跑 0 篇」。
     显式指定的意思就是「就重跑这一篇」，不该被默认清单的条件拦下。
+
+    ⚠️ 2026-10-25 新增两个维度（原来**没有**「按目标音色重跑」这条路）：
+    · `--to-voice <voice_id>`：重跑「当前音色 ≠ 目标音色」的文章
+      —— 语义 = 把存量换成这个音色（前提：该音色是默认音色，
+      蒸馏链路按「用户偏好 → 默认音色 → 全局配置」解析，没有「按文章指定」这一级）。
+    · `--all`：不看 `tts_voice_id`，全部有音频的重跑一遍。
     """
     if only:
         ids = ",".join("'" + a.replace("'", "") + "'" for a in only)
         where = f"d.article_id in ({ids}) and d.status='done' and d.audio_url is not null"
+    elif to_voice:
+        vid = to_voice.replace("'", "")
+        where = (
+            "d.status='done' and d.audio_url is not null "
+            f"and (d.tts_voice_id is null or d.tts_voice_id <> '{vid}')"
+        )
+    elif include_all:
+        where = "d.status='done' and d.audio_url is not null"
     else:
         where = "d.status='done' and d.audio_url is not null and d.tts_voice_id is null"
     sql = (
@@ -173,11 +191,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="批量重跑音色不一致的存量音频")
     ap.add_argument("--apply", action="store_true", help="真跑（默认只列清单）")
     ap.add_argument("--article", action="append", help="只重跑指定文章（可多次）")
+    ap.add_argument(
+        "--to-voice",
+        help="重跑「当前音色 ≠ 这个音色」的文章（把存量换成指定音色；该音色需为默认音色）",
+    )
+    ap.add_argument("--all", action="store_true", help="无视 tts_voice_id，全部有音频的重跑一遍")
     ap.add_argument("--delay", type=int, default=20, help="每篇之间的间隔秒数（默认 20）")
     ap.add_argument("--timeout", type=int, default=900, help="单篇等待完成的秒数（默认 900）")
     args = ap.parse_args()
 
-    items = candidates(args.article)
+    items = candidates(args.article, to_voice=args.to_voice, include_all=args.all)
     total_min = sum(i["duration_sec"] for i in items) / 60
     print(f"待重跑 {len(items)} 篇，合计 {total_min:.1f} 分钟旧音频")
     print(

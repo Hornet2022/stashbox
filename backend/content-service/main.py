@@ -182,6 +182,10 @@ sys.modules["content_service_tts_voice_router"] = _mod_tts_voice
 _spec_tts_voice.loader.exec_module(_mod_tts_voice)
 app.include_router(_mod_tts_voice.router)
 
+# 暴露模块本身：单测要 patch 它命名空间里的 get_ai_client 等依赖
+# （理由同上面 admin_router 那段注释）。
+tts_voice_router_module = _mod_tts_voice
+
 
 class InvalidRequest(BizException):
     """参数 / 身份类错误（HTTP 400，业务码按场景传）。"""

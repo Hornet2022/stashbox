@@ -188,6 +188,15 @@ ROUTES: list[Route] = [
         "content-service",
         _url("content-service"),
     ),
+    # 换音色并重渲存量（2026-10-25）：音色是合成期参数，换默认音色不会
+    # 改动已落盘的音频 ⇒ 必须有一条「重渲存量」的路，否则后台能换音色、
+    # 却没有任何办法让存量文章用上新音色。
+    Route(
+        "POST",
+        "/api/v1/admin/tts/voices/{voice_id}/re-distill",
+        "content-service",
+        _url("content-service"),
+    ),
     Route("POST", "/api/v1/distill/start", "ai-service", _url("ai-service")),
     Route("GET", "/api/v1/distill/{task_id}", "ai-service", _url("ai-service")),
     # B1/G5：distill 系端点显式注册（消除对 fallback 猜表的路径依赖，

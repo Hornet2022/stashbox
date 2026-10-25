@@ -486,12 +486,16 @@ async def resolve_voice_for_user(user_id: int | None) -> ResolvedVoice:
         )
 
     # 3) 全局 TTS 配置（历史兜底）
+    #
+    # ⚠️ 生产 provider 是 **openai**（托管端点，2026-10-25 实测），
+    # 而这级回退原先**只读** `indextts_ref_audio` ⇒ 生产永远读不到
+    # ⇒ 「音色库是空的」时整条链路没有兜底。现在两个 provider 的键都读。
     from stashbox.backend.app.services.tts import current_config
 
     cfg = await current_config()
     return ResolvedVoice(
-        ref_audio=cfg.get("indextts_ref_audio") or "",
-        ref_text=cfg.get("indextts_ref_text") or "",
+        ref_audio=(cfg.get("indextts_ref_audio") or cfg.get("openai_ref_audio") or ""),
+        ref_text=(cfg.get("indextts_ref_text") or cfg.get("openai_ref_text") or ""),
         voice_id=None,
         display_name=None,
         source="global_config",
@@ -501,3 +505,26 @@ async def resolve_voice_for_user(user_id: int | None) -> ResolvedVoice:
 def available_speeds() -> list[float]:
     """App 可选语速档位。服务端单一事实源，App 不再硬编码。"""
     return list(DEFAULT_PLAYBACK_SPEEDS)
+
+
+async def voice_usage_counts() -> dict[str, int]:
+    """每个音色被**多少用户**选中（`user_tts_preferences.voice_id` 计数）。
+
+    ## 为什么需要它
+
+    音色库页原来只能看到「这个音色存在」，看不到「**它有没有人用**」——
+    生产实测：音色库 1 条，用户偏好 2 行且 `voice_id` **全为 NULL**
+    ⇒ 管理员完全看不出「用户其实没在选音色」这件事。
+
+    顺带解决另一个更隐蔽的问题：**新建的音色默认不生效**
+    （`is_default=false` 且没人选它 ⇒ 解析链回落到默认音色），
+    而界面上毫无提示。管理端用这个计数算出 `is_effective`，
+    让「建了但没用上」这件事**在列表里看得见**。
+    """
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(
+            select(UserTTSPreference.voice_id, func.count())
+            .where(UserTTSPreference.voice_id.is_not(None))
+            .group_by(UserTTSPreference.voice_id)
+        )
+        return {str(vid): int(cnt) for vid, cnt in rows.all() if vid}

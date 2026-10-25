@@ -954,6 +954,14 @@ class TTSConfigUpdate(BaseModel):
     # （实测传了被静默丢弃）。自建端点的采样参数在 indextts_* 那一组。
     openai_instructions: str | None = None
     openai_language: str | None = None
+    # 托管端点（openai）零样本克隆用的**参考音频 + 参考文本**。
+    #
+    # ⚠️ 2026-10-25：原先参考音频只有 `indextts_*` 那组（本地 oMLX），
+    # 而生产的 provider 是 **openai**（托管端点）⇒ 全局兜底读不到、
+    # 后台「从当前配置导入音色」按钮也必然 400（死按钮）。
+    # 现在托管端点有自己的一组键，与 indextts_* 平级。
+    openai_ref_audio: str | None = None
+    openai_ref_text: str | None = None
     # doubao
     doubao_api_key: str | None = None
     doubao_token: str | None = None
@@ -986,6 +994,8 @@ _TTS_PLAIN_FIELDS = (
     "openai_voice",
     "openai_instructions",
     "openai_language",
+    "openai_ref_audio",
+    "openai_ref_text",
     "doubao_voice",
     "doubao_resource_id",
     "doubao_app_id",
@@ -1098,6 +1108,8 @@ def _masked_tts_config(config: dict, source: str, updated_at: str | None) -> dic
         "openai_voice": config.get("openai_voice"),
         "openai_instructions": config.get("openai_instructions"),
         "openai_language": config.get("openai_language"),
+        "openai_ref_audio": config.get("openai_ref_audio"),
+        "openai_ref_text": config.get("openai_ref_text"),
         "doubao_voice": config.get("doubao_voice"),
         "doubao_resource_id": config.get("doubao_resource_id"),
         "local_voice": config.get("local_voice"),

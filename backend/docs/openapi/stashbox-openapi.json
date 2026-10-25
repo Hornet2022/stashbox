@@ -2963,6 +2963,7 @@
     "/api/v1/admin/tts/voices": {
       "get": {
         "summary": "Admin List Voices",
+        "description": "音色列表（含已下架）。\n\n额外带 `selected_users`（被多少用户选中）与 `is_effective`\n（是否**真的**会用于新剪藏）—— 见 `AdminVoiceOut` 的注释：\n没有这两个字段时，「建了但没生效」与「没人选过音色」在界面上完全看不出来。",
         "operationId": "admin_list_voices_api_v1_admin_tts_voices_get",
         "parameters": [
           {
@@ -3067,7 +3068,7 @@
     "/api/v1/admin/tts/voices/import-from-config": {
       "post": {
         "summary": "Admin Import Voice From Config",
-        "description": "把当前全局 TTS 配置里的 indextts_ref_audio 收编成音色库第一条。\n\n存在的理由：迁移 0033 **刻意没有 seed 默认音色** —— 迁移里读 env 会把本机\n绝对路径固化进库，换台机器就是死路径。管理员点一次这个按钮，就能在不敲\n任何路径的前提下完成冷启动。",
+        "description": "把当前全局 TTS 配置里的参考音频收编成音色库第一条。\n\n存在的理由：迁移 0033 **刻意没有 seed 默认音色** —— 迁移里读 env 会把本机\n绝对路径固化进库，换台机器就是死路径。管理员点一次这个按钮，就能在不敲\n任何路径的前提下完成冷启动。\n\n⚠️ 2026-10-25：原先这里**只认** `indextts_ref_audio`，而生产的 provider 是\n**openai**（托管端点）、配置里根本没有这个键 ⇒ 这个按钮在生产上**必然 400**\n（死按钮）。现在两个 provider 的键都读，并给出可操作的提示。",
         "operationId": "admin_import_voice_from_config_api_v1_admin_tts_voices_import_from_config_post",
         "parameters": [
           {
@@ -3356,6 +3357,76 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/VoicePreviewOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
+    "/api/v1/admin/tts/voices/{voice_id}/re-distill": {
+      "post": {
+        "summary": "Admin Voice Redistill",
+        "description": "把目标音色设为默认，并重渲存量文章。\n\n行为：\n  1. reason ≥5 字符校验（与其他破坏性/批量操作同口径）\n  2. 音色必须存在且在架\n  3. **设为默认音色**（`is_default`，至多一条 —— DB 有部分唯一索引兜底）\n  4. 找出「当前音色 ≠ 目标音色」且已有音频的存量文章，逐篇重新入队蒸馏\n  5. 同事务写 `admin_operation_logs`（action=voice_redistill）\n\n⚠️ 蒸馏是**分钟级**的（单篇约 3~6 分钟），所以这里只负责入队，\n不等结果；进度看文章状态。",
+        "operationId": "admin_voice_redistill_api_v1_admin_tts_voices__voice_id__re_distill_post",
+        "parameters": [
+          {
+            "name": "voice_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Voice Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoiceRedistillIn"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VoiceRedistillOut"
                 }
               }
             }
@@ -9166,6 +9237,16 @@
               }
             ],
             "title": "Updated At"
+          },
+          "selected_users": {
+            "type": "integer",
+            "title": "Selected Users",
+            "default": 0
+          },
+          "is_effective": {
+            "type": "boolean",
+            "title": "Is Effective",
+            "default": false
           }
         },
         "type": "object",
@@ -9177,7 +9258,7 @@
           "ref_text"
         ],
         "title": "AdminVoiceOut",
-        "description": "管理端多吐几项：参考音频地址、参考文本、上下架、排序。"
+        "description": "管理端多吐几项：参考音频地址、参考文本、上下架、排序、**有没有人在用**。"
       },
       "ArticleResponse": {
         "properties": {
@@ -10138,6 +10219,28 @@
             ],
             "title": "Openai Language"
           },
+          "openai_ref_audio": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Openai Ref Audio"
+          },
+          "openai_ref_text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Openai Ref Text"
+          },
           "doubao_api_key": {
             "anyOf": [
               {
@@ -10642,6 +10745,100 @@
           "voice_id"
         ],
         "title": "VoicePreviewOut"
+      },
+      "VoiceRedistillIn": {
+        "properties": {
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Reason",
+            "description": "重渲原因，会写入审计日志"
+          },
+          "article_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Article Ids"
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit",
+            "default": 50
+          }
+        },
+        "type": "object",
+        "required": [
+          "reason"
+        ],
+        "title": "VoiceRedistillIn",
+        "description": "换音色并重渲存量文章。"
+      },
+      "VoiceRedistillItem": {
+        "properties": {
+          "article_id": {
+            "type": "string",
+            "title": "Article Id"
+          },
+          "current_voice_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Voice Id"
+          },
+          "queued": {
+            "type": "boolean",
+            "title": "Queued",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "article_id"
+        ],
+        "title": "VoiceRedistillItem"
+      },
+      "VoiceRedistillOut": {
+        "properties": {
+          "voice_id": {
+            "type": "string",
+            "title": "Voice Id"
+          },
+          "matched": {
+            "type": "integer",
+            "title": "Matched",
+            "default": 0
+          },
+          "queued": {
+            "type": "integer",
+            "title": "Queued",
+            "default": 0
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/VoiceRedistillItem"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "voice_id"
+        ],
+        "title": "VoiceRedistillOut"
       },
       "VoiceUpdateIn": {
         "properties": {
