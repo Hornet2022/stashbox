@@ -312,16 +312,21 @@ async def _download_one(
     url: str,
     *,
     timeout: float,
+    headers: dict[str, str] | None = None,
 ) -> tuple[bytes | None, str | None, str | None]:
     """下载一张图 → (图片字节, mime, 错误原因)。
 
     失败**不抛异常**：一张图坏掉不该让整篇抓取失败（见模块文档的"失败不阻断"）。
+
+    ⚠️ `headers` 必须走**请求级**（httpx 里请求级覆盖 client 级），
+    理由见 `caption_media` 里 Referer 那段注释 —— 放进 client 级会被
+    client 池吞掉（池的 key 不含 headers，首个使用者的值会被"烧"进去）。
     """
     blob = b""
     try:
         # 按 host 节流：我们对同一个图床连打好几张图，很容易被当成爬虫。
         await HOST_THROTTLE.wait(host_of(url))
-        async with client.stream("GET", url, timeout=timeout) as resp:
+        async with client.stream("GET", url, timeout=timeout, headers=headers) as resp:
             if resp.status_code != 200:
                 return None, None, f"下载失败: http {resp.status_code}"
             length = resp.headers.get("content-length", "")
@@ -410,10 +415,24 @@ async def caption_media(
             results[ref["token"]] = _failed(ref, "识图通道不可用（没配 LLM provider）")
         return _ordered(images, results)
 
-    extra_headers = {"Referer": referer} if referer else None
+    # ⚠️ Referer 必须走**请求级**，不能进 client 级 headers ——
+    #
+    # 2026-10-25 实测的真 bug：client 是**池化**的，而池的 key 是
+    # `(画像, 代理, guard_ssrf)` —— **不含 headers**（见 net.acquire_client）。
+    # ⇒ 第一次用某画像建 client 时，它当时的 headers 被"烧"进 client 级，
+    #   之后同画像的请求**复用**它 ⇒ **新传的 extra_headers 被丢弃**。
+    #
+    # 于是：页面抓取（`build_client_kwargs(profile)`，不带 Referer）先建了
+    # DESKTOP client ⇒ 识图时传的 `Referer: <文章URL>` **必然丢失** ⇒
+    # 图床防盗链回 403（实测 sspai 47 张全 403；用独立 client 手工测就是 200）。
+    #
+    # 微信为什么没事：它的 Referer 在**画像**里（`https://mp.weixin.qq.com/`），
+    # 那是 client 级的、固定的 ⇒ 不会被吞。⇒ **只有 per-article 的 Referer 会中招**。
+    #
+    # ⇒ 修法：Referer 每次请求都带（httpx 里请求级 headers 覆盖 client 级）。
+    request_headers = {"Referer": referer} if referer else None
     client_kwargs = build_client_kwargs(
         profile,
-        extra_headers=extra_headers,
         # 注入了 MockTransport 就不跑 DNS 校验：mock 不发真实请求，
         # 跑校验只会让用例依赖外网。生产路径永远带防护（与其它 fetcher 同一套约定）。
         guard_ssrf=transport is None,
@@ -444,7 +463,7 @@ async def caption_media(
                 return None, None, "抓取预算已耗尽（没时间下载配图了）"
             timeout = deadline.slice(MEDIA_DOWNLOAD_TIMEOUT) or MEDIA_DOWNLOAD_TIMEOUT
         async with semaphore:
-            return await _download_one(client, ref["url"], timeout=timeout)
+            return await _download_one(client, ref["url"], timeout=timeout, headers=request_headers)
 
     async def _producer(ref: ImageRef) -> None:
         """下载一张图 → 放进队列。**任何异常都要进队列**（否则消费者会等一辈子）。"""

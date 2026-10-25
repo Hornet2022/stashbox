@@ -657,3 +657,86 @@ async def test_识图超时取剩余预算而不是固定值(fake_provider, monk
     await media_ocr.caption_media(_refs(1), transport=_transport(), deadline=deadline)
     assert seen_timeouts
     assert seen_timeouts[0] <= 3.0, "超时不能超过剩余预算"
+
+
+# ---------------------------------------------------------------------------
+# 5. Referer 必须走**请求级**（2026-10-25 修的真 bug）
+# ---------------------------------------------------------------------------
+#
+# 现象：sspai 的一篇文章 47 张正文图**全部** 403（"下载失败: http 403"），
+# 而用独立 client 手工测同一个 URL 是 200。
+#
+# 根因：client 是**池化**的，池的 key 是 (画像, 代理, guard_ssrf) —— **不含 headers**
+# （见 net.acquire_client）。⇒ 第一次用某画像建 client 时它当时的 headers 被
+# "烧"进 client 级，之后同画像的请求**复用**它 ⇒ **新传的 client 级 headers
+# 被静默丢弃**。
+#
+# 于是：页面抓取（不带 Referer）先建了 DESKTOP client ⇒ 识图下载时传的
+# `Referer: <文章URL>`（per-article！）**必然丢失** ⇒ 图床防盗链回 403。
+#
+# 微信为什么没事：它的 Referer 在**画像**里（固定的）⇒ client 级，不受影响。
+
+
+def test_池复用时后来的client级headers会被丢弃():
+    """把**机制**钉住：池的 key 不含 headers ⇒ 后来的 client 级 headers 失效。
+
+    这条测试看着"在测一个 bug"，其实是在说明
+    「为什么 per-request 的头不能放 client 级」——没有它，
+    下一个人会理所当然地把 Referer 塞进 client 级。
+    """
+    net.reset_clients_for_tests()
+    try:
+        c1 = net.acquire_client(
+            net.HeaderProfile.DESKTOP, headers={"X-Test": "first"}, trust_env=False
+        )
+        c2 = net.acquire_client(
+            net.HeaderProfile.DESKTOP, headers={"X-Test": "second"}, trust_env=False
+        )
+        assert c1 is c2, "同画像应该复用同一个 client"
+        # ⚠️ 这就是坑：第二个调用方传的 client 级 header **被丢弃**了
+        assert c2.headers["x-test"] == "first"
+    finally:
+        net.reset_clients_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_识图下载的请求带文章Referer(fake_provider):
+    """效果：图下载请求必须**带**上文章 Referer（防盗链的钥匙）。"""
+    seen: dict[str, httpx.Headers] = {}
+    refs = _refs(1)
+    await media_ocr.caption_media(
+        refs,
+        transport=_transport(seen=seen),
+        referer="https://sspai.com/post/90211",
+    )
+    img_headers = seen["https://cdn.example.com/fig1.png"]
+    assert img_headers.get("referer") == "https://sspai.com/post/90211"
+
+
+@pytest.mark.asyncio
+async def test_识图不把Referer放进client级headers(monkeypatch, fake_provider):
+    """修法本身：**Referer 不许进 client 级 headers**。
+
+    进了就会在池复用时被丢弃（见上面那条）⇒ 表现为「图床 403」，
+    而表面上看代码是"传了 Referer 的"，极难定位。
+    """
+    captured: dict = {}
+    real = media_ocr.build_client_kwargs
+
+    def _spy(profile, **kwargs):
+        captured.update(kwargs)
+        return real(profile, **kwargs)
+
+    monkeypatch.setattr(media_ocr, "build_client_kwargs", _spy)
+
+    await media_ocr.caption_media(
+        _refs(1),
+        transport=_transport(),
+        referer="https://sspai.com/post/90211",
+    )
+
+    client_headers = {k.lower() for k in (captured.get("headers") or {})}
+    assert "referer" not in client_headers, (
+        "Referer 不能进 client 级 headers —— 池的 key 不含 headers，"
+        "它会被「首个使用者」的值覆盖掉"
+    )

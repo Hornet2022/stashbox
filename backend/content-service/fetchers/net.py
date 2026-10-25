@@ -61,6 +61,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import random
 import time
@@ -177,6 +178,9 @@ def build_headers(profile: HeaderProfile) -> dict[str, str]:
     if referer:
         headers["Referer"] = referer
     return headers
+
+
+log = logging.getLogger("stashbox.fetch.net")
 
 
 # -- 重试 --------------------------------------------------------------------
@@ -484,7 +488,30 @@ _CLIENTS: dict[tuple[Any, ...], httpx.AsyncClient] = {}
 
 
 def acquire_client(profile: HeaderProfile, **kwargs: Any) -> httpx.AsyncClient:
-    """取一个可长期复用的 client（无 transport 的生产路径走池）。"""
+    """取一个可长期复用的 client（无 transport 的生产路径走池）。
+
+    ## ⚠️ 池的 key **不含 headers** —— 传进来的 client 级 headers 只在**第一次**建池时生效
+
+    key = (画像, 代理, guard_ssrf)。⇒ 同一画像的 client 全局只有一个，
+    **它的 client 级 headers 是"首个使用者"那次的值**；之后再传的
+    `extra_headers`（走 `build_client_kwargs`）会被**静默丢弃**。
+
+    这不是理论问题，2026-10-25 在生产上踩过：识图下载要给图床带
+    `Referer: <文章URL>`（**每篇不同**），而页面抓取先用同一画像建了
+    client（不带 Referer）⇒ 识图传的 Referer 被吞 ⇒ 图床防盗链回 403
+    （sspai 一篇 47 张图全 403；用独立 client 手工测是 200）。
+
+    ⇒ **规矩**：
+      · **per-article / per-request 的头必须走请求级**
+        （`client.get(url, headers={...})`，httpx 里请求级覆盖 client 级）；
+      · client 级只放**按画像恒定**的头（UA / Accept / Accept-Language）。
+      · `douyin.py` 传的 `Referer: https://www.douyin.com/` 是**固定值**，
+        放 client 级没问题；`media_ocr.py` 的 per-article Referer 就必须走请求级。
+
+    为了让违反规矩的人**当场知道**，复用池里已有的 client 时会核对
+    client 级 headers 是否与传入的一致，不一致就 warn 一次
+    （见下面 `_warn_header_mismatch`）。
+    """
     transport = kwargs.get("transport")
     if transport is not None:
         return httpx.AsyncClient(**kwargs)
@@ -492,7 +519,41 @@ def acquire_client(profile: HeaderProfile, **kwargs: Any) -> httpx.AsyncClient:
     client = _CLIENTS.get(key)
     if client is None:
         client = _CLIENTS[key] = httpx.AsyncClient(**kwargs)
+    else:
+        _warn_header_mismatch(profile, client, kwargs.get("headers"))
     return client
+
+
+#: 已经就同一 (画像, 头不一致) 告警过的组合 —— 同一个错别报一堆。
+_HEADER_MISMATCH_WARNED: set[tuple[Any, ...]] = set()
+
+
+def _warn_header_mismatch(profile: HeaderProfile, client: httpx.AsyncClient, headers: Any) -> None:
+    """复用池里的 client 时，传入的 client 级 headers 与池里那个不一致 ⇒ 告警。
+
+    这类不一致**几乎总是 bug**：要么调用方以为新 headers 生效了（其实被丢），
+    要么它本该走请求级。静默丢弃的代价是「图床回 403」这种从表面看不出来的故障。
+    """
+    if not isinstance(headers, dict):
+        return
+    existing = {k.lower(): v for k, v in client.headers.items()}
+    incoming = {k.lower(): v for k, v in headers.items()}
+    # ⚠️ 只看**调用方实际传的那些键**：client.headers 里还有 httpx 自带的默认头
+    # （accept / accept-encoding / connection…），拿全量比对会永远不相等 ⇒ 误报。
+    diff = {k: (existing.get(k), v) for k, v in incoming.items() if existing.get(k) != v}
+    if not diff:
+        return
+    key = (profile, tuple(sorted(diff.items(), key=lambda kv: kv[0])))
+    if key in _HEADER_MISMATCH_WARNED:
+        return
+    _HEADER_MISMATCH_WARNED.add(key)
+    log.warning(
+        "client_pool_header_mismatch profile=%s diff=%s —— "
+        "池的 key 不含 headers，传入的 client 级 headers 已被丢弃；"
+        "per-request 的头请走请求级（client.get(url, headers=...））",
+        profile.value,
+        diff,
+    )
 
 
 async def close_clients() -> None:
