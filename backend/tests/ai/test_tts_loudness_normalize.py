@@ -174,3 +174,113 @@ def test_超时上限是几十秒级():
     timeout = sig.parameters["timeout"].default
     assert timeout <= 45, f"响度归一的超时上限过大：{timeout}s"
     assert timeout >= 10, f"超时上限过小，正常情况会被误杀：{timeout}s"
+
+
+# ---------------------------------------------------------------------------
+# 整篇口径的响度归一（2026-10-25 新增）
+# ---------------------------------------------------------------------------
+#
+# 老做法是**每段强制拉到同一个刻度**。实测问题：
+#   · 生产一篇文章的 7 个克隆段，段间 RMS 散布只有 **0.05 dB**
+#     —— 强制等电平几乎什么都没修，却把每段都重编码了一遍；
+#   · 还会压掉段内动态、把安静段的底噪一起拉起来。
+#
+# 新口径：**量每段 → 中位数当「这一篇的电平」→ 死区内的段不动 →
+# 离群段补增益（封顶）→ 最后整篇统一归一**。
+
+
+def _make_tone_at(duration_sec: float, volume_db: float) -> bytes:
+    """造一段指定电平的纯音。"""
+    proc = subprocess.run(
+        [
+            FFMPEG,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency=220:duration={duration_sec}",
+            "-af",
+            f"volume={volume_db}dB",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "64k",
+            "-f",
+            "mp3",
+            "-",
+        ],
+        capture_output=True,
+        check=True,
+    )
+    return proc.stdout
+
+
+def test_死区内的段不被改写():
+    """电平一致的段落（实测散布 0.05 dB）不该被逐段重编码。
+
+    判据：输出与输入**逐字节相同** —— 证明它根本没有被重新编码。
+
+    ⚠️ 这里把 `target_rms_db` 设成实测电平 ⇒ **文章级增益为 0**，
+    于是「死区内的段不动」才观察得到（文章级归一是另一件事，见下一条）。
+    """
+    from stashbox.backend.app.services.tts.audio_chunks import normalize_article_loudness
+
+    pieces = [_make_tone_at(1.0, 0.0) for _ in range(3)]
+    out = normalize_article_loudness(pieces, target_rms_db=_mean_db(pieces[0]))
+    assert out == pieces, "死区内的段被改写了 —— 逐段强制等电平的老行为没去掉"
+
+
+def test_整篇统一归一():
+    """整篇要落到目标电平（哪怕各段本来就在死区内）。"""
+    from stashbox.backend.app.services.tts.audio_chunks import normalize_article_loudness
+
+    pieces = [_make_tone_at(1.0, 0.0) for _ in range(3)]
+    target = _mean_db(pieces[0]) - 5.0
+    out = normalize_article_loudness(pieces, target_rms_db=target)
+    levels = [_mean_db(p) for p in out]
+    assert abs(levels[0] - target) < 1.0, f"整篇没有归一到目标电平：{levels[0]:.2f} vs {target:.2f}"
+
+
+def test_离群段被拉回来():
+    """明显更轻的一段要被拉回到与其它段一致。
+
+    ⚠️ 增益**封顶**在 6 dB ⇒ 一个低 10 dB 的离群段最多被拉 6 dB，
+    残留 4 dB 是**预期**的（不追到平，是刻意的：不放大底噪）。
+    """
+    from stashbox.backend.app.services.tts.audio_chunks import normalize_article_loudness
+
+    normal = _make_tone_at(1.0, 0.0)
+    quiet = _make_tone_at(1.0, -10.0)
+    pieces = [normal, normal, quiet]
+    out = normalize_article_loudness(pieces, target_rms_db=_mean_db(normal), max_gain_db=6.0)
+
+    levels = [_mean_db(p) for p in out]
+    spread = max(levels) - min(levels)
+    assert spread < 5.0, f"离群段没有被拉回来，段间散布仍有 {spread:.2f} dB"
+
+
+def test_增益封顶_安静段不被无限放大():
+    """安静段的增益**封顶** —— 追平均不能把底噪拉成嘶嘶声。"""
+    from stashbox.backend.app.services.tts.audio_chunks import normalize_article_loudness
+
+    normal = _make_tone_at(1.0, 0.0)
+    quiet = _make_tone_at(1.0, -20.0)
+    pieces = [normal, normal, quiet]
+    out = normalize_article_loudness(pieces, target_rms_db=_mean_db(normal), max_gain_db=6.0)
+
+    levels = [_mean_db(p) for p in out]
+    # 安静段最多被拉 6 dB（留一点余量给测量误差）
+    assert (
+        levels[-1] - levels[0] <= 6.5
+    ), f"安静段被拉高了 {levels[-1] - levels[0]:.2f} dB —— 增益没有封顶"
+
+
+def test_量不到电平时保持原样():
+    """量不到（ffmpeg 不可用）→ 保持原样，不丢内容。"""
+    from stashbox.backend.app.services.tts.audio_chunks import normalize_article_loudness
+
+    pieces = [_make_tone(0.5), _make_tone(0.5)]
+    out = normalize_article_loudness(pieces, ffmpeg_bin="/nonexistent/ffmpeg")
+    assert out == pieces

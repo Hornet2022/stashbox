@@ -3,17 +3,25 @@
 
 ## 这个脚本存在的理由
 
-`app/services/tts/openai.py` 里有两条判据阈值：
+`app/services/tts/openai.py` 里有一条判据阈值：
 
-    _TRUNCATION_CHARS_PER_SEC = 6.8   # ≥ 150 字的块
-    _SHORT_TEXT_MAX_CPS      = 8.0   # < 150 字的块
+    _TRUNCATION_CHARS_PER_SEC = 11.0   # 所有块长统一用这一档
 
-这两个数字**不是拍出来的**，是量出来的 —— 而量它们的工具原先是一次性脚本
+⚠️ **2026-10-25 变更**：原来有两条（6.8 / 8.0，按长度分档），
+   现在合并成一条 —— 因为实测 **cps 与块长无关**（只与文本内容有关），
+   分档是在给不存在的结构编理由。
+
+这个数字**不是拍出来的**，是量出来的 —— 而量它们的工具原先是一次性脚本
 （/tmp 里的探针），量完就没了。阈值于是变成「注释里的一个数字」：
 下一个想改它的人没法复现依据，只能选择信或不信。
 
 本脚本把量法固化成可复现的工具：**换个人、换个时间、换个 provider，
 都能重跑一遍拿到自己的带宽数据**，再决定阈值。
+
+⚠️ **换模型 / 换上游后必须重跑**：2026-10-24 的阈值 6.8 是给
+   **Qwen3-TTS-12Hz-1.7B-Base** 标的（正常 4.80~6.45 字/秒）；
+   生产换成 **CustomVoice** 后正常上界涨到 **9.65** ⇒ 6.8 落进正常区间内部
+   ⇒ 24h 内误判 107 次 ⇒ 凭空多出上百个音色接缝。
 
 ## 方法
 
@@ -28,11 +36,30 @@
    否则超阈值的块直接抛错 —— 恰恰量不到那些「被判截断」的样本。
    校验本身不受影响，这里只是测量。
 
-## 实测结论（2026-10-24，tertu.cn 的 Qwen3-TTS-12Hz-1.7B-CustomVoice + 克隆）
+## 实测结论
+
+⚠️ **两天的结论不一样，因为模型换了** —— 这正是「阈值必须重新标定」的实证。
+
+### ① 2026-10-25（当前：Qwen3-TTS-12Hz-1.7B-**CustomVoice** + 克隆）
+
+生产真实分块 + 生产克隆段，同一上游同一日：
+
+    250 字克隆块（n=20）   5.15 ~ 9.65    中位 ~7.0
+    700~900 字块（n=8）    5.43 ~ 6.51
+    909~983 字块（n=6）    5.56 ~ 6.49
+    短块 40~60 字          6.56 ~ 9.40
+
+⇒ 正常上界 **9.65** ⇒ 阈值取 **11.0**（留 14% 余量）。
+
+⚠️ 老阈值 6.8 ⇒ 生产近 24h 误判 **107 次**「分块被截断，二分重来」
+（块长 239~250 字，即**正常块**），每次自愈都凭空多出 1~2 个音色接缝。
+
+⚠️ **没有按块长分档**：实测 cps 与块长**无关**（250 字块能到 9.65，
+909 字块只有 6.49 —— 差别来自**文本内容**）。分档只会凭空造出结构。
+
+### ② 2026-10-24（当时：Qwen3-TTS-12Hz-1.7B-**Base** + 克隆）
 
 量法有两种，结果不同 —— **必须用生产真实分块**：
-
-### ① 生产真实分块（`split_into_chunks` 的实际产物）—— 这是定阈值的那一份
 
     块长          天然 cps 带宽        波动      6.8 阈值   8.0 阈值
     40~150 字     4.80 ~ 6.12          ≤19.9%      ✓ 有余量   ✓
@@ -41,15 +68,13 @@
 
     真截断样本（生产日志）：7.14 / 7.29 / 7.50 / 8.00 / 8.67
 
-⇒ 自然上界 6.45、真截断下界 7.14 ⇒ **长块阈值 6.8**（两侧各留约 5%）。
-   ⚠️ 曾经的 6.5 离自然上界只有 0.8% → 正常的 190 字块每次都被判成截断
-   → 每次多一次自愈重渲（生产实测 15 分钟内 8 次）。
+⇒ 那时的自然上界 6.45、真截断下界 7.14 ⇒ 阈值 6.8。
 
-⇒ **短块（<150 字）的带宽比长块宽**（波动最高 19.9%），用同一个阈值容易误伤，
-   而误伤会触发二分自愈 → 短块一旦被判错就整篇蒸馏失败（生产事故）。
-   ⇒ 阈值必须**按档位分开定**：长块 6.8、短块 8.0。
+⚠️ **那些「真截断」样本今天在正常带内**（今天正常上界 9.65 > 8.67）
+⇒ 它们在当前上游上**无法再与正常区分**。速率判据只能筛「缺得很狠」的截断
+   （缺 45% 以上），轻微截尾抓不到 —— 这是**已知能力边界**。
 
-### ② 同文连渲（同一段文本重复渲染）—— 只用来量**同文波动**，不能定阈值
+### ③ 同文连渲（同一段文本重复渲染）—— 只用来量**同文波动**，不能定阈值
 
     47 字  5.88 ~ 6.71        14.3%
     52 字  5.20 ~ 6.50        25.0%
@@ -59,7 +84,7 @@
 
 ⚠️ **别用这一份定阈值**：它把「同一段文本」重复渲染，测的是**渲染随机性**，
    而自然带是**不同文本**之间的差异 —— 后者更宽（尾部留白、句读停顿占比更大）。
-   拿 ② 定阈值会**定得过紧**。
+   拿 ③ 定阈值会**定得过紧**。
 
 ### ⚠️ 取数时别踩这个坑（实测差异 6.93 vs 6.45）
 
@@ -70,9 +95,9 @@
 
 ## 改阈值前
 
-先量自己这一档，别直接抄上面的数字（上游换版本/换 provider 都会变）：
+先量自己这一档，别直接抄上面的数字（**上游换版本 / 换 provider / 换模型**都会变）：
 
-    python scripts/calibrate_tts_chunk_rate.py --min-chars 150 --max-chars 260
+    python scripts/calibrate_tts_chunk_rate.py --chunk-chars 800 --min-chars 700 --max-chars 900
 
 ## 用法
 
@@ -148,7 +173,9 @@ def _rows(sql: str) -> list[list[str]]:
     return [r for r in csv.reader(io.StringIO(out)) if r]
 
 
-def _pick_chunks(scripts: list[str], lo: int, hi: int, want: int) -> list[str]:
+def _pick_chunks(
+    scripts: list[str], lo: int, hi: int, want: int, chunk_chars: int = CLONE_CHUNK_CHARS
+) -> list[str]:
     """按字数区间挑块：优先覆盖区间两端的样本。
 
     ⚠️ 导入放在函数内：`app.services.tts` 的包初始化会连带执行
@@ -158,9 +185,7 @@ def _pick_chunks(scripts: list[str], lo: int, hi: int, want: int) -> list[str]:
     """
     from stashbox.backend.app.services.tts.audio_chunks import split_into_chunks
 
-    pool = [
-        c for s in scripts for c in split_into_chunks(s, CLONE_CHUNK_CHARS) if lo <= len(c) <= hi
-    ]
+    pool = [c for s in scripts for c in split_into_chunks(s, chunk_chars) if lo <= len(c) <= hi]
     pool.sort(key=len)
     if not pool:
         return []
@@ -176,6 +201,16 @@ async def main() -> int:
     ap.add_argument("--sample", type=int, default=8, help="取多少个块做样本")
     ap.add_argument("--repeat", type=int, default=3, help="每个块连渲几次（量波动）")
     ap.add_argument("--articles", type=int, default=10, help="取多少篇真实稿件")
+    ap.add_argument(
+        "--chunk-chars",
+        type=int,
+        default=CLONE_CHUNK_CHARS,
+        help=(
+            "用多大的块长切样本（默认=现网克隆块长）。"
+            "**要标定新块长的阈值时必须传它** —— 否则切出来的还是旧块长，"
+            "在新区间里一个样本都挑不到。"
+        ),
+    )
     ap.add_argument(
         "--thresholds",
         default="6.8,8.0",
@@ -205,7 +240,7 @@ async def main() -> int:
         return 2
     print(f"真实稿件 {len(scripts)} 篇")
 
-    picked = _pick_chunks(scripts, args.min_chars, args.max_chars, args.sample)
+    picked = _pick_chunks(scripts, args.min_chars, args.max_chars, args.sample, args.chunk_chars)
     if not picked:
         print(
             f"在 {args.min_chars}~{args.max_chars} 字区间里没挑到块 —— "
@@ -213,8 +248,8 @@ async def main() -> int:
         )
         return 2
     print(
-        f"目标档位 {args.min_chars}~{args.max_chars} 字，样本 {len(picked)} 个："
-        f"{sorted(len(c) for c in picked)}"
+        f"目标档位 {args.min_chars}~{args.max_chars} 字（切块粒度 {args.chunk_chars}），"
+        f"样本 {len(picked)} 个：{sorted(len(c) for c in picked)}"
     )
 
     ref_audio, ref_text, voice_name = await _resolve_voice()

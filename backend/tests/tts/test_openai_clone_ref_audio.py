@@ -207,7 +207,7 @@ async def test_every_chunk_carries_identical_ref_audio(tmp_path, concat_stub):
     """**每一块**都要带逐字节相同的参考音 —— 少一块就是那一个人换了。"""
     p = tmp_path / "ref.wav"
     p.write_bytes(FAKE_WAV)
-    client = _client(chunk_chars=8)
+    client = _client(chunk_chars=8, clone_chunk_chars=8)
     bodies = _install_post(client, lambda body: _Resp(200, b"x" * 2000))
 
     await client.synthesize(
@@ -321,37 +321,59 @@ async def test_clone_and_voice_are_both_sent(concat_stub, tmp_path):
 # ==========================================================================
 
 
-async def test_clone_uses_smaller_chunks_than_plain_path(tmp_path, concat_stub):
-    """克隆时块长必须**另算**（默认 250 字），不能沿用普通路径的 700。
+async def test_clone_path_uses_its_own_chunk_budget(tmp_path, concat_stub):
+    """克隆路径的块长**独立于**普通路径（2026-10-25 起解耦）。
 
-    实测（2026-10-24，tertu.cn）：同样 700 字，
-        不克隆 → 音频 185.8s（3.77 字/秒）
-        克隆   → 音频 112.2s（6.24 字/秒）—— **慢 1.66 倍**
-    上游克隆时要额外处理参考音频 → 更容易撞它 60s 的墙钟，
-    而撞墙钟的后果是**静默截断**（HTTP 200 + 音频变短）→ 内容缺失。
+    ⚠️ **老契约**：克隆块长 = min(普通块长, 克隆块长) ⇒ 克隆块长永远 ≤ 普通块长。
+       那条耦合是 2026-10-24 的产物，理由是「克隆慢 1.66 倍，更容易撞 60s 墙钟」。
+
+    ⚠️ **新契约**：两条路径的**每字墙钟**不同，实测：
+
+        克隆（带 ref_audio）  ≈ 48ms/字  （250 字 12.1s / 800 字 31.8s）
+        预设音色（只有 voice） ≈ 61ms/字  （250 字 15.3s）
+
+    ⇒ 用**更贵**那条路径的预算去夹**更便宜**的那条，等于凭空砍掉一半余量。
+    ⇒ 克隆块长 = `clone_chunk_chars`（默认 800），普通块长管不了它。
+
+    这条契约的意义：**段数 = 接缝数**。生产实测 2544 字的稿子切成 12 段
+    （11 个接缝）—— 接缝就是「一篇音频听出好几种音色」的来源。
     """
     p = tmp_path / "ref.wav"
     p.write_bytes(FAKE_WAV)
-    text = "这是一段用来测试分块的中文文本。" * 20  # 280 字
+    text = "这是一段用来测试分块的中文文本。" * 60  # 900 字
 
     plain = _client(chunk_chars=700)
     plain_bodies = _install_post(plain, lambda body: _Resp(200, b"x" * 2000))
     await plain.synthesize(text)
     plain_chunks = len(plain_bodies)
 
-    cloned = _client(chunk_chars=700)
+    cloned = _client(chunk_chars=700, clone_chunk_chars=800)
     clone_bodies = _install_post(cloned, lambda body: _Resp(200, b"x" * 2000))
     await cloned.synthesize(text, ref_audio=str(p), ref_text=REF_TEXT)
     clone_chunks = len(clone_bodies)
 
-    assert plain_chunks == 1, "280 字在普通路径（700）下应该是 1 块"
-    assert clone_chunks > plain_chunks, (
-        f"克隆路径用了和普通路径一样的块长（{clone_chunks} 块）—— "
-        f"克隆慢 1.66 倍，更容易撞上游 60s 墙钟 → 静默截断 → 内容缺失"
-    )
+    assert plain_chunks == 2, f"900 字在普通路径（700）下应该是 2 块，实际 {plain_chunks}"
+    assert clone_chunks == 2, f"900 字在克隆路径（800）下应该是 2 块，实际 {clone_chunks}"
     assert all(
-        len(b["input"]) <= 250 for b in clone_bodies
-    ), "克隆块长应 ≤ 250 字（实测 250 字 → 音频 40~44s，离 60s 墙钟有 35% 余量）"
+        len(b["input"]) <= 800 for b in clone_bodies
+    ), "克隆块长应 ≤ clone_chunk_chars（800 字 → 墙钟 31.8s，对 60s 留 1.9 倍余量）"
+
+
+async def test_clone_chunk_budget_is_not_clamped_by_plain_chunk(tmp_path, concat_stub):
+    """普通块长**不得**反过来夹住克隆块长（这是解耦的核心断言）。"""
+    p = tmp_path / "ref.wav"
+    p.write_bytes(FAKE_WAV)
+    text = "这是一段用来测试分块的中文文本。" * 60  # 900 字
+
+    # 普通块长故意配得很小（100），克隆块长 800 —— 克隆路径应当仍按 800 切。
+    cloned = _client(chunk_chars=100, clone_chunk_chars=800)
+    clone_bodies = _install_post(cloned, lambda body: _Resp(200, b"x" * 2000))
+    await cloned.synthesize(text, ref_audio=str(p), ref_text=REF_TEXT)
+
+    assert len(clone_bodies) == 2, (
+        f"克隆路径被普通块长（100）夹住了，切出 {len(clone_bodies)} 块 —— "
+        f"两条路径的墙钟预算不同，不该互相夹"
+    )
 
 
 def test_short_text_is_not_flagged_as_truncated():
@@ -370,10 +392,15 @@ def test_short_text_is_not_flagged_as_truncated():
 
 
 def test_long_text_truncation_is_still_detected():
-    """长文本的截断检测不能因为上面的放宽而失效。"""
+    """长文本的截断检测不能因为放宽阈值而失效。
+
+    ⚠️ **2026-10-25：判据换了样本**。老样本「290 字 → 40.6s → 7.14 字/秒」
+    是 Base 模型时代的真截断，但今天上游正常就能到 9.65 字/秒 ⇒ 7.14 今天**不是异常**。
+    ⇒ 现在用「缺得很狠」的样本：290 字只产出 20s → 14.5 字/秒。
+    """
     client = _client()
     with pytest.raises(openai_module._TruncatedOutput):
-        client._assert_not_truncated("这" * 290, _fake_mp3_of_seconds(40))
+        client._assert_not_truncated("这" * 290, _fake_mp3_of_seconds(20))
 
 
 # ---------------------------------------------------------------------------
@@ -417,28 +444,41 @@ def test_短块在实测噪声带内不误判(chars, seconds):
     client._assert_not_truncated("这" * chars, _fake_mp3_of_seconds(seconds))
 
 
-def test_生产实测那条会被判出来():
-    """生产事故原样复现：47 字 / 5.0s（9.40 字/秒）→ **要判成异常**。
+def test_生产实测那条今天不再算异常():
+    """2026-10-24 的生产事故样本（47 字 / 5.0s → 9.40 字/秒）**今天不是异常**。
 
-    47 字的自然带是 7.0~8.0s（5.88~6.71 cps），5.0s 明显在带外 →
-    它**确实**是个异常，不该被放过。
+    ⚠️ 这条是 2026-10-25 误判 107 次的直接对策：
+    老阈值 6.5/6.8 把它判成截断 → 二分自愈 → **凭空多出音色接缝**。
+    今天重新标定：上游正常上界 9.65 字/秒 ⇒ 9.40 在正常带内。
 
-    注意：判出来只是第一步 —— 真正拖死整篇的是「判出来之后没法自愈」，
-    那由下面那条用例守住。
+    ⇒ 它必须**不再**被判成截断（否则就是同一个坑再来一遍）。
     """
     client = _client()
-    with pytest.raises(openai_module._TruncatedOutput):
-        client._assert_not_truncated("这" * 47, _fake_mp3_of_seconds(5))
+    client._assert_not_truncated("这" * 47, _fake_mp3_of_seconds(5))
+
+
+def test_真正缺一半的短块仍然被抓():
+    """短到不能再切（< `_MIN_SPLIT_CHARS`）的块：告警并**保留音频**，不上抛。
+
+    ⚠️ 2026-10-25 新行为。上抛异常的代价是**整篇蒸馏失败**
+    （实测：47 字的块被判 9.40 字/秒 → 整篇挂掉，只能靠 Arq 重试救）。
+    ⇒ 短块的代价对比很清楚：
+        · 保留音频 → 最多这一块语速偏高（听感上「念得快」）
+        · 上抛异常 → **整篇没了**
+    """
+    client = _client()
+    # 8 字 / 0.4s → 20 字/秒，远超阈值，但 8 < _MIN_SPLIT_CHARS(12) ⇒ 切不动
+    client._assert_not_truncated("这" * 8, _fake_mp3_of_seconds(0.4))
 
 
 @pytest.mark.asyncio
 async def test_生产实测那条不会拖死整篇():
-    """**死区修复**：47 字的块被判异常后，必须能自愈重渲，而不是整篇挂掉。
+    """被判异常的块必须能自愈重渲，而不是整篇挂掉。
 
     老写法 `len(text) <= min_chunk_chars(60) → raise` 让短块一旦误判就
     **直接放弃自愈** → 整篇蒸馏失败（生产实测：第 1 篇就挂，靠 Arq 重试才救回来）。
 
-    这里模拟真实上游：第一次渲染偏短（5.0s）→ 判异常 → 二分 →
+    这里模拟真实上游：第一次渲染偏短（明显缺失）→ 判异常 → 二分 →
     子块重新渲染（正常长度）→ 通过 → 整块合成成功。
     """
     client = _client(min_chunk_chars=60)
@@ -446,9 +486,9 @@ async def test_生产实测那条不会拖死整篇():
 
     async def _sometimes_short(text, voice=None, output_format="mp3", *, clone=None):
         calls.append(text)
-        # 整块（47 字）偏短；子块正常
+        # 整块（47 字）缺得很狠（47 字 / 3s = 15.7 字/秒）；子块正常
         if len(text) > 30:
-            return _fake_mp3_of_seconds(5)
+            return _fake_mp3_of_seconds(3)
         return _fake_mp3_of_seconds(4)
 
     client._synthesize_once = _sometimes_short  # type: ignore[assignment]
@@ -464,28 +504,36 @@ async def test_生产实测那条不会拖死整篇():
 
 
 def test_短块的明确缺失仍然被抓():
-    """短块只认「明显缺失」—— 不能把真截断一起放过。"""
+    """短块只认「明显缺失」—— 不能把真截断一起放过。
+
+    ⚠️ 2026-10-25：阈值统一到 11.0，但**仍然切得动**的块（≥ `_MIN_SPLIT_CHARS`）
+    依旧要抛异常 → 交给二分自愈重渲。
+    """
     client = _client()
     with pytest.raises(openai_module._TruncatedOutput):
-        # 20 字 → 1 秒 → 18.7 字/秒，远超短文本阈值 8.0
+        # 20 字 → 1 秒 → 20 字/秒，远超阈值 11.0
         client._assert_not_truncated("这" * 20, _fake_mp3_of_seconds(1))
 
 
 def test_长块在实测自然上界不误判():
-    """长块的自然上界（6.45 字/秒）**不能**被判成截断（2026-10-24 阈值回归）。
+    """长块的自然上界**不能**被判成截断（阈值回归）。
 
-    实测（生产真实分块，scripts/calibrate_tts_chunk_rate.py）：
-        182~199 字 → 天然 cps 5.35 ~ 6.45
-    阈值取 6.8（离上界 5.4%，离真截断 7.14 约 4.8%）。
-    曾经的 6.5 离上界只有 0.8% → 正常的 190 字块每次都被判成截断
-    → 每次多一次自愈重渲（生产实测 15 分钟内 8 次）。
+    ⚠️ **2026-10-25：自然上界从 6.45 变成 9.65**（上游换成 CustomVoice 后语速快了约 1.5 倍）。
+    实测（生产真实分块 + 生产克隆段，2026-10-25）：
+        250 字克隆块      5.15 ~ 9.65
+        700~900 字块     5.43 ~ 6.51
+    阈值取 **11.0**（离上界 9.65 有 14% 余量）。
+
+    老阈值 6.8 落在正常带**内部** ⇒ 正常块被劈开 ⇒ 每天凭空多出上百个接缝。
     """
     client = _client()
     # 190 字 / 29 秒 → 6.55 字/秒（自然带内）
     client._assert_not_truncated("这" * 190, _fake_mp3_of_seconds(29))
-    # 190 字 / 26 秒 → 7.31 字/秒（超出真截断带）→ 必须报出来
+    # 250 字 / 25.9 秒 → 9.65 字/秒（**今天的自然上界**）→ 仍不得误判
+    client._assert_not_truncated("这" * 250, _fake_mp3_of_seconds(25.9))
+    # 190 字 / 16 秒 → 11.9 字/秒（明显缺内容）→ 必须报出来
     with pytest.raises(openai_module._TruncatedOutput):
-        client._assert_not_truncated("这" * 190, _fake_mp3_of_seconds(26))
+        client._assert_not_truncated("这" * 190, _fake_mp3_of_seconds(16))
 
 
 @pytest.mark.asyncio
@@ -494,6 +542,10 @@ async def test_自愈切不动时就停():
 
     ⚠️ 地板管的是「**被切的文本**」：文本比 `_MIN_SPLIT_CHARS` 还小就不切了。
     切**出来**的块可以更小（硬切会留下 1 字的余块）—— 那不是问题。
+
+    ⚠️ **2026-10-25 新行为**：短到**切不动**的块（< `_MIN_SPLIT_CHARS`）
+    在 `_assert_not_truncated` 里就被拦下 → **保留音频、不上抛**。
+    ⇒ 这里断言的是「不抛异常、且只渲了一次」（不进入自愈）。
     """
     client = _client(min_chunk_chars=60)
     calls: list[str] = []
@@ -504,9 +556,35 @@ async def test_自愈切不动时就停():
 
     client._synthesize_once = _short_audio  # type: ignore[assignment]
 
-    with pytest.raises(Exception):
-        await client._synthesize_chunk("这" * 47)
+    audio = await client._synthesize_chunk("这" * 8)
 
+    assert audio, "切不动的短块应当保留音频，而不是让整篇失败"
+    assert len(calls) == 1, (
+        f"短到切不动的块不该进入二分自愈（实际渲了 {len(calls)} 次）—— "
+        f"自愈只能切 ≥ _MIN_SPLIT_CHARS 的文本"
+    )
+
+
+@pytest.mark.asyncio
+async def test_切得动的块仍会自愈到地板以下():
+    """能切的块一路切到地板以下；到地板后**保留音频**而不是抛异常。
+
+    ⚠️ **2026-10-25 新契约**：老行为是「切到地板 → 抛异常 → 整篇蒸馏失败」。
+    现在到地板（文本 < `_MIN_SPLIT_CHARS`，切不动了）就**保留那一小块音频**：
+    代价对比很清楚 ——「这一小块念得快」vs「整篇没了」。
+    """
+    client = _client(min_chunk_chars=60)
+    calls: list[str] = []
+
+    async def _short_audio(text, voice=None, output_format="mp3", *, clone=None):
+        calls.append(text)
+        return _fake_mp3_of_seconds(1)
+
+    client._synthesize_once = _short_audio  # type: ignore[assignment]
+
+    audio = await client._synthesize_chunk("这" * 47)
+
+    assert audio, "自愈到底后应当给出音频（保留那一小块），而不是抛异常拖死整篇"
     # 递归必须收敛（深度上限 6 ⇒ 最多 2^6 个叶子），不能无限切
     assert len(calls) <= 2 ** (
         openai_module._MAX_SPLIT_DEPTH + 1

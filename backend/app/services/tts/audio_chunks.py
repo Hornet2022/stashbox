@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import statistics
 import subprocess
 import tempfile
 from pathlib import Path
@@ -194,17 +195,20 @@ def concat_mp3(pieces: list[bytes], gap_sec: float = 0.3) -> bytes:
     """把多段 MP3 字节拼成一段。
 
     顺序很重要：
-      ① **响度归一**（每段）→ 消除段间音量跳变
-      ② **交叉淡化**（段间 300ms）→ 消除硬切，让音色过渡自然
+      ① **音域对齐 + 响度归一**（整篇口径，见 align_and_normalize）
+      ② **交叉淡化**（段间 100ms）→ 消除硬切，让音色过渡自然
       ③ 兜底：插入段间静音 + ffmpeg concat demuxer
       ④ 最后退化：裸字节拼接（不丢内容）
 
-    ## 响度归一为什么必须逐段做
+    ## 响度归一为什么改成「整篇口径」（2026-10-25）
 
-    实测（2026-10-22，同一段文字合成两次）：-26.0 / -22.5 LUFS ——
-    **同一句话都能差 3.9 LU**。分段后段间差 2.9 LU。
-    整体归一不会改变段与段的相对差异，必须逐段做。
-    音量跳变本身就会被听成「换人了」，与音色差异叠加更碎。
+    老做法是**每段强制拉到同一个刻度**。实测生产一篇文章的 7 个克隆段，
+    段间 RMS 散布只有 **0.05 dB** —— 强制等电平几乎什么都没修，
+    却把每段都重编码了一遍，还压掉段内动态、把安静段的底噪一起拉起来。
+
+    ⇒ 现在的口径：**量每段 → 取中位数当「这一篇的电平」→ 死区内的段不动 →
+    离群段补增益（封顶 6 dB）→ 最后整篇统一到目标电平**。
+    详见 `normalize_article_loudness`。
 
     ## 为什么不插段间静音当主路径
 
@@ -389,20 +393,42 @@ def align_and_normalize(pieces: list[bytes]) -> list[bytes]:
         except Exception as exc:  # noqa: BLE001 - 对齐失败不能影响主流程
             log.warning("TTS 音高对齐异常，保留原音频: %s", exc)
 
-    # ② 响度归一（逐段）
+    # ② 响度归一（**整篇口径**：只修离群段 + 整篇统一归一）
     #
-    # 实测（2026-10-22，同一段文字合成两次）：-26.0 / -22.5 LUFS ——
-    # **同一句话都能差 3.9 LU**。整体归一不会改变段与段的相对差异，必须逐段做。
-    normalized: list[bytes] = []
-    for piece in pieces:
-        norm = normalize_loudness(piece)
-        normalized.append(norm if norm else piece)
-    return normalized
+    # 实测依据（2026-10-25，生产一篇文章的 7 个克隆段）：
+    #     段间 RMS 散布只有 **0.05 dB** —— 逐段强制等电平几乎什么都没修，
+    #     却把每段都重编码了一遍，还会压掉段内动态、把安静段的底噪拉起来。
+    # ⇒ 改成 `normalize_article_loudness`：中位数定「这一篇的电平」，
+    #   死区内的段不动，离群段补增益（封顶），最后整篇统一到目标电平。
+    return normalize_article_loudness(pieces)
+
+
+# ── 交叉淡化时长（秒）──────────────────────────────────────────────────
+#
+# ⚠️ 2026-10-25：300ms → **100ms**。理由见 `crossfade_concat` 的 docstring：
+#   300ms 重叠 = 两个独立渲染同时发声 300ms —— 那正是「听出好几种音色」的来源。
+_CROSSFADE_SEC_DEFAULT = 0.1
+
+
+def _crossfade_sec() -> float:
+    """读 `OPENAI_TTS_CROSSFADE_SEC`（默认 100ms；设 0 = 不做淡化）。"""
+    raw = os.getenv("OPENAI_TTS_CROSSFADE_SEC", "").strip()
+    if not raw:
+        return _CROSSFADE_SEC_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("OPENAI_TTS_CROSSFADE_SEC 不是数字（%r），用默认值", raw)
+        return _CROSSFADE_SEC_DEFAULT
+    if value < 0:
+        log.warning("OPENAI_TTS_CROSSFADE_SEC 为负（%r），用默认值", raw)
+        return _CROSSFADE_SEC_DEFAULT
+    return value
 
 
 def crossfade_concat(
     pieces: list[bytes],
-    duration: float = 0.3,
+    duration: float | None = None,
     ffmpeg_bin: str | None = None,
     bitrate: str = "64k",
 ) -> bytes | None:
@@ -418,8 +444,20 @@ def crossfade_concat(
     一次合成能彻底消除，但上游有 60s 墙钟（504 backend_timeout），
     实测 1000 字必然撞线 —— 所以「整篇一次合成」在上游限制下做不到。
 
-    交叉淡化让 A 的尾 300ms 与 B 的头 300ms 重叠混合：听感上是「一个人的
-    音色在变」，而不是「突然换人念」。
+    交叉淡化让 A 的尾与 B 的头重叠混合：听感上是「一个人的音色在变」，
+    而不是「突然换人念」。
+
+    ## ⚠️ 时长为什么从 300ms 缩到 100ms（2026-10-25）
+
+    300ms 的重叠意味着**两个独立渲染同时发声 300ms** —— 耳朵在这 300ms 里
+    听到的是「两个人同时说话」，正是「一篇听出好几种音色」的听感来源之一。
+    而且段长放大后接缝变少，300ms 的重叠**占比更高**（2 个接缝 × 300ms
+    已经是 4 分钟音频里的 0.6s 双声重叠）。
+
+    业界通行做法也正是「fade 要短」：长交叉淡化会糊掉辅音（/t/ /k/ 的爆破
+    会被拉长），短 fade 足以消掉咔哒声。
+
+    ⇒ 默认 **100ms**（`OPENAI_TTS_CROSSFADE_SEC` 可调；设 0 = 不做淡化）。
 
     ## 代价
 
@@ -430,9 +468,11 @@ def crossfade_concat(
 
     ## 另一个方向（更彻底，但受限）
 
-    段长放大 → 段数变少 → 接缝变少。实测上游 60s 墙钟下 500 字 wall 35.7s、
-    1000 字必 504，所以段长的实际上限在 500~600 字。
+    段长放大 → 段数变少 → 接缝变少（这才是主解法，见 openai.py 的
+    `_CLONE_CHUNK_CHARS_DEFAULT`）。
     """
+    if duration is None:
+        duration = _crossfade_sec()
     if len(pieces) < 2 or duration <= 0:
         return None
     ffmpeg = ffmpeg_bin or os.getenv("FFMPEG_BIN", "ffmpeg")
@@ -522,6 +562,131 @@ def _measure_mean_db(ffmpeg: str, path: str, timeout: int) -> float | None:
         # 静音片段 mean_volume 是 -inf，float() 会抛 —— 已经处理掉了。
         return value
     return None
+
+
+def _measure_piece_db(
+    piece: bytes, ffmpeg_bin: str | None = None, timeout: int = 30
+) -> float | None:
+    """量一段音频的平均电平（dBFS）；量不到返回 None。"""
+    ffmpeg = ffmpeg_bin or os.getenv("FFMPEG_BIN", "ffmpeg")
+    is_wav = piece[:4] == b"RIFF"
+    try:
+        with tempfile.TemporaryDirectory(prefix="tts_meas_") as tmp:
+            src = os.path.join(tmp, "in.wav" if is_wav else "in.mp3")
+            Path(src).write_bytes(piece)
+            return _measure_mean_db(ffmpeg, src, timeout)
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        log.warning("TTS 响度测量失败: %s", exc)
+        return None
+
+
+def _apply_gain(
+    piece: bytes,
+    gain_db: float,
+    peak_db: float = -1.5,
+    ffmpeg_bin: str | None = None,
+    timeout: int = 30,
+) -> bytes | None:
+    """给一段音频施加**静态**增益并限峰（格式与输入一致）。失败返回 None。"""
+    ffmpeg = ffmpeg_bin or os.getenv("FFMPEG_BIN", "ffmpeg")
+    is_wav = piece[:4] == b"RIFF"
+    try:
+        with tempfile.TemporaryDirectory(prefix="tts_gain_") as tmp:
+            src = os.path.join(tmp, "in.wav" if is_wav else "in.mp3")
+            out = os.path.join(tmp, "out.wav" if is_wav else "out.mp3")
+            Path(src).write_bytes(piece)
+            limit = 10 ** (peak_db / 20.0)
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    src,
+                    "-af",
+                    f"volume={gain_db:.2f}dB,alimiter=limit={limit:.4f}:level=disabled",
+                    *(["-c:a", "pcm_s16le"] if is_wav else ["-c:a", "libmp3lame", "-b:a", "64k"]),
+                    out,
+                ],
+                capture_output=True,
+                timeout=timeout,
+                check=True,
+            )
+            data = Path(out).read_bytes()
+            if len(data) > 100:
+                return data
+            log.warning("TTS 增益产出异常(%dB)，退回原音频", len(data))
+    except FileNotFoundError:
+        log.warning("TTS 增益失败（无 ffmpeg），退回原音频")
+    except subprocess.SubprocessError as exc:
+        log.warning("TTS 增益失败：%s，退回原音频", exc)
+    return None
+
+
+def normalize_article_loudness(
+    pieces: list[bytes],
+    target_rms_db: float = -20.0,
+    dead_zone_db: float = 1.0,
+    max_gain_db: float = 6.0,
+    ffmpeg_bin: str | None = None,
+) -> list[bytes]:
+    """整篇响度归一：**只修离群段**，然后**整篇统一归一**。
+
+    ## 为什么不再「逐段强制等电平」（2026-10-25）
+
+    老做法是每段都强制拉到 -20 dBFS（`normalize_loudness`）。实测问题：
+
+    · **实测段间响度本来就很一致**：生产一篇文章的 7 个克隆段，
+      RMS 散布只有 **0.05 dB** —— 老做法几乎什么都没修，却把**每一段都重编码**了一遍。
+    · 真正该修的是**离群段**：某段特别轻/特别重，听感上就是「跳一下」。
+    · 「每段都拉到同一个刻度」会**放大安静段的底噪**（增益没有上限时尤其明显），
+      也压掉了段内的自然动态。
+
+    ⇒ 新口径：
+      ① 量每段电平 → 取**中位数**（稳健，不被离群段带跑）作为「这一篇的电平」；
+      ② **死区**内的段（|偏差| ≤ dead_zone_db）**不动** —— 保留自然动态；
+      ③ 死区外的段按偏差补增益，但**增益封顶**（max_gain_db）——
+         安静段不因为「要追平均」而被无限放大（那是在放大底噪）；
+      ④ 最后对**整篇**施加一个统一增益，让这篇整体落到目标电平。
+
+    ## 参数
+
+    - `dead_zone_db=1.0`：1 dB 以内听不出来（实测段间散布 0.05 dB），
+      所以死区不会掩盖真实跳变。
+    - `max_gain_db=6.0`：单段最多被拉 6 dB；再安静的段就保留原样
+      （宁可留一点响度差，也不要把底噪拉成嘶嘶声）。
+
+    ## 失败时的行为
+
+    量不到电平 / ffmpeg 不可用 / 增益失败 → **保留原音频**（宁可响度不齐，也不能丢内容）。
+    """
+    if not pieces:
+        return pieces
+
+    levels = [_measure_piece_db(p, ffmpeg_bin=ffmpeg_bin) for p in pieces]
+    known = [v for v in levels if v is not None]
+    if len(known) < 2:
+        # 量不到（或只有一段）→ 没有「整篇」可言，保持原样
+        return list(pieces)
+
+    median = float(statistics.median(known))
+    article_gain = max(-max_gain_db, min(max_gain_db, target_rms_db - median))
+
+    out: list[bytes] = []
+    for piece, level in zip(pieces, levels):
+        gain = article_gain
+        if level is not None:
+            dev = level - median
+            if abs(dev) > dead_zone_db:
+                gain += max(-max_gain_db, min(max_gain_db, -dev))
+        if abs(gain) < 0.05:
+            out.append(piece)
+            continue
+        adjusted = _apply_gain(piece, gain, ffmpeg_bin=ffmpeg_bin)
+        out.append(adjusted if adjusted else piece)
+    return out
 
 
 def normalize_loudness(
