@@ -16,12 +16,25 @@ CP4.7-E2E-BACKEND 端到端集成测试（content-service → ai-service → aud
 ⚠️ 早期版本这里**直连 ai-service**（端口从网关 +3 推导），而那台机的 8103 是
 **生产**端口 ⇒ 会把测试任务派进生产队列。已改回全部走网关 ——
 理由与事故记录见下面「不要在这个文件里直连 ai-service」那段注释。
+
+## 这个文件里有两类用例，跑法不一样
+
+| 类别 | 用例 | 标记 | 什么时候跑 |
+|---|---|---|---|
+| **live-service** | 4 条端到端（建文章 → 蒸馏 → audio_url 等） | `@pytest.mark.integration` | **显式**跑：`pytest tests/integration -m integration` |
+| **纯单测** | 2 条等待预算的回归（假网关，不碰任何服务） | 无 | **默认就跑**，CI 也跑 |
+
+为什么 live-service 要显式跑：它们会**真的建文章、真的派蒸馏任务**（真 LLM +
+真 TTS，单篇 100~250s），而 e2e 的 arq 队列是**全栈共享**的 ⇒ 一次全量 pytest
+就会给队列灌 4~10 个任务，把**后面**任何一次集成测试的等待时间拖长
+（2026-10-25 实测：某个任务在队列里排了 1381 秒，测试等不到就误报超时）。
+⇒ 判据写在 pyproject 的 `addopts`（`-m "not network and not integration"`），
+CI 与本地**同一份**表达式，不会漂移。
 """
 
 import asyncio
 import os
 import uuid
-from urllib.parse import urlparse
 
 import httpx
 import pytest
@@ -33,11 +46,21 @@ skip_in_ci = pytest.mark.skipif(
     reason="integration test requires running services (skipped in CI, run locally with services up)",
 )
 
-# 网关地址。默认指向隔离实例（18100），**不再默认打生产 8100** ——
-# 这个文件里的用例会真的建用户、建文章、派蒸馏任务，2026-10-02 实测因为
-# 默认值是 8100，一次全量 pytest 就往生产库灌了数据并占了 TTS 队列。
-# 隔离后端的起法见 admin-web/e2e-backend.sh。
-GATEWAY_URL = os.getenv("STASHBOX_GATEWAY", "http://127.0.0.1:18100")
+# 网关地址与生产端口守卫**统一用 conftest 的那一份**（`tests/integration/conftest.py`）。
+#
+# ⚠️ 2026-10-25 收口的原因：原来这个文件**自己又抄了一份** ——
+# 而且抄的是**会 raise 的那一版**：
+#     if urlparse(GATEWAY_URL).port in {8100, ...}:
+#         raise RuntimeError("拒绝执行：…")
+# `raise` 发生在**模块导入期** ⇒ 属于 collection error ⇒ 会让**整个 pytest
+# 收集中断**（退出码 2）—— 与本仓另外 1900+ 个毫无关系的用例一起跑不起来。
+# 而 conftest 里那份早就改成 `pytest.skip(allow_module_level=True)` 了
+# （注释里记着同一个坑：「raise 属于 collection error，会让整个 pytest 收集中断」）。
+# ⇒ 同一个坑的两份拷贝，其中一份还在流血。现在只有一份，且是 skip 版。
+#
+# 顺带：conftest 还有个 session 级 autouse fixture `require_gateway_up` ——
+# 网关没起就整目录 skip，而不是让每条用例各自抛 ConnectError。
+from tests.integration.conftest import GATEWAY_URL  # noqa: F401,E402
 
 # ── 剪藏夹具 URL ──────────────────────────────────────────────────────────
 #
@@ -73,12 +96,6 @@ GATEWAY_URL = os.getenv("STASHBOX_GATEWAY", "http://127.0.0.1:18100")
 # ⇒ 选 **iana.org 的说明页**：语义上仍是「保留示例域名」，
 # 且它的正文长度过了提取器的下限，**http 通道直接就能提取**。
 FIXTURE_URL = "https://www.iana.org/domains/example"
-
-if urlparse(GATEWAY_URL).port in {8100, 8101, 8102, 8103, 8104}:
-    raise RuntimeError(
-        f"拒绝执行：STASHBOX_GATEWAY={GATEWAY_URL} 指向生产端口，"
-        "这套 integration 用例会污染生产库并占住 TTS 队列。"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +241,8 @@ async def _poll_task_status(
 
 
 @pytest.mark.asyncio
+# ⚠️ live-service 用例：会真的建文章、派蒸馏任务 ⇒ 默认不跑（见文件头）。
+@pytest.mark.integration
 @skip_in_ci
 async def test_wechat_url_full_distill_pipeline():
     """
@@ -345,6 +364,8 @@ async def test_wechat_url_full_distill_pipeline():
 
 
 @pytest.mark.asyncio
+# ⚠️ live-service 用例：会真的建文章、派蒸馏任务 ⇒ 默认不跑（见文件头）。
+@pytest.mark.integration
 @skip_in_ci
 async def test_distill_failure_refund_quota():
     """
@@ -467,6 +488,8 @@ async def test_distill_failure_refund_quota():
 
 
 @pytest.mark.asyncio
+# ⚠️ live-service 用例：会真的建文章、派蒸馏任务 ⇒ 默认不跑（见文件头）。
+@pytest.mark.integration
 @skip_in_ci
 async def test_unsupported_url_returns_envelope_without_creating_article():
     """
@@ -513,6 +536,8 @@ async def test_unsupported_url_returns_envelope_without_creating_article():
 
 
 @pytest.mark.asyncio
+# ⚠️ live-service 用例：会真的建文章、派蒸馏任务 ⇒ 默认不跑（见文件头）。
+@pytest.mark.integration
 @skip_in_ci
 async def test_get_audio_before_distill_returns_404():
     """

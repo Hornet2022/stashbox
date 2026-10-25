@@ -16,8 +16,8 @@
 靠注释是不够的 —— 上一轮丢信号的原因恰恰就是「该跑什么」只写在注释里，
 而注释不会因为命令改了而报警。
 
-所以这里把 workflow 本身当被测对象：断言它确实覆盖了两棵树、确实带
-`-m "not network"`、确实没有整目录 --ignore。
+所以这里把 workflow 本身当被测对象：断言它确实覆盖了两棵树、确实没有整目录
+--ignore、确实**不**在命令里写 `-m`（marker 口径统一在 pyproject 的 addopts）。
 
 ## 还有一个隐蔽的失败模式
 
@@ -95,16 +95,68 @@ def test_两棵树_必须分开跑():
 # ---------------------------------------------------------------------------
 
 
-def test_ci_排除了_network_标记():
-    """每条 pytest 命令都要带 `-m "not network"`。
+def test_marker_口径_只在_pyproject_定义一次():
+    """workflow 里**不许**再写 `-m`：口径统一在 pyproject 的 addopts。
 
-    排除依据必须是 pytest marker（代码里），而不是 workflow 里的路径注释 ——
-    注释不会因为有人加了新文件而更新。
+    ⚠️ 为什么这是硬要求（2026-10-25 实测的机制）：
+    pytest 的 `-m` 是单值选项（`action="store"`）⇒ **命令行上的 `-m` 会覆盖
+    addopts 里的**。以前 workflow 写 `-m "not network"`、本地什么都不写 ⇒
+    CI 与本地的「跑哪些用例」是**两套口径**，只靠人记着；而 addopts 里的
+    表达式会被命令行那一条**整个顶掉**（不是叠加）⇒ 加了 addopts 也一样不生效。
+
+    ⇒ 口径写在一处（pyproject 的 addopts），workflow 与本地都不再写 `-m`；
+    显式 opt-in 时两边都加 `-m <marker>`（命令行覆盖 addopts，语义一致）。
     """
     for cmd in _pytest_run_blocks():
-        assert (
-            '-m "not network"' in cmd or "-m 'not network'" in cmd
-        ), f"这条 pytest 命令没排除 network 用例：{cmd.strip()[:80]}"
+        assert "-m " not in cmd, (
+            "pytest 命令里又出现 -m：口径会与 pyproject 的 addopts 漂移（"
+            f"命令行的 -m 会整个覆盖 addopts）。{cmd.strip()[:80]}"
+        )
+
+    text = PYPROJECT.read_text()
+    ini = text.split("[tool.pytest.ini_options]", 1)
+    assert len(ini) == 2, "找不到 [tool.pytest.ini_options] 段"
+    section = ini[1].split("[tool.ruff]", 1)[0]
+
+    assert "addopts" in section, "pyproject 里没有 addopts —— marker 口径没地方统一"
+    # 用 tomllib 正经解析 TOML，不要用正则：addopts 的值里带嵌套引号
+    # （'-m "not network and not integration"'），正则会在第一个引号处截断，
+    # 把表达式读成 "-m " —— 断言就成了「永远不成立」或「永远成立」的假信号。
+    import tomllib
+
+    with PYPROJECT.open("rb") as fh:
+        opts = tomllib.load(fh).get("tool", {}).get("pytest", {}).get("ini_options", {})
+    expr = opts.get("addopts", "")
+    assert "not network" in expr, f"addopts 没排除 network 用例：{expr!r}"
+    assert "not integration" in expr, f"addopts 没排除 integration 用例：{expr!r}"
+
+
+def test_live_service_用例_都打了_integration_标记():
+    """需要活的服务、会真的建文章派任务的用例，必须打 `integration` 标记。
+
+    为什么这条要单独断言：`integration` 标记是**默认排除**的唯一依据 ——
+    漏打一个文件，它就会在每次全量 pytest 时真跑，然后：
+      · 往 e2e 的共享 arq 队列里灌一个真蒸馏任务（真 LLM + 真 TTS，100~250s）；
+      · 把**后面**任何一次集成测试的等待时间拖长
+        （2026-10-25 实测：某个任务在队列里排了 1381 秒，测试等不到就误报超时）。
+
+    ⇒ 「新增一个 live-service 用例文件」必须同时打标记，否则默认套件会变慢、
+    变不稳，而且症状出现在**别的**测试上（极难定位）。
+    """
+    integration_dir = BACKEND_DIR / "tests" / "integration"
+    files = sorted(p for p in integration_dir.glob("test_*.py"))
+    assert files, "tests/integration/ 下一个测试文件都没有 —— 判据失效了"
+
+    for path in files:
+        src = path.read_text()
+        has_marker = "pytest.mark.integration" in src
+        # 本目录下的文件按约定必须显式声明；这里逐个点名，避免"目录里大部分
+        # 打了就算过"这种会随新文件退化的判据。
+        assert has_marker, (
+            f"{path.name} 没打 pytest.mark.integration —— "
+            "默认套件会真跑它（建文章 + 派蒸馏任务 + 拖慢后面的集成测试）。"
+            "确实是纯单测的话，把文件挪出 tests/integration/。"
+        )
 
 
 def test_network_标记_已在_pyproject_注册():
@@ -121,6 +173,9 @@ def test_network_标记_已在_pyproject_注册():
     assert (
         "network" in section
     ), "network marker 没注册 —— pytest 只会告警，-m 'not network' 形同虚设"
+    assert (
+        "integration" in section
+    ), "integration marker 没注册 —— pytest 只会告警，-m 'not integration' 形同虚设"
 
 
 def test_真实传输层_被封死():

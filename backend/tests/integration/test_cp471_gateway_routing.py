@@ -22,6 +22,13 @@ skip_in_ci = pytest.mark.skipif(
     reason="integration test requires running services (skipped in CI, run locally with services up)",
 )
 
+# ⚠️ live-service 用例 ⇒ 默认不跑，要显式 `pytest tests/integration -m integration`。
+#
+# 理由与判据见 `test_cp47_e2e_backend.py` 的文件头：这套用例会真的建用户、
+# 真的打活的网关，默认跑会让「全量 pytest」给 e2e 的共享 arq 队列灌任务。
+# 判据统一写在 backend/pyproject.toml 的 addopts 里（CI 与本地同一份表达式）。
+pytestmark = pytest.mark.integration
+
 
 @pytest.mark.asyncio
 @skip_in_ci

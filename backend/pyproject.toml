@@ -110,7 +110,24 @@ aiosqlite = "^0.22"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-# network：会真的发起公网请求的用例。CI 用 `-m "not network"` 排除。
+# ⚠️ marker 表达式**只在这里定义一次**（CI 的 workflow 里不再写 `-m`）。
+#
+# 为什么放 addopts 而不是 workflow：pytest 的 `-m` 是单值选项
+# （`action="store"`）⇒ **命令行上的 `-m` 会覆盖 addopts 里的**。
+# 以前 workflow 写 `-m "not network"`、本地什么都不写 ⇒ CI 与本地的
+# 「跑哪些用例」是**两套口径**，只靠人记着。⇒ 现在两边都吃同一份 addopts：
+#   · CI（workflow 不带 -m）→ 用这一份
+#   · 本地 `pytest tests/`      → 用这一份
+#   · 显式 opt-in（`-m integration` / `-m network`）→ 命令行覆盖 addopts
+#
+# 两条排除各管一类「会污染环境 / 会拖死 job」的用例：
+#   · network     —— 真出网，打的是 example.com / techcrunch.com 等 10 个真实站点
+#   · integration —— 需要活的本地服务，会**真的建文章、真的派蒸馏任务**
+#     （真 LLM + 真 TTS，单篇 100~250s；e2e 的 arq 队列是全栈共享的，
+#      一次全量 pytest 就会给它灌 4~10 个任务，把后面任何一次集成测试的
+#      等待时间拖长 —— 2026-10-25 实测有个任务在队列里排了 1381 秒）
+addopts = '-m "not network and not integration"'
+# network：会真的发起公网请求的用例。
 #
 # 为什么要显式注册而不是在 workflow 里写死路径：`content-service/tests/integration/
 # test_fetch_e2e.py` 打的是 example.com / techcrunch.com / news.sina.com.cn 等
@@ -121,12 +138,12 @@ testpaths = ["tests"]
 # 于是连**不**出网的 139 个用例也跟着一起失去了信号。改成标记之后，
 # 该跑的跑、该排除的排除，且排除依据写在代码里而不是写在注释里。
 markers = [
-    "network: 真的访问公网，CI 排除（-m 'not network'）",
+    "network: 真的访问公网，默认排除（-m 'not network' 可显式跑）",
     # content-service/tests/integration/test_fetch_e2e.py 在用，但一直没注册。
     # 未注册不会报错（除非开 --strict-markers），只会每次跑都吐一条
     # PytestUnknownMarkWarning —— 而这正是「标记写了、没人看得见」的那类隐患：
     # 真到有人靠标记做筛选时，它并不会报错，只是静默不生效。
-    "integration: 需要多服务/跨服务边界的集成用例",
+    "integration: 需要多服务/跨服务边界的集成用例，默认排除（-m 'integration' 可显式跑）",
 ]
 
 [tool.ruff]
