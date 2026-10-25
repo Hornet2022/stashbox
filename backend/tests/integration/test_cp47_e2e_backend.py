@@ -6,9 +6,16 @@ CP4.7-E2E-BACKEND 端到端集成测试（content-service → ai-service → aud
 2. 配额不足 → 402/403
 3. 不支持的 URL → 边界处理
 
-注意：POST /api/v1/articles/{id}/distill 在 gateway 中通过 fallback
-（第一段 "articles" → content-service）路由，但 content-service 无此端点。
-实际使用 /api/v1/distill/start（显式路由到 ai-service）。
+所有请求都走网关（gateway）—— 网关对这三个端点都有**显式路由**：
+    POST /api/v1/articles/{id}/distill  → ai-service
+    GET  /api/v1/distill/{task_id}       → ai-service
+    GET  /api/v1/articles/{id}/status    → content-service
+（见 api-gateway/config.py 的 CP4.7.1 与 api-gateway/main.py 的 `_resolve_target`；
+查询参数整条透传，见 `params=request.query_params`。）
+
+⚠️ 早期版本这里**直连 ai-service**（端口从网关 +3 推导），而那台机的 8103 是
+**生产**端口 ⇒ 会把测试任务派进生产队列。已改回全部走网关 ——
+理由与事故记录见下面「不要在这个文件里直连 ai-service」那段注释。
 """
 
 import asyncio
@@ -88,10 +95,75 @@ async def _login_via_wechat(code: str = "cp47_e2e_test") -> tuple[str, str]:
         return data["access_token"], data["user_id"]
 
 
+# ── 等待预算 ────────────────────────────────────────────────────────────────
+#
+# ⚠️ 2026-10-25 定位到的真根因（这个文件之前「时红时绿」的原因）：
+#
+# 这个 e2e 环境的 arq 队列是**全栈共享**的，而**每一次 POST /api/v1/articles
+# 都会自动派发一次真实的蒸馏任务**（真实 LLM + 真实 TTS，实测单篇 100~160s）。
+# 上一轮跑测试留下的任务会排在下一轮前面 ——
+# arq worker 日志里那一行 `delayed=` 就是**排队时长**
+# （arq 源码 worker.py:593：`delayed=(start_ms - score)/1000`），实测那一轮：
+#
+#     15:50:30 → delayed=1158.04s      （排了 19 分钟）
+#     16:03:19 → delayed=1634.00s      （排了 27 分钟）
+#     16:08:55 → delayed=1849.33s      （排了 31 分钟）
+#
+# 而这里原来的等待预算是**拍脑袋的单一常数**（用例1 等 600s、用例2 等 900s）⇒
+# 真实耗时（排队 + 执行）一旦超过预算，用例就红，**而链路本身没坏**
+# （同一个任务后来正常跑完了，worker 日志里有对应的 `←` 行）。
+# 2026-10-25 实测那一轮：
+#   · 用例1 的任务排了 1123s 才起跑（预算 600s）⇒ 必红；
+#   · 用例2 的任务排了 780s + 执行 138s = 918s，**差 18 秒**超过 900s ⇒ 也红。
+# 而把队列排空后用**同一份代码**重跑 ⇒ 4 passed（366s）。
+#
+# ⇒ 修法不是「把常数调大一点」，而是**把排队和执行分开算**：
+#   · **排队**是环境属性（队列里排在我前面有几个任务），不是这条链路的行为；
+#   · **执行**才是这条链路的行为（起跑后多久出结果）。
+# 怎么知道「起跑了」？content-service 的 `GET /articles/{id}/status` 里的 `stage`：
+# ai-service 的 agent 第一个节点（fetch）一开跑就写 stage
+# （common/distill_stage.py），跑完还会清掉 ⇒ stage 出现 = worker 已经取走任务。
+#
+# 预算用**轮询次数**表达（每次轮询间隔 1 秒 ⇒ 次数 ≈ 秒），和原实现的
+# `for i in range(timeout)` 同一个口径。
+
+#: 排队阶段的预算（轮询次数）。
+#: 依据：实测这个共享队列的排队最长 1849s ⇒ 取 2400（40 分钟）留足余量。
+#: 这不是无限等：超过它说明 worker 根本没在消费队列，要报错而不是挂着。
+QUEUE_BUDGET_POLLS = 2400
+
+#: 执行阶段的预算（轮询次数）：起跑之后多久必须出结果。
+#: 依据：arq worker 实测单任务执行 103~160s（`←` 行），ai-service/main.py 的
+#: 注释也记着「实测单篇 2~4 分钟」⇒ 600 有 3~6 倍余量。
+EXEC_BUDGET_POLLS = 600
+
+
+async def _read_stage(client: httpx.AsyncClient, article_id: str, auth: dict) -> str | None:
+    """读文章当前的蒸馏阶段；None = worker 还没取走任务（或已跑完并清掉了）。
+
+    为什么要它：把「还在排队」和「已经开跑」分开 —— 前者是队列积压（环境属性，
+    不该让用例背锅），后者才是这条链路自己的责任。
+    """
+    resp = await client.get(f"/api/v1/articles/{article_id}/status", headers=auth)
+    if resp.status_code != 200:
+        return None
+    try:
+        return resp.json().get("stage")
+    except Exception:  # noqa: BLE001 —— 读不到阶段不能影响主流程
+        return None
+
+
 async def _poll_task_status(
-    client: httpx.AsyncClient, task_id: str, auth: dict, timeout: int = 600
+    client: httpx.AsyncClient,
+    task_id: str,
+    auth: dict,
+    article_id: str,
+    *,
+    queue_budget_polls: int = QUEUE_BUDGET_POLLS,
+    exec_budget_polls: int = EXEC_BUDGET_POLLS,
+    poll_interval_s: float = 1.0,
 ) -> dict:
-    """轮询 GET /api/v1/distill/{task_id} 直到 status == 'ready'（最多 timeout 秒）。
+    """轮询 GET /api/v1/distill/{task_id} 直到对外状态是 'ready'。
 
     CP9.x 起蒸馏是真实 LLM（火山 ark）+ 真实 TTS（indextts）流水线，单任务
     端到端需要数分钟（step1 结构化 → step2 改写 → step3 TTS → step4 拼接），
@@ -106,8 +178,25 @@ async def _poll_task_status(
         产物表 queued / step1~4 → articles.status（pending 或 distilling）
     原来这里等的是内部值 "done" ⇒ **永远等不到**（外层看到的是 "ready"）⇒
     用例一路轮询到超时才失败，症状像「蒸馏卡住」，实际是判据用错了状态层。
+
+    ⚠️ 预算分**排队段 / 执行段**两段（依据见文件头「等待预算」的说明）：
+    单一常数在共享队列有积压时会误报「超时」，而任务其实只是排在别人后面。
+    排队段靠 `stage` 判定是否已起跑（见 `_read_stage`）。
     """
-    for i in range(timeout):
+    data: dict = {}
+    stage: str | None = None
+    running = False
+    phase_polls = 0
+    total_polls = 0
+    while True:
+        # 先读 stage、再读任务状态：这样「worker 取走了任务」这一事实
+        # 在同一轮里就能被看到，不会晚一轮才切到执行段。
+        if not running:
+            stage = await _read_stage(client, article_id, auth)
+            if stage:
+                running = True
+                phase_polls = 0  # 执行段重新计时
+
         resp = await client.get(f"/api/v1/distill/{task_id}", headers=auth)
         assert resp.status_code == 200, f"task status poll failed: {resp.status_code} {resp.text}"
         data = resp.json()
@@ -115,8 +204,18 @@ async def _poll_task_status(
             return data
         if data.get("status") in ("failed", "error"):
             pytest.fail(f"蒸馏任务失败: {data}")
-        await asyncio.sleep(1)
-    pytest.fail(f"任务 {task_id} 状态轮询超时：最后 status={data}")
+
+        budget = exec_budget_polls if running else queue_budget_polls
+        phase_polls += 1
+        total_polls += 1
+        if phase_polls > budget:
+            phase = "已经起跑但没跑完" if running else "还在排队（worker 还没取走任务）"
+            pytest.fail(
+                f"任务 {task_id} 等待超时：{phase}；"
+                f"本段已等 {phase_polls}s（预算 {budget}s），累计 {total_polls}s；"
+                f"最后 status={data.get('status')} stage={stage}"
+            )
+        await asyncio.sleep(poll_interval_s)
 
 
 # ---------------------------------------------------------------------------
@@ -185,10 +284,11 @@ async def test_wechat_url_full_distill_pipeline():
         job_id = distill_data.get("job_id") or task_id
         print(f"[CP4.7] 蒸馏任务已入队: task_id={task_id}, job_id={job_id}")
 
-        # Step 3: 轮询任务状态直到 ready（真实 LLM+TTS 流水线，最多 600s）
+        # Step 3: 轮询任务状态直到 ready（真实 LLM+TTS 流水线）
         # ⚠️ 对外状态是 "ready"（内部 done 经 common/distill_status.derive_distill_status 派生），
         # 不是内部状态机的 "done" —— 判据用错状态层会一路轮询到超时。
-        task_data = await _poll_task_status(client, task_id, auth, timeout=600)
+        # ⚠️ 预算是**两段**的（排队段 / 执行段），依据见文件头「等待预算」。
+        task_data = await _poll_task_status(client, task_id, auth, article_id)
         assert task_data["status"] == "ready", f"蒸馏未完成: status={task_data['status']}"
         print(f"[CP4.7] 蒸馏完成: task_status={task_data['status']}")
 
@@ -216,39 +316,32 @@ async def test_wechat_url_full_distill_pipeline():
 # ---------------------------------------------------------------------------
 
 
-# ai-service 直连端口（gateway 路由 articles/* → content-service，
-# 不走 /articles/{id}/distill 故需直打 ai-service）
-def _ai_service_url() -> str:
-    """ai-service 直连地址 —— 从网关地址推导，**不写死端口**。
-
-    为什么必须推导：这条用例要直打 ai-service（`/articles/{id}/distill` 在
-    gateway 里 fallback 到 content-service，那边没这个端点）。原来这里写死
-    `http://localhost:8103`，而 8103 是**生产** ai-service 的端口，且它真的在
-    监听（本机 lsof 实测）。于是把 STASHBOX_GATEWAY 指向 e2e 网关（:18100）
-    跑这套用例时，会发生最坏的一种组合：
-
-        用户/文章建在**隔离库**（stashbox_e2e）
-        蒸馏任务却入队到**生产** ai-service
-
-    —— 用例在"隔离环境"跑，却往生产队列派活、占 TTS、写生产库。
-    和 e2e-backend.sh 注释里记的那次事故同一类（那次是网关上游没全指到 e2e
-    实例，音色写进了生产 bucket）：静默默认值比没有默认值危险。
-
-    推导规则：两套环境网关与 ai-service 的端口差都是 +3
-    （生产 8100→8103、e2e 18100→18103），所以从网关端口 +3 即可。
-    需要覆盖时显式设 STASHBOX_AI_SERVICE。
-    """
-    override = os.getenv("STASHBOX_AI_SERVICE")
-    if override:
-        return override
-    parsed = urlparse(GATEWAY_URL)
-    scheme = parsed.scheme or "http"
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or (443 if scheme == "https" else 80)
-    return f"{scheme}://{host}:{port + 3}"
-
-
-AI_SERVICE_URL = _ai_service_url()
+# ⚠️ **不要在这个文件里直连 ai-service**（2026-10-25 改）。
+#
+# 原来这里有个 `_ai_service_url()`：从网关端口 +3 推出 ai-service 的直连地址，
+# 理由是「`/articles/{id}/distill` 在 gateway 里 fallback 到 content-service，
+# 那边没这个端点」。但那个前提早就**不成立**了 ——
+# 网关现在对这条路径是**显式路由**（api-gateway/config.py 的 CP4.7.1，
+# 以及 api-gateway/main.py 的 `_resolve_target`：`articles/` 开头的路径里
+# 带 `/distill` 的优先走 ai-service），查询参数也整条透传。
+#
+# 而直连的代价是实打实的：这台机的 **8103 是生产 ai-service 的端口**，
+# 且它真的在监听（本机 lsof 实测）。当时写死 `http://localhost:8103`，
+# 于是把 STASHBOX_GATEWAY 指向 e2e 网关（:18100）跑这套用例时，
+# 会发生最坏的一种组合：
+#
+#     用户/文章建在**隔离库**（stashbox_e2e）
+#     蒸馏任务却入队到**生产** ai-service
+#
+# —— 用例在「隔离环境」跑，却往生产队列派活、占 TTS、写生产库。
+# 和 e2e-backend.sh 注释里记的那次事故同一类（那次是网关上游没全指到
+# e2e 实例，音色写进了生产 bucket）：**静默默认值比没有默认值危险**。
+#
+# ⇒ 结论不是「把端口推导做得更聪明」，而是**根本不需要直连**：
+# 网关已经把三个相关端点都显式路由好了，统一走网关即可
+# （`/articles/{id}/distill`→ai-service、`/distill/{id}`→ai-service、
+# `/articles/{id}/status`→content-service），
+# 而且那才是 App 实际走的那条路。
 
 
 @pytest.mark.asyncio
@@ -277,8 +370,10 @@ async def test_distill_failure_refund_quota():
     再 POST `simulate_failure=true` → 这时才会真的入队一个「注定失败」的任务
     （失败在 agent 之前抛出，不烧 LLM/TTS，几秒内就结束）。
 
-    另注：`/articles/{id}/distill` 在 gateway 里显式路由到 ai-service
-    （不是 fallback），所以这里直打 ai-service 是为了看 job_id。
+    另注：`/articles/{id}/distill` 在 gateway 里**显式路由**到 ai-service
+    （不是 fallback —— 见 api-gateway/config.py 的 CP4.7.1 与 main.py 的
+    `_resolve_target`），查询参数也整条透传（`params=request.query_params`）⇒
+    这里统一走网关即可，不必直连 ai-service（网关才是 App 实际走的那条路）。
     """
     import uuid
 
@@ -309,13 +404,12 @@ async def test_distill_failure_refund_quota():
         quota_before = (await client.get("/api/v1/users/me/quota", headers=auth)).json()
         assert quota_before["quota_used"] == 1, quota_before
 
-    async with httpx.AsyncClient(base_url=AI_SERVICE_URL, timeout=60.0) as ai_client:
         # 等自动派的那次蒸馏跑完 —— 否则幂等守卫会吞掉 simulate_failure
         assert auto_task_id, "创建响应里没有 task_id，无法等自动蒸馏"
-        await _poll_task_status(ai_client, auto_task_id, auth, timeout=900)
+        await _poll_task_status(client, auto_task_id, auth, article_id)
 
         # 现在再请求「模拟失败」：守卫不该命中（已有任务是 done）
-        distill_resp = await ai_client.post(
+        distill_resp = await client.post(
             f"/api/v1/articles/{article_id}/distill",
             headers=auth,
             params={"simulate_failure": "true"},
@@ -341,22 +435,30 @@ async def test_distill_failure_refund_quota():
         # （`_derive_status` 以 articles.status 为准）—— 那里才是 "failed"。
         #
         # Arq 的重试退避是 15s + 30s ⇒ 终局失败在 ~1 分钟后出现。
-        async with httpx.AsyncClient(base_url=GATEWAY_URL, timeout=30.0) as gw_client:
-            for _ in range(180):
-                st = await gw_client.get(f"/api/v1/articles/{article_id}/status", headers=auth)
-                assert st.status_code == 200, f"文章状态查询失败: {st.status_code} {st.text}"
-                status_data = st.json()
-                if status_data.get("status") == "failed":
-                    break
-                await asyncio.sleep(1)
-            else:
-                pytest.fail(f"文章状态没有变成 failed: {status_data}")
+        for _ in range(180):
+            st = await client.get(f"/api/v1/articles/{article_id}/status", headers=auth)
+            assert st.status_code == 200, f"文章状态查询失败: {st.status_code} {st.text}"
+            status_data = st.json()
+            if status_data.get("status") == "failed":
+                break
+            await asyncio.sleep(1)
+        else:
+            pytest.fail(f"文章状态没有变成 failed: {status_data}")
 
-    # 失败 ⇒ 配额退还（剪藏时扣的那 1 次要退回来）
-    async with httpx.AsyncClient(base_url=GATEWAY_URL, timeout=30.0) as client:
-        quota_after = (await client.get("/api/v1/users/me/quota", headers=auth)).json()
-    assert quota_after["quota_used"] == 0, f"蒸馏失败后配额应退还: {quota_after}"
-    print(f"[CP4.7] 蒸馏失败验证通过，配额已退还: {quota_after}")
+        # 失败 ⇒ 配额退还（剪藏时扣的那 1 次要退回来）
+        #
+        # ⚠️ 退款发生在**文章落 failed 之后**（distill_task 里是先 commit
+        # articles.status='failed'，再 _refund_quota_once）⇒ 看到 failed 的
+        # 那一刻配额**可能还没退**。原来这里只读一次 ⇒ 竞态（差几十毫秒就红）。
+        # 改成有界轮询：给退款留 30 秒窗口，而不是赌它已经发生。
+        quota_after: dict = {}
+        for _ in range(30):
+            quota_after = (await client.get("/api/v1/users/me/quota", headers=auth)).json()
+            if quota_after["quota_used"] == 0:
+                break
+            await asyncio.sleep(1)
+        assert quota_after["quota_used"] == 0, f"蒸馏失败后配额应退还: {quota_after}"
+        print(f"[CP4.7] 蒸馏失败验证通过，配额已退还: {quota_after}")
 
 
 # ---------------------------------------------------------------------------
@@ -440,3 +542,126 @@ async def test_get_audio_before_distill_returns_404():
             audio_resp.status_code == 404
         ), f"未蒸馏文章应返回 404，实际 {audio_resp.status_code}: {audio_resp.text}"
         print("[CP4.7] 未蒸馏 audio-url 正确返回 404")
+
+
+# ---------------------------------------------------------------------------
+# 等待预算的回归测试（纯本地，不碰任何服务 ⇒ CI 也跑）
+# ---------------------------------------------------------------------------
+
+
+def _fake_gateway_after(worker_picks_up_at: int, completes: bool = True):
+    """造一个假的网关：worker 在第 N 次轮询之后才把任务取走。
+
+    返回 (handler, state)：
+    · `GET /api/v1/distill/{id}` —— 取走之前一直是 "distilling"，之后 "ready"
+    · `GET /api/v1/articles/{id}/status` —— 取走之前 stage=None，之后 stage="tts"
+
+    `completes=False` 用来演「worker 取走了任务但一直没跑完」。
+
+    stage 就是「worker 已经取走任务」的信号（ai-service 的 agent 第一个节点
+    一开跑就写它，见 common/distill_stage.py）。
+    """
+    state = {"polls": 0, "taken": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.startswith("/api/v1/distill/"):
+            state["polls"] += 1
+            if state["taken"] and completes:
+                return httpx.Response(200, json={"status": "ready", "task_id": "dst_fake"})
+            return httpx.Response(200, json={"status": "distilling", "task_id": "dst_fake"})
+        if path.endswith("/status"):
+            if state["polls"] >= worker_picks_up_at:
+                state["taken"] = True
+                return httpx.Response(200, json={"status": "distilling", "stage": "tts"})
+            return httpx.Response(200, json={"status": "distilling", "stage": None})
+        return httpx.Response(404, json={"code": 40400})
+
+    return handler, state
+
+
+@pytest.mark.asyncio
+async def test_poll_survives_queue_delay_beyond_legacy_budget():
+    """排队超过**老预算**才起跑 ⇒ 老口径必红、两段预算必须绿。
+
+    这是 2026-10-25 那个「时红时绿」的最小复现：
+    共享队列里有别的任务排在我前面 ⇒ 任务实际等待 = 排队 + 执行，
+    而老实现只有**一个**预算（600 次轮询），排队长一点就误报「超时」。
+
+    本用例用假网关把「排队 700 次」演出来，然后断言：
+      ① 老口径（单一预算 600）**失败** —— 证明这个场景老实现扛不住；
+      ② 新口径（排队段预算更大）**通过** —— 证明修复真的解了这个场景。
+    """
+    handler, _ = _fake_gateway_after(worker_picks_up_at=700)
+    auth = {"Authorization": "Bearer fake"}
+
+    # ① 老口径：单一预算 600 次（= 原来那个拍脑袋的常数）
+    with pytest.raises(pytest.fail.Exception, match="等待超时"):
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://fake"
+        ) as client:
+            await _poll_task_status(
+                client,
+                "dst_fake",
+                auth,
+                "art_fake",
+                queue_budget_polls=600,
+                exec_budget_polls=600,
+                poll_interval_s=0,
+            )
+
+    # ② 新口径：排队段与执行段分开算 ⇒ 排 700 次也能等到结果
+    handler, _ = _fake_gateway_after(worker_picks_up_at=700)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://fake"
+    ) as client:
+        data = await _poll_task_status(
+            client,
+            "dst_fake",
+            auth,
+            "art_fake",
+            poll_interval_s=0,
+        )
+    assert data["status"] == "ready", data
+
+
+@pytest.mark.asyncio
+async def test_poll_reports_queue_phase_vs_running_phase():
+    """超时时要说清是「还在排队」还是「已经起跑但没跑完」。
+
+    为什么：这两个是完全不同的故障（前者是队列积压/环境问题，后者是链路坏了），
+    混成一句「超时」就还得再查一轮 —— 而这正是 2026-10-25 定位花时间的原因。
+    """
+    handler, _ = _fake_gateway_after(worker_picks_up_at=10_000)
+    auth = {"Authorization": "Bearer fake"}
+
+    # 一直排不上队 ⇒ 报「还在排队」
+    with pytest.raises(pytest.fail.Exception, match="还在排队"):
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://fake"
+        ) as client:
+            await _poll_task_status(
+                client,
+                "dst_fake",
+                auth,
+                "art_fake",
+                queue_budget_polls=5,
+                exec_budget_polls=5,
+                poll_interval_s=0,
+            )
+
+    # worker 取走了任务但一直没跑完 ⇒ 报「已经起跑但没跑完」
+    handler, _ = _fake_gateway_after(worker_picks_up_at=2, completes=False)
+    with pytest.raises(pytest.fail.Exception, match="已经起跑但没跑完"):
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://fake"
+        ) as client:
+            await _poll_task_status(
+                client,
+                "dst_fake",
+                auth,
+                "art_fake",
+                queue_budget_polls=100,
+                exec_budget_polls=5,
+                poll_interval_s=0,
+            )
