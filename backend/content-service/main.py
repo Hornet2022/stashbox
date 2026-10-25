@@ -93,6 +93,7 @@ from stashbox.backend.common.exceptions import (
 )
 from stashbox.backend.common.logging import get_logger, setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
+from stashbox.backend.common.middleware.memory_trim import MemoryTrimMiddleware
 from stashbox.backend.common.models import (
     AdminOperationLog,
     Article,
@@ -127,6 +128,13 @@ log = get_logger(__name__)
 app = FastAPI(title="stashbox-content-service", version="0.3.0")
 register_exception_handlers(app)
 app.add_middleware(RequestIDMiddleware)
+# 内存回收（2026-10-25 生产事故）：content-service 被 cgroup memory.high
+# **节流永久冻死**（进程 D 状态 ⇒ 请求永不返回 + 整个服务不响应 + SIGKILL
+# 都杀不掉）。顶穿水位线的是**常驻内存** —— 实测每次剪藏留下约 26MiB 的
+# **分配器碎片**（gc 收不掉，malloc_trim 能全部收回）。
+# ⇒ 请求结束后按阈值把碎片还给内核，常驻内存就不会随剪藏次数爬升。
+# 详见 common/middleware/memory_trim.py 的说明与实测数据。
+app.add_middleware(MemoryTrimMiddleware)
 install_health_endpoints(app)
 # CORS（CP7.3.5）：content-service 此前没装 CORS 中间件，浏览器直连被拦，admin-web
 # 只能用 vite proxy 绕过 —— 生产部署没有 proxy，这里必须后端真支持。
