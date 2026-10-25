@@ -61,9 +61,20 @@ async def client(user_main):
         yield c
 
 
-def _ip() -> str:
-    """每个用例一个独立 IP —— 限流按 IP 分桶，天然隔离用例之间互不影响。"""
-    return f"198.51.100.{uuid.uuid4().int % 250 + 1}"
+def _ip(exclude: str | None = None) -> str:
+    """每个用例一个独立 IP —— 限流按 IP 分桶，天然隔离用例之间互不影响。
+
+    `exclude` 保证「要比较的两个 IP」一定不是同一个：IP 池只有 250 个，
+    两次独立随机有 **1/250（实测 0.39%）** 的概率抽到同一个 ——
+    那样「换个 IP 不该受影响」那条用例就是**自己把自己限流了**
+    （hot 用满了额度，cold 恰好是同一个 IP ⇒ 429 ⇒ 断言红）。
+    表现是「单跑绿、全量跑红」的典型低频偶发失败（2026-10-25 全量套件撞到一次）。
+    """
+    for _ in range(1000):
+        ip = f"198.51.100.{uuid.uuid4().int % 250 + 1}"
+        if ip != exclude:
+            return ip
+    raise RuntimeError("IP 池里取不到不冲突的地址（250 个池子不该发生）")
 
 
 @pytest.fixture(autouse=True)
@@ -118,10 +129,22 @@ async def test_login_rate_limited_after_threshold(client):
 # ---------------------------------------------------------------------------
 # B. 按 IP 隔离
 # ---------------------------------------------------------------------------
+def test_ip_pool_never_returns_the_excluded_address():
+    """`_ip(exclude=...)` 必须真的换个地址（这条是 B 的前置条件）。
+
+    为什么单独锁：IP 池只有 250 个，两次独立随机有 1/250 的概率撞上 ——
+    撞上时「换个 IP 不该受影响」那条用例会**自己把自己限流**，
+    表现为「单跑绿、全量跑红」的偶发失败（2026-10-25 全量套件撞到一次）。
+    """
+    for _ in range(500):
+        base = _ip()
+        assert _ip(exclude=base) != base
+
+
 async def test_rate_limit_is_per_ip(client):
     """一个 IP 超限，不影响另一个 IP（否则一人刷爆，全内测用户都登不进去）。"""
     hot = _ip()
-    cold = _ip()
+    cold = _ip(exclude=hot)
 
     for _ in range(4):
         await client.post(
