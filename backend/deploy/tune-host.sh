@@ -565,15 +565,20 @@ fi
 # 8. cgroup 内存上限（PG / Redis / nginx）
 # ═════════════════════════════════════════════════════════════════════
 say "cgroup 内存上限"
-# 5 个 Python 单元的 MemoryMax 之和是 1088M（见 deploy/systemd/README.md）。
+# 5 个 Python 单元的 MemoryMax 之和是 904M（见 deploy/systemd/README 的限额表
+# 与 deploy/README.md §9.3 的预算表 —— 两处是同一份账，改一处要改另一处）。
 # 这三个不是我们的单元，但它们同样在这台机器上 —— 不给上限的话，
 # PG 连接数暴涨就能把 2 GiB 吃光，Python 服务一个都活不下来。
-# 这三个上限之和：448 + 192 + 64 = 704M。
-# 合计：1088 + 704 + OS/journald ~150 = 1942M < 2048M ✓
+# 这三个上限之和：288 + 128 + 48 = 464M。
+# 合计：904 + 464 + OS/journald ~150 = 1518M < 1613M ✓（余量 95M）
 #
+# ⚠️ 物理内存实测 1613MB（不是标称 2 GiB）—— 数字都按 1613 算。
 # ⚠️ PostgreSQL 的 MemoryMax 触顶 = PG 被 OOM kill = 数据面掉线。
-#    448M 是按「shared_buffers 96MB + 40 条连接 × 6MB + 进程开销」估的，
-#    留了约 25% 余量。真不够用时先降 max_connections，别直接抬这个值。
+#    288M 是按「shared_buffers 64MB + ≤30 条连接 × ~6MB + 进程开销」估的
+#    （实测 PG 的 RSS 只有 23MB），留了约 25% 余量。
+#    真不够用时先降 max_connections，别直接抬这个值。
+#    2026-10-25 从 320M 收到 288M：给 content-service 的 MemoryMax
+#    176M→224M 腾位置（它要装得下一次剪藏的峰值，见 deploy/README.md 9.3）。
 write_cgroup_cap() {
   local unit="$1" high="$2" max="$3" comment="$4"
   # ⚠️ drop-in 目录名必须是**完整单元名 + .d**（`redis-server.service.d`），
@@ -672,7 +677,7 @@ MemoryMax=$max"
 # ⚠️ 真不够用时的正确顺序：先降 PG 的 max_connections 和 shared_buffers，
 #    再降 Redis maxmemory，**最后**才动 Python 单元的 MemoryMax ——
 #    PG 被 OOM kill 的代价（数据面全断）远大于单个 Python 单元重启。
-write_cgroup_cap_template 'postgresql@' 224M 320M "PostgreSQL 内存上限（1613MB 实测机器）"
+write_cgroup_cap_template 'postgresql@' 224M 288M "PostgreSQL 内存上限（1613MB 实测机器）"
 write_cgroup_cap redis-server 96M 128M "Redis 内存上限（1613MB 实测机器）"
 write_cgroup_cap nginx 24M 48M "nginx 内存上限（1613MB 实测机器）"
 

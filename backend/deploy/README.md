@@ -633,34 +633,95 @@ cd backend/deploy && ./preflight.sh /etc/stashbox/stashbox.env
 |---|---|---|---|---|
 | api-gateway | 17–40 MB | 60–90 MB | High 96M / **Max 128M** | 只做转发 + JWT 校验；上限 ≈1.4× 实测峰值 |
 | user-service | 17–40 MB | 60–90 MB | High 96M / **Max 128M** | bcrypt + PG 连接池 |
-| content-service | 17–40 MB | 60–90 MB | High 128M / **Max 176M** | 整页 HTML 与解析结果同时在内存里 |
+| content-service | 17–40 MB | 60–90 MB | High 160M / **Max 224M** | **剪藏路径的稳态峰值**：整页 HTML + 配图下载 + VLM 请求体（见下「剪藏路径」） |
 | ai-service | 17–40 MB | 60–90 MB | High 144M / **Max 200M** | LLM 响应 JSON + 音频缓冲 |
 | ai-worker | 17–40 MB | 60–90 MB | High 168M / **Max 224M** | 唯一会 fork ffmpeg 的（子进程同 cgroup） |
-| **五个常驻进程合计** | **~90 MB** | **~400 MB** | **856M** | MemoryMax 之和 |
-| PostgreSQL | 200–300 MB | — | cgroup **320M** | shared_buffers 64MB + ≤30 连接 × ~6MB |
+| **五个常驻进程合计** | **~90 MB** | **~400 MB** | **904M** | MemoryMax 之和 |
+| PostgreSQL | 200–300 MB | — | cgroup **288M** | shared_buffers 64MB + ≤30 连接 × ~6MB（实测 RSS 23MB） |
 | Redis | ~50 MB | — | cgroup **128M** | maxmemory 64mb + 开销 |
 | nginx | ~10 MB | — | cgroup **48M** | TLS + 反代 |
 | OS + systemd + journald | ~150 MB | — | journald `SystemMaxUse=200M` | 实测 |
 | ffmpeg 峰值（转码中） | 18 MB | 18 MB | 计入 ai-worker 的 cgroup | 实测 4MB WAV→64kbps AAC，墙钟 0.35s |
-| **合计（硬上限）** | **~550 MB** | **~860 MB** | **1352M / 1613M** | **余量 261M** + 2 GiB swap 兜底 |
+| **合计（硬上限）** | **~550 MB** | **~860 MB** | **1368M / 1613M** | **余量 245M** + 2 GiB swap 兜底 |
+
+### 9.3.1 剪藏路径：content-service 的峰值从哪来（2026-10-25 生产事故）
+
+「空闲 17-40 MB、80 并发 60-90 MB」这组数字**不含剪藏路径** ——
+而剪藏才是它内存最重的一条路。实测（一篇 17 图的微信文）：
+
+| 环节 | 修前 | 修后 |
+|---|---|---|
+| 抓取（3.6MB 整页 + 解析） | +9 MB | +9 MB |
+| 配图下载（17 张，合计 9.1MB） | +12 MB | +10 MB |
+| **识图（VLM 请求体）** | **+50 MB** | **+5 MB** |
+| **稳态边际成本合计** | **+48 MB** | **+21 MB** |
+
+**为什么识图那么肥**：`_ocr_one_image` 把**原始图片字节**直接 base64 塞进请求体，
+每张图的字节被复制 4~5 遍（原始 → base64 串 → JSON 串 → utf-8 字节 → 请求体）。
+12 张图 ⇒ 瞬时几十 MB。**顺带一提：VLM 的视觉 token 按图面积算 ⇒ 图小了 token 也少。**
+
+⇒ 现在的两道闸门（都在 `backend/content-service/fetchers/`）：
+1. **识图前缩图**（`ocr.shrink_image_for_vlm`，Pillow）—— 收口在**唯一**拼请求体的那一处；
+2. **单篇配图总字节预算**（`media_ocr.MAX_MEDIA_TOTAL_BYTES`）——
+   只限张数限不住内存（12×5MB 与 12×50KB 内存差 10 倍）。
+
+### 9.3.2 ⚠️ `MemoryHigh` 触发的是**永久冻死**，不是「回收压力」
+
+原预算表里写的是「`MemoryHigh`（软限）触发的是回收压力，不是杀进程；正常流量不会碰到」。
+**2026-10-25 实测推翻了后半句，也纠正了前半句的措辞**：
+
+cgroup v2 的 `memory.high` 是**节流**——越过水位线的分配会被内核挡在回收路径上，
+进程进入 **D 状态**（`wchan=mem_cgroup_handle_over_high`）。后果：
+
+1. 那个请求**永远不返回**（用户看到转圈到天荒地老）；
+2. **整个服务都不响应** —— 连 `GET /api/v1/articles`（列表查询）也一起超时；
+3. 进程在 D 状态 ⇒ **SIGKILL 都杀不掉** ⇒ 不会自愈、不会自动重启、不会告警；
+4. `memory.events` 里 `high 19414`（超水位被节流 19414 次）、`oom 0`
+   —— **「没 OOM」不等于「没事」**（压根没走到 OOM killer 那一步）。
+
+⇒ 判据要改成「**稳态峰值 + 余量**」，而不是「空闲/并发实测」。
+
+**处置（卡住了怎么办）**：
+
+```bash
+# ① 确认是不是被节流冻死了
+PID=$(systemctl show -p MainPID --value stashbox-content-service)
+ps -o pid,stat,wchan:28,rss -p "$PID"      # stat 含 D + wchan=mem_cgroup_handle_over_high ⇒ 就是它
+cat /sys/fs/cgroup/system.slice/stashbox-content-service.service/memory.events   # high 计数在涨 = 还在被节流
+
+# ② 先把水位临时抬上去，让被冻结的进程能继续跑完（D 状态杀不掉）
+CG=/sys/fs/cgroup/system.slice/stashbox-content-service.service
+echo 512M > $CG/memory.high && echo 512M > $CG/memory.max
+
+# ③ 重启服务拿一个干净进程（注意：restart 会把 cgroup 限额重置回 unit 里的值）
+systemctl restart stashbox-content-service
+
+# ④ 恢复 unit 里的限额（如果第 ③ 步没自动恢复）
+systemctl daemon-reload && systemctl restart stashbox-content-service
+```
+
+⚠️ 第 ② 步的抬水位是**急救**，不是修复：只要稳态峰值还是超过水位线，
+下一次剪藏会重新冻死 ⇒ 必须同时把代码侧的内存闸门补上。
 
 要点：
 
-- **所有硬上限加起来是 1352M ≤ 1613M × 0.85**。所以不会出现"5 个单元同时顶到
+- **所有硬上限加起来是 1368M ≤ 1613M × 0.85**。所以不会出现"5 个单元同时顶到
   上限 → 内核 OOM 屠机"——最坏情况也是先撞 swap。
 - **生产机实测**（5 个服务全部起来后）：
   | 服务 | 实际 RSS | MemoryMax |
   |---|---|---|
   | api-gateway | 75 MB | 128 MB |
   | user-service | 79 MB | 128 MB |
-  | content-service | 83 MB | 176 MB |
+  | content-service | 83 MB | 224 MB |
   | ai-service | 72 MB | 200 MB |
   | ai-worker | 89 MB | 224 MB |
-  | **合计** | **398 MB** | **856 MB** |
+  | **合计** | **398 MB** | **904 MB** |
 
   整机 `free -m`：used 832 / available 781（含 PG + Redis + nginx + OS）。
   内存吃紧的其实是 **PG + Redis + OS**（约 430MB），不是 Python 服务。
-- `MemoryHigh`（软限）触发的是回收压力，不是杀进程；正常流量不会碰到。
+- ⚠️ **`MemoryHigh` 不是「回收压力」，是「永久冻死」** ——
+  越线 ⇒ 进程卡在 D 状态、请求永不返回、**整个服务都不响应**、且**杀不掉**。
+  详见 §9.3.2（含处置步骤）。判据要按「稳态峰值 + 余量」算，不是按空闲/并发算。
 - **真不够用时的正确顺序**：先降 PG 的 `max_connections`（30→20）和
   `shared_buffers`（64→48MB），再降 Redis `maxmemory`（64→48mb），
   **最后**才动 Python 单元的 MemoryMax —— PG 被 OOM kill 的代价

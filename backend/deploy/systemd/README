@@ -101,22 +101,33 @@
 #   8) 预检：
 #        cd backend/deploy && ./preflight.sh /etc/stashbox/stashbox.env
 #
-# ── 内存 / CPU 上限（2 GiB 机器的分配账）──────────────────────────────
+# ── 内存 / CPU 上限（1613MB 实测机器的分配账）────────────────────────────
 #
 #   单元                    MemoryHigh  MemoryMax  CPUQuota
-#   api-gateway              128M        160M       25%
-#   user-service             128M        160M       40%
-#   content-service          160M        224M       35%
-#   ai-service               192M        256M       40%
-#   ai-worker                224M        288M       60%
-#   ── 合计                   812M       1088M      200%
+#   api-gateway              96M        128M       25%
+#   user-service             96M        128M       40%
+#   content-service         160M        224M       35%
+#   ai-service              144M        200M       40%
+#   ai-worker               168M        224M       60%
+#   ── 合计                  664M        904M      200%
 #
-#   · MemoryHigh 之和 812M：超过它才进入回收压力（软限，不杀进程）。
-#     实测峰值 60-90 MB/进程，正常流量不会碰到。
-#   · MemoryMax 之和 1088M：硬上限，触顶被 OOM kill，Restart=always 拉起。
-#     1088M + PG 448M + Redis 192M + nginx 64M + OS/journald ~150M
-#     ≈ 1942M < 2048M —— **所有硬上限加起来也在 2 GiB 以内**，
-#     所以不会出现"五个单元同时顶到上限 → 内核 OOM 屠机"。
+#   ⚠️ 上限**按部署机实测值填**，不要按「标称 2 GiB」算 ——
+#   生产机 `free -m` 实测物理内存只有 **1613MB**。
+#   （这张表 2026-10-25 之前写的是 128M/160M…合计 1088M，那是按 2 GiB 算的
+#   旧账，与实际部署值对不上；本表已与 /etc/systemd/system 下的实际文件核对。）
+#
+#   · MemoryHigh 之和 664M。
+#   ⚠️⚠️ **MemoryHigh 触发的不是「回收压力」，是「永久冻死」**（2026-10-25 实测）：
+#     cgroup v2 的 memory.high 是**节流** —— 越过水位线的分配被内核挡在回收
+#     路径上，进程进入 **D 状态**（wchan=mem_cgroup_handle_over_high）。
+#     后果：请求永不返回、**整个服务都不响应**（连列表查询也超时）、
+#     且 D 状态**杀不掉**（SIGKILL 无效）⇒ 不会自愈、不会告警。
+#     `memory.events` 里 `high` 计数在涨、`oom 0` ——「没 OOM」≠「没事」。
+#     判据要按「**该路径的稳态峰值 + 余量**」算，不是按空闲/并发算。
+#     处置步骤见 deploy/README.md §9.3.2（含急救 runbook）。
+#   · MemoryMax 之和 904M：硬上限，触顶被 OOM kill，Restart=always 拉起。
+#     904M + PG 288M + Redis 128M + nginx 48M + OS/journald ~150M
+#     = 1518M < 1613M ✓（余量 95M）
 #   · CPUQuota 之和 200% = 2 vCPU：任何单元都不会被饿到 0，
 #     也不会出现一个单元独占两个核。
 #
