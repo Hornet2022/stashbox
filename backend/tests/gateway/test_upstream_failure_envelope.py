@@ -139,7 +139,29 @@ async def test_downstream_failure_body_is_always_json(gw, upstream, exc):
 
 
 # ---------------------------------------------------------------------------
-# 6. 网关必须把真实客户端 IP 透给下游（限流/审计要用）
+# 6. admin 侧「按 URL 录入」超时 → 同样是 502 + 2002 + 「可能已提交」
+# ---------------------------------------------------------------------------
+async def test_admin_url_capture_timeout_returns_biz_envelope(gw, upstream):
+    """admin 录入链接**也是同步抓取**（2026-10-25 补进 _CAPTURE_PATHS）。
+
+    `POST /api/v1/admin/articles` 在建库前会调 `_prefetch_for_capture`
+    （budget 30s，整条降级链最坏 ~40.6s）。它原来不在 _CAPTURE_PATHS 里
+    ⇒ 网关超时后回的是笼统的「服务暂不可用」，而文章其实已经建好了
+    ⇒ 运营以为失败，重试 ⇒ 库里多一条重复文章。
+    """
+    upstream["exc"] = httpx.ReadTimeout("simulated upstream timeout")
+
+    r = await gw.post("/api/v1/admin/articles", json={"url": "https://example.com/a"})
+
+    assert r.status_code == 502, r.text
+    body = r.json()
+    assert body["code"] == 2002, body
+    assert body["data"] is None
+    assert "可能已经提交" in body["message"], body["message"]
+
+
+# ---------------------------------------------------------------------------
+# 7. 网关必须把真实客户端 IP 透给下游（限流/审计要用）
 # ---------------------------------------------------------------------------
 async def test_gateway_overwrites_x_forwarded_for(gw, upstream, upstream_requests):
     """网关转发给下游的 XFF，必须是**它自己解析出来的**真实客户端 IP。

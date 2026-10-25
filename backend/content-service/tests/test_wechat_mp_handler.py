@@ -312,6 +312,67 @@ async def test_wechat_mp_message_happy_path(monkeypatch, callback_secret):
     assert fake_ai.calls[0]["article_id"] == body["article_id"]
 
 
+@pytest.mark.asyncio
+async def test_wechat_mp_callback_fetch_is_budgeted(monkeypatch, callback_secret):
+    """服务号回调的抓取**必须带预算**（2026-10-25 补）。
+
+    ## 为什么这条要锁
+
+    回调端点原来写的是 `fetcher.fetch(url)` —— 不传 budget。
+    而 `Deadline(None)` 是**无上限**（见 `fetchers/net.py::Deadline`）。
+
+    加上识图（每张图最坏 15s 下载 + 15s OCR，单篇最多 5 张）之后，
+    一条回调最坏能挂 **150s**：微信那边早超时重试了，这边还在跑
+    ⇒ 同一篇文章被重复建出来。
+
+    这类缺陷在界面上**完全看不出来**（回调没有界面），所以只能靠断言锁。
+
+    ## 判据
+
+    · `budget` 必须存在且 > 0（`None` == 无上限，等于没传）；
+    · 阈值必须等于仓内既有定义 `_capture_fetch_budget()`（用户侧剪藏同一个常量）
+      —— **不另造常量**，否则两边迟早漂成两个数。
+    """
+    recorded: dict = {}
+
+    class _RecordingFetcher:
+        async def fetch(self, url, *, timeout=30.0, budget=None):
+            recorded["url"] = url
+            recorded["timeout"] = timeout
+            recorded["budget"] = budget
+            return cs_fetchers.FetchResult(
+                url=url,
+                title="预算探针标题",
+                content_html="<p>正文</p>",
+                content_text="正文",
+                source="wechat_mp",
+            )
+
+    monkeypatch.setattr(content_main, "get_fetcher", lambda url: _RecordingFetcher())
+    monkeypatch.setattr(content_main, "get_ai_client", lambda: FakeAIClient())
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=content_main.app), base_url="http://test"
+    ) as c:
+        r = await c.post(
+            MP_URL,
+            headers=callback_secret,
+            json={
+                "from_user": "o_budget_probe",
+                "text": "推荐 https://example.com/budget-probe 看看。",
+                "create_time": 1700000000,
+            },
+        )
+
+    assert r.status_code == 200, r.text
+    assert "budget" in recorded, "回调根本没调 fetcher.fetch"
+    budget = recorded["budget"]
+    assert budget is not None, "budget=None 等于无上限（Deadline(None)）—— 回调会挂死"
+    assert budget > 0, f"预算必须为正数，实际 {budget}"
+    expected = content_main._capture_fetch_budget()
+    assert budget == expected, "回调的抓取预算必须与用户侧剪藏同一个常量，不另造阈值"
+
+
 # ---------------------------------------------------------------------------
 # 5.5 raw_content 落库（CP-CREATE-ARTICLE，3）
 # ---------------------------------------------------------------------------

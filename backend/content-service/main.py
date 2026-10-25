@@ -2806,7 +2806,18 @@ async def wechat_mp_message(
         raise InvalidRequest(message="no fetcher matched", code=2001)
 
     try:
-        result = await fetcher.fetch(url)
+        # 预算：与用户侧剪藏**同一个常量**（`_capture_fetch_budget()`，默认 30s），
+        # 不另造阈值 —— 这两条路干的是同一件事（抓一篇公众号文章取正文），
+        # 阈值就该只有一份定义。
+        #
+        # 原来这里是 `fetcher.fetch(url)` —— 不传 budget，而 `Deadline(None)`
+        # 是**无上限**。加上识图（每张图最坏 15s 下载 + 15s OCR，单篇最多 5 张）
+        # 之后，一条回调最坏能挂 150s：微信那边早就超时重试了，
+        # 而这边还在跑 ⇒ 同一篇文章被重复建出来。
+        #
+        # 兜底通道（浏览器）也一并收进预算：它有 12s 独立上限，
+        # `slice` 只会拿到「剩余预算」与 12s 的较小值。
+        result = await fetcher.fetch(url, timeout=10.0, budget=_capture_fetch_budget())
     except FetcherError as exc:
         # CP6.2.2.2a: ARTICLE_CAPTURE_FAILED / ARTICLE_UNSUPPORTED 埋点
         if exc.code == FetcherErrorCode.UNSUPPORTED:

@@ -249,6 +249,13 @@ _CAPTURE_PATHS = frozenset(
         # 链接抓取相当（解析很快，但大文档的解析 + 建库 + 派蒸馏不便宜），
         # 所以超时时同样要按「可能已提交」的口径回。
         "/api/v1/articles/document",
+        # admin 侧「按 URL 录入」（2026-10-25 补）：这一条**同样**是同步抓取 ——
+        # `_create_article(fetch_on_create=True)` 会在建库前调
+        # `_prefetch_for_capture`（budget 30s，整条降级链最坏 ~40.6s）。
+        # 原来它不在这个集合里 ⇒ 网关超时后回的是笼统的「服务暂不可用」，
+        # 而文章其实已经建好了 ⇒ 运营以为失败，重试 ⇒ 重复文章。
+        # （与用户侧的唯一差别是 admin 路径不扣配额，但「可能已提交」这件事一样成立。）
+        "/api/v1/admin/articles",
     }
 )
 
