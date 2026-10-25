@@ -23,8 +23,14 @@
 
 这是 fail-closed 的关键取舍。备选方案是「未配置时放行 + 打 warning」，
 但那等于把「忘了配」变成「默认不安全」，而这类端点失效时的代价是直接烧钱。
-所以 `STASHBOX_CALLBACK_SECRET` 未设置时端点返回 503 并说明原因，
+所以 `CALLBACK_SHARED_SECRET` 未设置时端点返回 503 并说明原因，
 运维想开这个口子必须显式配一个密钥。
+
+⚠️ 环境变量的名字就是配置字段名的大写（`common/config.py` 没有设
+`env_prefix`）⇒ 真实名字是 **`CALLBACK_SHARED_SECRET`**。
+这一段早先写的是 `STASHBOX_CALLBACK_SECRET` —— 那是**过时的写法**，
+照着它去配环境变量的人会一直配不生效（字段根本不读那个名字），
+而端点看上去"配了密钥还是 503"。
 
 ## 用法
 
@@ -62,7 +68,7 @@ def verify_callback_secret(provided: str | None) -> None:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
                 f"回调端点未配置 {SECRET_HEADER} 服务端密钥，已拒绝。"
-                "确需启用请设置环境变量 STASHBOX_CALLBACK_SECRET。"
+                "确需启用请设置环境变量 CALLBACK_SHARED_SECRET。"
             ),
         )
     if not provided:
