@@ -132,7 +132,30 @@ MEDIA_DOWNLOAD_TIMEOUT = 15.0
 MEDIA_OCR_TIMEOUT = 15.0
 
 #: 单图大小上限（字节）。超了直接跳过，别把内存吃穿。
-MAX_MEDIA_BYTES = 5 * 1024 * 1024
+#:
+#: 2026-10-25 从 5MB 收到 2MB：认图前的缩图（`ocr.shrink_image_for_vlm`）
+#: 已经把大图压到 ~250KB，5MB 的原始上限只会让**下载阶段**同时在内存里
+#: 攥着好几张原图（队列 3 + 在途 4 = 7 张 × 5MB = 35MB）。
+#: 2MB × 7 = 14MB，实测微信正文图平均只有 548KB（最大的那张 4.4MB 会被缩）。
+MAX_MEDIA_BYTES = 2 * 1024 * 1024
+
+#: **单篇**配图的下载字节总预算（字节）。
+#:
+#: 为什么要有「总量」这道闸：只限张数（`MAX_MEDIA_CAPTIONS`）限不住内存 ——
+#: 12 张 × 5MB 和 12 张 × 50KB 在「张数」上一样，在内存上差 10 倍。
+#: 有了总量闸，**内存上界与文章有多少张图解耦**。
+#:
+#: 超预算的图不下载（记失败原因，占位符随后被删掉，正文完整）。
+#: 8MB 的依据：实测一篇 17 图的微信文全部下载也只有 9.1MB，
+#: 而正文真正用得上的图远少于这个数（上限本来就是 12 张）。
+#:
+#: ⚠️ 这是**软上限**，不是硬上限：检查在下载**之前**做，而下载有并发
+#: （`MEDIA_DOWNLOAD_CONCURRENCY = 4`），所以最多有 4 张图能同时「各自看见
+#: 还没超预算」⇒ 实际总量上界 = 8MB + 4×`MAX_MEDIA_BYTES` = **16MB**。
+#: 之所以不做硬上限（预占配额）：预占要按每张图的**上限**扣，8MB 预算只够
+#: 4 张 2MB 的「预占」，会把 12 张 548KB 的正常文章误杀成 4 张。
+#: ⇒ 取舍：宁可多占 8MB，也不要按张数误杀。
+MAX_MEDIA_TOTAL_BYTES = 8 * 1024 * 1024
 
 #: 图片下载并发上限。
 MEDIA_DOWNLOAD_CONCURRENCY = 4
@@ -605,6 +628,8 @@ async def caption_media(
         """
         outcomes: dict[str, tuple[str | None, str | None]] = {}
         queue: asyncio.Queue = asyncio.Queue(maxsize=MEDIA_OCR_QUEUE_SIZE)
+        #: 本篇已下载的配图字节（跨所有图累计）—— 内存闸门，见 MAX_MEDIA_TOTAL_BYTES。
+        spent = {"bytes": 0}
 
         async def _download(url: str) -> tuple[bytes | None, str | None, str | None]:
             # ⚠️ 超时取 **抓取总预算的剩余**，不是固定的 15s：
@@ -615,8 +640,20 @@ async def caption_media(
                 if deadline.expired():
                     return None, None, "抓取预算已耗尽（没时间下载配图了）"
                 timeout = deadline.slice(MEDIA_DOWNLOAD_TIMEOUT) or MEDIA_DOWNLOAD_TIMEOUT
+            # 单篇总字节预算：超了就不下载这张（不白花带宽与图床的耐心）。
+            if spent["bytes"] >= MAX_MEDIA_TOTAL_BYTES:
+                return (
+                    None,
+                    None,
+                    f"超出单篇配图字节预算（{MAX_MEDIA_TOTAL_BYTES // 1024 // 1024}MB）",
+                )
             async with semaphore:
-                return await _download_one(client, url, timeout=timeout, headers=request_headers)
+                blob, mime, error = await _download_one(
+                    client, url, timeout=timeout, headers=request_headers
+                )
+                if blob:
+                    spent["bytes"] += len(blob)
+                return blob, mime, error
 
         async def _producer(url: str) -> None:
             """下载一张图 → 放进队列。**任何异常都要进队列**（否则消费者会等一辈子）。"""
@@ -853,6 +890,7 @@ __all__ = [
     "CAPTION_PREFIX",
     "MAX_MEDIA_BYTES",
     "MAX_MEDIA_CAPTIONS",
+    "MAX_MEDIA_TOTAL_BYTES",
     "MEDIA_DOWNLOAD_CONCURRENCY",
     "MEDIA_DOWNLOAD_TIMEOUT",
     "MEDIA_OCR_CONCURRENCY",

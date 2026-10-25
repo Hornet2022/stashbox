@@ -65,6 +65,65 @@ OCR_TIMEOUT = 90.0
 #: 而正文里出现这些符号会被 TTS 当成怪东西念出来。
 _OCR_PROMPT = "识别图片里的全部文字，只输出文字本身，不要输出任何标记或解释。"
 
+# ── 送给 VLM 之前的缩图（内存闸门） ──────────────────────────────────────
+#
+# 为什么需要：`_ocr_one_image` 把**原始图片字节**直接 base64 塞进请求体，
+# 于是每张图的字节要被复制 4~5 遍（原始 → base64 串 → JSON 串 → utf-8 字节
+# → 请求体）。实测一篇 17 图的微信文：图片本身只有 9.1MB，**光这一段就
+# 让进程 RSS 涨了 52MB**（2026-10-25 实测，生产上把 content-service 顶到
+# cgroup 内存水位线，进程被内核永久节流冻死，见 deploy/README.md 9.3）。
+#
+# 缩图后同一张图从 4.4MB 变成 ~250KB ⇒ 请求体降一个数量级。
+# **顺带省钱**：VLM 的视觉 token 按图面积算，图小了 token 就少。
+#
+#: 缩图后的最长边（像素）。1536 = 150dpi 的 A4 扫描件原尺寸 ⇒
+#: 扫描件基本不会被缩，只把「超大 PNG」压下来。
+VLM_MAX_SIDE = 1536
+#: 小于这个字节数的图**原样送**（不折腾：省 CPU，也不掉画质）。
+VLM_SHRINK_MIN_BYTES = 256 * 1024
+#: 缩图后的 JPEG 质量。80 是肉眼几乎无损的档位。
+VLM_JPEG_QUALITY = 80
+
+
+def shrink_image_for_vlm(image: bytes, mime: str) -> tuple[bytes, str]:
+    """把图缩成「VLM 用得上的尺寸」—— 收口在**唯一拼请求体**的那一处。
+
+    为什么收在这里：`_ocr_one_image` 是**唯一**把图片变成请求体的地方
+    （正文配图识图与扫描件 OCR 都走它）⇒ 缩图规则只写一份，
+    改 provider 协议时不会只改到一半。
+
+    返回 (字节, mime)。任何异常都**原样返回**——缩图是优化，不是功能：
+    认不出/解不开的图照样该送（模型自己看得懂 GIF、SVG 之类）。
+    """
+    if len(image) < VLM_SHRINK_MIN_BYTES:
+        return image, mime
+    try:
+        from PIL import Image
+
+        with Image.open(BytesIO(image)) as im:
+            im.thumbnail((VLM_MAX_SIDE, VLM_MAX_SIDE), Image.LANCZOS)
+            if im.mode not in ("RGB", "L"):
+                # 透明 PNG 直接转 RGB 会把透明区变黑 ⇒ 文字可能糊在黑底上。
+                # 先贴到白底上再转。
+                if im.mode in ("RGBA", "LA", "P"):
+                    im = im.convert("RGBA")
+                    bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+                    bg.alpha_composite(im)
+                    im = bg.convert("RGB")
+                else:
+                    im = im.convert("RGB")
+            buf = BytesIO()
+            im.save(buf, format="JPEG", quality=VLM_JPEG_QUALITY)
+            out = buf.getvalue()
+    except Exception as exc:  # noqa: BLE001 —— 缩图失败不该让识图失败
+        log.info("vlm_shrink_skipped err=%s", type(exc).__name__)
+        return image, mime
+    if len(out) >= len(image):
+        # 压不小（本来就是小图 / 已经是压缩格式）⇒ 用原图，别做无谓的有损转码
+        return image, mime
+    log.info("vlm_shrink_ok bytes=%d→%d side=%d", len(image), len(out), VLM_MAX_SIDE)
+    return out, "image/jpeg"
+
 
 class OCRUnavailableError(RuntimeError):
     """OCR 通道不可用（没配 provider / 模型不存在 / 网络失败）。"""
@@ -202,7 +261,12 @@ async def _ocr_one_image(
     （图表不是纯文字段落，见 `media_ocr._MEDIA_OCR_PROMPT`）。
     请求体的拼装**只有这一份** —— 复制一份的话，provider 改了协议
     （比如 `image_url` 的写法）就会只改到一半，另一半静默失配。
+
+    ⚠️ **缩图也在这里做**（`shrink_image_for_vlm`）：请求体是这份唯一出口，
+    在这里缩 ⇒ 内存与 token 一起降；放在调用点就会每个调用点各缩一次
+    （漏一处就多一份内存）。
     """
+    image, mime = shrink_image_for_vlm(image, mime)
     b64 = base64.b64encode(image).decode("ascii")
     body = {
         "model": model,
