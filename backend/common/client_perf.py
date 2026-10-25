@@ -127,7 +127,17 @@ async def _durations_in_window(
     start: datetime,
     end: datetime,
 ) -> list[float]:
-    """窗口内该事件的有效 `duration_ms` 列表。"""
+    """窗口内该事件的有效 `duration_ms` 列表。
+
+    ⚠️ **为什么把行拉进 Python 算，而不是在 SQL 里 `percentile_cont`**：
+    ① 分位数算法可以**脱离数据库**单测（边界、空列表、偶数个样本的中点）；
+    ② 不绑死数据库方言。
+    代价：窗口内匹配的行会被读进内存。
+    内测期埋点表是**千行级**（2026-10-25 实测 1381 行）⇒ 完全够用；
+    真到**十万行/窗口**的量级时，要改成 SQL 侧 `percentile_cont` 聚合
+    （那时 `quantile()` 的插值算法要与 PG 的 `percentile_cont` 对齐，
+    PG 用的也是线性插值，口径一致）。
+    """
     rows = await db.execute(
         select(Feedback.metadata_).where(
             Feedback.type == event_type,
