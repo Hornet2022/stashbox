@@ -580,13 +580,13 @@ say "cgroup 内存上限"
 #    2026-10-25 从 320M 收到 288M：给 content-service 的 MemoryMax
 #    176M→224M 腾位置（它要装得下一次剪藏的峰值，见 deploy/README.md 9.3）。
 #
-# ⚠️ 为什么 PG 保留 high(224M) < max(288M) 这个「节流区」，而五个 Python
-#    单元都改成了 high == max（见 deploy/README.md §9.3.2 的对照实验）：
-#    memory.high 是节流，跨过去进程会**永久冻死**（D 状态，杀不掉）。
-#    Python 单元有 Restart=always ⇒ 宁可被 OOM 杀掉也不冻死（high==max）。
-#    但 PG 的 Restart=no ⇒ 被 OOM kill 就**没人拉起**（数据面直接掉线），
-#    而 PG 的实际用量（23MB）离 high 线还差 200MB ⇒ 那个区间够不着。
-#    ⇒ 真要统一之前，先单独给 PG 做一次「跨 high 会怎样」的实测。
+# ⚠️ PG 的 MemoryHigh 现在也 == MemoryMax（288M，2026-10-25 改）——
+#    理由见下面 write_cgroup_cap_template 调用处的注释：
+#    memory.high 是节流，跨过去进程会**永久冻死**（D 状态，杀不掉），
+#    而 PG 跨过去 = 所有 backend 一起卡住 = 整个数据面挂死。
+#    跨过 max 则是 OOM kill：postmaster 带 OOMScoreAdjust=-900 ⇒ 内核挑
+#    backend 杀、postmaster 活下来 ⇒ 那个连接报错可重试，PG 本身不受影响。
+#    ⇒ 宁可 backend 被杀，不要整库冻死。
 write_cgroup_cap() {
   local unit="$1" high="$2" max="$3" comment="$4"
   # ⚠️ drop-in 目录名必须是**完整单元名 + .d**（`redis-server.service.d`），
@@ -685,7 +685,55 @@ MemoryMax=$max"
 # ⚠️ 真不够用时的正确顺序：先降 PG 的 max_connections 和 shared_buffers，
 #    再降 Redis maxmemory，**最后**才动 Python 单元的 MemoryMax ——
 #    PG 被 OOM kill 的代价（数据面全断）远大于单个 Python 单元重启。
-write_cgroup_cap_template 'postgresql@' 224M 288M "PostgreSQL 内存上限（1613MB 实测机器）"
+#
+# ⚠️⚠️ PG 的 MemoryHigh == MemoryMax（288M），**不**留节流区（2026-10-25 改）：
+#    memory.high 是**节流** —— 跨过它 ⇒ 进程进 D 状态 ⇒ 请求永不返回、
+#    且 SIGKILL 都杀不掉（生产实测，详见 deploy/README.md §9.3.2 的对照实验）。
+#    PG 跨过 high 的后果尤其糟：**所有 backend 一起卡住** ⇒ 整个数据面挂死。
+#    跨过 max 则是 OOM kill：postmaster 带 OOMScoreAdjust=-900（Debian 单元写死），
+#    backend 自己把分数重置为 0 ⇒ 内核挑 **backend** 杀，postmaster 活下来
+#    ⇒ 那个连接报错、可以重试，PG 本身不受影响。
+#    ⇒ 宁可 backend 被杀，不要整库冻死。
+write_cgroup_cap_template 'postgresql@' 288M 288M "PostgreSQL 内存上限（1613MB 实测机器）"
+
+# ── PG 被杀之后要能自己起来 ────────────────────────────────────────────
+#
+# ⚠️ Debian 的 postgresql@.service 把 `Restart=on-failure` **注释掉**了，
+#    理由是「restarting automatically will prevent pg_ctlcluster stop from working」。
+#    ⇒ 解法是配套 `RestartPreventExitStatus=SIGINT SIGTERM`：
+#      · `pg_ctlcluster stop` / `systemctl stop` 走 SIGTERM ⇒ 不触发重启；
+#      · OOM kill 是 SIGKILL ⇒ 不在阻止名单里 ⇒ 被 systemd 拉起。
+#    （生产实测三条：SIGKILL postmaster → 14 秒内自己起来；systemctl stop →
+#      保持 inactive；pg_ctlcluster stop → 保持 down。没有重启循环。）
+#
+# ⚠️ StartLimit* 放在 [Unit]（systemd v229+ 的位置）：崩溃反复时 systemd 放弃，
+#    而不是无限重启。
+if [ "$DRY_RUN" -eq 1 ]; then
+  printf '    [dry-run] 写 %s（PG 被杀自启）\n' "/etc/systemd/system/postgresql@.service.d/20-restart-on-failure.conf"
+else
+  mkdir -p /etc/systemd/system/postgresql@.service.d
+  cat > /etc/systemd/system/postgresql@.service.d/20-restart-on-failure.conf <<'PGCONF'
+# PG 被杀之后要能自己起来。
+#
+# ⚠️ Debian 的 postgresql@.service 把 Restart=on-failure **注释掉**了，
+#    理由是「restarting automatically will prevent pg_ctlcluster stop from working」。
+#    ⇒ 解法是配套 RestartPreventExitStatus=SIGINT SIGTERM：
+#    `pg_ctlcluster stop` / `systemctl stop` 走的是 SIGTERM ⇒ 不触发重启；
+#    而 OOM kill 是 SIGKILL ⇒ 不在阻止名单里 ⇒ 会被 systemd 拉起。
+# StartLimit* 放在 [Unit]（systemd v229+ 的位置）：崩溃反复时 systemd 会放弃。
+[Unit]
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=SIGINT SIGTERM
+PGCONF
+  chmod 0644 /etc/systemd/system/postgresql@.service.d/20-restart-on-failure.conf
+  say "写入 /etc/systemd/system/postgresql@.service.d/20-restart-on-failure.conf（PG 被杀自启）"
+  ROLLBACK[${#ROLLBACK[@]}]="撤销 PG 的被杀自启：rm -f /etc/systemd/system/postgresql@.service.d/20-restart-on-failure.conf && systemctl daemon-reload"
+fi
 write_cgroup_cap redis-server 96M 128M "Redis 内存上限（1613MB 实测机器）"
 write_cgroup_cap nginx 24M 48M "nginx 内存上限（1613MB 实测机器）"
 
@@ -717,6 +765,25 @@ if [ "$DRY_RUN" -eq 0 ]; then
       warn "$_u —— memory.max 仍是 max（无限）！drop-in 可能挂错单元/目录名"
     else
       info "$_u —— memory.max = $((_v / 1024 / 1024)) MB ✅"
+    fi
+    # ⚠️ PG 额外两条不变量（2026-10-25）：
+    #   ① memory.high == memory.max（不留节流区 ⇒ 跨过就是被杀，不是冻死）
+    #   ② Restart=on-failure（postmaster 被杀后能自己起来）
+    # 这两条错了不会报错，只会让「出事时」的表现完全不同 ⇒ 必须显式验。
+    if [ "$_u" = "postgresql@16-main" ]; then
+      _h="$(cat "/sys/fs/cgroup${_cg}/memory.high" 2>/dev/null)"
+      if [ "$_h" != "$_v" ]; then
+        warn "postgresql —— memory.high($((_h / 1024 / 1024))M) != memory.max($((_v / 1024 / 1024))M)！"
+        warn "  节流区是**死亡陷阱**：跨过 high ⇒ backend 全部卡死 ⇒ 整个数据面挂死（杀不掉）"
+      else
+        info "postgresql —— memory.high == memory.max == $((_v / 1024 / 1024)) MB ✅（无节流区）"
+      fi
+      _r="$(systemctl show "$_u" -p Restart --value 2>/dev/null)"
+      if [ "$_r" = "on-failure" ]; then
+        info "postgresql —— Restart=on-failure ✅（被杀后能自起）"
+      else
+        warn "postgresql —— Restart=$_r（不是 on-failure）⇒ postmaster 被杀后没人拉起"
+      fi
     fi
   done
 fi

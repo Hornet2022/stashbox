@@ -637,24 +637,35 @@ cd backend/deploy && ./preflight.sh /etc/stashbox/stashbox.env
 | ai-service | 17–40 MB | 60–90 MB | **High = Max 200M** | LLM 响应 JSON + 音频缓冲 |
 | ai-worker | 17–40 MB | 60–90 MB | **High = Max 224M** | 唯一会 fork ffmpeg 的（子进程同 cgroup） |
 | **五个常驻进程合计** | **~90 MB** | **~400 MB** | **904M** | MemoryMax 之和 |
-| PostgreSQL | 200–300 MB | — | cgroup High 224M / **Max 288M** | shared_buffers 64MB + ≤30 连接 × ~6MB（实测 RSS 23MB） |
+| PostgreSQL | 200–300 MB | — | cgroup **High = Max 288M** | shared_buffers 64MB + ≤30 连接 × ~6MB（实测 RSS 23MB）；另配 `Restart=on-failure`（见下） |
 | Redis | ~50 MB | — | cgroup **128M** | maxmemory 64mb + 开销 |
 | nginx | ~10 MB | — | cgroup **48M** | TLS + 反代 |
 | OS + systemd + journald | ~150 MB | — | journald `SystemMaxUse=200M` | 实测 |
 | ffmpeg 峰值（转码中） | 18 MB | 18 MB | 计入 ai-worker 的 cgroup | 实测 4MB WAV→64kbps AAC，墙钟 0.35s |
 | **合计（硬上限）** | **~550 MB** | **~860 MB** | **1368M / 1613M** | **余量 245M** + 2 GiB swap 兜底 |
 
-> ⚠️ **五个 Python 单元的 `MemoryHigh` 一律 == `MemoryMax`** —— 这不是笔误，
+> ⚠️ **Python 单元与 PG 的 `MemoryHigh` 一律 == `MemoryMax`** —— 这不是笔误，
 > 是 2026-10-25 用对照实验定下来的（见 §9.3.2）：`high < max` 那个区间是
 > **死亡陷阱**，跨进去进程就永久挂死；而跨过 `max` 只是被 OOM 杀掉，
 > 有 `Restart=always` ⇒ systemd 拉起来（自愈）。**宁可被杀，不要挂死。**
 > 硬上限（MemoryMax）没动 ⇒ 这张预算表不受影响。
 >
-> ⚠️ PG / Redis / nginx **保留 high < max**：它们的实际用量离 high 线还很远
-> （PG 实测 RSS 23MB vs high 224MB；Redis 5MB vs 96MB），而且 PG 一旦被
-> OOM kill **没人拉起**（`Restart=no`）—— 对数据面来说那是整机掉线。
-> 这三个的冻结风险因此远低于 Python 单元；要改之前先单独实测。
-> （已知隐患：PG 若真的被 OOM kill，得手动 `systemctl start postgresql@16-main`。）
+> **PG 尤其要去掉节流区**：它跨过 `high` 的后果是**所有 backend 一起卡住**
+> ⇒ 整个数据面挂死（比 Python 服务更糟：连列表查询都拿不到数据）。
+> 跨过 `max` 则是 OOM kill，而 postmaster 带 `OOMScoreAdjust=-900`
+> （Debian 单元里写死，backend 自己把分数重置为 0）⇒ 内核挑 **backend** 杀，
+> postmaster 活下来 ⇒ 那个连接报错、可以重试，PG 本身不受影响。
+>
+> ⇒ PG 另配了 `Restart=on-failure` + `RestartPreventExitStatus=SIGINT SIGTERM`
+> （Debian 单元把 Restart 注释掉了，理由是会破坏 `pg_ctlcluster stop`；
+> 配上阻止名单后两条都成立：生产实测 SIGKILL postmaster → 14 秒内自己起来；
+> `systemctl stop` / `pg_ctlcluster stop` → 都保持停止，没有重启循环）。
+> 见 `tune-host.sh` 里的 `20-restart-on-failure.conf`。
+>
+> ⚠️ Redis / nginx **保留 high < max**：它们的用量离 high 线还很远
+> （Redis 5MB vs 96MB、nginx 9MB vs 24MB），且它们被 OOM 杀掉的影响面小
+> （Redis 有 `maxmemory 64mb` 这道数据级上限，nginx 被杀只是入口不通）。
+> 要统一之前先单独实测。
 
 ### 9.3.1 剪藏路径：content-service 的峰值从哪来（2026-10-25 生产事故）
 

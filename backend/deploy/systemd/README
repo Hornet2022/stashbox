@@ -132,6 +132,14 @@
 #   · MemoryMax 之和 904M：硬上限，触顶被 OOM kill，Restart=always 拉起。
 #     904M + PG 288M + Redis 128M + nginx 48M + OS/journald ~150M
 #     = 1518M < 1613M ✓（余量 95M）
+#   · PostgreSQL 走同一套原则：MemoryHigh == MemoryMax == 288M
+#     （drop-in: /etc/systemd/system/postgresql@.service.d/10-stashbox-2g.conf，
+#      由 tune-host.sh 生成）。PG 跨过 high 的后果比 Python 服务更糟 ——
+#     **所有 backend 一起卡住** = 整个数据面挂死；跨过 max 则是 OOM kill，
+#     而 postmaster 带 OOMScoreAdjust=-900 ⇒ 内核挑 backend 杀、postmaster 活。
+#     另配 20-restart-on-failure.conf：PG 被 SIGKILL 后 systemd 拉起，
+#     而 `pg_ctlcluster stop` / `systemctl stop` 仍能正常停（靠
+#     RestartPreventExitStatus=SIGINT SIGTERM）。生产实测三条都过。
 #   · CPUQuota 之和 200% = 2 vCPU：任何单元都不会被饿到 0，
 #     也不会出现一个单元独占两个核。
 #
