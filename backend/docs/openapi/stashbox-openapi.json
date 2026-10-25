@@ -6295,6 +6295,79 @@
         ]
       }
     },
+    "/api/v1/internal/articles/{article_id}/captions": {
+      "post": {
+        "summary": "Fill Article Captions",
+        "description": "给**已落库**的文章补配图图注（识图挪出剪藏请求后的补图注入口）。\n\n## 谁调它\n\nai-service 的蒸馏任务，在**读正文之前**调一次（见\n`ai-service/tasks/distill_task.py`）。识图是「下载图片 + 调 VLM」，\n实测一篇 12 张图要 20~30s ⇒ 放在剪藏请求里会让用户盯着转圈\n（内测反馈的「剪藏不成功」一半来自这里）⇒ 挪到这里，蒸馏前再补。\n\n## 鉴权\n\n共享密钥（`X-Callback-Secret`，见 `common/callback_auth.py`）——\n**fail-closed**：没配密钥就是 503，而不是放行。\n理由：未鉴权的话，任意匿名请求就能让本服务去下载任意图片、\n调任意次数的 VLM ⇒ 直接烧钱。\n\n## 幂等\n\n补完就把 `media_refs` 删掉 ⇒ 再调一次是 no-op（不会重复烧 token）。\n\n## 失败怎么办\n\n任何异常都不返回 5xx 给调用方去重试 —— 识图失败只意味着\"这篇没有图表信息\"，\n正文照常蒸馏。调用方（ai-service）也做了兜底：占位符会被剥掉。",
+        "operationId": "fill_article_captions_api_v1_internal_articles__article_id__captions_post",
+        "parameters": [
+          {
+            "name": "article_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Article Id"
+            }
+          },
+          {
+            "name": "X-Callback-Secret",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Callback-Secret"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
     "/api/v1/later-listens": {
       "get": {
         "summary": "List Later Listens",
