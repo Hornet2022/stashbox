@@ -52,12 +52,18 @@ async def test_naive输入原样返回():
 async def test_带时区的输入被当作绝对时刻换算到库里的钟():
     """带时区 = 一个**绝对时刻** ⇒ 换算到库里的钟（不是 Python 猜一个时区）。
 
-    12:00 UTC = 20:00 Asia/Shanghai（生产 PG 的 TimeZone，2026-10-25 实测）。
-    ⚠️ 这条断言顺带把「这台库的时区」钉住了 —— 运维真去改 PG 的 TimeZone 时，
-    这里会响，而不是让某个指标悄悄偏 8 小时。
+    12:00 UTC = 20:00 Asia/Shanghai。
+
+    ⚠️ 为什么要在测试里**固定会话时区**：
+    这台库的时区是**部署配置**（生产 Asia/Shanghai，CI 是 UTC）——
+    直接断言换算结果，等于把环境配置写进了测试：
+    CI 会红（实测 2026-10-25：CI 的 PG 是 UTC，换算出来是 12:00 而不是 20:00）。
+    ⇒ 用 `SET LOCAL TIME ZONE`（**事务级**：事务结束自动回滚，不污染连接池）
+    把会话时区固定成 Asia/Shanghai，断言就与部署环境无关了。
     """
-    aware = datetime(2021, 5, 20, 12, 0, 0, tzinfo=timezone.utc)
     async with AsyncSessionLocal() as s:
+        await s.execute(text("SET LOCAL TIME ZONE 'Asia/Shanghai'"))
+        aware = datetime(2021, 5, 20, 12, 0, 0, tzinfo=timezone.utc)
         got = await db_now(s, now=aware)
 
     assert got == datetime(2021, 5, 20, 20, 0, 0)
@@ -67,13 +73,15 @@ async def test_db_now不是python的utcnow():
     """`db_now()` 与 `datetime.now(timezone.utc)` **不是同一个钟**。
 
     这条把「别拿 Python 的 UTC now 当窗口上界」写成可执行的判据：
-    在这台库上两者差一个时区偏移（生产是 8 小时）。
+    会话时区固定成 Asia/Shanghai 后，两者必然差 8 小时。
 
-    ⚠️ 如果运维把 PG 的 TimeZone 改成 UTC，这条会红 —— 那时旧写法反而对了，
-    所以这里**必须**跟着改，而不是让它悄悄过去。
+    ⚠️ 同样要固定会话时区（理由见上一条）：
+    在 UTC 库上这个断言本身就不成立 —— 而那里也确实**没有**这个 bug。
     """
     async with AsyncSessionLocal() as s:
+        await s.execute(text("SET LOCAL TIME ZONE 'Asia/Shanghai'"))
         n = await db_now(s)
 
     utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
     assert n != utc_naive
+    assert n.tzinfo is None

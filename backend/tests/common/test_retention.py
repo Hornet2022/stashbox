@@ -27,7 +27,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import delete, text
 
 from stashbox.backend.common.database import AsyncSessionLocal, engine
 from stashbox.backend.common.models import Feedback
@@ -220,8 +220,16 @@ async def test_不传now时_窗口上界用库里的钟而不是UTC():
     ⚠️ 写成 `>=` 而不是 `==`：共享测试库里别的用例也会往当前月插行
     （`test_export_csv.py` 不给 created_at ⇒ PG 用 now() 填），
     它们的行可能正好落在这 8 小时里 ⇒ 差值可能是 1 也可能更大。
+
+    ⚠️ 为什么要**固定会话时区**：
+    这台库的时区是**部署配置**（生产 Asia/Shanghai，CI 是 UTC）。
+    在 UTC 库上「库里的钟」与「Python 的 UTC now」是同一个钟 ⇒ 压根没有这个 bug，
+    断言也就无从谈起（CI 实测红过一次）。
+    ⇒ 用 `SET LOCAL TIME ZONE`（事务级，结束即回滚）把会话时区固定成
+    Asia/Shanghai，**任何部署环境下这条都成立**。
     """
     async with AsyncSessionLocal() as s:
+        await s.execute(text("SET LOCAL TIME ZONE 'Asia/Shanghai'"))
         now_local = await db_now(s)
         # 上个月的 15 号（naive，库里的钟）
         # ⚠️ `replace(day=1)` **保留时分秒** ⇒ 只减 1 秒跨不到上个月
@@ -255,6 +263,7 @@ async def test_不传now时_窗口上界用库里的钟而不是UTC():
 
     # ① 生产路径：不传 now ⇒ 上界取自库里的钟
     async with AsyncSessionLocal() as s:
+        await s.execute(text("SET LOCAL TIME ZONE 'Asia/Shanghai'"))
         r_db_clock = await monthly_retention(s)
         # ② 旧写法：上界用 Python 的 UTC now（比库里的钟慢 8 小时）
         utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
