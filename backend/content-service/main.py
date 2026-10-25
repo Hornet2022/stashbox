@@ -92,8 +92,7 @@ from stashbox.backend.common.exceptions import (
     register_exception_handlers,
 )
 from stashbox.backend.common.logging import get_logger, setup_logging
-from stashbox.backend.common.middleware import RequestIDMiddleware
-from stashbox.backend.common.middleware.memory_trim import MemoryTrimMiddleware
+from stashbox.backend.common.middleware import MemoryTrimMiddleware, RequestIDMiddleware
 from stashbox.backend.common.models import (
     AdminOperationLog,
     Article,
