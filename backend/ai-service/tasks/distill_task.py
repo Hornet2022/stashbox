@@ -21,9 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from llm import get_llm_client, maybe_close_llm_client
 from llm import reload as llm_reload
 from arq_settings import load_arq_config
+from services.content_client import fill_article_captions
 from stashbox.backend.app.services.tts import reload as tts_reload
 from stashbox.backend.common.database import AsyncSessionLocal
 from stashbox.backend.common import cache_service
+from stashbox.backend.common import media_placeholders as placeholders
 from stashbox.backend.common.models import Article
 from stashbox.backend.common.models.tag import Tag, TagSubscription
 from stashbox.backend.common.models.push_notification import PushNotification
@@ -435,6 +437,25 @@ async def distill_task(
                 "articles_status_distilling_write_err", article_id=article_id, error=str(exc)
             )
 
+    # CP-DISTILL-CAPTION（2026-10-25）：**读正文之前**先补配图图注。
+    #
+    # 为什么在这里补：识图（下载图片 + 调 VLM）实测一篇 12 张图要 20~30s，
+    # 放在剪藏请求里会让用户盯着转圈（内测反馈的「剪藏不成功」一半来自这里）
+    # ⇒ 改成剪藏只留占位符、**蒸馏前**再补。
+    #
+    # 为什么补图注归 content-service 做：图片下载要走它那套 SSRF 防护与
+    # 池化 client（复制一份到 ai-service 就是两份各自漂移），
+    # 而图注要写回 `articles.raw_content`（它写的表）。
+    #
+    # ⚠️ 失败**不抛**：补图注失败只意味着「这篇没有图表信息」，
+    # 正文照常蒸馏 —— 不能因为可有可无的图表把整篇稿子赔进去。
+    # 第二道兜底：下面读到的正文会被 `strip_placeholders` 剥干净，
+    # 绝不让占位符进 LLM。
+    try:
+        await fill_article_captions(article_id)
+    except Exception as exc:  # noqa: BLE001 —— 双保险（client 内部已兜一层）
+        log.warning("caption_fill_unexpected", article_id=article_id, error=str(exc))
+
     # CP2 + CP3 打通：从 articles.raw_content JSONB 读真正文（替代占位文本）
     #
     # 2026-10-03：拿不到正文时 **明确失败，不重试**。
@@ -486,6 +507,17 @@ async def distill_task(
                 reason="auto_retry_never_charged",
             )
         return {"task_id": task_id, "status": "failed", "reason": "empty_article_content"}
+
+    # CP-DISTILL-CAPTION 兜底：正文里**绝不能**留占位符。
+    #
+    # 正常情况下补图注已经把占位符换成图注（或删掉）了，这里是**第二道防线**：
+    # 补图注请求失败 / 端点 503 / 正文里本来就有历史脏数据时，
+    # 至少保证 LLM 看到的是干净的正文 ——
+    # `\x00IMG3\x00` 这种东西进了 prompt，模型会把它当正文的一部分胡编。
+    #
+    # ⚠️ 两种形态都剥（内存态 NUL 哨兵 + 落库态可见记法）：
+    # 正文是从 JSONB 读出来的，可能是落库态。
+    raw_content = placeholders.strip_placeholders(raw_content)
 
     # CP-AGENT-RUNNER-INTEGRATION：distill 走 LangGraph agent（替代硬编码 pipeline）
     # - raw_content 直接当 fetched_content 喂入（避免真实 fetch_url 调外部网络）
