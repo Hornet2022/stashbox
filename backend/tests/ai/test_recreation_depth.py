@@ -127,6 +127,82 @@ def test_weak_items_empty_when_all_good(quality):
 
 
 # ---------------------------------------------------------------------------
+# 1b. 篇幅下限（软约束 → 硬判据）
+# ---------------------------------------------------------------------------
+
+
+def test_target_chars_tiers(quality):
+    """三档与 prompt 第 10 条一一对应。"""
+    assert quality.target_chars(400) == (900, 1200)
+    assert quality.target_chars(1500) == (1400, 1900)
+    assert quality.target_chars(8000) == (1900, 2600)
+
+
+def test_chars_shortfall_counts_missing_items(quality):
+    """离下限还差多少字 ⇒ 折算成还差几条。"""
+    parts = {"related": [], "insights": [], "follow_ups": []}
+    gap, items = quality.chars_shortfall(parts, 8000)
+    assert gap == 1900
+    assert items > 0
+
+
+def test_chars_shortfall_counts_body_sections(quality):
+    """⚠️ 字数阶梯是**四段合计** ⇒ 正文要点必须算进去。
+
+    漏算正文 = 拿三段去比四段的下限 ⇒ 差出一个正文的量 ⇒ 补救被误触发
+    （实测会一口气要求补十几条）。
+    """
+    body = "正文要点。" * 100  # 500 字
+    with_body = {"sections": [body], "related": [], "insights": [], "follow_ups": []}
+    without_body = {"related": [], "insights": [], "follow_ups": []}
+    assert (
+        quality.chars_shortfall(with_body, 400)[0] < quality.chars_shortfall(without_body, 400)[0]
+    )
+
+
+def test_chars_shortfall_zero_when_above_floor(quality):
+    parts = {
+        "related": [GOOD_RELATED] * 4,
+        "insights": [GOOD_INSIGHT] * 4,
+        "follow_ups": [GOOD_FOLLOW_UP] * 4,
+    }
+    gap, items = quality.chars_shortfall(parts, 400)
+    assert gap <= 0
+    assert items == 0
+
+
+@pytest.mark.asyncio
+async def test_remediate_runs_when_script_is_short(runner, monkeypatch):
+    """**篇幅不够也要补救** —— prompt 里的字数下限是软约束，模型不保证照做。
+
+    实测（2026-10-25）：一篇 8578 字原文的稿子只写到 1783 字，
+    比规格下限还低 12% ⇒ 光喊没用，得有一条机械判据。
+    """
+    fake = _fake_chat(json.dumps({"related": [GOOD_RELATED]}, ensure_ascii=False))
+    monkeypatch.setattr(runner, "_chat_text", fake)
+    p = _parts(runner, related=[], insights=[], follow_ups=[])
+    accepted = await runner._remediate_recreation(runner, p, "", "原文" * 2000)
+    assert accepted, "篇幅不够 ⇒ 应该触发补救"
+    assert "还差" in fake.calls[0]["prompt"], "prompt 里要写明还差多少字"
+
+
+@pytest.mark.asyncio
+async def test_remediate_not_called_when_short_but_floor_is_met(runner, monkeypatch):
+    """已达篇幅下限时不该白花一次 LLM 调用。"""
+    called = []
+
+    async def _boom(llm, user_prompt, *, system_prompt=None, step="", **kw):
+        called.append(1)
+        return "{}"
+
+    monkeypatch.setattr(runner, "_chat_text", _boom)
+    p = _full_parts(runner)
+    accepted = await runner._remediate_recreation(runner, p, "", "短")
+    assert accepted == {}
+    assert not called
+
+
+# ---------------------------------------------------------------------------
 # 2. 补救的合并规则
 # ---------------------------------------------------------------------------
 
@@ -198,12 +274,22 @@ def test_apply_remediation_rebuilds_sections_in_product_order(runner):
 # ---------------------------------------------------------------------------
 
 
+def _full_parts(runner):
+    """三段都达标：条数够、每条够长、整稿够长（⇒ 不该触发补救）。"""
+    return _parts(
+        runner,
+        related=[GOOD_RELATED] * 4,
+        insights=[GOOD_INSIGHT] * 4,
+        follow_ups=[GOOD_FOLLOW_UP] * 4,
+    )
+
+
 def _fake_chat(payload):
     async def _chat_text(llm, user_prompt, *, system_prompt=None, step="", **kw):
-        _fake_chat.calls.append({"prompt": user_prompt, "system": system_prompt})
+        _chat_text.calls.append({"prompt": user_prompt, "system": system_prompt})
         return payload
 
-    _fake_chat.calls = []
+    _chat_text.calls = []
     return _chat_text
 
 
@@ -242,12 +328,7 @@ async def test_remediate_recreation_returns_empty_when_nothing_to_fix(runner, mo
         return "{}"
 
     monkeypatch.setattr(runner, "_chat_text", _boom)
-    p = _parts(
-        runner,
-        follow_ups=[GOOD_FOLLOW_UP, GOOD_RELATED],
-        related=[GOOD_RELATED, GOOD_INSIGHT],
-        insights=[GOOD_INSIGHT, GOOD_RELATED, GOOD_INSIGHT_2],
-    )
+    p = _full_parts(runner)
     accepted = await runner._remediate_recreation(runner, p, "", "原文")
     assert accepted == {}
     assert not called, "没问题可改就不该调 LLM"

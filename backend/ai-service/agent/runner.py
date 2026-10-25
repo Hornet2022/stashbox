@@ -1170,6 +1170,7 @@ def _remediate_prompt(
     weak: dict[str, list[tuple[str, list[str]]]],
     under: dict[str, str],
     needs: dict[str, tuple[int, int]],
+    shortfall_chars: int = 0,
 ) -> str:
     """构造补救 prompt（user 侧）。
 
@@ -1178,22 +1179,28 @@ def _remediate_prompt(
     模型只重写不合格的那几条，**不会顺手补齐条数** ⇒ 补齐落空，
     补救只做了一半。
     """
-    lines = [
-        "# 原文",
-        (fetched_content or "")[:_REMEDIATE_SOURCE_MAX_CHARS],
-        "",
-        "# 需要重写的条目（方括号里是它不合格的原因）",
-    ]
-    for part, items in weak.items():
-        n_rewrite, n_new = needs.get(part, (len(items), 0))
-        lines.append(f"\n## {part}（重写 {n_rewrite} 条，另补 {n_new} 条）")
-        for item, codes in items:
+    lines = ["# 原文", (fetched_content or "")[:_REMEDIATE_SOURCE_MAX_CHARS], ""]
+    if shortfall_chars > 0:
+        lines += [
+            f"# ⚠️ 整稿还差 {shortfall_chars} 字才够篇幅下限",
+            "（这是**下限**，不是目标）—— 请按下面的条数写满，每条都要有新信息，"
+            "不许注水、不许重复已有的内容。",
+            "",
+        ]
+    lines.append("# 需要重写的条目（方括号里是它不合格的原因）")
+    for part, (n_rewrite, n_new) in needs.items():
+        bits = []
+        if n_rewrite:
+            bits.append(f"重写 {n_rewrite} 条")
+        if n_new:
+            bits.append(f"另补 {n_new} 条**新内容**（不要重写已有的）")
+        if not bits:
+            continue
+        lines.append(f"\n## {part}（{'，'.join(bits)}）")
+        for item, codes in weak.get(part, []):
             lines.append(f"- [{'/'.join(codes)}] {item}")
-    if under:
-        lines.append("\n# 需要补齐的段（条数没到下限）")
-        for part, reason in under.items():
-            n_rewrite, n_new = needs.get(part, (0, 0))
-            lines.append(f"- {part}：{reason} → 需要补 {n_new} 条**新内容**（不要重写已有的）")
+        if part in under:
+            lines.append(f"- （该段条数不足：{under[part]}）")
     lines.append("\n请按 JSON 格式输出重写/补齐后的条目。")
     return "\n".join(lines)
 
@@ -1220,26 +1227,38 @@ async def _remediate_recreation(
     }
     weak = recreation_quality.weak_items(groups, body_text)
     under = recreation_quality.underfilled(groups)
-    if not weak and not under:
+    # ⚠️ 字数阶梯是「四段合计」⇒ 必须把**正文要点**一起算进去；
+    # 只算三段会拿三段去比四段的下限 ⇒ 差出一个正文的量 ⇒ 补救被误触发。
+    gap_chars, gap_items = recreation_quality.chars_shortfall(
+        {**groups, "sections": list(parts.body_sections)}, len(fetched_content or "")
+    )
+    if not weak and not under and not gap_items:
         return {}
 
     log.warning(
-        "agent_rewrite_recreation_remediate weak_parts=%s under=%s",
+        "agent_rewrite_recreation_remediate weak_parts=%s under=%s short_chars=%d",
         ",".join(weak) or "-",
         json.dumps(under, ensure_ascii=False) if under else "-",
+        gap_chars,
     )
 
-    # 每段要产出几条：重写不合格的 + 补齐条数下限的
+    # 每段要产出几条：重写不合格的 + 补齐条数下限的 + 补齐篇幅下限的
     needs: dict[str, tuple[int, int]] = {}
     for part in set(weak) | set(under):
         n_rewrite = len(weak.get(part, []))
         n_new = max(0, recreation_quality.MIN_ITEM_COUNTS.get(part, 0) - len(groups[part]))
         needs[part] = (n_rewrite, n_new)
+    if gap_items:
+        # 篇幅不够 ⇒ 多写几条，按产品顺序轮流分摊到三段
+        for i in range(gap_items):
+            part = ("related", "insights", "follow_ups")[i % 3]
+            n_rewrite, n_new = needs.get(part, (0, 0))
+            needs[part] = (n_rewrite, n_new + 1)
 
     try:
         raw = await _chat_text(
             llm,
-            _remediate_prompt(fetched_content, weak, under, needs),
+            _remediate_prompt(fetched_content, weak, under, needs, gap_chars),
             system_prompt=_REMEDIATE_SYSTEM,
             step=step,
             max_tokens=4096,

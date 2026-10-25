@@ -379,3 +379,52 @@ def underfilled(parts: dict[str, list[str]]) -> dict[str, str]:
         if len(items) < floor:
             out[part] = f"条数 {len(items)} < 下限 {floor}"
     return out
+
+
+#: 整稿（四段合计）的**目标字数阶梯**，按**原文**长度分档。
+#:
+#: 为什么要有它（2026-10-25 实测）：prompt 里写了「1900-2600 字」，但模型
+#: **不会保证照做** —— 实测一篇 8578 字原文的稿子只写到 1783 字，
+#: 比它自己那份规格的下限还低 12%。⇒ 篇幅下限是**软约束**，
+#: 想让它成立就得有一条**机械判据**。
+#:
+#: 三档与 `_REWRITE_SYSTEM` 第 10 条一一对应（改一处要改两处，测试会挡住）。
+TARGET_CHARS_BY_SOURCE_LEN: tuple[tuple[int, int, int], ...] = (
+    # (原文字数上界, 下限, 上限)
+    (500, 900, 1200),
+    (2000, 1400, 1900),
+    (10**9, 1900, 2600),
+)
+
+
+def target_chars(source_len: int) -> tuple[int, int]:
+    """按原文长度返回整稿的 (下限, 上限)。"""
+    for upper, low, high in TARGET_CHARS_BY_SOURCE_LEN:
+        if source_len <= upper:
+            return low, high
+    return TARGET_CHARS_BY_SOURCE_LEN[-1][1], TARGET_CHARS_BY_SOURCE_LEN[-1][2]
+
+
+#: 一条再创作内容的**典型**字数（用于估算「还差几条」）。
+#:
+#: 取生产实测均值（related 111 / insights 105 / follow_ups 95）的中位偏上值 110。
+_TYPICAL_ITEM_CHARS = 110
+
+
+def chars_shortfall(parts: dict[str, list[str]], source_len: int) -> tuple[int, int]:
+    """整稿离字数下限还差多少。
+
+    ⚠️ `parts` 必须包含 **正文要点**（`sections`）——
+    prompt 第 10 条的字数阶梯是「sections + insights + related + follow_ups 合计」，
+    只算三段的话会拿三段去比四段的下限 ⇒ 差出一个正文的量 ⇒ 补救会被
+    触发得莫名其妙（实测会一口气要求补十几条）。
+
+    Returns:
+        ``(差额, 还差几条)``；差额 ≤ 0 表示已达下限。
+    """
+    low, _high = target_chars(source_len)
+    total = sum(len(x or "") for items in parts.values() for x in (items or []))
+    gap = low - total
+    if gap <= 0:
+        return 0, 0
+    return gap, -(-gap // _TYPICAL_ITEM_CHARS)  # 向上取整
