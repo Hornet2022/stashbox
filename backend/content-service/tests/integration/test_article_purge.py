@@ -93,15 +93,20 @@ async def user_row():
         # 测试不该动它，更不该因为自己需要它就把它删了。
         if created:
             async with AsyncSessionLocal() as db:
-                # purge 刻意保留的反馈行仍引用着这个 user，先按精确 id 清掉，
+                # purge 刻意保留的反馈行仍引用着这个 user，先清掉，
                 # 否则 feedback_v2_user_id_fkey 会让删用户行直接失败。
-                if _CREATED_ARTICLE_IDS:
-                    await db.execute(
-                        delete(FeedbackV2).where(
-                            FeedbackV2.user_id == TEST_USER_ID,
-                            FeedbackV2.article_id.in_(_CREATED_ARTICLE_IDS),
-                        )
-                    )
+                #
+                # ⚠️ 2026-10-25 修 CI：条件**不能**只按 article_id 匹配。
+                # purge 的设计是「feedback_v2.article_id 置 NULL、反馈行保留」
+                # （评分是画像训练资产）⇒ 那些行的 article_id 已经是 NULL，
+                # 压根不在 _CREATED_ARTICLE_IDS 里 ⇒ 按 article_id 匹配**漏掉它们**
+                # ⇒ 残留行仍引用着 user_id ⇒ 删用户行报 ForeignKeyViolationError
+                # （CI 第一次跑到这个目录就撞上：content-service/tests/ 之前
+                #  因 Pillow 缺失挂在第一个 pytest 步骤，从没跑到这一步）。
+                #
+                # 按 user_id 删是安全的：这段只在 `created` 为真时执行
+                # —— 也就是这个 user 刚刚由本夹具新建，不可能有别人的反馈行。
+                await db.execute(delete(FeedbackV2).where(FeedbackV2.user_id == TEST_USER_ID))
                 await db.execute(delete(User).where(User.id == TEST_USER_ID))
                 await db.commit()
         _CREATED_ARTICLE_IDS.clear()
