@@ -32,6 +32,41 @@ skip_in_ci = pytest.mark.skipif(
 # 隔离后端的起法见 admin-web/e2e-backend.sh。
 GATEWAY_URL = os.getenv("STASHBOX_GATEWAY", "http://127.0.0.1:18100")
 
+# ── 剪藏夹具 URL ──────────────────────────────────────────────────────────
+#
+# ⚠️ 2026-10-25 换掉 example.org，**因为它暴露了一个真问题**：
+#
+# 原来的夹具是 `https://example.org/`（IANA 保留示例域名）。它一直能用，
+# 但今天全量 pytest 出现 1 failed、单跑该文件出现 2 failed（**且失败的是
+# 不同的用例**），全都卡在「建文章」这一步，错误是
+#     502 {"code":2002,"message":"没能提取出文章正文…"}
+#
+# 顺着 content-service 的日志查到了根因（不是抖动，也不是代码回归）：
+#     fetch_parse_escalate url=https://example.org/ tier=http
+#         code=fetcher.parse msg=no article content extracted
+#     fetch_ok url=https://example.org/ tier=browser tried=['http', 'browser']
+# ⇒ **example.org 的正文太短，http 通道提取不出来**，靠**升级到 browser 通道**才成功。
+#
+# 而**生产上 browser 通道是关的**：`STASHBOX_FETCH_BROWSER_TIER=0`
+# （chromium RSS 300MB+，而 content-service 的 MemoryMax 只有 224MB ——
+# 开浏览器通道就等于给自己埋一个 OOM；README §9.4 有记录）。
+# ⇒ 本地 e2e（有 browser）时好时坏，**生产上则必然剪不动这个页面**。
+#
+# ⚠️ 这暴露的通用教训：**测试夹具必须在「生产的实际开关」下也能过**。
+# 用一个生产上被关掉的降级通道当夹具 ⇒ 测试间歇红、生产却是好的，
+# 于是人会一直「重跑」而永远找不到根因。
+#
+# 现在这个夹具的判据（2026-10-25 实测，逐个剪一遍看日志里的 tier）：
+#     https://www.iana.org/domains/example      tier=http  ✅ 生产能剪
+#     https://httpbin.org/html                   tier=http  ✅
+#     https://www.rfc-editor.org/rfc/rfc9110.html tier=http  ✅
+#     https://www.python.org/about/              tier=http  ✅
+#     https://blog.python.org/                   tier=http  ✅
+#     https://example.org/  /  example.com/      tier=browser ❌ 生产剪不动
+# ⇒ 选 **iana.org 的说明页**：语义上仍是「保留示例域名」，
+# 且它的正文长度过了提取器的下限，**http 通道直接就能提取**。
+FIXTURE_URL = "https://www.iana.org/domains/example"
+
 if urlparse(GATEWAY_URL).port in {8100, 8101, 8102, 8103, 8104}:
     raise RuntimeError(
         f"拒绝执行：STASHBOX_GATEWAY={GATEWAY_URL} 指向生产端口，"
@@ -109,12 +144,9 @@ async def test_wechat_url_full_distill_pipeline():
     async with httpx.AsyncClient(base_url=GATEWAY_URL, timeout=60.0) as client:
         # Step 1: 创建文章
         #
-        # ⚠️ 夹具 URL 必须是 **example.org 的根路径**，不能是 example.com 的子路径：
-        # `https://example.com/article-1` 返回**硬 404**（example.com 只服务 `/`），
-        # 而抓取失败在 2026-10-03 之后是**当场报错**（2002，不建库不计费）⇒
-        # 用例在建文章那一步就断了，断言「文章创建成功」永远到不了。
-        # example.org 的根页面是 IANA 保留的文档用域名，正文长度过下限，能剪藏成功。
-        url = "https://example.org/"
+        # ⚠️ 夹具 URL 见文件头的 FIXTURE_URL —— 必须是 **http 通道就能提取正文**的页面
+        # （生产上 browser 通道是关的，见 FIXTURE_URL 上面的说明）。
+        url = FIXTURE_URL
         create_resp = await client.post(
             "/api/v1/articles",
             json={"url": url, "source": "web"},
@@ -254,20 +286,19 @@ async def test_distill_failure_refund_quota():
     auth = {"Authorization": f"Bearer {token}"}
 
     async with httpx.AsyncClient(base_url=GATEWAY_URL, timeout=60.0) as client:
-        # 夹具 URL：example.org 的**根路径**（IANA 保留的文档用域名）。
-        # ⚠️ 必须是根路径：example.com / example.org 的**子路径是硬 404**
-        #    ⇒ 抓取失败在建文章这步就断了（2026-10-03 后失败是当场报错）。
-        # ⚠️ 外部站点会偶发抓取失败（网络抖动/限流）⇒ 502 时要能一眼看出
+        # 夹具 URL 见文件头 FIXTURE_URL（http 通道就能提取，生产也剪得动）。
+        # ⚠️ 外部站点仍可能**偶发**抓取失败（网络抖动/限流）⇒ 502 时要能一眼看出
         #    「是外部站点没抓到」而不是「契约不对」。
         create_resp = await client.post(
             "/api/v1/articles",
-            json={"url": "https://example.org/", "source": "web"},
+            json={"url": FIXTURE_URL, "source": "web"},
             headers=auth,
         )
         assert create_resp.status_code in (200, 201), (
             f"创建文章失败 {create_resp.status_code}: {create_resp.text}\n"
-            "  若 code=2002/2001 → **外部站点（example.org）这次没抓到**，"
-            "属夹具抖动，重跑即可；否则是契约问题。"
+            "  若 code=2002/2001 → **外部站点这次没抓到**（网络抖动/限流），可重跑；\n"
+            "  但若 code=2002 且日志里 tier=browser ⇒ 夹具又选成需要 browser 通道的页面了\n"
+            "  （生产 STASHBOX_FETCH_BROWSER_TIER=0，剪不动）——换夹具，别重跑。"
         )
         create_data = create_resp.json()
         article_id = create_data.get("article_id") or create_data.get("id")
@@ -350,7 +381,8 @@ async def test_unsupported_url_returns_envelope_without_creating_article():
     实测（2026-10-25，隔离栈 18100）：
       https://lobste.rs/        → 502 {"code":2002,"message":"没能提取出文章正文…"}
       https://example.com/article-1 → 502 {"code":2002,"message":"这篇文章已被删除或链接已失效"}
-      （example.com 的**子路径**是硬 404；只有 example.org 的根路径能剪藏成功）
+      （example.com 的**子路径**是硬 404；而 example.org 的**根路径**虽然能抓，
+        但靠的是 browser 降级通道 ⇒ 生产上剪不动，见文件头 FIXTURE_URL 的说明）
     """
     token, _ = await _login_via_wechat(f"cp47_unsupported_{uuid.uuid4().hex[:8]}")
     auth = {"Authorization": f"Bearer {token}"}
@@ -393,7 +425,7 @@ async def test_get_audio_before_distill_returns_404():
         # 创建文章（不蒸馏）
         create_resp = await client.post(
             "/api/v1/articles",
-            json={"url": "https://example.org/", "source": "web"},
+            json={"url": FIXTURE_URL, "source": "web"},
             headers=auth,
         )
         assert create_resp.status_code in (200, 201), create_resp.text
