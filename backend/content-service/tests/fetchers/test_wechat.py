@@ -307,21 +307,28 @@ def test_ua_contains_micromessenger_token():
 
 @pytest.mark.asyncio
 async def test_download_sends_wechat_four_piece_headers():
-    """4 件套（UA / Referer / Accept / Accept-Language）必须齐发。"""
-    captured: dict[str, str] = {}
+    """4 件套（UA / Referer / Accept / Accept-Language）必须齐发。
+
+    ⚠️ 2026-10-25：正文配图识图上线后，抓取会**多发图片请求**
+    （图片 CDN 的 Referer 是原文 URL，和文章请求的 `https://mp.weixin.qq.com/` 不同）。
+    所以这里必须**按 URL 分别记录**头，否则断言会被后发的图片请求覆盖掉 ——
+    覆盖掉的不是"4 件套没发"，而是"抓的其实是另一个请求"。
+    """
+    captured: dict[str, dict[str, str]] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured.update({k.lower(): v for k, v in request.headers.items()})
+        captured[str(request.url)] = {k.lower(): v for k, v in request.headers.items()}
         return httpx.Response(200, text=WECHAT_HTML, headers=HTML_HEADERS)
 
     fetcher = WechatFetcher(transport=httpx.MockTransport(handler))
     await fetcher.fetch(ARTICLE_URL)
 
-    assert captured["user-agent"] == WechatFetcher.UA
-    assert captured["referer"] == "https://mp.weixin.qq.com/"
+    article = next(h for url, h in captured.items() if url.startswith(ARTICLE_URL))
+    assert article["user-agent"] == WechatFetcher.UA
+    assert article["referer"] == "https://mp.weixin.qq.com/"
     # application/xml 不能省：缺了部分 CDN 返 406
-    assert "application/xml" in captured["accept"]
-    assert captured["accept-language"].startswith("zh-CN")
+    assert "application/xml" in article["accept"]
+    assert article["accept-language"].startswith("zh-CN")
 
 
 @pytest.mark.asyncio

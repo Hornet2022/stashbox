@@ -59,6 +59,7 @@ from .base import (
     FetcherError,
     FetcherErrorCode,
 )
+from .media_ocr import MediaImageCollector, caption_media_into, pick_image_src
 from .net import (
     Deadline,
     HeaderProfile,
@@ -205,21 +206,33 @@ def _check_wechat_block(html: str) -> None:
 
 
 class _TagStripper(HTMLParser):
-    """HTML 片段 → 纯文本（跳过 script/style，块级标签补换行）。"""
+    """HTML 片段 → 纯文本（跳过 script/style，块级标签补换行）。
+
+    `images`：可选的正文配图收集器。传入时，正文里的 `<img>` 会留下一个
+    **不可见占位符**（`\\x00IMG{n}\\x00`），位置就是它在正文里的位置 ——
+    后面（`fetch()` 里）会把图里的文字注回这个位置。
+    不传收集器时行为与从前完全一致。
+    """
 
     _BREAK_TAGS = frozenset({"br", "p", "div", "section", "li", "tr", "h1", "h2", "h3", "h4"})
     _SKIP_TAGS = frozenset({"script", "style", "noscript", "template", "svg", "iframe"})
 
-    def __init__(self) -> None:
+    def __init__(self, images: MediaImageCollector | None = None) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self._skip_depth = 0
+        self._images = images
 
     def handle_starttag(self, tag: str, attrs: Any) -> None:
         if tag in self._SKIP_TAGS:
             self._skip_depth += 1
             return
-        if not self._skip_depth and tag in self._BREAK_TAGS:
+        if self._skip_depth:
+            return
+        if tag == "img":
+            self._collect_image(dict(attrs))
+            return
+        if tag in self._BREAK_TAGS:
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
@@ -233,13 +246,24 @@ class _TagStripper(HTMLParser):
         if not self._skip_depth:
             self.parts.append(data)
 
+    def _collect_image(self, attr: dict[str, str]) -> None:
+        """正文里的一张 `<img>` → 占位符（前后补空格，避免图注和文字粘在一起）。
+
+        公众号的图默认懒加载，真链在 `data-src`（见 `pick_image_src`）。
+        """
+        if self._images is None:
+            return
+        token = self._images.add(pick_image_src(attr))
+        if token:
+            self.parts.append(f" {token} ")
+
     def text(self) -> str:
         return "".join(self.parts)
 
 
-def _strip_tags(html: str) -> str:
+def _strip_tags(html: str, images: MediaImageCollector | None = None) -> str:
     """去掉标签，返回带换行的纯文本（再交给 `_norm` 折叠空白）。"""
-    stripper = _TagStripper()
+    stripper = _TagStripper(images)
     stripper.feed(html)
     stripper.close()
     return stripper.text()
@@ -304,7 +328,7 @@ class WechatFetcher(Fetcher):
         # 这类 userinfo 写法照样命中（实测请求真的打到了本机 8100 网关）。
         # 拦截点统一在 net.build_client_kwargs()，新增 fetcher 也不会漏挂。
         deadline = Deadline(budget)
-        return await fetch_with_escalation(
+        result = await fetch_with_escalation(
             url=url,
             parse=self.parse,
             source=self.name,
@@ -317,19 +341,33 @@ class WechatFetcher(Fetcher):
                 with_browser=self._transport is None,
             ),
         )
+        # 正文配图识图：把正文里的图注注回原位（失败不阻断，见 media_ocr）。
+        #
+        # 为什么放在 `fetch()` 而不是 `parse()`：识图是**网络 + 模型**调用，
+        # 而 `parse()` 是给降级链用的**纯函数**（浏览器通道也要走它，
+        # 在那里做网络调用会让降级链的语义变脏）。
+        await caption_media_into(
+            result, profile=self.PROFILE, transport=self._transport, deadline=deadline
+        )
+        return result
 
     def parse(self, acq: Acquired) -> FetchResult:
         """pipeline 要求的解析入口（浏览器通道拿到的 HTML 也走这里）。
 
         反爬判定放在这里而不是 `_download` 之后：浏览器通道的 HTML 也必须过同一道闸，
         否则渲染出来的风控页会被当成正文页建库。
+
+        正文里的图在这里留下**占位符**（`images` 收集器），
+        由 `fetch()` 里的识图步骤替换成图注文字。
         """
         _check_wechat_block(acq.html)
+        images = MediaImageCollector(base_url=acq.final_url or acq.url)
         return self.parse_article(
             acq.html,
             url=acq.url or acq.final_url,
             final_url=acq.final_url,
             status_code=acq.status or 200,
+            images=images,
         )
 
     # -- 下载 ---------------------------------------------------------------
@@ -430,9 +468,20 @@ class WechatFetcher(Fetcher):
 
     # -- 解析 ---------------------------------------------------------------
     def parse_article(
-        self, html: str, *, url: str, final_url: str, status_code: int
+        self,
+        html: str,
+        *,
+        url: str,
+        final_url: str,
+        status_code: int,
+        images: MediaImageCollector | None = None,
     ) -> FetchResult:
-        """纯函数：HTML → FetchResult（测试和真抓取共用同一条解析路径）。"""
+        """纯函数：HTML → FetchResult（测试和真抓取共用同一条解析路径）。
+
+        `images`：可选的正文配图收集器。传入时，正文里的 `<img>` 会在
+        `content_text` 里留下占位符，图清单进 `raw_metadata["media_refs"]`
+        （由 `fetch()` 的识图步骤消费）。**不传就是从前那个行为。**
+        """
         try:
             title_ex = TitleExtractor().parse(html)
             author_ex = AuthorExtractor().parse(html)
@@ -477,7 +526,7 @@ class WechatFetcher(Fetcher):
 
         # 正文：公众号固定容器 #js_content
         content_html = self._extract_body(html)
-        content_text = _norm(_strip_tags(content_html))
+        content_text = _norm(_strip_tags(content_html, images))
         if not content_text:
             raise FetcherError(
                 code=FetcherErrorCode.PARSE,
@@ -497,6 +546,20 @@ class WechatFetcher(Fetcher):
                 source=self.name,
             )
 
+        raw_metadata: dict[str, Any] = {
+            "wechat_id": account_name,
+            "author_url": final_url,
+            "final_url": final_url,
+            "status_code": status_code,
+            "og_title": title_ex.og_title,
+            "html_title": title_ex.title,
+            "publish_time_raw": publish_time_raw,
+        }
+        if images is not None and images.storage_refs:
+            # 正文配图清单（url + 序号，**不含带 NUL 的占位符** —— JSONB 不接受
+            # \u0000）。`fetch()` 的识图步骤会取走它，换成 `media_captions`。
+            raw_metadata["media_refs"] = images.storage_refs
+
         return FetchResult(
             url=url,
             title=_clean_title(title_ex.best or "", account_name) or final_url,
@@ -506,15 +569,7 @@ class WechatFetcher(Fetcher):
             publish_time=publish_time,
             media_urls=media_urls,
             source=self.name,
-            raw_metadata={
-                "wechat_id": account_name,
-                "author_url": final_url,
-                "final_url": final_url,
-                "status_code": status_code,
-                "og_title": title_ex.og_title,
-                "html_title": title_ex.title,
-                "publish_time_raw": publish_time_raw,
-            },
+            raw_metadata=raw_metadata,
         )
 
     @staticmethod

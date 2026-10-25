@@ -75,3 +75,36 @@ def _no_real_network(monkeypatch, request):
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _blocked_real_network)
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _blocked_real_network)
+
+
+@pytest.fixture(autouse=True)
+async def _dispose_pools():
+    """每个 case 结束释放 DB/Redis 连接池。
+
+    pytest-asyncio 为每个 async test 建新 event loop，而连接池是**模块级全局**的，
+    不释放就会把上一个 loop 的连接带到下一个 case。
+
+    ⚠️ 2026-10-25（正文配图识图）踩到的具体后果：抓取路径会读一次
+    LLM/OCR 配置（Redis 缓存 + DB），于是**抓取用例也碰了库**。
+    没有这层隔离时，那次读会拿到上一个（已关闭）loop 建的连接 →
+    ``Event loop is closed`` → 连接带着"事务已损坏"的状态回到池里 →
+    **下一个**用库的用例报 ``cannot rollback; the transaction is in error state``。
+    （症状出现在毫不相干的用例上，极难定位。）
+
+    ``backend/tests/conftest.py`` 早就有同一份 fixture —— 两棵树行为必须一致，
+    否则"在 backend/tests 绿、在 content-service/tests 红"会变成常态。
+    """
+    yield
+    from stashbox.backend.common import database, redis_client
+
+    try:
+        await database.engine.dispose()
+    except Exception:
+        pass
+    pool = redis_client._redis_pool
+    if pool is not None:
+        try:
+            await pool.disconnect(inuse_connections=True)
+        except Exception:
+            pass
+        redis_client._redis_pool = None

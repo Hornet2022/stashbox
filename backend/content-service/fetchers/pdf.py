@@ -221,7 +221,7 @@ class PdfFetcher(Fetcher):
             # （扫描件的图本来就在 PDF 里，pypdf 能原样抽出来）。
             # 详见 fetchers/ocr.py 的说明（含实测结论）。
             try:
-                from .ocr import OCRUnavailableError, ocr_pdf
+                from .ocr import ocr_pdf
 
                 content_text, ocr_metadata = await ocr_pdf(body)
             except Exception as exc:

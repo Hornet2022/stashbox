@@ -513,13 +513,34 @@ def _json_default(obj):
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
+def _strip_nul(obj):
+    """落库前清掉 NUL 哨兵（递归）。
+
+    正文里的图片占位符是 `\\x00IMG1\\x00` 这种 NUL 哨兵 —— 正常情况下
+    它在抓取结束前就被替换/删掉了（见 `fetchers/media_ocr.py`）。
+    但 **PostgreSQL 的 JSONB 不接受** `\\u0000`
+    （实测报 `unsupported Unicode escape sequence`）：
+    哪怕只有一条路径漏掉了替换，整条建库就会炸在这里 —— 用户看到的是
+    "剪藏失败"，而真正的原因是正文里混进了几个不可见字符。
+
+    NUL 不是正文的一部分，直接去掉是最省事也最安全的兜底。
+    """
+    if isinstance(obj, str):
+        return obj.replace("\x00", "")
+    if isinstance(obj, dict):
+        return {k: _strip_nul(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_strip_nul(v) for v in obj]
+    return obj
+
+
 def _to_raw_content(result) -> dict:
     """FetchResult → JSONB-ready dict。
 
     asdict 只重建 dict/list/tuple，datetime 会原样保留（不会自动转 ISO 字符串），
     直接写 JSONB 会在序列化时炸，故再走一次 json 归一化。
     """
-    return json.loads(json.dumps(asdict(result), default=_json_default))
+    return json.loads(json.dumps(_strip_nul(asdict(result)), default=_json_default))
 
 
 #: 剪藏抓取的总时限预算（秒），覆盖「HTTP 退避重试 + 无头浏览器兜底」整条降级链。

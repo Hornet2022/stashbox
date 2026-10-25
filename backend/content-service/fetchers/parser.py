@@ -17,6 +17,16 @@ CP2.4 在 generic_url.py 里写的 5 个 stdlib HTMLParser，CP2.2 抽到这里�
 
 从 generic_url.py 平移时**行为不改**（阈值 / 段落数 / 截断位置全部照搬），
 CP2.4 的 5 个解析测试（test_generic_url.py）就是回归验证。
+
+## 正文配图（2026-10-25）
+
+`ContentExtractor` 多了一个**可选**的 `images` 收集器（`media_ocr.MediaImageCollector`）。
+传入时，正文里出现的 `<img>` 会在正文里留下一个**不可见占位符**
+（`\\x00IMG{n}\\x00`），位置在它在文档里出现的地方 ——
+这样后面才能把"图里的文字"**注回原位**，而不是堆在文末。
+
+⚠️ **不传收集器时行为与从前完全一致**（占位符、图片都不出现），
+这是刻意的：解析器本身不该改变"正文是什么"，它只负责把位置标出来。
 """
 
 from __future__ import annotations
@@ -27,6 +37,8 @@ from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urljoin
+
+from .media_ocr import MediaImageCollector, pick_image_src
 
 # --------------------------------------------------------------------------
 # readability 简化启发式的阈值（每个值的取舍见 fetchers/README.md §5）
@@ -240,9 +252,12 @@ class ContentExtractor(_Extractor):
     密度 = 纯文本长度 / 原始 HTML 长度。只保留"叶子"段（不含嵌套候选段的段），
     容器段（包着正文的 <article>/<div>）不参与竞争，否则会出现整页大段胜出。
     最终取密度最高的 MAX_PARAGRAPHS 段，再按文档顺序输出。
+
+    `images`：可选的正文配图收集器。传入时，正文里的 `<img>` 会留下占位符
+    （见模块文档）。**不传就是从前那个行为，一个字都不变。**
     """
 
-    def __init__(self) -> None:
+    def __init__(self, images: MediaImageCollector | None = None) -> None:
         super().__init__(convert_charrefs=True)
         self._html = ""
         self._line_starts: list[int] = [0]
@@ -250,6 +265,10 @@ class ContentExtractor(_Extractor):
         self._skip_depth = 0
         self._boilerplate_depth = 0
         self.blocks: list[dict[str, Any]] = []
+        self._images = images
+        # 正文里的图：(占位符, 锚点)。锚点 = 出现这张图时**已经定稿**的块数 - 1，
+        # 即"这张图排在哪个块之后"。用它把图插回它在文档里的位置。
+        self._image_refs: list[tuple[str, int]] = []
 
     # -- 位置换算 ---------------------------------------------------------
     def _abs(self) -> int:
@@ -276,6 +295,9 @@ class ContentExtractor(_Extractor):
             self._skip_depth += 1
             return
         if self._skip_depth:
+            return
+        if tag == "img":
+            self._collect_image(dict(attrs))
             return
         if tag in _BOILERPLATE_TAGS:
             self._boilerplate_depth += 1
@@ -313,15 +335,41 @@ class ContentExtractor(_Extractor):
             return
         self._stack[-1]["text"].append(data)
 
+    def _collect_image(self, attr: dict[str, str]) -> None:
+        """正文里的一张 `<img>` → 登记占位符 + 记住它在文档里的位置。
+
+        位置用"锚点"表示：**这张图排在已经定稿的第 N 个块之后**。
+        段落是边解析边定稿的，所以锚点就是"此刻已定稿的块数 - 1"。
+
+        图在某个块**里面**时先挂在那个块上：等这个块定稿后，
+        锚点会改成它自己的序号（图注就落在这一段之后，位置最准）。
+        """
+        if self._images is None:
+            return
+        token = self._images.add(pick_image_src(attr))
+        if not token:
+            return
+        anchor = len(self.blocks) - 1
+        if self._stack:
+            self._stack[-1].setdefault("images", []).append((token, anchor))
+        else:
+            self._image_refs.append((token, anchor))
+
     def _finalize(self, frame: dict[str, Any]) -> None:
         raw = self._html[frame["start"] : self._abs_end()]
         text = _norm("".join(frame["text"]))[:MAX_BLOCK_TEXT]
+        images = frame.get("images") or []
         if frame["boilerplate"] or frame["has_child"]:
+            # 这个块被丢掉（容器/样板）⇒ 里面的图回到"松散图"，
+            # 锚点保持"出现时已定稿的块数 - 1"，位置仍然对。
+            self._image_refs.extend(images)
             return
         if len(text) < MIN_PARAGRAPH_CHARS or len(raw) > MAX_BLOCK_RAW:
+            self._image_refs.extend(images)
             return
         density = len(text) / max(len(raw), 1)
         if density < MIN_TEXT_DENSITY:
+            self._image_refs.extend(images)
             return
         self.blocks.append(
             {
@@ -332,6 +380,9 @@ class ContentExtractor(_Extractor):
                 "density": density,
             }
         )
+        # 块被选中 ⇒ 里面的图锚到这个块（= 紧跟这一段之后）
+        order = len(self.blocks) - 1
+        self._image_refs.extend((token, order) for token, _ in images)
 
     # -- 输出 -------------------------------------------------------------
     def best(self, limit: int = MAX_PARAGRAPHS) -> list[dict[str, Any]]:
@@ -340,7 +391,43 @@ class ContentExtractor(_Extractor):
         return sorted(ranked, key=lambda b: b["order"])
 
     def content_text(self, limit: int = MAX_PARAGRAPHS) -> str:
-        return "\n\n".join(b["text"] for b in self.best(limit))[:MAX_CONTENT_TEXT]
+        blocks = self.best(limit)
+        if not self._image_refs:
+            return "\n\n".join(b["text"] for b in blocks)[:MAX_CONTENT_TEXT]
+        return "\n\n".join(self._parts(blocks))[:MAX_CONTENT_TEXT]
+
+    def _parts(self, blocks: list[dict[str, Any]]) -> list[str]:
+        """正文段落 + 图片占位符，按文档顺序拼成一份。
+
+        图片占位符**单独成段**（和段落之间用空行隔开）：
+        这样图注替换进去之后是"图表：……"独立一行，
+        不会和段落文字粘在一起（下游 prompt 禁止括号/方括号类舞台提示，
+        图注必须读起来像正文的一部分）。
+
+        锚点规则：锚点 A = "这张图排在第 A 个块之后"。
+        - 锚点落在某个**被选中**的块上 → 紧跟那个块；
+        - 锚点落在一个**被丢掉**的块上 → 跟在它前面那个被选中的块后面
+          （文档位置不会因为密度启发式丢块而改变）；
+        - 锚点在第一个被选中的块之前 → 排在最前面。
+        """
+        pending = sorted(self._image_refs, key=lambda item: item[1])
+        parts: list[str] = []
+        idx = 0
+        for block in blocks:
+            # 锚点 < 当前块 → 这些图在当前块之前（前面没有可挂靠的选中块）
+            while idx < len(pending) and pending[idx][1] < block["order"]:
+                parts.append(pending[idx][0])
+                idx += 1
+            parts.append(block["text"])
+            # 锚点 == 当前块 → 紧跟这个块之后
+            while idx < len(pending) and pending[idx][1] == block["order"]:
+                parts.append(pending[idx][0])
+                idx += 1
+        # 剩下的图排在最后一个选中块之后
+        while idx < len(pending):
+            parts.append(pending[idx][0])
+            idx += 1
+        return parts
 
     def content_html(self, limit: int = MAX_PARAGRAPHS) -> str:
         out: list[str] = []

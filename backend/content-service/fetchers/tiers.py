@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from urllib.parse import urlparse
 
 from .browser import browser_tier_enabled, get_renderer
 from .net import Deadline, HeaderProfile
+from .net import host_of as _host_of
 from .pipeline import BROWSER_TIER_CAP, Acquired, Tier
 
 log = logging.getLogger("stashbox.fetch.tiers")
@@ -111,11 +111,12 @@ def standard_tiers(
 
 
 def host_of(url: str) -> str:
-    """取 host（节流用；解析失败时退化成整串 URL 的短前缀，避免空 key 撞在一起）。"""
-    try:
-        return urlparse(url).netloc or url[:40]
-    except ValueError:
-        return url[:40]
+    """取 host（节流用；解析失败时退化成整串 URL 的短前缀，避免空 key 撞在一起）。
+
+    实现搬到 `net.py` 了（节流是网络层的事，而这一层会连带 import 浏览器通道）。
+    这里保留同名导出，老引用（`from .tiers import host_of`）照常可用。
+    """
+    return _host_of(url)
 
 
 __all__ = ["browser_acquirer", "host_of", "standard_tiers"]

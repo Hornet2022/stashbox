@@ -66,6 +66,7 @@ import random
 import time
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, TypeVar
+from urllib.parse import urlparse
 
 import httpx
 
@@ -352,6 +353,20 @@ class HostThrottle:
 HOST_THROTTLE = HostThrottle()
 
 
+def host_of(url: str) -> str:
+    """取 host（节流用；解析失败时退化成整串 URL 的短前缀，避免空 key 撞在一起）。
+
+    为什么定义在**这一层**而不是 `tiers.py`：节流是网络层的事，
+    而 `tiers` 会连带 import 浏览器通道（playwright）——
+    只为了一个 URL 取 host 的模块（比如正文配图下载）不该背上那串依赖。
+    `tiers.py` 仍然导出它，老引用照常可用。
+    """
+    try:
+        return urlparse(url).netloc or url[:40]
+    except ValueError:
+        return url[:40]
+
+
 # -- 代理 --------------------------------------------------------------------
 
 
@@ -505,6 +520,7 @@ __all__ = [
     "build_headers",
     "close_clients",
     "fetch_with_retry",
+    "host_of",
     "is_retryable_status",
     "proxy_url",
     "reset_clients_for_tests",

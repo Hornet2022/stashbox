@@ -32,6 +32,7 @@ from .base import (
     FetcherErrorCode,
 )
 
+from .media_ocr import MediaImageCollector, caption_media_into
 from .net import (
     Deadline,
     HeaderProfile,
@@ -124,7 +125,7 @@ class GenericURLFetcher(Fetcher):
         # 而冗余的防护如果没有任何测试覆盖，就等于给后来人一个「已经校验过了」的
         # 错觉，正是本项目反复吃过亏的那类假守卫。单一拦截点 = 单一可测事实。
         deadline = Deadline(budget)
-        return await fetch_with_escalation(
+        result = await fetch_with_escalation(
             url=url,
             parse=self.parse,
             source=self.name,
@@ -137,6 +138,15 @@ class GenericURLFetcher(Fetcher):
                 with_browser=self._transport is None,
             ),
         )
+        # 正文配图识图：把正文里的图注注回原位（失败不阻断，见 media_ocr）。
+        #
+        # 为什么放在 `fetch()` 而不是 `parse()`：识图是**网络 + 模型**调用，
+        # 而 `parse()` 是给降级链用的**纯函数**（浏览器通道也要走它，
+        # 在那里做网络调用会让降级链的语义变脏）。
+        await caption_media_into(
+            result, profile=self.PROFILE, transport=self._transport, deadline=deadline
+        )
+        return result
 
     def parse(self, acq: Acquired) -> FetchResult:
         """纯解析：HTML → FetchResult。浏览器通道拿到的 HTML 也走这里。
@@ -151,12 +161,13 @@ class GenericURLFetcher(Fetcher):
             )
 
         # 3 + 4. 5 个 stdlib HTMLParser 抽元数据 + 正文
+        images = MediaImageCollector(base_url=final_url)
         try:
             title_ex = _TitleExtractor().parse(html)
             author_ex = _AuthorExtractor().parse(html)
             time_ex = _TimeExtractor().parse(html)
             media_ex = _MediaExtractor(base_url=final_url).parse(html)
-            content_ex = _ContentExtractor().parse(html)
+            content_ex = _ContentExtractor(images=images).parse(html)
         except Exception as exc:  # HTMLParser 理论上不抛，兜底防脏 HTML 炸主流程
             raise FetcherError(
                 code=FetcherErrorCode.PARSE,
@@ -187,6 +198,21 @@ class GenericURLFetcher(Fetcher):
             )
 
         # 5. 构造 FetchResult
+        raw_metadata: dict = {
+            "final_url": final_url,
+            "status_code": acq.status,
+            "content_type": acq.extra.get("content_type", ""),
+            "og_title": title_ex.og_title,
+            "html_title": title_ex.title,
+            "publish_time_raw": time_ex.raw,
+            "paragraph_count": len(content_ex.best()),
+            "candidate_count": len(content_ex.blocks),
+        }
+        if images.storage_refs:
+            # 正文配图清单（url + 序号，**不含带 NUL 的占位符** —— JSONB 不接受
+            # \u0000）。`fetch()` 的识图步骤会取走它，换成 `media_captions`。
+            raw_metadata["media_refs"] = images.storage_refs
+
         return FetchResult(
             url=acq.url or final_url,
             title=title_ex.best or final_url,
@@ -196,16 +222,7 @@ class GenericURLFetcher(Fetcher):
             publish_time=time_ex.best,
             media_urls=media_ex.urls,
             source=self.name,
-            raw_metadata={
-                "final_url": final_url,
-                "status_code": acq.status,
-                "content_type": acq.extra.get("content_type", ""),
-                "og_title": title_ex.og_title,
-                "html_title": title_ex.title,
-                "publish_time_raw": time_ex.raw,
-                "paragraph_count": len(content_ex.best()),
-                "candidate_count": len(content_ex.blocks),
-            },
+            raw_metadata=raw_metadata,
         )
 
     # -- 下载 ---------------------------------------------------------------

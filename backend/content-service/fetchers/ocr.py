@@ -151,19 +151,41 @@ def _extract_page_images(data: bytes, *, max_pages: int) -> list[tuple[bytes, st
     return out
 
 
+#: 图片魔数 → mime。**按字节判断**，不看扩展名/Content-Type
+#: （实测 pypdf 的 image.name 不可靠 —— 有时是 'image.jpg'；
+#: 图床返回的 Content-Type 也经常是 application/octet-stream）。
+_IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"BM", "image/bmp"),
+)
+
+
+def image_mime_for(blob: bytes) -> str | None:
+    """按魔数判图片类型；**不是图片**返回 None。
+
+    为什么要有"返回 None"这个分支（而不是像 `_ext_for` 那样兜底成 jpeg）：
+    图床在防盗链/404 时会返回一段 **HTML**，把它当成 jpeg 塞给识图模型
+    只会得到一段胡说，还白烧 token。认不出来就当"不是图片"，让调用方跳过。
+    """
+    if not blob:
+        return None
+    for magic, mime in _IMAGE_MAGIC:
+        if blob.startswith(magic):
+            return mime
+    if blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 def _ext_for(blob: bytes) -> str:
     """按魔数猜图片类型（pypdf 的 image.name 不可靠 —— 实测有时是 'image.jpg'）。"""
-    if blob[:3] == b"\xff\xd8\xff":
+    mime = image_mime_for(blob)
+    if not mime:
         return "jpeg"
-    if blob[:8] == b"\x89PNG\r\n\x1a\n":
-        return "png"
-    if blob[:6] in (b"GIF87a", b"GIF89a"):
-        return "gif"
-    if blob[:2] == b"BM":
-        return "bmp"
-    if blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
-        return "webp"
-    return "jpeg"
+    return mime.split("/", 1)[1]
 
 
 async def _ocr_one_image(
@@ -172,8 +194,15 @@ async def _ocr_one_image(
     image: bytes,
     mime: str,
     model: str,
+    prompt: str = _OCR_PROMPT,
 ) -> str:
-    """单张图 → 文字。"""
+    """单张图 → 文字。
+
+    `prompt` 默认走扫描件那版；正文配图识图会传自己那版
+    （图表不是纯文字段落，见 `media_ocr._MEDIA_OCR_PROMPT`）。
+    请求体的拼装**只有这一份** —— 复制一份的话，provider 改了协议
+    （比如 `image_url` 的写法）就会只改到一半，另一半静默失配。
+    """
     b64 = base64.b64encode(image).decode("ascii")
     body = {
         "model": model,
@@ -181,7 +210,7 @@ async def _ocr_one_image(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": _OCR_PROMPT},
+                    {"type": "text", "text": prompt},
                     {
                         "type": "image_url",
                         "image_url": {"url": f"data:{mime};base64,{b64}"},
@@ -197,6 +226,48 @@ async def _ocr_one_image(
         raise OCRUnavailableError(f"ocr http {resp.status_code}: {resp.text[:200]}")
     data = resp.json()
     return str(data["choices"][0]["message"]["content"] or "").strip()
+
+
+async def ocr_config() -> tuple[str, str, str]:
+    """(base_url, api_key, model) —— `_resolve_config` 的公开别名。
+
+    给别的模块判断"识图通道是否可用"用：没配 provider 时就不该去下载图片
+    （白下载一遍，最后还是识不了）。
+    """
+    return await _resolve_config()
+
+
+async def ocr_image_bytes(
+    blob: bytes,
+    mime: str,
+    *,
+    prompt: str | None = None,
+    timeout: float | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> str:
+    """单张图 → 文字（公开入口，供正文配图识图复用）。
+
+    与 `ocr_pdf` **共用同一个 provider 通道**（同一个 base_url / api_key / 模型），
+    所以运营在后台改 LLM 配置，识图自动跟着走，不需要配第二套凭据。
+    """
+    base_url, api_key, model = await _resolve_config()
+    if not base_url or not api_key:
+        raise OCRUnavailableError("没配置 LLM provider（base_url/api_key），无法识图")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(
+        base_url=base_url,
+        headers=headers,
+        timeout=timeout if timeout is not None else OCR_TIMEOUT,
+        trust_env=False,
+        transport=transport,
+    ) as client:
+        return await _ocr_one_image(
+            client,
+            image=blob,
+            mime=mime,
+            model=model,
+            prompt=prompt or _OCR_PROMPT,
+        )
 
 
 async def ocr_pdf(
@@ -248,5 +319,8 @@ __all__ = [
     "DEFAULT_OCR_MODEL",
     "MAX_OCR_PAGES",
     "OCRUnavailableError",
+    "image_mime_for",
+    "ocr_config",
+    "ocr_image_bytes",
     "ocr_pdf",
 ]
