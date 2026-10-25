@@ -295,3 +295,87 @@ def _to_num(text: str) -> float | None:
         return float(text.rstrip("%"))
     except ValueError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# 「丰度」判据（2026-10-25 产品反馈：「内容不够深刻、丰富」）
+# ---------------------------------------------------------------------------
+#
+# ## 为什么「条数」才是杠杆，而不是「每条字数」
+#
+# 实测（2026-10-25，生产 32 篇 + 两篇新规格探针）：
+#
+#     段          prompt 规格        生产实测每条字数        生产实测条数/篇
+#     sections    80-160 字           均值 123（max 219）      4.1 节
+#     related     45-80  字           均值 111（max 147）      1.47 条
+#     insights    50-100 字           均值 105（max 145）      2.2 条
+#     follow_ups  45-80  字           均值  95（max 124）      1.4 条
+#
+# ⇒ **每条的字数早就超出规格**（模型自己写得更饱满），真正被卡住的是
+# **条数**和**总字数闸门**（prompt 第 10 条把整稿钉在 1000-1400 字）。
+# ⇒ 想让内容「更丰富」，该抬的是**条数下限**，不是字数下限。
+#
+# ## 为什么单条字数下限要**分段**给
+#
+# 全局 40 字（`_MIN_ITEM_CHARS`）是「塞得下一个论证」的底线。
+# 分段的下限取生产实测**最小值**下方一点点（related 72→60、insights 76→70、
+# follow_ups 62→60）⇒ 只抓**明显过短**的，不误伤正常条目。
+#
+# ⚠️ 这两个下限都是「判据」，不是「丢弃规则」：不合格的条目由
+# `runner._remediate_recreation` **重写**，不是删掉（删内容比内容浅更糟）。
+
+#: 三段再创作内容的**条目数下限**。
+MIN_ITEM_COUNTS: dict[str, int] = {"related": 2, "insights": 3, "follow_ups": 2}
+
+#: 三段再创作内容的**单条字数下限**（分段给，见上面的推导）。
+MIN_CHARS_BY_PART: dict[str, int] = {"related": 60, "insights": 70, "follow_ups": 60}
+
+
+def check_item_for_part(item: str, part: str, body_text: str = "") -> list[str]:
+    """按段判定一条内容是否合格。
+
+    = `check_item` + 该段的字数下限（`too_short`）。
+
+    为什么单列一个函数而不是给 `check_item` 加参数：
+    `check_item` 是**单条**契约（40 字底线），分段下限是**丰度**契约，
+    两者会分头演进（前者跟着「塞得下一个论证」走，后者跟着「说得清一个论证」走）。
+    """
+    codes = check_item(item, body_text)
+    floor = MIN_CHARS_BY_PART.get(part)
+    text = (item or "").strip()
+    if floor and 0 < len(text) < floor and "too_short" not in codes:
+        codes.append("too_short")
+    return codes
+
+
+def weak_items(
+    parts: dict[str, list[str]], body_text: str = ""
+) -> dict[str, list[tuple[str, list[str]]]]:
+    """每段里不合格的条目 + 原因码（供「补救」用）。
+
+    Returns:
+        {"related": [(条目, ["no_reasoning"]), ...], ...}；没有不合格的段不出现在结果里。
+    """
+    out: dict[str, list[tuple[str, list[str]]]] = {}
+    for part, items in parts.items():
+        bad: list[tuple[str, list[str]]] = []
+        for item in items or []:
+            codes = check_item_for_part(item, part, body_text)
+            if codes:
+                bad.append((item, codes))
+        if bad:
+            out[part] = bad
+    return out
+
+
+def underfilled(parts: dict[str, list[str]]) -> dict[str, str]:
+    """未达标的段 → 原因描述（条数不足）。
+
+    与 `missing_parts`（整段为空）互补：这里管的是「段在，但条数不够」。
+    """
+    out: dict[str, str] = {}
+    for part, floor in MIN_ITEM_COUNTS.items():
+        items = parts.get(part) or []
+        if len(items) < floor:
+            out[part] = f"条数 {len(items)} < 下限 {floor}"
+    return out

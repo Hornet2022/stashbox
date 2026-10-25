@@ -278,6 +278,43 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
                             _item[:200],
                         )
 
+        # ── 再创作内容的「补救」（2026-10-25）─────────────────────────
+        #
+        # 抬高规格（条数 ↑ / 篇幅 ↑）之后实测：同一篇原文产出从 1308 字 → 1866 字，
+        # 但**多出来的条目里混进了选题短语**（判据通过率 7/7 → 8/10）。
+        # ⇒ 深度只能靠**把不合格的换掉**拿到，不能靠 prompt 里再喊几句「要深刻」。
+        #
+        # 这里做的是**局部重写**（只重写不合格的条目 + 补齐条数不够的段），
+        # 不是整篇重来 —— 成本低一个量级。
+        #
+        # ⚠️ 失败时**保留原条目**（只记不丢）：删内容比内容浅更糟。
+        if _REMEDIATE_ENABLED and not parts.degraded:
+            _body = "\n".join([parts.hook] + list(parts.sections))
+            try:
+                _accepted = await _remediate_recreation(llm, parts, _body, fetched_content)
+            except Exception as exc:  # noqa: BLE001 —— 补救失败不许拖垮整篇稿
+                log.warning("agent_rewrite_recreation_remediate_error err=%s", repr(exc))
+                _accepted = {}
+            if _accepted:
+                _weak = recreation_quality.weak_items(
+                    {
+                        "related": list(parts.related),
+                        "insights": list(parts.insights),
+                        "follow_ups": list(parts.follow_ups),
+                    },
+                    _body,
+                )
+                _apply_remediation(parts, _accepted, _weak)
+                log.info(
+                    "agent_rewrite_recreation_remediated parts=%s "
+                    "related=%d insights=%d follow_ups=%d script=%dB",
+                    ",".join(_accepted),
+                    len(parts.related),
+                    len(parts.insights),
+                    len(parts.follow_ups),
+                    len(parts.script),
+                )
+
         if not parts.script.strip():
             return _error_update(
                 state,
@@ -757,10 +794,10 @@ _REWRITE_SYSTEM = """你是一个中文播客主理人。任务：把原文改�
 【输出格式 — 严格 JSON，不要 Markdown 代码块】
 {
   "hook": "开场钩子，≤ 80 字，15 秒左右能读完",
-  "sections": ["核心要点（正文节拍），一节一个字符串，80-160 字，共 3-5 节"],
-  "related": ["关联思考，1-2 条，每条 45-80 字"],
-  "insights": ["延伸判断，2-3 条，每条 50-100 字"],
-  "follow_ups": ["拓展方向，1-2 条，每条 45-80 字"],
+  "sections": ["核心要点（正文节拍），一节一个字符串，100-200 字，共 4-6 节"],
+  "related": ["关联思考，2-3 条，每条 70-130 字"],
+  "insights": ["延伸判断，3-4 条，每条 80-150 字"],
+  "follow_ups": ["拓展方向，2-3 条，每条 70-130 字"],
   "outro": "收束，≤ 80 字，呼应 hook 的开头句式或意象",
   "tags": ["主题标签，1-3 个，必须从候选标签里原样选"]
 }
@@ -867,8 +904,21 @@ _REWRITE_SYSTEM = """你是一个中文播客主理人。任务：把原文改�
      · **四段都要有**：实在写不出来就写得浅一点、写得保守一点，
        但**不要整段留空** ——「宁缺毋滥」约束的是**单条的质量**
        （没推理 / 复述原文 / 名词短语），不是「这段干脆不写」。
-10. **长度自适应**：原文 < 500 字 → 600-800 字；500-2000 字 → 800-1100 字；> 2000 字 → 1000-1400 字
+10. **长度自适应**：原文 < 500 字 → 900-1200 字；500-2000 字 → 1400-1900 字；> 2000 字 → 1900-2600 字
     （sections + insights + related + follow_ups 合计）
+
+    ⚠️ 这是**下限也是上限**：宁可多写一条有内容的，也不要靠注水凑字数；
+    但如果按上面给的条数写完还没到下限，说明你**没把原文榨干** —— 回去再找。
+
+    ⚠️ 为什么把上限抬了（2026-10-25）：实测生产 32 篇，整稿中位只有 1150 字，
+    正好顶在这条「1000-1400」的闸门上 ⇒ 内容「不够丰富」是**被规格卡住的**，
+    不是模型写不动。实测把规格抬到上面这档，同一篇原文的产出从 1308 字
+    涨到 1866 字（+43%），条数从 2/3/2 涨到 3/4/3。
+
+11. **具体性**：每一条都要落到**具体对象**上 —— 公司、产品、协议、版本号、数字、
+    时间、某次事故或某个具体做法。不许整段停在抽象名词（「行业」「生态」「趋势」
+    「范式」「格局」「浪潮」）。写完自检：这条里有没有一个**听众能去查的名字或数字**？
+    没有就换一条。
 
 输出纯 JSON。"""
 
@@ -1045,6 +1095,227 @@ def _rewrite_prompt(fetched_content: str) -> str:
     system 契约放在 `_chat_text(system_prompt=...)`，这里只拼原文。
     """
     return f"# 原文\n{fetched_content}"
+
+
+# ---------------------------------------------------------------------------
+# 再创作内容的「补救」（2026-10-25）
+# ---------------------------------------------------------------------------
+#
+# ## 为什么需要这一步
+#
+# 抬高规格（条数 ↑ / 篇幅 ↑）之后实测（生产两篇原文，新旧规格各跑一次）：
+#
+#     旧规格：整稿 1308 字，related/insights/follow_ups = 2/3/2，判据合格 7/7
+#     新规格：整稿 1866 字，related/insights/follow_ups = 3/4/3，判据合格 8/10
+#
+# ⇒ 篇幅确实涨了（+43%），但**多出来的条目里混进了「关注X的部署进度」
+# 「追踪Y的里程碑」这种选题短语**（`no_reasoning`）。
+#
+# ⇒ 单纯「写更多」会把「浅」一起放大。深度只能靠**把不合格的换掉**拿到，
+# 而不是在 prompt 里再多喊几句「要深刻」（喊了也不落地，没有判据就没有闸门）。
+#
+# ## 为什么是「局部重写」而不是「整篇重来」
+#
+# 整篇重来 = 1 次长文改写（实测 ~40s + 整篇 token），
+# 而要修的往往只是 1~2 条 ⇒ 局部重写便宜一个量级。
+#
+# ## 失败时怎么办
+#
+# **只记不丢**：重写失败 / 解析不出 JSON / 重写后仍不合格 ⇒ 保留原条目。
+# 删内容比内容浅更糟。
+
+#: 补救开关。关掉后行为 = 改写一次即落库（2026-10-25 之前的行为）。
+_REMEDIATE_ENABLED = True
+
+#: 补救时送进 prompt 的原文长度上限（超了截断）。
+#:
+#: 实测最长的一篇原文 8578 字 ⇒ 不截断也能整份送进去；
+#: 但「几万字的长文」会撑爆 prompt，所以留一个上限。
+_REMEDIATE_SOURCE_MAX_CHARS = 12000
+
+_REMEDIATE_SYSTEM = """你是一个中文播客主理人，负责**重写稿子里不合格的段落**。
+
+上游模型已经写过一版稿子，但其中有几条不合格。你的任务只做一件事：
+把指定的那几条重写成合格的，**不要重写整篇稿子**，也不要输出正文要点。
+
+【什么算合格】每一条都必须同时满足：
+① **有推论**：必须写出"因为/所以/但/反而/这意味着/前提是…"这类推理，让人知道你
+   **为什么**这么判断。只给定义、只给标签（"X 的设计""X 的影响"）、只复述原文主旨，
+   一律不合格。
+② **有依据**：依据 = **原文给了什么事实/矛盾/数字** **加上你自己的领域判断**。
+   ⚠️ 不许编造原文里没有的具体数字、版本号、事件、时间。
+③ **是给听众的一句话判断**，不是标签、不是选题清单、不是短语。
+④ **具体**：要落到具体对象（公司、产品、协议、版本号、数字、时间）上，
+   不许停在「行业」「生态」「趋势」「范式」这类抽象名词。
+
+【分段的分工，不要混】
+· related（关联思考）—— 这件事和**什么**相关/矛盾/互相印证？
+· insights（延伸判断）—— **往后看会怎样**？真正的瓶颈、代价、边界、什么时候会失效。
+· follow_ups（拓展方向）—— 听众接下来该**盯住什么**，为什么现在值得盯。
+
+【输出格式 — 严格 JSON，不要 Markdown 代码块】
+{
+  "related": ["重写后的关联思考，每条 70-130 字"],
+  "insights": ["重写后的延伸判断，每条 80-150 字"],
+  "follow_ups": ["重写后的拓展方向，每条 70-130 字"]
+}
+
+只输出**需要修的**那些段；没问题的段不要出现在输出里。
+每条都要能独立站住（听众只听声音、看不到列表）。
+"""
+
+
+def _remediate_prompt(
+    fetched_content: str,
+    weak: dict[str, list[tuple[str, list[str]]]],
+    under: dict[str, str],
+    needs: dict[str, tuple[int, int]],
+) -> str:
+    """构造补救 prompt（user 侧）。
+
+    `needs` = 每段要产出几条：``(重写几条, 新增几条)``。
+    ⚠️ **必须把条数写进 prompt** —— 实测（2026-10-25）不写条数时，
+    模型只重写不合格的那几条，**不会顺手补齐条数** ⇒ 补齐落空，
+    补救只做了一半。
+    """
+    lines = [
+        "# 原文",
+        (fetched_content or "")[:_REMEDIATE_SOURCE_MAX_CHARS],
+        "",
+        "# 需要重写的条目（方括号里是它不合格的原因）",
+    ]
+    for part, items in weak.items():
+        n_rewrite, n_new = needs.get(part, (len(items), 0))
+        lines.append(f"\n## {part}（重写 {n_rewrite} 条，另补 {n_new} 条）")
+        for item, codes in items:
+            lines.append(f"- [{'/'.join(codes)}] {item}")
+    if under:
+        lines.append("\n# 需要补齐的段（条数没到下限）")
+        for part, reason in under.items():
+            n_rewrite, n_new = needs.get(part, (0, 0))
+            lines.append(f"- {part}：{reason} → 需要补 {n_new} 条**新内容**（不要重写已有的）")
+    lines.append("\n请按 JSON 格式输出重写/补齐后的条目。")
+    return "\n".join(lines)
+
+
+async def _remediate_recreation(
+    llm: Any,
+    parts: "_RewriteParts",
+    body_text: str,
+    fetched_content: str,
+    *,
+    step: str = "agent_rewrite_remediate",
+) -> dict[str, list[str]]:
+    """重写不合格的再创作者条目 + 补齐缺段/条数不足的段。
+
+    Returns:
+        ``{"related": [...], "insights": [...], "follow_ups": [...]}`` ——
+        只含**实际要替换/新增**的条目，且每条都**通过了复判**。
+        没问题可改时返回 ``{}``。
+    """
+    groups = {
+        "related": list(parts.related),
+        "insights": list(parts.insights),
+        "follow_ups": list(parts.follow_ups),
+    }
+    weak = recreation_quality.weak_items(groups, body_text)
+    under = recreation_quality.underfilled(groups)
+    if not weak and not under:
+        return {}
+
+    log.warning(
+        "agent_rewrite_recreation_remediate weak_parts=%s under=%s",
+        ",".join(weak) or "-",
+        json.dumps(under, ensure_ascii=False) if under else "-",
+    )
+
+    # 每段要产出几条：重写不合格的 + 补齐条数下限的
+    needs: dict[str, tuple[int, int]] = {}
+    for part in set(weak) | set(under):
+        n_rewrite = len(weak.get(part, []))
+        n_new = max(0, recreation_quality.MIN_ITEM_COUNTS.get(part, 0) - len(groups[part]))
+        needs[part] = (n_rewrite, n_new)
+
+    try:
+        raw = await _chat_text(
+            llm,
+            _remediate_prompt(fetched_content, weak, under, needs),
+            system_prompt=_REMEDIATE_SYSTEM,
+            step=step,
+            max_tokens=4096,
+            temperature=0.6,
+        )
+    except Exception as exc:  # noqa: BLE001 —— 补救失败不许拖垮整篇稿
+        log.warning("agent_rewrite_recreation_remediate_failed err=%s", repr(exc))
+        return {}
+
+    obj = _extract_json_object(raw)
+    if obj is None:
+        log.warning("agent_rewrite_recreation_remediate_unparsable")
+        return {}
+
+    accepted: dict[str, list[str]] = {}
+    for part in ("related", "insights", "follow_ups"):
+        cands = _str_list(obj.get(part))
+        if not cands:
+            continue
+        good: list[str] = []
+        rejected = 0
+        for cand in cands:
+            codes = recreation_quality.check_item_for_part(cand, part, body_text)
+            if codes:
+                rejected += 1
+                continue
+            good.append(cand)
+        if rejected:
+            log.warning(
+                "agent_rewrite_recreation_remediate_rejected part=%s rejected=%d kept=%d",
+                part,
+                rejected,
+                len(good),
+            )
+        if good:
+            accepted[part] = good
+    return accepted
+
+
+def _apply_remediation(
+    parts: "_RewriteParts",
+    accepted: dict[str, list[str]],
+    weak: dict[str, list[tuple[str, list[str]]]],
+) -> None:
+    """把补救结果并回 `_RewriteParts`（就地修改）。
+
+    合并规则：
+    · 该段有不合格条目 ⇒ 逐条替换；**替补用完就保留原条目**（只记不丢）。
+    · 该段只是条数不够 ⇒ 追加到满足下限。
+    · 最后重建 `sections`（= 正文要点 + 三段，顺序 = 产品定义）。
+    """
+    for part, new_items in accepted.items():
+        current = list(getattr(parts, part))
+        bad = [item for item, _ in weak.get(part, [])]
+        if bad:
+            merged: list[str] = []
+            pending = list(new_items)
+            for item in current:
+                if item in bad:
+                    if pending:
+                        merged.append(pending.pop(0))
+                    else:
+                        merged.append(item)  # 没有替补 ⇒ 保留原条目
+                else:
+                    merged.append(item)
+            merged.extend(pending)  # 多出来的合格新条目
+        else:
+            merged = current + list(new_items)
+        setattr(parts, part, merged)
+
+    parts.sections = (
+        list(parts.body_sections)
+        + list(parts.related)
+        + list(parts.insights)
+        + list(parts.follow_ups)
+    )
 
 
 def _str_list(value: Any) -> list[str]:
