@@ -849,6 +849,52 @@ systemctl daemon-reload && systemctl restart stashbox-content-service
 ⇒ **「RSS 只涨不跌」先分清是活对象还是碎片**（`del`+`gc` 不降但 `malloc_trim` 能降
 ⇒ 就是碎片），再用「同进程连跑 N 次」测残留。
 
+### 9.3.4 主机垃圾清理：让垃圾**不再长回来**（2026-10-25）
+
+这台机器是 2 GiB 小机器（物理实测 1613MB / 40G 磁盘），
+而「垃圾」长得比想象中快：每次探针/调试都会在 `/tmp` 留下脚本、日志、
+测试音频、APK……**实测一次就攒了 402 个条目 / 152MB**。
+
+**清理脚本**：`backend/deploy/cleanup-host-junk.sh`（**版本可控**，
+部署到 `/opt/stashbox/stashbox/backend/deploy/`，cron 每周日凌晨 04:17 跑）。
+清四样：`/tmp` 里超 7 天的条目、apt 缓存、journal 压到 100M、部署目录的 `__pycache__`。
+支持 `--dry-run`。
+
+⚠️ **它绝不碰的东西**（每条都有理由，脚本头部有完整清单）：
+
+| 不碰 | 为什么 |
+|---|---|
+| `/tmp/systemd-private-*` | systemd 给 `PrivateTmp=true` 单元建的**私有** /tmp。五个服务单元全是 PrivateTmp ⇒ 删了服务当场挂 |
+| `/tmp/aliyun_assist_service.sock` | 阿里云监控 agent 的活动套接字 |
+| `/var/lib/stashbox/data` | **生产音频存储**（`STORAGE_PROVIDER=local`），文章的 `audio_url` 指的就是这里的文件 |
+| `/root/*backup*` | 历次维护的回滚保险，删了不可逆 |
+
+#### ⚠️ 别用 `systemd-tmpfiles` 来清 `/tmp`（实测踩过的坑）
+
+Ubuntu 的 `/usr/lib/tmpfiles.d/tmp.conf` 写的是 `D /tmp 1777 root root 30d`，
+而 `tmpfiles.d(5)` 里 `D` 的定义是「**当 `--remove` 被使用时**才清目录内容」——
+而 `systemd-tmpfiles-clean.timer` 跑的是 **`--clean`** ⇒
+**那条 30d 规则对定时清理根本不生效**。
+
+实测证据链：
+
+1. `/tmp` 攒了 402 个条目、跨 4 天没被清过；
+2. 放一个 30 天前的文件进去跑 `systemd-tmpfiles --clean` ⇒ **没被删**；
+3. 换 `e` 类型（man 页说「按 age 清内容、--clean 时生效」）⇒ **仍然没删**（systemd 255）；
+4. 把 `/tmp` 自身 mtime 设旧、条目保持新鲜 ⇒ 条目留着 ⇒ 说明 age 是按**条目**判的，
+   与 `x` 排除规则无关（已用对照实验排除：去掉 `x` 规则后仍不删）。
+
+⇒ 结论：`/tmp` 的清理**自己做**（`find` + 显式排除项），
+别指望 tmpfiles —— 留一条「看起来在清、实际不清」的规则只会误导运维。
+
+⚠️ **另外两处也改了**（2026-10-25）：
+
+- `/etc/apt/apt.conf.d/10periodic` 的 `APT::Periodic::AutocleanInterval`
+  默认是 `"0"`（**关**）⇒ apt 缓存会重新长到 291MB ⇒ 已改成 `"7"`（每周），
+  `apt-daily.timer` 会跑。
+- journald 的 `SystemMaxUse=200M` **没动**（那是刻意设的保留策略）；
+  只是把当前占用从 141M 压回 100M 上下，给那条上限留一倍余量。
+
 ### 9.4 故意**没有**放到这台机器上的东西
 
 | 没放的东西 | 为什么 | 用什么代替 |
