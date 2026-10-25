@@ -54,7 +54,28 @@ class EventName(str, Enum):
     ARTICLE_RETRY_REQUESTED = "article_retry_requested"  # CP5.2
 
     # === 音频播放（CP6.2.1 覆盖 2）===
-    AUDIO_PLAY_START = "audio_play_start"  # CP6.2.1
+    #
+    # ⚠️ AUDIO_PLAY_START 与 AUDIO_PLAY_START_CLIENT 是**两件不同的事**，
+    # 别合并（2026-10-25 实测踩过）：
+    #
+    #   AUDIO_PLAY_START        —— **服务端**打的：用户点了播放 → 前端来取音频
+    #                               直链（content-service/main.py 的 audio-url
+    #                               端点）。它是「取到地址了」，不是「声音出来了」。
+    #   AUDIO_PLAY_START_CLIENT —— **客户端**打的：用户点了播放 → 播放器真的
+    #                               进入出声状态（ExoPlayer isPlaying 由 false
+    #                               变 true）。它带 duration_ms。
+    #
+    # 为什么必须是两个事件名：A/B 报表（ai-service/distill/ab_report.py）直接
+    # `count(Feedback.type == 'audio_play_start')` 当**播放次数**的分母 ——
+    # 完听率 = audio_complete / audio_play_start，复听率 = 同一 (user, article)
+    # 有 ≥2 次播放。客户端再用同名打一次 ⇒ 一次播放变两条 ⇒
+    # **完听率直接掉一半、复听率把「播放 1 次」误判成「复听过」**。
+    #
+    # 也不改服务端那条的名字：那样会断 A/B 报表的历史序列（0029 迁移上线前的
+    # 数据都是 audio_play_start），而客户端这条是**新指标**（只为带 duration_ms），
+    # 本来就不该混进「播放次数」的分母。
+    AUDIO_PLAY_START = "audio_play_start"  # CP6.2.1（服务端：取到音频直链）
+    AUDIO_PLAY_START_CLIENT = "audio_play_start_client"  # 客户端：真的出声了
     AUDIO_PAUSE = "audio_pause"  # CP6.2.2
     AUDIO_RESUME = "audio_resume"  # CP6.2.2
     AUDIO_COMPLETE = "audio_complete"  # CP6.2.1
@@ -65,11 +86,11 @@ class EventName(str, Enum):
     #
     # 「7 大指标」里两个**客户端**指标的落点（cp10.9-product-audit.md §4）：
     #   · 首屏加载 < 1.5s  → APP_FIRST_FRAME，properties.duration_ms
-    #   · 音频启动 < 500ms → 复用 AUDIO_PLAY_START，properties.duration_ms
+    #   · 音频启动 < 500ms → AUDIO_PLAY_START_CLIENT，properties.duration_ms
     #
-    # 为什么音频启动**复用** AUDIO_PLAY_START 而不新加一个事件：
-    # 「用户点了播放」与「声音真的出来了」是**同一个动作的两端**，
-    # 拆成两个事件就要对账（两次上报可能只到一次）⇒ 同一个事件带时长更准。
+    # 为什么音频启动**不**复用服务端的 AUDIO_PLAY_START：见上面那段说明 ——
+    # 那两个事件测的是**两件不同的事**（取到直链 vs 真的出声），复用会污染
+    # A/B 报表的播放次数分母。
     APP_FIRST_FRAME = "app_first_frame"
 
     # === 互动反馈（CP6.2.2 全做：客户端）===
