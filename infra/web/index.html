@@ -142,6 +142,13 @@ body {
 .v-broadsheet .wordmark {
   font-family: var(--serif); font-size: 22px; font-weight: 600;
   letter-spacing: 0.22em; color: var(--fg);
+  /* ⚠️ 2026-10-24：补 `margin: 0`。
+     这条规则**漏了** margin，而页面上没有全局的 `p { margin: 0 }` 重置
+     ⇒ 浏览器默认的 `p { margin: 1em 0 }` 生效（22px 字号 ⇒ 上下各 22px）。
+     实测（320px 宽）：wordmark 这个 p 只有 21px 高的图，却占了 **59px**
+     —— 多出来的 38px 全是默认外边距，白占掉小屏的高度预算。
+     别的规则都显式写了 margin: 0，只有这里漏了。 */
+  margin: 0;
 }
 .v-broadsheet .dateline {
   font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em;
@@ -437,13 +444,41 @@ body {
    分隔线仍在栏间（border-right），文字的右内缩也保留 → 不会压线。 */
 @media (max-width: 760px) {
   .v-broadsheet { padding: 0 16px clamp(12px, 2vh, 24px); }
-  .v-broadsheet .cols { grid-template-columns: repeat(3, 1fr); gap: 16px; }
-  .v-broadsheet .col { padding: 10px 0 0; }
-  .v-broadsheet .col:not(:last-child)::after { right: -8px; }
-  .v-broadsheet .col + .col { border-top: 0; padding-top: 10px; }
-  .v-broadsheet .col h3 { font-size: 13px; line-height: 1.35; margin-bottom: 4px; }
-  .v-broadsheet .col p { font-size: 11px; line-height: 1.55; padding-right: 0; }
-  .v-broadsheet .col .num { margin-bottom: 4px; }
+
+  /* ── 手机端：三栏并排 → 三行（2026-10-24）────────────────────
+     为什么改：390~412px 的屏上三栏并排，每栏只剩 ~108px 宽
+     （屏宽 − padding − 两个栏间距 ÷ 3），中文一行只剩 5~6 个字 ——
+     看着挤、读起来也断句；≤380px 那档更是把正文压到 9.5px
+     （注释里自己写着「再小就伤可读性了」）。
+     而同一屏上，标题区因为 `margin: auto` 留着 270px 空白 ——
+     **空间分配不均**，挤的其实是内容，留白却给了标题区。
+
+     ⇒ 手机端改成**三行**（编号在左、标题 + 正文在右）：
+       · 行宽回到整屏（~360px），一行能放 20+ 个字；
+       · 字号回到 13.5px（可读），不用再压到 9.5px；
+       · 行间用横线分隔（竖线是「栏间分隔线」，在三行布局里没有意义）。
+     ⇒ **仍然一屏**：多出来的高度会被标题区的 auto margin 自动吸收
+     （auto margin 只吃「剩余」空间），所以 measure-landing.mjs 的
+     「任何视口不得可滚动」门禁不破。 */
+  .v-broadsheet .cols { grid-template-columns: 1fr; gap: 0; }
+  .v-broadsheet .col {
+    display: grid;
+    grid-template-columns: 26px 1fr;
+    grid-template-areas: "num title" "num text";
+    column-gap: 8px;
+    padding: 9px 0 10px;
+    border-top: 1px solid var(--rule);
+  }
+  .v-broadsheet .col:first-child { border-top: 0; padding-top: 2px; }
+  .v-broadsheet .col .num { grid-area: num; margin: 2px 0 0; }
+  .v-broadsheet .col h3 {
+    grid-area: title; font-size: 15px; line-height: 1.3; margin: 0 0 3px;
+  }
+  .v-broadsheet .col p {
+    grid-area: text; font-size: 13.5px; line-height: 1.6; padding-right: 0;
+  }
+  /* 竖线是「栏间分隔线」——三行布局里去掉（行间已有横线） */
+  .v-broadsheet .col:not(:last-child)::after { display: none; }
   .v-broadsheet .headline { padding: 14px 0 10px; gap: 10px; }
   .v-broadsheet h1 { font-size: clamp(28px, 8.4vw, 40px); }
   .v-broadsheet .standfirst { font-size: 13px; line-height: 1.6; }
@@ -475,14 +510,16 @@ body {
   .v-broadsheet .headline { padding: 6px 0 5px; gap: 4px; }
   .v-broadsheet h1 { font-size: clamp(22px, 7.2vw, 30px); }
   .v-broadsheet .standfirst { font-size: 11.5px; line-height: 1.45; }
-  .v-broadsheet .col { padding: 7px 0 0; }
-  .v-broadsheet .cols { gap: 12px; }
-  .v-broadsheet .col:not(:last-child)::after { right: -6px; }
-  .v-broadsheet .col p { padding-right: 8px; }
+  /* 2026-10-24：改成三行之后行宽够用了，正文**不必再压到 9.5px**
+     （9.5px 的中文在手机上已经伤可读性）—— 收到 12px 即可。 */
+  .v-broadsheet .col { padding: 8px 0 9px; }
+  .v-broadsheet .cols { gap: 0; }
+  .v-broadsheet .col:not(:last-child)::after { display: none; }
+  .v-broadsheet .col p { padding-right: 0; }
   .v-broadsheet .col + .col { padding-left: 0; }
-  .v-broadsheet .col h3 { font-size: 11px; margin-bottom: 3px; }
+  .v-broadsheet .col h3 { font-size: 13.5px; margin-bottom: 3px; }
   .v-browsheet-num, .v-broadsheet .col .num { margin-bottom: 3px; }
-  .v-broadsheet .col p { font-size: 9.5px; line-height: 1.35; }
+  .v-broadsheet .col p { font-size: 12px; line-height: 1.55; }
   .v-broadsheet .cta-row { margin: 8px auto 0; padding-top: 8px; }
   .site-footer { font-size: 9px; line-height: 1.35; padding: 3px 10px 4px; }
   .site-footer-copyright { font-size: 10.5px; }
@@ -492,18 +529,22 @@ body {
    高度只有 390px 左右，标题与三栏都要再收一档，
    目标是把 CTA（下载按钮）拉回首屏。 */
 @media (max-height: 520px) and (orientation: landscape) {
-  .v-broadsheet { padding: 0 20px 4px; }
-  .v-broadsheet .masthead { padding: 4px 0; }
-  .v-broadsheet .headline { padding: 4px 0; gap: 4px; }
-  .v-broadsheet h1 { font-size: clamp(20px, 5.6vh, 30px); }
+  /* 2026-10-24：这一档原先「文档高 495px / 视口 390px」⇒ 整页多出 105px、
+     页脚掉出首屏。补了 p 的默认外边距之后降到 407px，还差 17px ——
+     这里把报头/标题区/CTA/页脚的间距各收一档，把最后 17px 收掉。
+     （横屏仍是**三栏**布局：844px > 760px 断点，三栏在横屏上并不挤。） */
+  .v-broadsheet { padding: 0 20px 3px; }
+  .v-broadsheet .masthead { padding: 2px 0; }
+  .v-broadsheet .headline { padding: 2px 0; gap: 3px; }
+  .v-broadsheet h1 { font-size: clamp(19px, 5.2vh, 28px); }
   .v-broadsheet .kicker { font-size: 10px; }
-  .v-broadsheet .standfirst { font-size: 11px; line-height: 1.4; }
-  .v-broadsheet .col { padding: 5px 14px 0 0; }
+  .v-broadsheet .standfirst { font-size: 10.5px; line-height: 1.35; }
+  .v-broadsheet .col { padding: 4px 14px 0 0; }
   .v-broadsheet .col p { font-size: 11px; line-height: 1.4; }
-  .v-broadsheet .col h3 { font-size: 13px; margin-bottom: 4px; }
-  .v-broadsheet .cta-row { margin: 6px auto 0; padding-top: 6px; }
-  .v-broadsheet .btn { padding: 8px 18px; font-size: 13px; }
-  .site-footer { font-size: 9.5px; line-height: 1.4; padding: 3px 12px 4px; }
+  .v-broadsheet .col h3 { font-size: 13px; margin-bottom: 3px; }
+  .v-broadsheet .cta-row { margin: 4px auto 0; padding-top: 4px; }
+  .v-broadsheet .btn { padding: 7px 18px; font-size: 13px; }
+  .site-footer { font-size: 9.5px; line-height: 1.3; padding: 2px 12px 3px; }
   .site-footer-copyright { font-size: 10.5px; }
 }
 
@@ -564,6 +605,7 @@ a.btn { text-decoration: none; }
 }
 .site-footer a { color: var(--fg-muted); text-decoration: none; }
 .site-footer a:hover { text-decoration: underline; }
+.site-footer p { margin: 0; }   /* 同上：浏览器默认的 p 外边距白占高度 */
 .site-footer-copyright { font-size: 14px; color: var(--fg-muted); }
 .site-footer-filing { margin-top: 4px; }
 .site-footer-sep { margin: 0 10px; opacity: .45; }
