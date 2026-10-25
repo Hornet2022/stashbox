@@ -10,27 +10,55 @@ from stashbox.backend.common.exceptions import BizException
 
 from .base import Fetcher, FetcherError, FetcherErrorCode, FetchResult
 from .douyin import DouyinFetcher
+from .e2e_mock import build_transport as _build_e2e_mock_transport
 from .generic_url import GenericURLFetcher
 from .pdf import PdfFetcher
 from .github import GitHubFetcher
 from .wechat import WechatFetcher
 
-# 顺序 = 优先级：专属域名在前，通用兜底在后
-_ALL_FETCHERS: list[Fetcher] = [
-    WechatFetcher(),
-    DouyinFetcher(),
-    # CP11.0.8 P3.3: PDF 直链（URL path 以 .pdf 结尾才接）
-    PdfFetcher(),
-    # 2026-10-23：GitHub 仓库。
-    #
-    # ⚠️ **必须在 GenericURLFetcher 之前** —— 通用那个是 catch-all
-    # （supports 恒 True），放在它后面就永远轮不到。
-    # 不接专属通道的话，GitHub 仓库页会被网页密度启发式抽成
-    # 一堆导航文字（GitHub 首页是 JS 应用壳，正文异步加载）⇒
-    # 用户剪藏一个开源库，拿到一篇没信息的稿子。
-    GitHubFetcher(),
-    GenericURLFetcher(),  # 通用放最后（catch-all，优先级最低）
-]
+
+def _build_fetchers() -> list[Fetcher]:
+    """按开关决定装载哪些 fetcher。
+
+    ## 两种模式
+
+    **正常模式**（生产）：顺序 = 优先级，专属域名在前、通用兜底在后。
+
+    **e2e mock 模式**（`STASHBOX_E2E_FETCH_MOCK=1`）：**只装载带 transport
+    注入点的两个 fetcher**（wechat / generic），并给它们注入 mock transport。
+
+    ⚠️ 为什么要**只装这两个**：douyin / pdf / github 三个 fetcher 没有
+    transport 注入点，装上就意味着它们仍会发**真实请求** ⇒ mock 模式就变成
+    「一半假一半真」，夹具的行为随 URL 域名而变，最难排查。
+    少装两个换来一条硬保证：**mock 模式下不可能有任何真实请求发出去**。
+
+    代价：e2e 夹具只能用 wechat / 通用 URL 形态（`https://mp.weixin.qq.com/s/xxx`
+    正好就是现有夹具在用的形态），GitHub / 抖音 / PDF 的抓取在 e2e 里不覆盖。
+    """
+    transport = _build_e2e_mock_transport()
+    if transport is None:
+        return [
+            WechatFetcher(),
+            DouyinFetcher(),
+            # CP11.0.8 P3.3: PDF 直链（URL path 以 .pdf 结尾才接）
+            PdfFetcher(),
+            # 2026-10-23：GitHub 仓库。
+            #
+            # ⚠️ **必须在 GenericURLFetcher 之前** —— 通用那个是 catch-all
+            # （supports 恒 True），放在它后面就永远轮不到。
+            # 不接专属通道的话，GitHub 仓库页会被网页密度启发式抽成
+            # 一堆导航文字（GitHub 首页是 JS 应用壳，正文异步加载）⇒
+            # 用户剪藏一个开源库，拿到一篇没信息的稿子。
+            GitHubFetcher(),
+            GenericURLFetcher(),  # 通用放最后（catch-all，优先级最低）
+        ]
+    return [
+        WechatFetcher(transport=transport),
+        GenericURLFetcher(transport=transport),
+    ]
+
+
+_ALL_FETCHERS: list[Fetcher] = _build_fetchers()
 
 
 def get_fetcher(url: str) -> Fetcher | None:
