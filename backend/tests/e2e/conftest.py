@@ -41,6 +41,13 @@ GATEWAY = os.getenv("STASHBOX_GATEWAY", "http://127.0.0.1:8100")
 # ⚠️ 必须用 int：`urlparse(...).port` 返回的是 int，写成字符串集合会让
 #    `8100 in {"8100"}` 恒为 False —— 守卫看着在、实际从不触发，
 #    比没有守卫更危险。
+#
+# ⚠️ 本目录**故意不打** `integration` 标记（证据见 README「为什么本目录不打
+# integration 标记」一节，2026-10-25 实测：全打 ⇒ README 文档化的走查命令
+# 收不到一条且**不报错**）。「默认不跑」靠的就是下面这个守卫：
+#   · 默认套件（pytest tests/）→ 本目录整目录跳过；
+#   · -m integration            → 本目录仍整目录跳过。
+# ⇒ 想跑本目录请用 README 里那条**不带 -m** 的命令。
 _PRODUCTION_PORTS = {8100, 8101, 8102, 8103, 8104}
 
 

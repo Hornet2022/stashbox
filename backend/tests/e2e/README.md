@@ -37,6 +37,50 @@ STASHBOX_E2E_SKIP_DEVICE=1 ... -m pytest backend/tests/e2e -v
 | `STASHBOX_E2E_SKIP_DEVICE` | — | 设 `1` 跳过所有需要设备的用例 |
 | `STASHBOX_TEST_DSN` | `postgresql://stashbox:stashbox_dev@localhost:5432/stashbox` | 直连 DB |
 
+## 为什么本目录**不**打 `integration` 标记（2026-10-25 实测，勿改）
+
+`backend/pyproject.toml` 的 `addopts` 是 `-m "not network and not integration"`，
+而 pytest 的 `-m` 是**单值**选项 ⇒ 命令行上的 `-m` 会**整体覆盖** addopts。
+
+本目录的走查命令（上面「跑法」里那条）**不带 `-m`**：
+
+```bash
+backend/.venv/bin/python -m pytest backend/tests/e2e -v
+```
+
+⇒ 一旦给本目录的文件打上 `integration` 标记，这条**文档化**的走查命令就会
+**静默**地一条都收不到：
+
+| 实验（2026-10-25 实测，`--collect-only`） | 结果 |
+|---|---|
+| 不打标记（现状） | `35 tests collected` |
+| 只给 `test_e2e_03_quota.py` 打 | `29/35 tests collected (6 deselected)` |
+| 6 个文件全打 | `no tests collected (35 deselected)` |
+
+**静默**是最糟的那种：pytest 不报错、退出码 0，人只会以为「用例都过了」，
+而实际上一条都没跑。
+
+那「默认套件会不会被真机用例污染」呢？—— 不会，本目录**已经有自己的守卫**：
+`conftest.py` 的 `_assert_not_production()` 在**模块导入期**判定
+`STASHBOX_GATEWAY` 是不是生产端口（8100-8104），是就
+`pytest.skip(allow_module_level=True)`（整个目录一起跳）。
+
+* 默认套件（`pytest tests/`）：本目录整目录跳过 ⇒ **不碰 e2e 队列、不碰共享库**；
+* 显式跑活服务用例（`-m integration`）：本目录仍整目录跳过。
+
+⇒ 「默认不跑 + 显式跑」这个效果**已经由守卫实现了**，不靠 marker。
+marker 是给**别的目录**里的用例用的（`tests/integration/`），套到这里只会
+打断上面那条走查命令。
+
+⚠️ 唯一要小心的场景：`STASHBOX_GATEWAY` 指向隔离后端（:18100）时守卫不触发，
+这时 `-m integration` 会把真机用例一起选中。所以**别**用 `-m integration`
+来跑隔离后端，要跑本目录就用上面那条不带 `-m` 的命令。
+
+⚠️ 顺带记一笔（免得有人去"补注册"）：`device` / `slow` 两个标记由本目录
+`conftest.py` 的 `pytest_configure` **运行时**注册，不在 `pyproject.toml` 里。
+实测 `pytest tests/e2e --collect-only` 的 `PytestUnknownMarkWarning` 数为 **0**
+⇒ 「device 没注册、每次跑都吐警告」这个说法**不成立**。
+
 ## 用例清单
 
 | 文件 | 覆盖 | 是否需要设备 |

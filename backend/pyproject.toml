@@ -144,6 +144,12 @@ markers = [
     # PytestUnknownMarkWarning —— 而这正是「标记写了、没人看得见」的那类隐患：
     # 真到有人靠标记做筛选时，它并不会报错，只是静默不生效。
     "integration: 需要多服务/跨服务边界的集成用例，默认排除（-m 'integration' 可显式跑）",
+    # ⚠️ `tests/e2e/`（真机走查）**故意不打** integration —— 它的走查命令
+    #    （README 里那条，不带 -m）会被 addopts 的 "not integration" 静默清空
+    #    （实测：全打 ⇒ no tests collected (35 deselected)，且**不报错**）。
+    #    它靠 conftest 的生产端口守卫实现「默认不跑」。详见 tests/e2e/README.md。
+    #    `device` / `slow` 两个标记由 tests/e2e/conftest.py 运行时注册，
+    #    不在这里（实测 PytestUnknownMarkWarning = 0）。
 ]
 
 [tool.ruff]
