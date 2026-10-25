@@ -740,3 +740,248 @@ async def test_识图不把Referer放进client级headers(monkeypatch, fake_provi
         "Referer 不能进 client 级 headers —— 池的 key 不含 headers，"
         "它会被「首个使用者」的值覆盖掉"
     )
+
+
+# ---------------------------------------------------------------------------
+# 11. A. 按 URL 去重（2026-10-25）
+# ---------------------------------------------------------------------------
+#
+# 同一张图在一篇里出现几次（重复插图、站点自己的图标）**只需要识别一次** ——
+# 之前是"出现几次就识几次"，白烧几份 token，还把图床的耐心耗掉了。
+#
+# 注意：**占位符不能去重**（每张图在正文里的位置不同），
+# 去重只发生在"下载 + 识图"那一层，图注要**复制**给每个占位符。
+
+
+def _figure_transport(urls: list[str]) -> httpx.MockTransport:
+    """每张图给**不同的字节**，字节里带上自己的编号（假识图靠它认自己）。"""
+
+    bodies = {url: PNG_BYTES + f"FIG{i + 1}".encode() for i, url in enumerate(urls)}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/chat/completions"):
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": DEFAULT_CAPTION}}]}
+            )
+        body = bodies.get(str(request.url))
+        return httpx.Response(200, content=body or PNG_BYTES)
+
+    return httpx.MockTransport(handler)
+
+
+def _figure_of(blob: bytes) -> int:
+    """从图片字节里认出编号（配 `_figure_transport`）。"""
+    raw = blob.decode("latin-1")
+    return int("".join(ch for ch in raw.split("FIG", 1)[-1] if ch.isdigit()) or 0)
+
+
+@pytest.mark.asyncio
+async def test_同一个URL只识一次_图注复制给每个占位符(monkeypatch, fake_provider):
+    """同一张图出现三次 ⇒ 只 OCR 一次，三个占位符**都**拿到图注。"""
+    url = "https://cdn.example.com/same.png"
+    refs = [{"url": url, "token": f"\x00IMG{i}\x00"} for i in (1, 2, 3)]
+    calls = {"n": 0}
+
+    async def _fake_ocr(blob, mime, *, prompt=None, timeout=None, transport=None):
+        calls["n"] += 1
+        return "这张图写着 42"
+
+    monkeypatch.setattr(media_ocr, "ocr_image_bytes", _fake_ocr)
+
+    captions = await media_ocr.caption_media(refs, transport=_transport())
+
+    assert calls["n"] == 1, "同一个 URL 不该识多次（白烧 token）"
+    assert len(captions) == 3
+    assert all(c["ok"] for c in captions), captions
+    assert all(c["caption"] == "这张图写着 42" for c in captions)
+
+    # 三个占位符都被换成图注（复制，不是"只留一个"）
+    out = media_ocr.apply_captions("\n\n".join(f"\x00IMG{i}\x00" for i in (1, 2, 3)), captions)
+    assert out.count("图表：这张图写着 42") == 3
+    assert "\x00" not in out
+
+
+@pytest.mark.asyncio
+async def test_上限数的是不同URL_重复图不额外占名额(monkeypatch, fake_provider):
+    """上限按**不同 URL 数**计（不是位置数）。
+
+    A A B C 四张位置、limit=2 ⇒ 识 A 和 B 两个 URL（按位置算的话只识得到 A）。
+    """
+    urls = [
+        "https://cdn.example.com/a.png",
+        "https://cdn.example.com/a.png",
+        "https://cdn.example.com/b.png",
+        "https://cdn.example.com/c.png",
+    ]
+    refs = [{"url": u, "token": f"\x00IMG{i + 1}\x00"} for i, u in enumerate(urls)]
+    seen: list[str] = []
+
+    async def _fake_ocr(blob, mime, *, prompt=None, timeout=None, transport=None):
+        return "有内容"
+
+    monkeypatch.setattr(media_ocr, "ocr_image_bytes", _fake_ocr)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if not request.url.path.endswith("/chat/completions"):
+            seen.append(str(request.url))
+        return httpx.Response(200, content=PNG_BYTES)
+
+    captions = await media_ocr.caption_media(refs, transport=httpx.MockTransport(handler), limit=2)
+
+    assert sorted(set(seen)) == [
+        "https://cdn.example.com/a.png",
+        "https://cdn.example.com/b.png",
+    ], f"识了不该识的图：{seen}"
+    assert captions[0]["ok"] and captions[1]["ok"], "A 的两个位置都要有图注"
+    assert captions[2]["ok"], "B 要有图注（重复的 A 不该占掉 B 的名额）"
+    assert captions[3]["ok"] is False, "C 超上限"
+    assert "超出单篇识图上限" in (captions[3]["error"] or "")
+
+
+# ---------------------------------------------------------------------------
+# 12. B. 零信息判失败（2026-10-25）
+# ---------------------------------------------------------------------------
+#
+# OCR **明确声明「图里没有文字」** ⇒ 这张图没有任何可用信息 ⇒ 判失败。
+# 不判的话，正文里会出现"图表：图中无文字与数字内容。"这种纯噪音。
+
+
+def test_零信息判据只认明确声明_不误杀真有内容的图():
+    """判据的形状来自**生产实测**（2026-10-25，sspai 47 张图）。
+
+    - 零信息的主流形态是"图中无文字与数字内容。"（6/47）；
+    - 上一版启发式（按长度/画面描述过滤）**误杀**了下面这些**真有文字**的图
+      ⇒ 判据只认"明确声明"，不认启发式。
+    """
+    assert media_ocr._is_zero_info("图中无文字与数字内容。")
+    assert media_ocr._is_zero_info("图中没有文字。")
+    assert media_ocr._is_zero_info("图片中没有可识别的文字内容。")
+    assert media_ocr._is_zero_info("该图片不包含任何文字信息。")
+
+    for text in (
+        "10 小米10 新品直播发布会",
+        "高端是小米发展的必由之路，更是生死之战！",
+        "为小米汽车而战",
+        "红色圆形背景中有一个白色的希腊字母π。",
+        "工作、消费主义和新穷人",
+    ):
+        assert not media_ocr._is_zero_info(text), f"误杀了真有内容的图：{text}"
+
+
+@pytest.mark.asyncio
+async def test_零信息图注判失败_不进正文(monkeypatch, fake_provider):
+    """零信息 ⇒ 判失败 ⇒ 正文里**不留**"图表：图中无文字"。"""
+
+    async def _fake_ocr(blob, mime, *, prompt=None, timeout=None, transport=None):
+        return "图中无文字与数字内容。"
+
+    monkeypatch.setattr(media_ocr, "ocr_image_bytes", _fake_ocr)
+
+    captions = await media_ocr.caption_media(_refs(1), transport=_transport())
+
+    assert captions[0]["ok"] is False
+    assert media_ocr.ZERO_INFO_ERROR in (captions[0]["error"] or "")
+    out = media_ocr.apply_captions("前文 \x00IMG1\x00 后文", captions)
+    assert "图表：" not in out, "零信息不该进正文"
+    assert "图中无文字" not in out
+    assert "前文" in out and "后文" in out
+
+
+# ---------------------------------------------------------------------------
+# 13. C. 补位（2026-10-25）
+# ---------------------------------------------------------------------------
+#
+# 空出来的名额由**后面的图**补上。
+# 闸门（必须）：**最多 1 轮**、**总尝试 ≤ 2×limit**、预算耗尽不补。
+
+
+@pytest.mark.asyncio
+async def test_零信息占掉的名额由后面的图补上(monkeypatch, fake_provider):
+    """第一轮零信息占掉的名额 ⇒ 补位轮拿后面的图顶上。"""
+    urls = [f"https://cdn.example.com/fig{i}.png" for i in range(1, 6)]
+    refs = [{"url": u, "token": f"\x00IMG{i + 1}\x00"} for i, u in enumerate(urls)]
+    calls: list[int] = []
+
+    async def _fake_ocr(blob, mime, *, prompt=None, timeout=None, transport=None):
+        n = _figure_of(blob)
+        calls.append(n)
+        if n == 1:
+            return "图中无文字与数字内容。"
+        return f"图 {n} 的内容"
+
+    monkeypatch.setattr(media_ocr, "ocr_image_bytes", _fake_ocr)
+
+    captions = await media_ocr.caption_media(refs, transport=_figure_transport(urls), limit=2)
+
+    assert sorted(calls) == [1, 2, 3], f"补位轮没跑或跑多了：{calls}"
+    assert captions[0]["ok"] is False, "零信息那张仍然是失败"
+    assert media_ocr.ZERO_INFO_ERROR in (captions[0]["error"] or "")
+    assert captions[1]["ok"] is True
+    assert captions[2]["ok"] is True, "补位上来的那张要有图注"
+    assert captions[2]["caption"] == "图 3 的内容"
+    assert captions[3]["ok"] is False, "没被补到的仍然超上限"
+    assert "超出单篇识图上限" in (captions[3]["error"] or "")
+
+
+@pytest.mark.asyncio
+async def test_补位最多一轮_不会一直往下翻图(monkeypatch, fake_provider):
+    """闸门：第一轮全失败 ⇒ 只补 1 轮（总尝试 ≤ 2×limit），不会有第三轮。"""
+    urls = [f"https://cdn.example.com/fig{i}.png" for i in range(1, 11)]
+    refs = [{"url": u, "token": f"\x00IMG{i + 1}\x00"} for i, u in enumerate(urls)]
+    calls: list[int] = []
+
+    async def _fake_ocr(blob, mime, *, prompt=None, timeout=None, transport=None):
+        calls.append(_figure_of(blob))
+        return "图中无文字与数字内容。"
+
+    monkeypatch.setattr(media_ocr, "ocr_image_bytes", _fake_ocr)
+
+    captions = await media_ocr.caption_media(refs, transport=_figure_transport(urls), limit=3)
+
+    assert len(calls) == 6, f"总尝试应 ≤ 2×limit=6，实际 {len(calls)}"
+    assert all(c["ok"] is False for c in captions)
+    assert all("超出单篇识图上限" in (c["error"] or "") for c in captions[6:])
+
+
+@pytest.mark.asyncio
+async def test_预算耗尽不补位(monkeypatch, fake_provider):
+    """剪藏总时限是硬约束 ⇒ 预算耗尽时**不再开新一轮**。"""
+    urls = [f"https://cdn.example.com/fig{i}.png" for i in range(1, 7)]
+    refs = [{"url": u, "token": f"\x00IMG{i + 1}\x00"} for i, u in enumerate(urls)]
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if not request.url.path.endswith("/chat/completions"):
+            seen.append(str(request.url))
+        return httpx.Response(200, content=PNG_BYTES)
+
+    deadline = net.Deadline(0.0)
+    captions = await media_ocr.caption_media(
+        refs, transport=httpx.MockTransport(handler), limit=2, deadline=deadline
+    )
+
+    assert len(seen) == 0, f"预算耗尽就不该下载：{seen}"
+    assert all(c["ok"] is False for c in captions)
+    assert all("预算" in (c["error"] or "") for c in captions[:2])
+
+
+@pytest.mark.asyncio
+async def test_补位轮炸了_不毁掉第一轮的图注(monkeypatch, fake_provider):
+    """补位是**锦上添花**：它炸了也不能让第一轮已经拿到的图注全丢。"""
+    urls = [f"https://cdn.example.com/fig{i}.png" for i in range(1, 5)]
+    refs = [{"url": u, "token": f"\x00IMG{i + 1}\x00"} for i, u in enumerate(urls)]
+
+    async def _fake_ocr(blob, mime, *, prompt=None, timeout=None, transport=None):
+        n = _figure_of(blob)
+        if n == 1:
+            return "图中无文字与数字内容。"
+        if n == 3:
+            raise RuntimeError("补位那一轮炸了")
+        return f"图 {n} 的内容"
+
+    monkeypatch.setattr(media_ocr, "ocr_image_bytes", _fake_ocr)
+
+    captions = await media_ocr.caption_media(refs, transport=_figure_transport(urls), limit=2)
+
+    assert captions[1]["ok"] is True, "第一轮成功的图注不能被补位失败带走"
+    assert captions[1]["caption"] == "图 2 的内容"

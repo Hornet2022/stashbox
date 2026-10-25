@@ -34,8 +34,14 @@
 * **只给正文里的图留占位符**：`og:image` 是 `<meta>` 不是 `<img>`，
   天然进不了正文；封面/头图同理（判断依据就是"解析正文 HTML 时拿到的
   `<img src>` / `<img data-src>`"）；
-* **每篇最多识 `MAX_MEDIA_CAPTIONS` 张图** —— 识图是**真金白银**的 token，
+* **每篇最多识 `MAX_MEDIA_CAPTIONS` 个不同的图 URL** —— 识图是**真金白银**的 token，
   而一篇长文可能有几十张图；上限的取值与实测依据见该常量的注释；
+* **同一个 URL 只 OCR 一次**（2026-10-25）—— 一篇里同一张图可能出现多次
+  （重复插图、站点自己的图标），识别一次就够，识别结果**复制**给它的每个占位符；
+* **OCR 说「图里没有文字」⇒ 判失败**（2026-10-25）—— 那是**零信息**，
+  留着只会变成正文里的一句"图表：图中没有文字"（判据见 `_is_zero_info`）；
+* **空出来的名额由后面的图补上**（2026-10-25）—— 最多补 **1 轮**、
+  **总尝试 ≤ 2×上限**（见 `caption_media` 里的补位轮）；
 * **下载并发（≤4）、识图并发（≤3，全进程 ≤6）** —— 实测 provider 在并发 6 下
   零失败零限流（详见 `MEDIA_OCR_CONCURRENCY` 的注释），
   而串行会让剪藏从 ~10s 变成 22.8s；
@@ -108,6 +114,12 @@ log = logging.getLogger("stashbox.fetch.media")
 #:
 #: 上限最终定多少由 `tests/content/test_media_ocr.py` 里的判据锁住，
 #: 不是拍脑袋 —— 改这个数之前先跑一次同口径的产出对照。
+#:
+#: ⚠️ **上限数的是「不同的图 URL」，不是「图片位置」**（2026-10-25）：
+#: 同一张图在一篇里出现几次（重复插图、站点自己的图标）**只占一个名额**
+#: —— 它的识别结果会复制给每一个占位符。
+#: ⇒ 同一份预算覆盖**更多**内容，而 OCR 次数**不会**变多
+#: （之前同一张图出现三次就是识别三次，白烧三份 token）。
 MAX_MEDIA_CAPTIONS = 12
 
 #: 单图下载超时（秒）。
@@ -182,6 +194,133 @@ _MEDIA_OCR_PROMPT = (
     "这张图可能是一张图表。请把图里的文字与数字按阅读顺序整理成通顺的短句输出；"
     "只输出内容本身，不要输出任何标记、解释或 markdown。"
 )
+
+
+#: 零信息（OCR 明确声明图中没有文字）的失败原因文案。
+#:
+#: 单独一个常量，是为了让"这篇为什么没有图表信息"**查得到原因**：
+#: `raw_metadata["media_captions"]` 里每条失败都带原因，
+#: 零信息这一类要能和"下载失败 403""识图超时"区分开。
+ZERO_INFO_ERROR = "零信息（OCR 声明图中没有文字）"
+
+#: 「OCR 明确声明图中没有文字」的最长字数。
+#:
+#: 为什么有上限：判据是"**整条结果**就是一句『这里没有文字』"，
+#: 而不是"结果里出现了『没有文字』" —— 后者会把
+#: "红色圆形背景中有一个白色的希腊字母π"这种**真有内容**的图误杀。
+_ZERO_INFO_MAX_LEN = 40
+
+#: 声明后面允许跟的"尾巴"最长多少字。
+_ZERO_INFO_TAIL_MAX_LEN = 12
+
+#: 「没有文字」的**声明本体**（整条结果去掉空白与标点后**整体**匹配）。
+#:
+#: 只认**明确声明**，不认启发式（结果太短 / 像画面描述 / 图太小）——
+#: 实测那些启发式会误杀**真有文字**的图：
+#: "10 小米10 新品直播发布会"、"为小米汽车而战"、
+#: "红色圆形背景中有一个白色的希腊字母π"。
+#: ⇒ 宁可放过一点噪音，也不能把内容删了。
+#:
+#: ⚠️ 对象可以是**并列**的（"文字**与数字**"）——
+#: 生产实测零信息的**主流形态**就是
+#: "图中无文字与数字内容。"（sspai 47 张里 6 张是这个形态）。
+_ZERO_INFO_CORE = re.compile(
+    r"^(?:这(?:张|幅|副)|该|此)?"
+    r"(?:图片|图|画面|图像|照片|插画|海报|截图|图表)?"
+    r"(?:当中|里面|之中|中|里|内|上)?"
+    r"(?:没有|无|不含|不包含|不存在|未见|未发现|未检测到|未看到|看不到|找不到)"
+    r"(?:任何|一些|检测到|看到|发现|可辨(?:识|认)(?:的)?|可读(?:的)?|可见(?:的)?"
+    r"|明确(?:的)?|明显的|清晰的|额外的|可供?(?:识别|阅读)(?:的)?)*"
+    r"(?:文字|文本|字符|字|字母|数字)"
+    # 并列对象："文字与数字" / "文字和数字" / "文字、数字"（"、"已被归一化去掉）
+    r"(?:(?:与|和|及|或)?\s*(?:文字|文本|字符|字|字母|数字))*"
+    r"(?:内容|信息)?"
+)
+
+#: 英文版声明（"This image contains no text."）。
+_ZERO_INFO_CORE_EN = re.compile(
+    r"^(?:this|the)?\s*(?:image|picture|photo|graphic|figure)?\s*"
+    r"(?:contains?|has|have|with|shows?|features?)?\s*"
+    r"(?:no|without)\s+(?:any\s+)?(?:readable\s+|visible\s+|legible\s+|meaningful\s+)?"
+    r"(?:text|words|characters?|letters?)",
+    re.IGNORECASE,
+)
+
+#: 归一化：去掉空白与标点
+#: （让「图中没有文字。」和「图中没有文字」等价，也顺手干掉换行）。
+_ZERO_INFO_FLATTEN = re.compile(
+    r"[\s，。；、！？：,.!?;:'\"“”‘’()（）\[\]【】《》〈〉「」『』…—\-·~]+"
+)
+
+#: 声明后面允许跟的尾巴用词（**本身不构成信息**）。
+#:
+#: 为什么允许尾巴：模型常写成"图中没有文字，仅为装饰性图形" ——
+#: 尾巴是"没有实质内容"的同义改写，不是新信息。
+#: 但尾巴**必须**由这些用词拼成，否则整条不算零信息
+#: （"图中没有文字，但描述了一个男孩在操作机器" ⇒ 尾巴里有实义 ⇒ 不算）。
+_ZERO_INFO_TAIL_CHARS = set(
+    "仅为是只就系一张幅副纯装饰性图案形插画风景照背景配空白色块二维码logo" "无实内容信息图片"
+)
+
+
+def _tail_is_filler(rest: str) -> bool:
+    """声明后面的尾巴是不是"没有实质内容"的同义改写。
+
+    尾巴先**去掉标点**再判：英文那句尾巴就只是个句点
+    （"This image contains no text."），它不是"信息"，更不是"实义"。
+    """
+    rest = _ZERO_INFO_FLATTEN.sub("", (rest or "").strip().lower())
+    if not rest:
+        return True
+    if len(rest) > _ZERO_INFO_TAIL_MAX_LEN:
+        return False
+    return all(ch in _ZERO_INFO_TAIL_CHARS for ch in rest)
+
+
+def _is_zero_info(text: str) -> bool:
+    """这条 OCR 结果是不是「明确声明图里没有文字」。
+
+    判据只有一条：**OCR 自己在说"这张图里没有文字"**。
+
+    为什么不用启发式（结果太短 / 像画面描述 / 图很小）：
+    实测那些启发式会误杀**真有文字**的图 ——
+    "10 小米10 新品直播发布会"、"为小米汽车而战"、
+    "红色圆形背景中有一个白色的希腊字母π" ——
+    宁可放过一点噪音，也不能把内容删了。
+    """
+    body = (text or "").strip()
+    if not body or len(body) > _ZERO_INFO_MAX_LEN:
+        return False
+
+    # 英文：保留空格匹配
+    match = _ZERO_INFO_CORE_EN.match(body)
+    if match:
+        return _tail_is_filler(body[match.end() :])
+
+    # 中文：去掉空白与标点后**整体**匹配声明本体
+    flat = _ZERO_INFO_FLATTEN.sub("", body.lower())
+    match = _ZERO_INFO_CORE.match(flat)
+    if match:
+        return _tail_is_filler(flat[match.end() :])
+    return False
+
+
+def _group_by_url(images: list[ImageRef]) -> tuple[list[str], dict[str, list[ImageRef]]]:
+    """按 URL 分组（保持**首次出现**的顺序）。
+
+    为什么按 URL 而不是按位置去重：一篇里同一张图可能出现多次
+    （重复插图、站点自己的图标），它们**只需要识别一次** ——
+    识别结果复制给每一个占位符即可。
+    """
+    order: list[str] = []
+    by_url: dict[str, list[ImageRef]] = {}
+    for ref in images:
+        url = ref.get("url", "")
+        if url not in by_url:
+            by_url[url] = []
+            order.append(url)
+        by_url[url].append(ref)
+    return order, by_url
 
 
 class ImageRef(TypedDict):
@@ -387,10 +526,20 @@ async def caption_media(
 ) -> list[MediaCaption]:
     """给正文里的图识图 → 每张图一条结果（成功/失败都有记录）。
 
+    ## 三条规则（2026-10-25）
+
+    1. **按 URL 去重** —— 同一个 URL 在一篇里出现几次，**只 OCR 一次**，
+       识别结果**复制**给它的每一个占位符（省 token，也省图床的耐心）；
+    2. **零信息判失败** —— OCR **明确声明「图里没有文字」** ⇒ 判失败，
+       不进正文（判据见 `_is_zero_info`）；
+    3. **补位** —— 空出来的名额由后面的图补上：
+       **最多 1 轮**、**总尝试 ≤ 2×limit**。
+
     Args:
-        images: 正文里的图（占位符 + 真链）。
+        images: 正文里的图（占位符 + 真链）。同一个 URL 出现多次也照收，
+            去重发生在 OCR 那一层。
         referer: 防盗链用的 Referer（微信图床 `mmbiz.qpic.cn` 认这个）。
-        limit: 最多识几张（超出的直接判失败，占位符会被删掉）。
+        limit: 最多识**几个不同的图 URL**（超出的直接判失败，占位符会被删掉）。
         profile: 下载用的 header 画像。
         transport: 测试注入点（httpx.MockTransport）；生产传 None（走 SSRF 防护）。
 
@@ -400,19 +549,26 @@ async def caption_media(
     if not images:
         return []
 
-    attempted = list(images[:limit])
-    skipped = list(images[limit:])
+    # ── A. 按 URL 去重（同一个 URL 只占一个名额） ─────────────────────────
+    order, by_url = _group_by_url(images)
+
     results: dict[str, MediaCaption] = {}
 
-    for ref in skipped:
-        results[ref["token"]] = _failed(ref, f"超出单篇识图上限（最多 {limit} 张）")
+    # 超出上限的 URL：整组判失败（**不下载、不识图**）。
+    selected = order[:limit]
+    overflow = order[limit:]
+    over_limit_error = f"超出单篇识图上限（最多 {limit} 个不同图 URL）"
+    for url in overflow:
+        for ref in by_url[url]:
+            results[ref["token"]] = _failed(ref, over_limit_error)
 
     # 早退：识图通道不可用就**别下载图**（白下载一遍，最后还是识不了，
     # 还把流量和图床的耐心都耗掉了）。
     base_url, api_key, _model = await ocr_config()
     if not base_url or not api_key:
-        for ref in attempted:
-            results[ref["token"]] = _failed(ref, "识图通道不可用（没配 LLM provider）")
+        for url in selected:
+            for ref in by_url[url]:
+                results[ref["token"]] = _failed(ref, "识图通道不可用（没配 LLM provider）")
         return _ordered(images, results)
 
     # ⚠️ Referer 必须走**请求级**，不能进 client 级 headers ——
@@ -441,107 +597,162 @@ async def caption_media(
     client = acquire_client(profile, **client_kwargs)
     semaphore = asyncio.Semaphore(MEDIA_DOWNLOAD_CONCURRENCY)
 
-    # ── 下载 → 识图：**有界队列流水线** ─────────────────────────────────
-    #
-    # 为什么不是「全部下完再开始识」（原来的写法）：
-    #   ① 慢：下载的 4s 和识图的 17s **串行相加**；
-    #   ② 内存：N 张图（每张上限 5MB）**同时**堆在内存里
-    #      —— 12 张就是 60MB，而服务 MemoryMax=176M。
-    #
-    # 流水线：下载完的图**立刻**进队列等识图，队列有界 ⇒ 队列满时下载得停下
-    # ⇒ ① 下载与识图重叠（总耗时 ≈ max(下载, 识图)）；
-    #   ② 内存里的图片张数有闸门（队列长度 + 在识的并发数）。
-    queue: asyncio.Queue = asyncio.Queue(maxsize=MEDIA_OCR_QUEUE_SIZE)
+    async def _ocr_urls(urls: list[str]) -> dict[str, tuple[str | None, str | None]]:
+        """给一批 URL 做「下载 + 识图」→ url → (图注, 错误原因)。
 
-    async def _download(ref: ImageRef) -> tuple[bytes | None, str | None, str | None]:
-        # ⚠️ 超时取 **抓取总预算的剩余**，不是固定的 15s：
-        # 剪藏是同步接口，用户盯着转圈等，总时限（30s）是硬约束（见 net.Deadline）。
-        # 抓取本身可能已经用掉 25s ⇒ 留给识图的只有 5s ⇒ 下载必须自己收敛。
-        timeout = MEDIA_DOWNLOAD_TIMEOUT
-        if deadline is not None:
-            if deadline.expired():
-                return None, None, "抓取预算已耗尽（没时间下载配图了）"
-            timeout = deadline.slice(MEDIA_DOWNLOAD_TIMEOUT) or MEDIA_DOWNLOAD_TIMEOUT
-        async with semaphore:
-            return await _download_one(client, ref["url"], timeout=timeout, headers=request_headers)
+        内部是**下载 → 识图的有界队列流水线**（两者重叠，总耗时 ≈ max 而非相加），
+        队列长度就是内存闸门（见 `MEDIA_OCR_QUEUE_SIZE` 的注释）。
+        """
+        outcomes: dict[str, tuple[str | None, str | None]] = {}
+        queue: asyncio.Queue = asyncio.Queue(maxsize=MEDIA_OCR_QUEUE_SIZE)
 
-    async def _producer(ref: ImageRef) -> None:
-        """下载一张图 → 放进队列。**任何异常都要进队列**（否则消费者会等一辈子）。"""
-        try:
-            blob, mime, error = await _download(ref)
-        except Exception as exc:  # noqa: BLE001 —— 一张图下载炸了不该拖死整篇
-            blob, mime, error = None, None, f"下载失败: {type(exc).__name__}: {exc}"
-        await queue.put((ref, blob, mime, error))
+        async def _download(url: str) -> tuple[bytes | None, str | None, str | None]:
+            # ⚠️ 超时取 **抓取总预算的剩余**，不是固定的 15s：
+            # 剪藏是同步接口，用户盯着转圈等，总时限（30s）是硬约束（见 net.Deadline）。
+            # 抓取本身可能已经用掉 25s ⇒ 留给识图的只有 5s ⇒ 下载必须自己收敛。
+            timeout = MEDIA_DOWNLOAD_TIMEOUT
+            if deadline is not None:
+                if deadline.expired():
+                    return None, None, "抓取预算已耗尽（没时间下载配图了）"
+                timeout = deadline.slice(MEDIA_DOWNLOAD_TIMEOUT) or MEDIA_DOWNLOAD_TIMEOUT
+            async with semaphore:
+                return await _download_one(client, url, timeout=timeout, headers=request_headers)
 
-    async def _consumer() -> None:
-        """从队列取图 → 识图 → 写结果。"""
-        while True:
-            item = await queue.get()
-            if item is None:  # 结束哨兵
-                return
-            ref, blob, mime, error = item
+        async def _producer(url: str) -> None:
+            """下载一张图 → 放进队列。**任何异常都要进队列**（否则消费者会等一辈子）。"""
             try:
-                if error or not blob or not mime:
-                    results[ref["token"]] = _failed(ref, error or "下载失败")
-                    continue
-                # ⚠️ 预算耗尽 ⇒ 剩下的图**直接放弃**（占位符随后被删掉，正文完整）。
-                # 宁可这一篇没有图注，也不能让用户多等 —— 剪藏总时限是硬约束。
-                timeout = MEDIA_OCR_TIMEOUT
-                if deadline is not None:
-                    if deadline.expired():
-                        results[ref["token"]] = _failed(ref, "抓取预算已耗尽（没时间识图了）")
-                        continue
-                    timeout = deadline.slice(MEDIA_OCR_TIMEOUT) or MEDIA_OCR_TIMEOUT
-                try:
-                    async with _global_ocr_semaphore():
-                        text = await ocr_image_bytes(
-                            blob,
-                            mime,
-                            prompt=_MEDIA_OCR_PROMPT,
-                            timeout=timeout,
-                            transport=transport,
-                        )
-                except Exception as exc:  # noqa: BLE001 —— 一张图认不出来不该炸掉整篇
-                    results[ref["token"]] = _failed(ref, f"识图失败: {type(exc).__name__}: {exc}")
-                    continue
-                text = (text or "").strip()
-                if not text:
-                    results[ref["token"]] = _failed(ref, "识图结果为空")
-                    continue
-                results[ref["token"]] = {
-                    "url": ref["url"],
-                    "token": ref["token"],
-                    "caption": text,
-                    "ok": True,
-                    "error": None,
-                }
-            except Exception as exc:  # noqa: BLE001 —— 兜底：消费者绝不能死
-                results[ref["token"]] = _failed(ref, f"识图流程异常: {type(exc).__name__}: {exc}")
+                blob, mime, error = await _download(url)
+            except Exception as exc:  # noqa: BLE001 —— 一张图下载炸了不该拖死整篇
+                blob, mime, error = None, None, f"下载失败: {type(exc).__name__}: {exc}"
+            await queue.put((url, blob, mime, error))
 
-    consumers = [asyncio.create_task(_consumer()) for _ in range(MEDIA_OCR_CONCURRENCY)]
-    producers = [asyncio.create_task(_producer(ref)) for ref in attempted]
+        async def _consumer() -> None:
+            """从队列取图 → 识图 → 写结果。"""
+            while True:
+                item = await queue.get()
+                if item is None:  # 结束哨兵
+                    return
+                url, blob, mime, error = item
+                try:
+                    if error or not blob or not mime:
+                        outcomes[url] = (None, error or "下载失败")
+                        continue
+                    # ⚠️ 预算耗尽 ⇒ 剩下的图**直接放弃**（占位符随后被删掉，正文完整）。
+                    # 宁可这一篇没有图注，也不能让用户多等 —— 剪藏总时限是硬约束。
+                    timeout = MEDIA_OCR_TIMEOUT
+                    if deadline is not None:
+                        if deadline.expired():
+                            outcomes[url] = (None, "抓取预算已耗尽（没时间识图了）")
+                            continue
+                        timeout = deadline.slice(MEDIA_OCR_TIMEOUT) or MEDIA_OCR_TIMEOUT
+                    try:
+                        async with _global_ocr_semaphore():
+                            text = await ocr_image_bytes(
+                                blob,
+                                mime,
+                                prompt=_MEDIA_OCR_PROMPT,
+                                timeout=timeout,
+                                transport=transport,
+                            )
+                    except Exception as exc:  # noqa: BLE001 —— 一张图认不出来不该炸掉整篇
+                        outcomes[url] = (None, f"识图失败: {type(exc).__name__}: {exc}")
+                        continue
+                    text = (text or "").strip()
+                    if not text:
+                        outcomes[url] = (None, "识图结果为空")
+                        continue
+                    # ── B. 零信息判失败 ───────────────────────────────────
+                    # OCR **明确声明「图里没有文字」** ⇒ 这张图没有任何可用信息
+                    # ⇒ 判失败（不进正文），而不是把"图中没有文字"当图注写进稿子。
+                    if _is_zero_info(text):
+                        outcomes[url] = (None, ZERO_INFO_ERROR)
+                        continue
+                    outcomes[url] = (text, None)
+                except Exception as exc:  # noqa: BLE001 —— 兜底：消费者绝不能死
+                    outcomes[url] = (None, f"识图流程异常: {type(exc).__name__}: {exc}")
+
+        consumers = [asyncio.create_task(_consumer()) for _ in range(MEDIA_OCR_CONCURRENCY)]
+        producers = [asyncio.create_task(_producer(url)) for url in urls]
+        try:
+            await asyncio.gather(*producers)
+        finally:
+            # 放结束哨兵，消费者逐个退出。
+            for _ in consumers:
+                await queue.put(None)
+            await asyncio.gather(*consumers, return_exceptions=True)
+        return outcomes
+
+    attempted = list(selected)
+    outcomes: dict[str, tuple[str | None, str | None]] = {}
     try:
-        await asyncio.gather(*producers)
+        outcomes.update(await _ocr_urls(selected))
+
+        # ── C. 补位轮 ─────────────────────────────────────────────────
+        # 空出来的名额由**后面的图**补上（零信息是最常见的一种空位，
+        # 但下载失败 / 识图失败同样是空位 —— 一视同仁）。
+        #
+        # 闸门（**必须**，否则补位会变成"无限往下翻图"）：
+        #   · 最多 **1 轮**；
+        #   · **总尝试 ≤ 2×limit**（第一轮 limit 个 + 补位最多 limit 个）；
+        #   · 预算耗尽 ⇒ **不补**（剪藏总时限是硬约束）。
+        failed = [url for url in selected if not _outcome_ok(outcomes.get(url))]
+        if failed and overflow and not _budget_gone(deadline):
+            spare = overflow[: len(failed)]
+            try:
+                extra = await _ocr_urls(spare)
+            except Exception as exc:  # noqa: BLE001 —— 补位失败不该毁掉第一轮的成果
+                log.warning("media_caption_backfill_failed err=%s: %s", type(exc).__name__, exc)
+                extra = {}
+            outcomes.update(extra)
+            # 只把**真的拿到结果**的 URL 算进尝试数
+            # （失败的那些保留"超出单篇识图上限"的原因，别记成"识图未完成"）。
+            attempted.extend(url for url in spare if url in extra)
     finally:
-        # 放结束哨兵，消费者逐个退出。
-        for _ in consumers:
-            await queue.put(None)
-        await asyncio.gather(*consumers, return_exceptions=True)
         # 只有自己建的 client 才关（池里的 client 关了会连累别的 fetcher）。
         if transport is not None:
             await client.aclose()
 
-    for ref in attempted:
-        caption = results.get(ref["token"])
-        if caption is None:  # 理论上不会发生（每条路径都写了 results）
-            results[ref["token"]] = _failed(ref, "识图未完成")
+    for url in attempted:
+        caption, error = outcomes.get(url, (None, "识图未完成"))
+        for ref in by_url[url]:
+            if error or not caption:
+                results[ref["token"]] = _failed(ref, error or "识图未完成")
+            else:
+                results[ref["token"]] = {
+                    "url": ref["url"],
+                    "token": ref["token"],
+                    "caption": caption,
+                    "ok": True,
+                    "error": None,
+                }
         log.info(
-            "media_caption url=%s ok=%s error=%s",
-            ref["url"],
-            results[ref["token"]]["ok"],
-            results[ref["token"]]["error"],
+            "media_caption url=%s refs=%d ok=%s error=%s",
+            url,
+            len(by_url[url]),
+            _outcome_ok(outcomes.get(url)),
+            error,
         )
+
+    log.info(
+        "media_caption_summary images=%d distinct=%d attempted=%d ok=%d zero_info=%d backfilled=%d",
+        len(images),
+        len(order),
+        len(attempted),
+        sum(1 for url in attempted if _outcome_ok(outcomes.get(url))),
+        sum(1 for url in attempted if (outcomes.get(url) or (None, ""))[1] == ZERO_INFO_ERROR),
+        len(attempted) - len(selected),
+    )
     return _ordered(images, results)
+
+
+def _outcome_ok(outcome: tuple[str | None, str | None] | None) -> bool:
+    """一次识图的结局是不是"成功"。"""
+    return outcome is not None and bool(outcome[0]) and not outcome[1]
+
+
+def _budget_gone(deadline: Deadline | None) -> bool:
+    """抓取总预算是不是已经耗尽（耗尽了就不再开新的一轮请求）。"""
+    return deadline is not None and deadline.expired()
 
 
 def _ordered(images: list[ImageRef], results: dict[str, MediaCaption]) -> list[MediaCaption]:
@@ -648,6 +859,7 @@ __all__ = [
     "MEDIA_OCR_GLOBAL_CONCURRENCY",
     "MEDIA_OCR_QUEUE_SIZE",
     "MEDIA_OCR_TIMEOUT",
+    "ZERO_INFO_ERROR",
     "ImageRef",
     "MediaCaption",
     "MediaImageCollector",
