@@ -3115,19 +3115,52 @@ async def list_tags(
     """CP5.3a：从 DB 读标签（不再用 mock）
     P1-1：LEFT JOIN tag_subscriptions 取每 tag 的"我是否已订阅"，客户端 Switch 即时正确显示
     CP-TAG-FILTER：article_count 一次 group by 算完（零 N+1），用户能看到该标签下已蒸馏的文章数
+    2026-10-26 产品拍板（订阅页数字口径）：标签卡片同时展示两个数字 ——
+    · `article_count`：**该用户自己**蒸馏且打了此标签的文章数（`Article.user_id == uid`）；
+    · `subscribable_count`：**订阅这个标签后能看到多少篇** —— 全站所有用户的
+      `da.tags ∪ shared_tags` 命中该标签、且已就绪（有音频、未删除）的文章数。
+      **与订阅 feed 的 total 语义完全一致**（feed 就是按订阅标签分发这些内容）。
+      这样「我蒸馏了多少」和「订阅能带来多少」不再混成同一个数。
     """
     uid = _uid(user)
     # CP-TAG-FILTER：article_count 统计「该 user 已蒸馏且打了此标签」的文章数。
     # ⚠️ @> 条件必须放在 DistilledArticle 的 OUTER JOIN 的 **ON 子句** 里，
     # 而不是外层 WHERE：放 WHERE 会把 LEFT JOIN 退化成 INNER JOIN ——
-    # 用户没有任何已蒸馏文章的标签（新用户尤甚）会被整行过滤掉，
-    # 订阅页拿到 {"tags":[]} 直接空白（真机反馈，2026-09-23 修复）。
+    # 用户没有任何蒸馏文章的标签（新用户尤甚）会被整行过滤掉，
+    # 订阅页拿到 {"articles":[]} 整行空白（真机反馈，2026-09-23 修复）。
+    #
+    # 订阅可得计数：对每个 tag 用一条**相关标量子查询**算「订阅这个标签能有多少篇」。
+    # 与订阅 feed 的 total 同源 —— 不限 user_id、含 shared_tags、只要已就绪。
+    # 用 @> 而不是 ?| 是为了与上方 article_count 的既有写法保持一致
+    # （json_build_array(Tag.name) 是列引用，不能直接 bind 成 Python 数组）。
+    # 单元素语义下 `@> '["name"]'` 与 feed 的 `?| ARRAY[name]` 等价。
+
+    def _tag_name_jsonb(name_col):
+        return func.cast(func.json_build_array(name_col), JSONB)
+
+    subscribable_subq = (
+        select(func.count(func.distinct(DistilledArticle.article_id)))
+        .select_from(DistilledArticle)
+        .join(Article, Article.id == DistilledArticle.article_id)
+        .where(
+            DistilledArticle.status == "done",
+            DistilledArticle.deleted_at.is_(None),
+            DistilledArticle.audio_url.isnot(None),
+            (
+                DistilledArticle.tags.op("@>")(_tag_name_jsonb(Tag.name))
+                | Article.shared_tags.op("@>")(_tag_name_jsonb(Tag.name))
+            ),
+        )
+        .correlate(Tag)
+        .scalar_subquery()
+    )
     rows = (
         await db.execute(
             select(
                 Tag,
                 TagSubscription.tag_id.is_not(None),
                 func.count(DistilledArticle.article_id),
+                subscribable_subq,
             )
             .outerjoin(
                 TagSubscription,
@@ -3164,8 +3197,11 @@ async def list_tags(
                 "subscribed": bool(is_subscribed),
                 # CP-TAG-FILTER：该 user 在此标签下已蒸馏的文章数（订阅页跳文章流用）
                 "article_count": int(cnt),
+                # 2026-10-26：订阅这个标签后能看到多少篇（全站 da.tags ∪ shared_tags 已就绪）。
+                # 与订阅 feed 的 total 语义一致；article_count 是「自己蒸馏」，两者本就不该相等。
+                "subscribable_count": int(sub_cnt),
             }
-            for tag, is_subscribed, cnt in rows
+            for tag, is_subscribed, cnt, sub_cnt in rows
         ]
     }
 

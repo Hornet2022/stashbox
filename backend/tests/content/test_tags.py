@@ -11,7 +11,7 @@ from sqlalchemy import delete, select, text
 
 from helpers import content_main, new_user
 from stashbox.backend.common.database import AsyncSessionLocal
-from stashbox.backend.common.models import Tag, TagSubscription
+from stashbox.backend.common.models import Article, DistilledArticle, Tag, TagSubscription
 
 
 def _override_auth(dep_name: str, mock_user: dict):
@@ -219,5 +219,139 @@ async def test_user_unsubscribe_tag_idempotent():
     # cleanup
     async with AsyncSessionLocal() as s:
         await s.execute(delete(TagSubscription).where(TagSubscription.user_id == user_id))
+        await s.execute(delete(Tag).where(Tag.slug == slug))
+        await s.commit()
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-26 产品拍板：list_tags 同时返回 article_count（自己蒸馏）与
+# subscribable_count（订阅可得，全站 da.tags ∪ shared_tags 已就绪）。
+# 语义与订阅 feed 的 total 完全一致 —— 两个数字本就不该相等。
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_list_tags_subscribable_count():
+    """GET /api/v1/tags：article_count 只算自己蒸馏；subscribable_count 算全站订阅可得。
+
+    口径（与实现/文档一致）：
+      · article_count = 该用户**自己**蒸馏且 da.tags 命中该标签的文章数 —— **不看就绪状态**
+        （文档「已蒸馏」，running 也算；它只是「我蒸馏了多少」，不承诺可听）。
+      · subscribable_count = **全站** da.tags ∪ shared_tags 命中、且**已就绪**（done+有音频）的文章数。
+
+    场景：
+      · 自己蒸馏 done（da.tags 命中）→ article_count + subscribable_count 都算；
+      · 自己蒸馏 running（da.tags 命中）→ 只算 article_count，不进 subscribable_count；
+      · 别人蒸馏 done（da.tags 命中）→ 只进 subscribable_count；
+      · 别人共享（da.tags 空、shared_tags 命中）→ 只进 subscribable_count。
+    期望：article_count=2（自己 done+running），subscribable_count=3（自己 done + 别人 done + 别人共享）。
+    """
+    slug = _unique_slug()
+    tag_name = f"科技-{slug[-6:]}"
+    user_id, _tok = await new_user()
+    other_id, _ = await new_user()
+
+    async with AsyncSessionLocal() as s:
+        t = Tag(slug=slug, name=tag_name, category="test", is_system=False, creator_id=1)
+        s.add(t)
+        await s.commit()
+
+    async with AsyncSessionLocal() as s:
+        # 自己蒸馏、已就绪 → article_count + subscribable_count
+        a1 = Article(
+            id=f"art_{uuid.uuid4().hex[:24]}",
+            user_id=user_id,
+            url="https://e/1",
+            title="自己",
+            source="wechat",
+        )
+        s.add(a1)
+        s.add(
+            DistilledArticle(
+                id=f"dst_{uuid.uuid4().hex[:24]}",
+                article_id=a1.id,
+                status="done",
+                audio_url="https://x/a.mp3",
+                tags=[tag_name],
+            )
+        )
+        # 别人蒸馏、已就绪 → 只进 subscribable_count
+        a2 = Article(
+            id=f"art_{uuid.uuid4().hex[:24]}",
+            user_id=other_id,
+            url="https://e/2",
+            title="别人",
+            source="wechat",
+        )
+        s.add(a2)
+        s.add(
+            DistilledArticle(
+                id=f"dst_{uuid.uuid4().hex[:24]}",
+                article_id=a2.id,
+                status="done",
+                audio_url="https://x/b.mp3",
+                tags=[tag_name],
+            )
+        )
+        # 别人共享（da.tags 空、shared_tags 命中）→ 只进 subscribable_count
+        a3 = Article(
+            id=f"art_{uuid.uuid4().hex[:24]}",
+            user_id=other_id,
+            url="https://e/3",
+            title="共享",
+            source="wechat",
+            shared_tags=[tag_name],
+        )
+        s.add(a3)
+        s.add(
+            DistilledArticle(
+                id=f"dst_{uuid.uuid4().hex[:24]}",
+                article_id=a3.id,
+                status="done",
+                audio_url="https://x/c.mp3",
+                tags=[],
+            )
+        )
+        # 自己未就绪 → 只算 article_count（自己蒸馏过），不进 subscribable_count
+        a4 = Article(
+            id=f"art_{uuid.uuid4().hex[:24]}",
+            user_id=user_id,
+            url="https://e/4",
+            title="未就绪",
+            source="wechat",
+        )
+        s.add(a4)
+        s.add(
+            DistilledArticle(
+                id=f"dst_{uuid.uuid4().hex[:24]}",
+                article_id=a4.id,
+                status="running",
+                tags=[tag_name],
+            )
+        )
+        await s.commit()
+
+    mock_user = {"id": user_id, "sub": str(user_id)}
+    with _override_auth("require_user", mock_user):
+        transport = ASGITransport(app=content_main.app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/v1/tags")
+        assert resp.status_code == 200, f"期望 200，实际 {resp.status_code}: {resp.text}"
+
+    target = next(t for t in resp.json()["tags"] if t["id"] == slug)
+    assert (
+        target["article_count"] == 2
+    ), f"article_count 应为 2（自己蒸馏 done+running，不看就绪），实际 {target['article_count']}"
+    assert (
+        target["subscribable_count"] == 3
+    ), f"subscribable_count 应为 3（全站订阅可得已就绪），实际 {target['subscribable_count']}"
+
+    # cleanup
+    async with AsyncSessionLocal() as s:
+        await s.execute(delete(TagSubscription).where(TagSubscription.user_id == user_id))
+        await s.execute(
+            delete(DistilledArticle).where(
+                DistilledArticle.article_id.in_([a1.id, a2.id, a3.id, a4.id])
+            )
+        )
+        await s.execute(delete(Article).where(Article.id.in_([a1.id, a2.id, a3.id, a4.id])))
         await s.execute(delete(Tag).where(Tag.slug == slug))
         await s.commit()
