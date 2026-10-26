@@ -114,9 +114,35 @@ class ArticleResponse(BaseModel):
     # 以及用全局配置合成的（source 不可溯源，刻意不塞假音色）。
     #
     # ⚠️ **只在详情页填**，列表接口恒为 null：列表每行都挂个音色名是噪音，
-    # 而且要为此在列表查询里多 join 一次音色表。详情页和 /status 才需要它 ——
+    # 而且要为此在列表查询里 join 一次音色表。详情页和 /status 才需要它 ——
     # 后者是「换音色重生成」时 App 轮询的那个端点，不带缓存，重生成后能立刻看到音色变了。
     tts_voice: TTSVoiceBrief | None = None
+    # 0041：用户剪藏内容共享（2026-10-26 产品拍板）。
+    #
+    # `shared` = 这篇是否已共享给订阅者（true 表示订阅了 `shared_tags` 里
+    # 任一标签的其他用户能通过订阅流看到它）。**属主永远能看自己的内容**，
+    # 这个字段只描述「对别人是否可见」。
+    #
+    # `shared_tags` = 用户共享时手动选的公开标签（中文标签名数组）。
+    # 与 `tags`（LLM 分类）**并存**：共享是「额外公开」，不覆盖 LLM 的分类。
+    #
+    # ⚠️ 这两个字段**只对属主**有意义：订阅者看到的是别人的内容，
+    # 「我能不能共享它」无从谈起。所以订阅者视角下恒为 `shared=false` /
+    # `shared_tags=null`（不泄露属主的共享意愿）。
+    shared: bool = False
+    shared_tags: list[str] | None = None
+
+
+class ShareRequest(BaseModel):
+    """0041：用户**共享**一篇文章时提交的公开标签（2026-10-26 产品拍板）。
+
+    - `shared_tags`：中文标签名数组，去重后落 `articles.shared_tags`（JSONB）。
+      空数组 / 缺省 ⇒ **取消共享**（置 NULL，等价于「不再对订阅者公开」）。
+    - 只接受**属主**调用；订阅者调共享接口一律 403。
+    - 标签是**顺序无关**的集合语义：服务端去重、不保证顺序。
+    """
+
+    shared_tags: list[str] = []
 
 
 class D9AddRequest(BaseModel):

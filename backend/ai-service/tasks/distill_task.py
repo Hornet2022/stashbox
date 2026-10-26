@@ -168,17 +168,26 @@ async def _trigger_subscription_pushes(
         da = await db.scalar(
             select(DistilledArticle).where(DistilledArticle.article_id == article_id)
         )
-        if not da or not da.tags:
+        if not da:
             return 0
 
         # DistilledArticle 无 title 字段，需从 Article 表查
         article_title = "新文章"
+        art = None
         if da.article_id:
             art = await db.get(Article, da.article_id)
             if art and art.title:
                 article_title = art.title[:50]
 
+        # 0041 共享语义：**用户共享的标签也要触发订阅推送**。
+        # 订阅流/读侧授权按 `da.tags ∪ shared_tags` 合并，推送是订阅闭环的
+        # **入流一环**（先有推送，用户才点进来看），必须同一口径 ——
+        # 否则用户刚共享一篇，订阅者既收不到推送、流里也看不到（不一致）。
+        # 共享标签可能不在 tags 表（第 2 步映射 slug 时自然过滤掉），不影响。
         article_tags = da.tags if isinstance(da.tags, list) else []
+        shared_tags = getattr(art, "shared_tags", None) if art else None
+        if isinstance(shared_tags, list):
+            article_tags = list(dict.fromkeys([*article_tags, *shared_tags]))
         # CP-MOCK-SENTINEL：兜底过滤 mock 兜底标签（pipeline 已过滤，再加一层防御）
         article_tags = [a for a in article_tags if a != "__mock__"]
         if not article_tags:

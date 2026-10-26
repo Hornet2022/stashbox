@@ -75,6 +75,7 @@ from schemas import (  # noqa: E402
     ClawBotMessageRequest,
     D9AddRequest,
     D9AddResponse,
+    ShareRequest,
     TTSVoiceBrief,
     WechatMpMessageRequest,
 )
@@ -249,11 +250,16 @@ def _to_response(
     full_script: bool = False,
     tts_voice: TTSVoiceBrief | None = None,
     stage: str | None = None,
+    for_owner: bool = True,
 ) -> ArticleResponse:
     """CP9.x dev 兜底：本地模式（STORAGE_PROVIDER=local）下 audio_url 用
     PUBLIC_GATEWAY_URL 拼，避免真机客户端连到 localhost（设备本机）。
 
     生产模式（OSS / 公网）：保持 task.audio_url 原值（已是 OSS 公网/签名 URL）。
+
+    `for_owner`（0041）：`shared` / `shared_tags` 只对**属主**有意义 ——
+    订阅者看到的是别人的内容，「我能不能共享它」无从谈起，且不该泄露
+    属主的共享意愿。订阅者视角下恒为 `shared=false` / `shared_tags=null`。
     """
     audio_url = task.audio_url if task else None
     if (settings.storage_provider == "local" or settings.enable_local_audio_mount) and audio_url:
@@ -264,6 +270,7 @@ def _to_response(
             audio_url = f"{settings.public_gateway_url.rstrip('/')}{path}"
         # CP9.x：扫描磁盘实际存在的扩展名，避免后缀不匹配（见 _resolve_actual_audio_extension）
         audio_url = _resolve_actual_audio_extension(audio_url, settings.local_audio_dir)
+    shared_tags = a.shared_tags if isinstance(a.shared_tags, list) and a.shared_tags else None
     return ArticleResponse(
         id=a.id,
         url=a.url,
@@ -294,6 +301,9 @@ def _to_response(
         else None,
         # CP-TTS-VOICE 溯源：只有详情页调用方才解析（列表恒 None，见 schema 注释）
         tts_voice=tts_voice,
+        # 0041：共享状态只对属主透出（订阅者视角恒为未共享，不泄露属主意愿）
+        shared=bool(shared_tags) if for_owner else False,
+        shared_tags=shared_tags if for_owner else None,
     )
 
 
@@ -348,12 +358,39 @@ async def _get_owned(article_id: str, user_id: int, db: AsyncSession) -> Article
 # ⚠️ **只放行「消费」类操作**：读稿、听音频、记自己的收听进度/评分/收藏。
 #    **删除、重试蒸馏、稍后读**这些是**属主的私有操作**，不给订阅者
 #    （否则订阅者能删掉别人的文章）。
+def _effective_tags(art: Article, da: DistilledArticle | None) -> list[str]:
+    """一篇文章**对订阅者可见**的标签 = `da.tags ∪ shared_tags`（0041）。
+
+    这是共享功能的核心合并语义，订阅流 / 读侧授权 / 推送**三处共用**：
+
+    · `da.tags`：蒸馏时 LLM 猜的分类（运营内容会被 `manual_tags` 覆盖）；
+    · `art.shared_tags`：用户共享时手动选的公开标签（0041，**并存不覆盖**）。
+
+    合并 = 共享是「额外公开」：订阅了 LLM 分类**或**共享标签里任一标签的用户，
+    都能看到这篇。取消共享（shared_tags 置 NULL/空）后，只剩 `da.tags` 生效。
+
+    ⚠️ 返回的是**去重后的顺序无关列表**，只用于 `set` 交集判断与 `jsonb ?|`
+    过滤，不保证与任一来源的顺序一致。
+    """
+    merged: list[str] = []
+    for src in (
+        da.tags if da and isinstance(da.tags, list) else [],
+        getattr(art, "shared_tags", None)
+        if isinstance(getattr(art, "shared_tags", None), list)
+        else [],
+    ):
+        for t in src:
+            if isinstance(t, str) and t and t not in merged:
+                merged.append(t)
+    return merged
+
+
 async def _subscription_grants_access(art: Article, user_id: int, db: AsyncSession) -> bool:
     """订阅者是否可以消费这篇文章（读 / 听 / 记录自己的状态）。"""
     da = await db.scalar(select(DistilledArticle).where(DistilledArticle.article_id == art.id))
     if da is None or da.status != "done" or not da.audio_url:
         return False
-    art_tags = da.tags if isinstance(da.tags, list) else []
+    art_tags = _effective_tags(art, da)
     if not art_tags:
         return False
     rows = await db.execute(
@@ -1657,11 +1694,65 @@ async def get_article(
         task,
         full_script=True,
         tts_voice=await _tts_voice_brief(task),
+        # 0041：shared/shared_tags 只对属主透出（订阅者视角恒为未共享）
+        for_owner=(art.user_id == uid),
     ).model_dump()
     await cache_service.set_article(article_id, payload, owner_id=art.user_id)  # ttl 300s
     # stage 现读、不入缓存（与上面缓存命中分支同一口径）
     payload["stage"] = await get_stage(article_id)
     return payload
+
+
+@app.post("/api/v1/articles/{article_id}/share", response_model=ArticleResponse)
+async def share_article(
+    article_id: str,
+    req: ShareRequest,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """0041：共享一篇剪藏（2026-10-26 产品拍板）。
+
+    - **只接受属主**（`_get_owned`）：订阅者不能替别人共享。
+    - `req.shared_tags`：手动选的公开标签（中文名，去重），落 `articles.shared_tags`。
+      空数组 ⇒ 取消共享（置 NULL）。
+    - 写库后失效 article detail 缓存（订阅流 / 详情页都要看到最新共享态）。
+    """
+    uid = _uid(user)
+    art, task = await _get_owned_with_task(article_id, uid, db)
+    # 去重、去空串（顺序无关的集合语义；保留首次出现顺序便于 diff）
+    tags: list[str] = []
+    for t in req.shared_tags or []:
+        if isinstance(t, str) and t.strip() and t not in tags:
+            tags.append(t.strip())
+    art.shared_tags = tags or None
+    await db.commit()
+    await db.refresh(art)  # commit 后回读（expire_on_commit）
+    await cache_service.invalidate_article(article_id)
+    payload = _to_response(
+        art,
+        task,
+        full_script=True,
+        tts_voice=await _tts_voice_brief(task),
+        for_owner=True,
+    ).model_dump()
+    payload["stage"] = await get_stage(article_id)
+    return payload
+
+
+@app.post("/api/v1/articles/{article_id}/unshare")
+async def unshare_article(
+    article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)
+):
+    """0041：取消共享（等价于 `POST .../share` 传空 `shared_tags`）。
+
+    幂等：本来就没共享时直接返回 ok。只属主可调。
+    """
+    uid = _uid(user)
+    art = await _get_owned(article_id, uid, db)
+    art.shared_tags = None
+    await db.commit()
+    await cache_service.invalidate_article(article_id)
+    return {"id": article_id, "shared": False, "shared_tags": None}
 
 
 @app.delete("/api/v1/articles/{article_id}")
@@ -3299,11 +3390,17 @@ async def subscription_feed(
     # 渲染成 `jsonb ?| $2::JSONB` → Postgres 报
     # `operator does not exist: jsonb ?| jsonb`（实测踩过）。
     tag_array = cast(tag_names, ARRAY(String))
-    tag_filter = func.jsonb_exists_any(DistilledArticle.tags, tag_array)
+    # 0041 共享语义：订阅者能看到的标签 = `da.tags ∪ shared_tags`。
+    # 命中任一来源即入流。`jsonb_exists_any` 对 NULL 返回 NULL（假），
+    # 所以未共享的文章（shared_tags IS NULL）不会误命中 —— 只有 da.tags 生效。
+    tag_filter = func.jsonb_exists_any(DistilledArticle.tags, tag_array) | func.jsonb_exists_any(
+        Article.shared_tags, tag_array
+    )
 
     count_stmt = (
         select(func.count())
         .select_from(DistilledArticle)
+        .join(Article, Article.id == DistilledArticle.article_id)
         .where(
             DistilledArticle.status == "done",
             DistilledArticle.deleted_at.is_(None),
@@ -3335,7 +3432,9 @@ async def subscription_feed(
                 "article_id": art.id,
                 "title": art.title or "未命名",
                 "source": art.source,
-                "tags": da.tags if isinstance(da.tags, list) else [],
+                # 0041：透出**合并后**的标签（LLM 分类 ∪ 用户共享标签），
+                # 客户端据此展示「这篇覆盖哪些分类」。
+                "tags": _effective_tags(art, da),
                 "audio_url": da.audio_url,
                 "duration_sec": da.duration_sec,
                 "created_at": da.created_at.isoformat() if da.created_at else None,

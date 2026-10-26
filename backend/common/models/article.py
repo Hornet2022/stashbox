@@ -57,6 +57,20 @@ class Article(Base, TimestampMixin):
     manual_tags: Mapped[list | None] = mapped_column(
         JSONB, nullable=True
     )  # 运营指定的分类（中文标签名数组，NULL = 未指定，用 LLM 猜的）
+    # 0041：**用户共享的标签**（2026-10-26 产品拍板）。
+    #
+    # 用户剪藏的内容**默认只有自己可见**。共享后，订阅了这些标签的**其他用户**
+    # 才能通过订阅流看到、读、听；取消共享则恢复只有属主可见。
+    #
+    # 与 `manual_tags`（运营）的区别：运营是**覆盖** `da.tags`；用户共享是
+    # **并存（merge）** —— 共享是「额外公开」，不该把 LLM 已给的分类抹掉。
+    # 所以订阅流 / 读侧授权 / 推送都按 `da.tags ∪ shared_tags` 合并判断。
+    #
+    # NULL / 空数组 = 未共享（默认）。属主**永远**能看自己的内容，共享开关
+    # 只影响「别人能不能看到」（见 `_subscription_grants_access` 的说明）。
+    shared_tags: Mapped[list | None] = mapped_column(
+        JSONB, nullable=True
+    )  # 用户共享时手动选的公开标签（中文标签名数组，NULL = 未共享）
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0", nullable=False

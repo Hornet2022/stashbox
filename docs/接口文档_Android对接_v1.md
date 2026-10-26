@@ -451,11 +451,66 @@ curl -s -X POST "$GW/api/v1/distill/$TID/evaluation" -H "$AUTH" \
 
 ---
 
+## 6.5 剪藏共享（0041，2026-10-26 产品拍板）
+
+**一句话**：属主可以把自己的剪藏「共享」给订阅了某些标签的用户 —— 订阅了
+`shared_tags` 里任一标签的用户，就能在订阅流里看到并收听这篇。
+
+### 6.5.1 数据口径：`shared` / `shared_tags`（只对属主透出）
+
+- `Article.shared`：`true` = 这篇已共享（订阅了 `shared_tags` 任一标签的其他用户
+  能在订阅流看到它）。**属主永远能看自己的内容**，这个字段只描述「对别人是否可见」。
+- `Article.shared_tags`：共享时手动选的**公开标签名数组**（中文名，去重、顺序无关）。
+  与 `tags`（LLM 分类）**并存**：共享是「额外公开」，不覆盖 LLM 的分类。
+
+⚠️ **这两个字段只对属主有意义**。订阅者视角下恒为 `shared=false` / `shared_tags=null`
+（不泄露属主的共享意愿）。所以只有属主自己的文章详情 / 列表会带它们。
+
+### 6.5.2 共享 / 取消共享
+
+```
+POST /api/v1/articles/{article_id}/share
+Authorization: Bearer <token>
+Content-Type: application/json
+Body: { "shared_tags": ["科技", "AI"] }
+```
+
+| 场景 | 行为 |
+|---|---|
+| `shared_tags` 非空 | 去重后落 `articles.shared_tags`（JSONB），文章对订阅者公开 |
+| `shared_tags` 为空数组 / 缺省 | **取消共享**（置 NULL），等价于 `unshare` |
+| 订阅者调用 | 403（`_get_owned` 统一 404，不泄露存在性） |
+
+响应：完整 `ArticleResponse`（属主视角，含 `shared` / `shared_tags`）。
+
+```
+POST /api/v1/articles/{article_id}/unshare
+```
+取消共享，幂等（本来就没共享也返回 ok）。响应精简体：
+`{"id": article_id, "shared": false, "shared_tags": null}`
+
+### 6.5.3 订阅流的合并可见性
+
+订阅者能看到的标签 = `da.tags ∪ shared_tags`（`da.tags` 是 LLM 分类，运营会被
+`manual_tags` 覆盖）。**合并 = 共享是「额外公开」**：订阅了 LLM 分类或共享标签里
+任一标签的用户都能看到这篇。取消共享后只剩 `da.tags` 生效。订阅流 / 读侧授权 /
+推送三处共用同一套合并逻辑。
+
+### 6.5.4 客户端要点
+
+- 只有**属主**的文章才显示共享入口；订阅者视角无此入口。
+- 共享对话框里标签可多选：保存时若一个都没选 → 调 `unshare`；否则调 `share(selected)`。
+- 共享成功/取消后，详情页与列表页要就地刷新 `shared` / `shared_tags`（后端已失效
+  article detail 缓存，重新拉详情/列表即得最新态）。
+
+---
+
 ## 7. 变更记录
 
 | 版本 | 日期 | 内容 |
 |---|---|---|
-| v1.3 | 2026-09-30 | **CP-TTS-VOICE 落地**：§5.5 音色库 + 语速偏好（`GET /api/v1/tts/voices`、`GET/PUT /api/v1/users/me/tts-preference`）+ `POST /api/v1/distill/start` 作为「用当前音色重新生成」入口。⚠️ 前置：迁移须到 **0033**（新增 `tts_voices` / `user_tts_preferences` 两表 + `distilled_articles.tts_voice_id` 列）。三态 `voice_id` 语义与 Kotlin 序列化坑见 §5.5.2 |
+| v1.4 | 2026-10-26 | **0041 剪藏共享落地**：§6.5 共享/取消共享端点（`POST /api/v1/articles/{id}/share|unshare`）+ `Article.shared`/`shared_tags` 字段语义（只对属主透出）+ 订阅流合并可见性（`da.tags ∪ shared_tags`）。⚠️ 前置：迁移须到 **0041**（`articles.shared_tags` JSONB 列，NULL=未共享） |
+| v1.3 | 2026-09-30 | **CP 0-TTS-VOID 落地**：§5.5 音色库 + 语速偏好（`GET /api/v1/tts/voices`、`GET/PUT /api/v1/users/me/tts-preference`）+ `POST /api/v1/distill/start` 作为「用当前音色重新生成」入口。⚠️ 前置：迁移须到 **0033**（新增 `tts_voices` / `user_tts_preferences` 两表 + `distilled_articles.tts_voice_id` 列）。三态 `voice_id` 语义与 Kotlin 序列化坑见 §5.5.2 |
 | v1.2 | 2026-09-24 | **G1 落地**：§2.6 四维评分端点完整契约（请求/响应/校验/联动语义/触发时机）；§0.3/§3 路由升级为显式注册（G5 关闭）；§4 个性化状态更新（分桶已落库、评分→画像闭环已通）；§5 缺口清单刷新（G1/G5 done，G2/G3/G4 开放）；§6 冒烟补 4 维评分 + 迁移 0029 硬前提 |
 | v1.1 | 2026-09-24 | 新增 §3 多码率变体（CP7.3.0）、§4 个性化现状、§5 缺口清单 G1-G5 |
 | v1.0 | 2026-09-16 | 初版（CP1.x 主链路） |
