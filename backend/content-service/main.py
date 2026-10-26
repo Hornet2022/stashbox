@@ -645,6 +645,7 @@ async def _create_article(
     fetch_on_create: bool = True,  # True=建库前调 fetcher 抓 title/source/raw_content
     dedup: bool = True,  # True=同用户同 URL 已有未删文章则复用（CP-DUPLICATE-CLIP）
     manual_tags: list[str] | None = None,  # 运营指定的分类（0040；None=用 LLM 猜的）
+    warning_sink: list[str] | None = None,  # 非 None 时，把「需要运营注意」的提示追加进来
 ) -> Article:
     # 2026-10-23：往 articles 写 `user_id=0` 之前，哨兵用户必须存在 ——
     # articles.user_id 有 FK 到 users(id)，而哨兵（id=0）是**按需**建的
@@ -721,13 +722,19 @@ async def _create_article(
                 art.manual_tags = new_tags
                 await db.commit()
                 if art.status in ("ready", "listened"):
+                    msg = (
+                        f"这篇已发布（status={art.status}），分类已记到 manual_tags，"
+                        f"但已蒸馏的稿子需要**重新蒸馏**才会换分类 —— "
+                        f"distilled_articles.tags 是蒸馏时写的。"
+                    )
                     log.warning(
-                        "duplicate_clip_manual_tags_updated article=%s tags=%s "
-                        "(已发布的稿子需要**重新蒸馏**才会换分类 —— "
-                        "distilled_articles.tags 是蒸馏时写的)",
+                        "duplicate_clip_manual_tags_updated article=%s tags=%s %s",
                         art.id,
                         new_tags,
+                        msg,
                     )
+                    if warning_sink is not None:
+                        warning_sink.append(msg)
                 else:
                     log.info(
                         "duplicate_clip_manual_tags_updated article=%s tags=%s",
@@ -1288,6 +1295,7 @@ async def admin_create_article(
     **不扣配额**、写 admin 审计日志、照常派蒸馏。
     """
     _validate_url(req.url)
+    warnings: list[str] = []
     art = await _create_article(
         req.url,
         ANONYMOUS_USER_ID,
@@ -1296,6 +1304,7 @@ async def admin_create_article(
         db,
         event=EventName.ARTICLE_SUBMIT,
         manual_tags=req.tags,
+        warning_sink=warnings,
     )
     # 记审计：这条是 admin 写操作，不能只靠 AuditMiddleware（它只挂在网关上，
     # 直连 content-service:8102 绕过网关时不会有记录 —— 见 plist 绑定收紧的说明）。
@@ -1330,6 +1339,7 @@ async def admin_create_article(
         "url": art.url,
         "status": art.status,
         "task_id": task_id,
+        "warning": warnings[0] if warnings else None,
     }
 
 
@@ -1386,6 +1396,7 @@ async def admin_create_article_document(
 
     final_title = (title or "").strip() or fr.title
     # 内容 hash 当 url → 同一份文档重复录入复用同一篇（与用户侧同口径）
+    warnings: list[str] = []
     art = await _create_article(
         fr.url,
         ANONYMOUS_USER_ID,
@@ -1396,6 +1407,7 @@ async def admin_create_article_document(
         manual_tags=tags,
         event=EventName.ARTICLE_SUBMIT,
         fetch_on_create=False,  # 正文已经在上传里了，不该再去抓一次
+        warning_sink=warnings,
     )
 
     db.add(
@@ -1437,6 +1449,7 @@ async def admin_create_article_document(
         "filename": filename,
         "content_type": content_type,
         "text_length": len(fr.content_text),
+        "warning": warnings[0] if warnings else None,
     }
 
 
@@ -2981,6 +2994,28 @@ async def wechat_mp_message(
     }
 
 
+# ---------------------------------------------------------------------------
+# CP-TAG-CATEGORY：标签分组的**可读中文名**（单源定义）。
+#
+# tags.category 是内部取值（生产 seed / 创建默认恒为 "subject"），没有枚举约束。
+# 直接把它抛给客户端会露出英文毛刺（真机反馈：订阅页分组标题显示 "subject"）。
+#
+# 为什么放后端而不是只让客户端各自维护一张映射：
+#   · 分类是**运营在后台建的**，什么时候新增、叫什么，只有后端这一个源头知道；
+#   · 客户端各自维护 = 每个端都要记得同步，漏一个就毛刺（安卓就曾因此露过）。
+#   ⇒ 后端在 list_tags / admin_list_tags 里多吐一个 `category_label`（可读中文名），
+#     未知分类 fallback 回原文 —— 运营日后新增分类也不会崩、不会露英文。
+#   安卓端仍保留 KNOWN_TAG_CATEGORIES 作为**旧服务端兜底**（不依赖新字段也能显示）。
+TAG_CATEGORY_LABELS: dict[str, str] = {
+    "subject": "主题",
+}
+
+
+def _tag_category_label(category: str) -> str:
+    """把内部 category 映射成可读中文名；未知值原样返回（不露英文、不崩）。"""
+    return TAG_CATEGORY_LABELS.get(category, category)
+
+
 @app.get("/api/v1/tags")
 async def list_tags(
     user: dict = Depends(require_user),
@@ -3033,6 +3068,8 @@ async def list_tags(
                 "id": tag.slug,  # 用 slug 作为 id（与 mock 兼容）
                 "name": tag.name,
                 "category": tag.category,
+                # CP-TAG-CATEGORY：可读中文分组名（单源定义，安卓订阅页分组标题用）
+                "category_label": _tag_category_label(tag.category),
                 "subscribed": bool(is_subscribed),
                 # CP-TAG-FILTER：该 user 在此标签下已蒸馏的文章数（订阅页跳文章流用）
                 "article_count": int(cnt),

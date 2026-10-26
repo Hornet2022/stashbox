@@ -2614,12 +2614,26 @@ def _histogram_quantile(
     return None
 
 
+# CP-TAG-CATEGORY：标签分组的**可读中文名**（单源定义，与 main.py 的 list_tags 同口径）。
+# tags.category 是内部取值（生产 seed / 创建默认恒为 "subject"），没有枚举约束；
+# 直接抛给客户端会露出英文毛刺（真机反馈：订阅页分组标题显示 "subject"）。
+# 未知分类 fallback 回原文 —— 运营日后新增分类也不会露英文、不会崩。
+ADMIN_TAG_CATEGORY_LABELS: dict[str, str] = {
+    "subject": "主题",
+}
+
+
+def _admin_tag_category_label(category: str) -> str:
+    """把内部 category 映射成可读中文名；未知值原样返回。"""
+    return ADMIN_TAG_CATEGORY_LABELS.get(category, category)
+
+
 @router.get("/api/v1/admin/tags")
 async def admin_list_tags(
     user: dict = Depends(require_admin_or_operator),
     db: AsyncSession = Depends(get_db),
 ):
-    """CP-DELETE：admin 标签列表（含数字 id / is_system / 订阅数）。
+    """CP-DELETE：admin 标签列表（含 /api/v1/admin/tags 数字 id / is_system / 订阅数）。
 
     用户端 GET /api/v1/tags 的 id 是 slug 且无 is_system，无法驱动删除按钮
     （删除端点按数字 tag_id + 系统标签保护），故给 admin-web 单独一份。
@@ -2639,6 +2653,8 @@ async def admin_list_tags(
                 "slug": tag.slug,
                 "name": tag.name,
                 "category": tag.category,
+                # CP-TAG-CATEGORY：可读中文分组名（与用户端 list_tags 同口径）
+                "category_label": _admin_tag_category_label(tag.category),
                 "is_system": tag.is_system,
                 "subscriber_count": int(cnt),
                 "created_at": tag.created_at.isoformat() if tag.created_at else None,
@@ -2660,7 +2676,9 @@ async def admin_delete_tag(
     保护：is_system 系统标签禁删（403）——蒸馏 LLM 输出对齐依赖内置标签集。
     级联：tag_subscriptions（FK ondelete=CASCADE）、push_notifications.tag_slug
     （FK ondelete=SET NULL）由 DB 自动处理，无需应用层清理。
-    distilled_articles.tags 为 JSONB 文本数组（非 FK），历史标签值保留不动。
+    distilled_articles.tags 为 JSONB 文本数组（非 FK）——这里**同事务**把该标签名
+    从所有已蒸馏文章的 tags 数组里剥掉，避免「标签已删、文章还挂着幽灵标签名」
+    （详情页/订阅流会把一个不存在的标签渲染给用户）。
     reason ≥5 字符必填（审计），同事务写 admin_operation_logs。
     """
     if len(req.reason.strip()) < 5:
@@ -2674,6 +2692,29 @@ async def admin_delete_tag(
 
     tag_name = tag.name
     await db.delete(tag)
+
+    # CP-DELETE-TAG-CLEANUP：剥掉幽灵标签名。distilled_articles.tags 存的是中文标签名
+    # （非 FK），删除 tag 后不清理会让文章详情/订阅源把「已不存在的标签」渲染给用户。
+    # 逐行在 Python 端剥（JSONB 数组移除元素没有稳定的 SQL 运算符）：
+    # 只影响「tags 含该名」的行，剥空后该文章不再出现在标签筛选/订阅源里（合理——
+    # 它唯一的标签被删了）。与 tag 删除、审计日志同事务，失败整体回滚。
+    ghost_rows = (
+        (
+            await db.execute(
+                select(DistilledArticle).where(
+                    DistilledArticle.tags.is_not(None),
+                    DistilledArticle.tags.op("@>")(
+                        func.cast(func.json_build_array(tag_name), JSONB)
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for da in ghost_rows:
+        if isinstance(da.tags, list) and tag_name in da.tags:
+            da.tags = [t for t in da.tags if t != tag_name]
 
     log_row = AdminOperationLog(
         admin_id=_uid(user),

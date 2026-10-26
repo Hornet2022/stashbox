@@ -364,6 +364,69 @@ async def test_admin录入链接_来源用真实来源而不是占位码(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_admin录入链接_重复录入已发布稿换分类_返回warning(monkeypatch):
+    """重复录入同一 URL 且这次指定了分类 → 响应带 `warning` 提示需重新蒸馏。
+
+    为什么锁这条（0040 的静默失败治理）：运营对**已发布**（status=ready）的稿子
+    改分类时，`manual_tags` 会被更新，但 `distilled_articles.tags` **不会跟着变**
+    —— 那是蒸馏时写死的。若这里不返回 warning，运营看到「创建成功」就以为
+    分类已生效，实际订阅分类的用户看到的还是旧分类（静默失败）。
+
+    这条锁住：重复录入 + 指定不同分类 + 稿子已 ready → `warning` 非空，
+    且文案明确点出「需要重新蒸馏」。
+    """
+
+    from httpx import ASGITransport, AsyncClient
+
+    from fetchers.base import FetchResult
+
+    class _FakeFetcher:
+        async def fetch(self, url: str, timeout: float | None = None, budget: float | None = None):
+            return FetchResult(
+                url=url,
+                title="重复分类测试",
+                content_html="<p>正文</p>",
+                content_text="这是足够长的正文内容，用于通过正文长度下限。" * 30,
+                source="web",
+            )
+
+    monkeypatch.setattr(content_main, "get_fetcher", lambda _url: _FakeFetcher())
+    url = f"https://example.com/dup-warning-{id(object())}"
+
+    with _override_auth("require_admin_or_operator", ADMIN_USER):
+        transport = ASGITransport(app=content_main.app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+
+            def _post(tags):
+                return client.post(
+                    "/api/v1/admin/articles",
+                    json={"url": url, "source": "url", "tags": tags},
+                )
+
+            first = await _post(["科技"])
+            assert first.status_code == 200, first.text
+            art_id = first.json()["article_id"]
+            # 第一次建出来是 pending；把稿子置为已发布，复现「运营改已发布稿的分类」
+            async with AsyncSessionLocal() as s:
+                art = await s.get(Article, art_id)
+                art.status = "ready"
+                await s.commit()
+
+            second = await _post(["财经"])
+            assert second.status_code == 200, second.text
+
+    data = second.json()
+    assert data["article_id"] == art_id, "重复录入应复用同一篇文章"
+    assert data["warning"], f"已发布稿换分类应返回 warning，实际 {data['warning']!r}"
+    assert "重新蒸馏" in data["warning"], data["warning"]
+
+    # 分类确实落到了 manual_tags（不能静默丢掉）
+    async with AsyncSessionLocal() as s:
+        art = await s.get(Article, art_id)
+        assert art.manual_tags == ["财经"]
+
+
+@pytest.mark.asyncio
 async def test_admin录入文档_普通用户被拒():
     """普通用户不能往全站塞内容。
 

@@ -24,9 +24,11 @@
 
 import uuid
 
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import JSONB
 
 from stashbox.backend.common.database import AsyncSessionLocal
-from stashbox.backend.common.models import Tag
+from stashbox.backend.common.models import Article, DistilledArticle, Tag
 from stashbox.backend.common.models.tts_voice import TTSVoice
 
 from helpers import client, new_user
@@ -75,6 +77,56 @@ async def _purge_voice(voice_id: str) -> None:
         if v is not None:
             await s.delete(v)
             await s.commit()
+
+
+async def _make_distilled_with_tags(tags: list[str]) -> str:
+    """造一篇 tags 数组里含给定标签名的已蒸馏文章（distilled_articles.tags 是 JSONB 数组）。
+
+    返回蒸馏记录 id，供断言把验证范围锁在这篇自己造的文章上，避免被共享测试库里
+    历史遗留的 tags='null'（JSONB 的 JSON null，`IS NOT NULL` 测不出来）污染。
+    """
+    async with AsyncSessionLocal() as s:
+        uid, _ = await new_user()
+        a = Article(
+            id=f"art_{uuid.uuid4().hex[:24]}",
+            user_id=uid,
+            url=f"https://example.com/{uuid.uuid4().hex}.html",
+            source="d9",
+            status="ready",
+            favorite=False,
+            skip=False,
+        )
+        s.add(a)
+        await s.flush()
+        d = DistilledArticle(
+            id=f"dst_{uuid.uuid4().hex[:24]}",
+            article_id=a.id,
+            status="done",
+            tags=tags,
+        )
+        s.add(d)
+        await s.commit()
+        return d.id
+
+
+async def _distilled_tags_contain(tag_name: str) -> list[str]:
+    """返回所有 tags 数组里仍含 tag_name 的文章 id（用于断言幽灵标签被剥干净）。"""
+    async with AsyncSessionLocal() as s:
+        rows = (
+            (
+                await s.execute(
+                    select(DistilledArticle).where(
+                        DistilledArticle.tags.is_not(None),
+                        DistilledArticle.tags.op("@>")(
+                            func.cast(func.json_build_array(tag_name), JSONB)
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return [r.id for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +222,41 @@ async def test_admin_delete_tag_未登录_401():
         r = await c.request("DELETE", f"{ADMIN_TAGS}/{tag_id}", json={"reason": "未登录也要删除"})
     assert r.status_code == 401, r.text
     assert await _tag_exists(tag_id) is True
+
+
+async def test_admin_delete_tag_剥掉文章里的幽灵标签名():
+    """CP-DELETE-TAG-CLEANUP：删标签时**同事务**把该标签名从已蒸馏文章的 tags 数组剥掉。
+
+    distilled_articles.tags 是 JSONB 文本数组（非 FK），删了 tag 不清理，
+    文章详情/订阅流会把「已不存在的标签」渲染给用户。本用例验证：
+    1. 含该标签名（混在其它标签里）的文章被剥掉该名，其它标签保留；
+    2. 不含该标签名的文章不受影响。
+    """
+    token = await _staff_token()
+    tag_id = await _make_tag("幽灵标签")
+    d1 = await _make_distilled_with_tags(["幽灵标签", "科技"])
+    d2 = await _make_distilled_with_tags(["商业"])
+
+    async with client(token) as c:
+        r = await c.request("DELETE", f"{ADMIN_TAGS}/{tag_id}", json={"reason": "清理幽灵标签名"})
+
+    assert r.status_code == 200, r.text
+    assert await _tag_exists(tag_id) is False
+    # 名字必须被剥干净：没有任何文章的 tags 还挂着它
+    assert await _distilled_tags_contain("幽灵标签") == [], "幽灵标签名必须被剥干净"
+
+    # 其它标签不受影响（剥空的那篇只剩 "科技"）。验证范围锁在本次造的两篇上，
+    # 不扫全表 —— 共享测试库里可能有历史遗留的 tags='null'（JSONB 的 JSON null，
+    # `IS NOT NULL` 筛不掉，但 ORM 会反序列化成 Python None 触发 tuple(None)）。
+    async with AsyncSessionLocal() as s:
+        rows = (
+            (await s.execute(select(DistilledArticle).where(DistilledArticle.id.in_([d1, d2]))))
+            .scalars()
+            .all()
+        )
+        tag_sets = {tuple(r.tags) for r in rows}
+    assert ("科技",) in tag_sets, "同文的其它标签必须保留"
+    assert ("商业",) in tag_sets, "不含该名的文章必须原样保留"
 
 
 # ---------------------------------------------------------------------------
