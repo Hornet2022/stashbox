@@ -93,6 +93,22 @@ class EventName(str, Enum):
     # A/B 报表的播放次数分母。
     APP_FIRST_FRAME = "app_first_frame"
 
+    # === 播放中断与恢复（2026-10-26 补）===
+    #
+    # 内测反馈「放后台播放，几分钟后就没声了」——但此前播放失败**只写进
+    # 客户端的 logcat**，服务端一个字都没留 ⇒ 只能靠猜是哪一类断流。
+    #
+    # 这两条是一对：
+    #   · PLAYBACK_ERROR —— 断了。properties: kind / attempt /
+    #     position_ms / duration_ms / cause / article_id
+    #   · PLAYBACK_RECOVERED —— 自己接上了。properties: attempts / article_id
+    #
+    # 判读方式：**只有失败没有恢复** ⇒ 彻底断了（音频没了 / 网络彻底不通）；
+    # **成对出现** ⇒ 抖了一下，已自动接上（此时该看的是「抖动频率」，
+    # 而不是「播放成功率」）。
+    PLAYBACK_ERROR = "playback_error"
+    PLAYBACK_RECOVERED = "playback_recovered"
+
     # === 互动反馈（CP6.2.2 全做：客户端）===
     FAVORITE_ADD = "favorite_add"
     FAVORITE_REMOVE = "favorite_remove"
