@@ -142,7 +142,14 @@ def _shared_setup(monkeypatch):
         yield session
 
     async def _fake_run_via_agent(
-        task_id, article_id, user_id, url, raw_content, source="web", simulate_failure=False
+        task_id,
+        article_id,
+        user_id,
+        url,
+        raw_content,
+        source="web",
+        title=None,
+        simulate_failure=False,
     ):
         AgentCallRecorder.calls.append(
             {
@@ -152,6 +159,8 @@ def _shared_setup(monkeypatch):
                 "url": url,
                 "raw_content": raw_content,
                 "source": source,
+                # CP-TITLE-ANNOUNCE（2026-10-26）：标题进 agent（给音频开头播报用）
+                "title": title,
                 "simulate_failure": simulate_failure,
             }
         )
@@ -268,6 +277,19 @@ async def test_title_is_optional(fake_agent):
     """title 可选：不传也能跑通（agent 用 raw_content 就够了）。"""
     result = await dt_module.distill_task(CTX, "dst_1", "art_1", 7, "https://x.com/a")
     assert result["status"] == "done"
+
+
+async def test_title_reaches_the_agent(fake_agent):
+    """CP-TITLE-ANNOUNCE（2026-10-26）：标题必须进 agent。
+
+    不进 agent ⇒ 音频开头就没有标题播报（用户内测反馈的那条）。
+    """
+    await dt_module.distill_task(
+        CTX, "dst_1", "art_1", 7, "https://x.com/a", title="为什么需要 Ontology"
+    )
+
+    call = AgentCallRecorder.calls[0]
+    assert call["title"] == "为什么需要 Ontology"
 
 
 # ---------------------------------------------------------------------------

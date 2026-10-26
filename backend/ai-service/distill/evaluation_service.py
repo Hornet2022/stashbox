@@ -49,6 +49,34 @@ def validate_evaluation_payload(req: Any) -> None:
         raise InvalidRequest(message="skip_reason too long (max 32 chars)", code=4001)
 
 
+def _extract_pool_hook(da: DistilledArticle) -> str:
+    """取**真正的开场钩子**（给 few-shot 池用）。
+
+    ## 为什么不能直接 `script_text.split("\\n\\n", 1)[0]`
+
+    CP-TITLE-ANNOUNCE（2026-10-26）之后，script_text 的**第一段是标题播报句**
+    （"本期分享的标题是：…"），不是 hook。
+
+    这不是"多了一段无所谓"：入池的文本会被当成**高分开场范例**喂给后续所有改写
+    （few-shot 池）。把播报句当范例存进去 ⇒ 之后每篇稿子的开场都变成同一句
+    ⇒ 开场公式化。而这个污染**完全静默**：池子照常增长，稿子照常生成。
+
+    ## 判据：服务端有没有明确给 hook
+
+    - `content_parts` 里有 "hook" 键 → 服务端已经明确告诉你 hook 是什么
+      （新数据）。**照它说的**，哪怕是空串（hook 为空就不入池，别退回去拿
+      播报句凑数）。
+    - 没有这个键 → 存量数据（script_text 第一段就是 hook），按旧取法。
+
+    ⚠️ 这里用"键在不在"而不是"值非空"做判断：值可能是**故意**为空
+    （降级稿没有 hook），而"值非空"会把这种情况错误地退回到旧取法。
+    """
+    parts = getattr(da, "content_parts", None)
+    if isinstance(parts, dict) and "hook" in parts:
+        return str(parts.get("hook") or "").strip()
+    return (da.script_text or "").split("\n\n", 1)[0].strip()
+
+
 async def submit_user_evaluation(
     db: AsyncSession,
     da: DistilledArticle,
@@ -86,10 +114,10 @@ async def submit_user_evaluation(
     db.add(evaluation)
     await db.flush()
 
-    # -- 联动 1：高分入 few-shot 池（script_text 首段=hook；<4 函数内置拒绝） --
+    # -- 联动 1：高分入 few-shot 池（hook 取法见 `_extract_pool_hook`；<4 函数内置拒绝） --
     in_pool = False
     try:
-        hook_text = (da.script_text or "").split("\n\n", 1)[0].strip()
+        hook_text = _extract_pool_hook(da)
         if hook_text:
             pool_row = await add_high_score_to_pool(
                 db, evaluation, hook_text, "hook", user_id=user_id

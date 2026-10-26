@@ -106,6 +106,16 @@ def build_ctx_from_agent_final(
     duration = final.get("tts_duration_sec")
     audio_url = final.get("final_audio_url") or final.get("tts_audio_url") or ""
 
+    # CP-TITLE-ANNOUNCE（2026-10-26）：整稿第一段可能是**标题播报句**
+    # （"本期分享的标题是：…"）。回退切分时必须先把它摘掉 ——
+    # 否则 hook 会被判成播报句，入池后所有后续改写都学会用同一句开场。
+    #
+    # 用**精确前缀匹配**而不是"按段落形状猜"：final 里带着播报句原文，
+    # 精确比对不会误伤真正内容里恰好长得像播报句的段落。
+    announcement = final.get("title_announcement") or ""
+    if announcement and script.startswith(announcement):
+        script = script[len(announcement) :].lstrip("\n")
+
     has_structured = any(
         final.get(k) for k in ("rewrite_hook", "rewrite_sections", "rewrite_outro")
     )
@@ -128,6 +138,9 @@ def build_ctx_from_agent_final(
         user_id=user_id,
         url=url,
         raw_content=raw_content or "",
+        # 标题带进 ctx：旧 pipeline 路径（distill/steps.py）拼 TTS 段时
+        # 要用它播报标题，两条路径口径一致。
+        title=final.get("title") or None,
         rewrite=rewrite,
     )
 

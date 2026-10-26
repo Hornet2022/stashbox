@@ -321,8 +321,33 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
                 "rewrite",
                 ToolError("llmerr", "LLM 改写返回空内容"),
             )
+
+        # ── 标题播报（CP-TITLE-ANNOUNCE，2026-10-26）─────────────────
+        #
+        # 音频开头先报本期标题，播放列表切到下一篇时不突兀。
+        #
+        # ⚠️ **必须在拼整稿这一步做，且播报句要进整稿**（而不是只在 TTS 时拼）：
+        # App 的字幕时间轴是从 script_text 按字数比例估算的（生产的 TTS 不返回
+        # 词级时间戳）。音频多播 4 秒而 script_text 里没有对应的字 ⇒ 字幕
+        # 整体早 4 秒，误差随进度线性放大。
+        #
+        # ⚠️ **不要让 LLM 把标题写进开场**：标题常常是标题党措辞，LLM 照着它
+        # 写 hook 容易引出正文里没有的事实（这正是本仓「不许编造具体事实」
+        # 那条铁律要防的）。播报句由代码拼，口径唯一。
+        from stashbox.backend.common.title_announce import prepend_title_announcement
+
+        script, announcement = prepend_title_announcement(parts.script, state.get("title"))
+        if announcement:
+            log.info(
+                "agent_rewrite_title_announced article_id=%s chars=%d",
+                state.get("article_id"),
+                len(announcement),
+            )
+
         return {
-            "rewritten_script": parts.script,
+            "rewritten_script": script,
+            # 真正的 hook 保持**不含**播报句 —— few-shot 入池 / 详情页导语要用它。
+            "title_announcement": announcement,
             # 结构化字段单独存：入池取 hook、下游要 outro 都不用再切字符串
             "rewrite_hook": parts.hook,
             "rewrite_sections": parts.sections,

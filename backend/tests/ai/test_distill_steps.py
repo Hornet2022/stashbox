@@ -204,7 +204,13 @@ async def test_step3_passes_rewrite_body_to_tts(ctx, fake_llm_cls):
     # 不再断言 tts.prompts[0] == body，改断言"所有 prompt 拼起来 ≈ 全文"
     joined = "".join(tts.prompts)
     expected_full = ctx.rewrite.hook + "".join(ctx.rewrite.sections) + ctx.rewrite.outro
-    assert joined == expected_full
+    # CP-TITLE-ANNOUNCE（2026-10-26）：开头多一段标题播报
+    # （与 agent 活路径同一个口径 —— 两条路径各写一句就会漂移）。
+    from stashbox.backend.common.title_announce import build_title_announcement
+
+    announcement = build_title_announcement(ctx.title)
+    assert announcement is not None
+    assert joined == announcement + expected_full
     # 不带元指令
     assert "STEP3_USER" not in joined
     assert "分 3-5 段" not in joined

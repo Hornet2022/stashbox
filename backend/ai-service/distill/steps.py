@@ -427,6 +427,22 @@ async def step3_tts(ctx: DistillContext, tts_client) -> None:
     chunks = [c for c in chunks if c]
     # 对齐 gap_after_ms 与 chunks（chunk 数可能因 strip 后变少）
     gap_after_ms = gap_after_ms[: len(chunks)] + [0] * max(0, len(chunks) - len(gap_after_ms))
+
+    # ── CP-TITLE-ANNOUNCE（2026-10-26）：开头播报本期标题 ──────────────
+    #
+    # 与 agent 活路径（agent/runner.py:rewrite_node）**同一个口径**
+    # （共用 common/title_announce.py）——两条路径各写一句 ⇒ 口径漂移，
+    # 而漂移是静默的（少播一次标题没人会发现）。
+    #
+    # 播报之后留 700ms 呼吸，和 hook→第一节 的停顿同档：
+    # 听感上是「报完标题，停一下，再进正文」，而不是黏在一起。
+    from stashbox.backend.common.title_announce import build_title_announcement
+
+    announcement = build_title_announcement(getattr(ctx, "title", None))
+    if announcement:
+        chunks.insert(0, announcement)
+        gap_after_ms.insert(0, 700)
+
     if not chunks:
         raise ValueError("rewrite 内容为空，无法合成语音")
     ctx.tts_chunks = chunks  # 供观测/重试

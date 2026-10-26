@@ -343,6 +343,36 @@ async def _load_material_source(db: AsyncSession, article_id: str) -> str:
     return "unknown"
 
 
+async def _load_article_title(db: AsyncSession, article_id: str) -> str | None:
+    """取本期标题（给标题播报用）。
+
+    ## 为什么以 DB 为准，而不是用入队时带的 title
+
+    入队参数 `title` 是**入队那一刻**的快照（`ai-service/main.py` 里
+    `title = art.title`）。文章标题在入队之后被改（运营在后台改标题、
+    剪藏时补标题）时，worker 手里那份就是旧的 —— 播报出一个已经不存在的标题。
+    DB 里那份是当下的真相。
+
+    入队参数仍然作为**兜底**（DB 查不到时用），两处都有才播报。
+
+    ## 为什么取不到就返回 None 而不是编一个
+
+    没有标题 = 不播报（`build_title_announcement` 会返回 None）。
+    编一句「本期分享的标题是：（无标题）」比不播更糟。
+    """
+    try:
+        art = await db.get(Article, article_id)
+        title = getattr(art, "title", None) if art is not None else None
+        # ⚠️ 只认 **str**：非 str（None / Mock / 其它类型）一律当"没有标题"。
+        # 宽松的 `if title` 会让一个 Mock 对象变成标题的字符串化结果
+        # （"<Mock id=...>"）—— 那会被原样念进音频里。
+        if isinstance(title, str) and title.strip():
+            return title.strip()
+    except Exception as exc:  # noqa: BLE001 - 取不到标题不该毁掉整篇蒸馏
+        log.warning("article_title_load_failed", article_id=article_id, error=str(exc))
+    return None
+
+
 async def distill_task(
     ctx: dict,
     task_id: str,
@@ -462,10 +492,15 @@ async def distill_task(
     # 下面的通用 except 会 `raise` 交给 Arq retry（默认 retry_max=2），
     # 但"没正文"是数据问题不是瞬时故障 —— 重试两次也是同样的结果，
     # 每次都白跑一次状态回写。走下面的专用收口：置 failed + 退配额 + 不抛。
+    # CP-TITLE-ANNOUNCE（2026-10-26）：本期标题（给音频开头播报用）。
+    # 先给入队参数兜底，下面用 DB 里的现值覆盖。
+    article_title = title
     try:
         async with AsyncSessionLocal() as db:
             raw_content = await _load_raw_content(db, article_id)
             source = await _load_material_source(db, article_id)
+            # DB 为准、入队参数兜底 —— 理由见 `_load_article_title`。
+            article_title = await _load_article_title(db, article_id) or title
     except EmptyArticleContentError as e:
         log.warning("arq_distill_skipped_empty_content", task_id=task_id, error=str(e))
         try:
@@ -531,6 +566,9 @@ async def distill_task(
             url=url,
             raw_content=raw_content,
             source=source,
+            # CP-TITLE-ANNOUNCE（2026-10-26）：标题进 agent state，
+            # rewrite_node 用它拼开头那句「本期分享的标题是：…」。
+            title=article_title,
             simulate_failure=simulate_failure,
         )
         # CP-AGENT-FAILURE-PROPAGATION：agent 失败（final.status != "done"）必须走
@@ -957,6 +995,7 @@ async def _run_distill_via_agent(
     url: str,
     raw_content: str,
     source: str = "web",
+    title: str | None = None,
     simulate_failure: bool = False,
 ) -> dict:
     """CP-AGENT-RUNNER-RUN：把 distill 走 LangGraph agent 跑（替代 DistillPipeline.run）。
@@ -1013,6 +1052,9 @@ async def _run_distill_via_agent(
         "user_id": user_id,
         "url": url,
         "source": source,
+        # CP-TITLE-ANNOUNCE（2026-10-26）：标题只给播报用，**不进 prompt**
+        # （标题常是标题党措辞，让 LLM 看着写 hook 容易引出正文没有的事实）。
+        "title": title,
         "current_step": "fetch",
         "started_at": datetime.now(timezone.utc).isoformat(),
         "trace_id": task_id,
@@ -1299,6 +1341,19 @@ async def _persist_agent_final(
                 "insights": list(final.get("rewrite_insights") or []),
                 "related": list(final.get("rewrite_related") or []),
                 "follow_ups": list(final.get("rewrite_follow_ups") or []),
+                # ── CP-TITLE-ANNOUNCE（2026-10-26）────────────────────
+                #
+                # script_text 的**第一段现在是标题播报句**（"本期分享的标题是：…"），
+                # 所以「首段 = hook」这个旧契约不再成立。把三样东西**明确**交出去，
+                # 让下游不必去猜：
+                # · hook  = 真正的开场钩子（few-shot 入池 / 详情页导语用这个）
+                # · outro = 收束段
+                # · intro = 标题播报句（App 知道它是口播，不当正文展示）
+                #
+                # ⚠️ 存量数据没有这三个键 ⇒ 下游必须容忍缺失（回退旧取法）。
+                "hook": str(final.get("rewrite_hook") or ""),
+                "outro": str(final.get("rewrite_outro") or ""),
+                "intro": str(final.get("title_announcement") or ""),
             }
             log.info(
                 "agent_persist_content_parts article=%s sections=%d insights=%d "

@@ -96,9 +96,16 @@ def wired(monkeypatch):
         return "wechat_mp"
 
     async def _fake_run_via_agent(
-        task_id, article_id, user_id, url, raw_content, source="web", simulate_failure=False
+        task_id,
+        article_id,
+        user_id,
+        url,
+        raw_content,
+        source="web",
+        title=None,
+        simulate_failure=False,
     ):
-        agent_calls.append({"raw_content": raw_content})
+        agent_calls.append({"raw_content": raw_content, "title": title})
         return {
             "status": "done",
             "current_step": "done",

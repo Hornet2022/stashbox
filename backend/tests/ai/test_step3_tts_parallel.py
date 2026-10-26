@@ -43,7 +43,15 @@ class SlowFakeTTS:
 
 
 def _make_ctx(n_chunks: int) -> DistillContext:
-    """构造一个有 N 个 section 的 ctx，step3_tts 会切出 N+2 段（hook + N sections + outro）."""
+    """构造一个有 N 个 section 的 ctx。
+
+    step3_tts 会切出 **N+3** 段：
+    0=标题播报（CP-TITLE-ANNOUNCE，2026-10-26）、
+    1=hook、2..N+1=sections、末段=outro。
+
+    标题播报那一段由 `ctx.title` 决定；本文件的用例只关心**顺序**，
+    播报本身的行为在 tests/ai/test_title_announce.py 里单独钉住。
+    """
     sections = [f"第{i + 1}段内容。" for i in range(n_chunks)]
     return DistillContext(
         task_id="dst_test0000000000000000001",
@@ -67,7 +75,7 @@ def _make_ctx(n_chunks: int) -> DistillContext:
 async def test_gather_returns_segments_in_order():
     """并发后 segment 顺序必须与原 chunk index 一致（step4 拼接依赖）。"""
     tts = SlowFakeTTS(latency_ms=30)
-    ctx = _make_ctx(10)  # 12 段（hook + 10 sections + outro）
+    ctx = _make_ctx(10)  # 13 段（播报 + hook + 10 sections + outro）
 
     await step3_tts(ctx, tts)
 
@@ -75,7 +83,7 @@ async def test_gather_returns_segments_in_order():
     indices = [s["index"] for s in ctx.tts.segments]
     assert indices == sorted(indices), f"段顺序错乱: {indices}"
     assert indices[0] == 0
-    assert indices[-1] == 11  # 0=hook, 1-10=sections, 11=outro
+    assert indices[-1] == 12  # 0=播报, 1=hook, 2-11=sections, 12=outro
 
 
 # ---------------------------------------------------------------------------
@@ -122,8 +130,8 @@ async def test_semaphore_respects_max_concurrent(monkeypatch):
     assert (
         tts.concurrent_observed <= 3
     ), f"Semaphore 未生效: peak={tts.concurrent_observed}, expected ≤ 3"
-    # 全 22 段都处理了
-    assert len(ctx.tts.segments) == 22
+    # 全 23 段都处理了（20 sections + hook + outro + 标题播报）
+    assert len(ctx.tts.segments) == 23
 
 
 # ---------------------------------------------------------------------------

@@ -470,6 +470,15 @@ class DistillPipeline:
             return pieces
 
         script_parts: list[str] = []
+        # CP-TITLE-ANNOUNCE（2026-10-26）：标题播报句作为**第一段**。
+        #
+        # 必须与 step3 播的**同一段文字**（同一个函数生成）—— 音频里念了什么，
+        # script_text 里就得有对应的字，否则 App 的字幕时间轴会整体偏移。
+        from stashbox.backend.common.title_announce import build_title_announcement
+
+        announcement = build_title_announcement(getattr(ctx, "title", None))
+        if announcement:
+            script_parts.append(announcement)
         if ctx.rewrite is not None:
             hook = (ctx.rewrite.hook or "").strip()
             if hook:

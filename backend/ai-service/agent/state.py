@@ -26,6 +26,13 @@ class AgentState(TypedDict, total=False):
     user_id: int
     url: str
     source: str  # wechat / douyin / pdf / web / unknown
+    # CP-TITLE-ANNOUNCE（2026-10-26）：本期标题。
+    #
+    # 用途：音频开头先播报标题（播放列表切换时不突兀）。
+    # 由调用方（distill_task）从 articles.title 取 —— **不入 prompt**：
+    # 标题不是原文内容，让 LLM「看着标题写」会诱发编造（标题常常是运营/标题党的
+    # 措辞，正文里未必有对应事实）。
+    title: Optional[str]
 
     # === 流程控制 ===
     current_step: str  # 'fetch' / 'rewrite' / 'tts' / 'concat' / 'done' / 'failed'
@@ -54,6 +61,13 @@ class AgentState(TypedDict, total=False):
     rewrite_follow_ups: Optional[list[str]]
     # **合并前**的正文要点（不含上面三类）—— 分区展示用这一份。
     rewrite_body_sections: Optional[list[str]]
+    # CP-TITLE-ANNOUNCE（2026-10-26）：本次实际播报的标题句（None = 没播报）。
+    #
+    # 单独带出来是为了让下游**知道有这一段**：
+    # · 落库时进 content_parts.intro → App 知道哪段是口播、不是正文；
+    # · few-shot 入池 / 详情页导语改读 content_parts.hook（真正的 hook），
+    #   免得把「本期分享的标题是：xxx」当成开场钩子学进去。
+    title_announcement: Optional[str]
     # 标签候选清单（tags 表的 name 列表，逗号分隔）。
     # 由调用方（distill_task）加载后注入 —— agent 模块不碰 DB。
     # LLM 必须**逐字**从里面选：订阅推送是按标签名精确匹配的。
