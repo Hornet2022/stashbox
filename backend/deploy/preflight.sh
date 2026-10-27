@@ -579,10 +579,19 @@ else
     *)
       tts_env_key="$(v OPENAI_TTS_API_KEY)$(v DOUBAO_TTS_API_KEY)$(v DOUBAO_TTS_TOKEN)$(v VOLCENGINE_TTS_API_KEY)"
       db_tts_key=""
-      if command -v psql >/dev/null 2>&1 && [ -n "${db_llm_key:-}" ]; then
+      # ⚠️ 这里必须查**多个字段名**（2026-10-27 实测踩到）：
+      # 管理后台「TTS 设置」把 key 存成 `openai_api_key`（见
+      # content-service/admin_router.py 的 TTS 配置字段映射），
+      # 而旧探针只查 `api_key` —— 于是生产明明配好了 key，
+      # 预检却报「env 与管理后台都没有 key」并**阻断发版**。
+      # 一个查错字段名的门禁 = 永远在喊狼来了，真正的故障反而被淹没。
+      #
+      # 另外：**不再**拿 db_llm_key 当开关（那是 LLM 那段留下的耦合）——
+      # DB 里只配了 TTS、没配 LLM 时，这个探针本来根本不会跑。
+      if command -v psql >/dev/null 2>&1 && [ -n "${pg_pw:-}" ] && [ -n "${pg_u:-}" ] && [ -n "${pg_d:-}" ]; then
         db_tts_key="$(
           PGPASSWORD="$pg_pw" psql -h "${pg_h:-127.0.0.1}" -U "$pg_u" -d "$pg_d" -tAc \
-            "select coalesce((value->>'api_key'),'') from system_config where key='tts';" 2>/dev/null \
+            "select coalesce(nullif(value->>'openai_api_key',''), nullif(value->>'api_key',''), nullif(value->>'doubao_api_key',''), nullif(value->>'doubao_token',''), nullif(value->>'volcengine_tts_api_key','')) from system_config where key='tts';" 2>/dev/null \
           | tr -d '\r\n' | head -c 4
         )"
       fi
