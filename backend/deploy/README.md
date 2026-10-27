@@ -73,10 +73,30 @@ backend/
 # 改完本地 → 跑测试 → 提交 → 同步
 cd backend && .venv/bin/python -m pytest tests/ -q
 git commit -am "fix(xxx): …"
-rsync -a <改动的文件> root@<服务器>:/opt/stashbox/stashbox/backend/<路径>
+rsync -a --chown=stashbox:stashbox <改动的文件> root@<服务器>:/opt/stashbox/stashbox/backend/<路径>
 # 改了依赖或 service 定义 → 同步完要重启对应服务
 ssh root@<服务器> "systemctl restart stashbox-<service>"
 ```
+
+> ⚠️ **`--chown=stashbox:stashbox` 不能省**（2026-10-26 真实事故的根因）。
+>
+> `rsync -a` 含 `-o -g`，会**保留源端的属主** —— 从 macOS 同步过去就是
+> `501:staff`（你 Mac 的 uid），而服务是以 `stashbox` 身份跑的。
+> 仓里有 3 个文件是 **mode 600**（`alembic/versions/0015_seed_admin_email_password.py`
+> 含种子管理员口令、`.env`、`common/README.md`）——
+> **属主是 `501:staff` + 权限 600 ⇒ `stashbox` 读不到** ⇒
+> `stashbox-migrate.service` 抛 `PermissionError` 退出 ⇒
+> migrate 停在 failed ⇒ 5 个服务因 `Requires=stashbox-migrate.service`
+> **全部 start 失败（'dependency'）** ⇒ **整套后端一起下线**。
+>
+> 这次事故最阴的地方：事后补跑了 migrate 就恢复了，但**没人补跑
+> ai-worker 的 start 作业** ⇒ Arq 蒸馏队列消费者死了 14 小时 ⇒
+> 期间**一条新推送都不会产生**（用户侧看到的是「通知列表永远是空的」）。
+>
+> ⇒ `--chown` 把属主定死给服务用户，600 的文件对服务仍然可读，
+>   同时保留 600 对口令的保护。`deploy/preflight.sh` 里的
+>   `CODE_TREE_READABLE` / `STASHBOX_UNITS` 两项就是为了**在发版前**把这类
+>   问题拦下来（详见那两项的注释）。
 
 ---
 

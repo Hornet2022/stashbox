@@ -12,6 +12,7 @@ from sqlalchemy import delete, select, text
 from helpers import content_main, new_user
 from stashbox.backend.common.database import AsyncSessionLocal
 from stashbox.backend.common.models import Article, DistilledArticle, Tag, TagSubscription
+from stashbox.backend.common.models.push_notification import PushNotification
 
 
 def _override_auth(dep_name: str, mock_user: dict):
@@ -220,6 +221,372 @@ async def test_user_unsubscribe_tag_idempotent():
     async with AsyncSessionLocal() as s:
         await s.execute(delete(TagSubscription).where(TagSubscription.user_id == user_id))
         await s.execute(delete(Tag).where(Tag.slug == slug))
+        await s.commit()
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-27：退订必须连带删掉该用户该标签的**已推送通知**
+#
+# ## 为什么要这条测试
+#
+# 用户点通知进详情页 → 客户端报「请求失败（403）」。根因是**两边口径不一致**：
+#   · 写侧：退订只删 tag_subscriptions，不动已推的 push_notifications；
+#   · 读侧：_subscription_grants_access 只认**当前**订阅，非属主拿不到文章。
+# ⇒ 退订后，历史通知全成死链。
+#
+# 这类缺陷**不会自己暴露**：接口都返回 200，数据也自洽，
+# 只有用户真的点进去才发现。⇒ 钉成测试。
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_unsubscribe_deletes_own_tag_notifications():
+    """退订该标签 ⇒ 该用户该标签的通知被清掉；别人的通知不受影响。"""
+    slug = _unique_slug()
+    user_id, _tok = await new_user()
+    other_id, _tok2 = await new_user()
+
+    async with AsyncSessionLocal() as s:
+        t = Tag(slug=slug, name="unsub_notif_test", category="test", is_system=False, creator_id=1)
+        s.add(t)
+        await s.commit()
+
+    # 造两条通知：一条属于本用户、一条属于另一个用户，都指向同一个 tag
+    async with AsyncSessionLocal() as s:
+        s.add_all(
+            [
+                PushNotification(
+                    user_id=user_id,
+                    article_id=None,
+                    tag_slug=slug,
+                    title="给本用户的通知",
+                    body="body",
+                    status="sent",
+                ),
+                PushNotification(
+                    user_id=other_id,
+                    article_id=None,
+                    tag_slug=slug,
+                    title="给别人的通知",
+                    body="body",
+                    status="sent",
+                ),
+            ]
+        )
+        await s.commit()
+
+    mock_user = {"id": user_id, "sub": str(user_id)}
+    with _override_auth("require_user", mock_user):
+        transport = ASGITransport(app=content_main.app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.post(f"/api/v1/tags/{slug}/subscribe")
+            resp = await client.post(f"/api/v1/tags/{slug}/unsubscribe")
+            assert resp.status_code == 200, f"退订失败: {resp.text}"
+            data = resp.json()
+            assert data["ok"] is True
+            assert (
+                data.get("deleted_notifications") == 1
+            ), f"退订应删掉本用户该标签的 1 条通知，实际 {data.get('deleted_notifications')}"
+
+    async with AsyncSessionLocal() as s:
+        mine = (
+            (
+                await s.execute(
+                    select(PushNotification).where(
+                        PushNotification.user_id == user_id,
+                        PushNotification.tag_slug == slug,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(mine) == 0, "退订后本用户该标签的通知必须被清掉（否则点进去必然 403）"
+
+        others = (
+            (
+                await s.execute(
+                    select(PushNotification).where(
+                        PushNotification.user_id == other_id,
+                        PushNotification.tag_slug == slug,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(others) == 1, "别人的通知不能被误删"
+
+    # cleanup
+    async with AsyncSessionLocal() as s:
+        await s.execute(
+            delete(PushNotification).where(
+                PushNotification.user_id.in_([user_id, other_id]),
+                PushNotification.tag_slug == slug,
+            )
+        )
+        await s.execute(delete(TagSubscription).where(TagSubscription.user_id == user_id))
+        await s.execute(delete(Tag).where(Tag.slug == slug))
+        await s.commit()
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_keeps_notifications_of_other_tags():
+    """退订 A 标签不能误删该用户 B 标签的通知。"""
+    slug_a = _unique_slug()
+    slug_b = _unique_slug()
+    user_id, _tok = await new_user()
+
+    async with AsyncSessionLocal() as s:
+        s.add_all(
+            [
+                Tag(slug=slug_a, name="unsub_a", category="test", is_system=False, creator_id=1),
+                Tag(slug=slug_b, name="unsub_b", category="test", is_system=False, creator_id=1),
+            ]
+        )
+        await s.commit()
+
+    async with AsyncSessionLocal() as s:
+        s.add_all(
+            [
+                PushNotification(
+                    user_id=user_id,
+                    article_id=None,
+                    tag_slug=slug_a,
+                    title="A",
+                    body="b",
+                    status="sent",
+                ),
+                PushNotification(
+                    user_id=user_id,
+                    article_id=None,
+                    tag_slug=slug_b,
+                    title="B",
+                    body="b",
+                    status="sent",
+                ),
+            ]
+        )
+        await s.commit()
+
+    mock_user = {"id": user_id, "sub": str(user_id)}
+    with _override_auth("require_user", mock_user):
+        transport = ASGITransport(app=content_main.app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.post(f"/api/v1/tags/{slug_a}/subscribe")
+            await client.post(f"/api/v1/tags/{slug_b}/subscribe")
+            resp = await client.post(f"/api/v1/tags/{slug_a}/unsubscribe")
+            assert resp.status_code == 200, resp.text
+
+    async with AsyncSessionLocal() as s:
+        remain = (
+            (
+                await s.execute(
+                    select(PushNotification).where(
+                        PushNotification.user_id == user_id,
+                        PushNotification.tag_slug == slug_b,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(remain) == 1, "退订 A 不能连带删掉 B 标签的通知"
+
+    # cleanup
+    async with AsyncSessionLocal() as s:
+        await s.execute(
+            delete(PushNotification).where(
+                PushNotification.user_id == user_id,
+                PushNotification.tag_slug.in_([slug_a, slug_b]),
+            )
+        )
+        await s.execute(delete(TagSubscription).where(TagSubscription.user_id == user_id))
+        await s.execute(delete(Tag).where(Tag.slug.in_([slug_a, slug_b])))
+        await s.commit()
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-27 加固：判据是「文章还能不能读」，不是「通知挂在哪个标签下」
+#
+# 生产库实测（user 23 只订阅「生活」）：同时含「生活+科技/财经」的 3 篇文章里，
+# 有 **2 篇**推给她的通知 tag_slug 是 tech/finance（主标签 ≠ 用户订阅的标签）
+# ⇒ 按 tag_slug=life 删会漏掉这 2 条 ⇒ 死链还在。
+# ---------------------------------------------------------------------------
+async def _make_shared_article(owner_id: int, tag_names: list[str]):
+    """造一篇「别人家的」文章 + 蒸馏产物（tags 是**标签名**）。返回 article_id。"""
+    art_id = f"art_{uuid.uuid4().hex[:24]}"
+    async with AsyncSessionLocal() as s:
+        s.add(
+            Article(
+                id=art_id,
+                user_id=owner_id,
+                url=f"https://example.com/{art_id}",
+                title="共享标签文章",
+                source="web",
+                status="ready",
+                raw_content={"content_text": "正文" * 50, "source": "web"},
+                favorite=False,
+                skip=False,
+            )
+        )
+        s.add(
+            DistilledArticle(
+                id=f"dst_{art_id[4:]}",
+                article_id=art_id,
+                status="done",
+                script_text="稿子" * 40,
+                audio_url="https://oss.example.com/a.mp3",
+                duration_sec=60,
+                tags=tag_names,
+            )
+        )
+        await s.commit()
+    return art_id
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_deletes_notification_whose_tag_is_not_the_unsubscribed_one():
+    """退订 A ⇒ 通知挂在 B 标签下、但文章已经读不了了 ⇒ 也必须删掉。
+
+    场景 = 生产实测：通知的 tag_slug 是**文章主标签**（`_trigger_subscription_pushes`
+    里 `primary_tag_slug = tag_slugs[0]`，取标签 id 最小的那个），
+    未必是用户订阅的那个标签。
+    """
+    slug_a = _unique_slug()
+    slug_b = _unique_slug()
+    name_a, name_b = f"名A{uuid.uuid4().hex[:6]}", f"名B{uuid.uuid4().hex[:6]}"
+    user_id, _tok = await new_user()
+    owner_id, _tok2 = await new_user()
+
+    async with AsyncSessionLocal() as s:
+        s.add_all(
+            [
+                Tag(slug=slug_a, name=name_a, category="test", is_system=False, creator_id=1),
+                Tag(slug=slug_b, name=name_b, category="test", is_system=False, creator_id=1),
+            ]
+        )
+        await s.commit()
+
+    # 文章同时属于 A、B 两个标签 ⇒ 用户只要还订阅其中任一个就还读得到
+    art_id = await _make_shared_article(owner_id, [name_a, name_b])
+
+    async with AsyncSessionLocal() as s:
+        s.add(
+            PushNotification(
+                user_id=user_id,
+                article_id=art_id,
+                tag_slug=slug_a,  # ← 主标签 A，用户其实订阅的是 B
+                title="通知",
+                body="b",
+                status="sent",
+            )
+        )
+        await s.commit()
+
+    mock_user = {"id": user_id, "sub": str(user_id)}
+    with _override_auth("require_user", mock_user):
+        transport = ASGITransport(app=content_main.app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.post(f"/api/v1/tags/{slug_b}/subscribe")
+            resp = await client.post(f"/api/v1/tags/{slug_b}/unsubscribe")
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            assert data.get("deleted_notifications") == 1, (
+                "退订后文章已读不了（通知 tag_slug 与被退订标签不同也要删），"
+                f"实际 {data.get('deleted_notifications')}"
+            )
+
+    async with AsyncSessionLocal() as s:
+        remain = (
+            (
+                await s.execute(
+                    select(PushNotification).where(
+                        PushNotification.user_id == user_id,
+                        PushNotification.article_id == art_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(remain) == 0, "文章已经读不了 ⇒ 这条通知是死链 ⇒ 必须被删掉"
+
+    # cleanup
+    async with AsyncSessionLocal() as s:
+        await s.execute(delete(PushNotification).where(PushNotification.user_id == user_id))
+        await s.execute(delete(TagSubscription).where(TagSubscription.user_id == user_id))
+        await s.execute(delete(DistilledArticle).where(DistilledArticle.article_id == art_id))
+        await s.execute(delete(Article).where(Article.id == art_id))
+        await s.execute(delete(Tag).where(Tag.slug.in_([slug_a, slug_b])))
+        await s.commit()
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_keeps_notification_whose_article_is_still_readable():
+    """反向护栏：还有别的订阅撑着文章 ⇒ 通知**必须留着**（别过度删除）。"""
+    slug_a = _unique_slug()
+    slug_b = _unique_slug()
+    name_a, name_b = f"名A{uuid.uuid4().hex[:6]}", f"名B{uuid.uuid4().hex[:6]}"
+    user_id, _tok = await new_user()
+    owner_id, _tok2 = await new_user()
+
+    async with AsyncSessionLocal() as s:
+        s.add_all(
+            [
+                Tag(slug=slug_a, name=name_a, category="test", is_system=False, creator_id=1),
+                Tag(slug=slug_b, name=name_b, category="test", is_system=False, creator_id=1),
+            ]
+        )
+        await s.commit()
+
+    art_id = await _make_shared_article(owner_id, [name_a, name_b])
+
+    async with AsyncSessionLocal() as s:
+        s.add(
+            PushNotification(
+                user_id=user_id,
+                article_id=art_id,
+                tag_slug=slug_a,
+                title="通知",
+                body="b",
+                status="sent",
+            )
+        )
+        await s.commit()
+
+    mock_user = {"id": user_id, "sub": str(user_id)}
+    with _override_auth("require_user", mock_user):
+        transport = ASGITransport(app=content_main.app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.post(f"/api/v1/tags/{slug_a}/subscribe")
+            await client.post(f"/api/v1/tags/{slug_b}/subscribe")
+            resp = await client.post(f"/api/v1/tags/{slug_b}/unsubscribe")
+            assert resp.status_code == 200, resp.text
+            assert (
+                resp.json().get("deleted_notifications") == 0
+            ), "还订阅着 A ⇒ 文章仍读得到 ⇒ 不该删这条通知"
+
+    async with AsyncSessionLocal() as s:
+        remain = (
+            (
+                await s.execute(
+                    select(PushNotification).where(
+                        PushNotification.user_id == user_id,
+                        PushNotification.article_id == art_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(remain) == 1, "文章还能读 ⇒ 通知必须留着"
+
+    # cleanup
+    async with AsyncSessionLocal() as s:
+        await s.execute(delete(PushNotification).where(PushNotification.user_id == user_id))
+        await s.execute(delete(TagSubscription).where(TagSubscription.user_id == user_id))
+        await s.execute(delete(DistilledArticle).where(DistilledArticle.article_id == art_id))
+        await s.execute(delete(Article).where(Article.id == art_id))
+        await s.execute(delete(Tag).where(Tag.slug.in_([slug_a, slug_b])))
         await s.commit()
 
 

@@ -1,8 +1,12 @@
 [Unit]
 Description=Stashbox 数据库迁移（alembic upgrade head，一次性）
 Documentation=file:///opt/stashbox/stashbox/backend/deploy/README.md
-After=network-online.target
+After=network-online.target postgresql.service
 Wants=network-online.target
+# alembic 要连 PG。开机时若 PG 还没就绪，迁移会失败 → migrate 停在
+# failed → 5 个服务因 Requires=stashbox-migrate.service 全都起不来
+# （fail-closed 本身是对的，但得先让迁移有机会跑）。
+Requires=postgresql.service
 
 [Service]
 Type=oneshot
@@ -69,3 +73,13 @@ ReadWritePaths=-/var/lib/stashbox/data
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=stashbox-migrate
+
+[Install]
+# 开机自启。没有这段，`systemctl enable` 会直接报
+# "The unit files have no installation config"，README 里写的
+# `systemctl enable --now ...` 引导命令跑不通，服务只靠人工 start 撑着
+# —— 机器一重启整套后端就全灭（通知推送、蒸馏 worker 全都停摆）。
+#
+# multi-user.target 是 nginx / postgresql / redis 所在的同一层级，
+# 本组 unit 自己用 Requires/After 排好先后（见 [Unit] 段）。
+WantedBy=multi-user.target

@@ -3319,13 +3319,130 @@ async def subscribe_tag(
     return {"ok": True, "tag_id": tag_id, "tag_slug": tag_slug}
 
 
+async def _purge_unreadable_notifications(
+    uid: int, db: AsyncSession, unsubscribed_tag_slug: str | None = None
+) -> int:
+    """清掉该用户**已经点不开**的推送通知（退订时的连带清理）。
+
+    ## 判据：这篇文章该用户还能不能读
+
+    读侧放行条件见 [`_subscription_grants_access`]：
+    属主 ∨ (蒸馏完成且有音频 ∧ 有效标签 ∩ 该用户**当前**订阅的标签名 ≠ ∅)。
+    本函数用同一套口径，只是把「当前订阅」换成「**退订之后**还订阅的标签」。
+
+    ## 为什么不能按「通知的 tag_slug == 被退订的标签」来删（2026-10-27 生产库实测）
+
+    `push_notifications.tag_slug` 存的是**文章的主标签**
+    （`ai-service/tasks/distill_task.py` 里 `primary_tag_slug = tag_slugs[0]`，
+    取的是标签 id 最小的那个），**不是**该用户订阅的那个标签。
+
+    实测：user 23 只订阅「生活」，而同时含「生活 + 科技/财经」的 3 篇文章里，
+    有 **2 篇**推给她的通知 `tag_slug` 是 `tech` / `finance`
+    ⇒ 退订「生活」时按 `tag_slug = life` 删，会漏掉这 2 条 ⇒ 它们仍是死链。
+
+    ⇒ 判据必须是「这篇文章该用户还能不能读」，而不是「通知挂在哪个标签下」。
+
+    ## 无目标文章的通知（article_id IS NULL）
+
+    没有文章就没法判断可读性 —— 退化成「是不是被退订的那个标签的通知」。
+    这类通知本来就点不出内容，删掉不留死角。
+    """
+    from stashbox.backend.common.models.push_notification import PushNotification
+
+    # 退订之后该用户还订阅的标签**名**（读侧授权用的就是 Tag.name）
+    subs_rows = await db.execute(
+        select(Tag.name)
+        .join(TagSubscription, TagSubscription.tag_id == Tag.id)
+        .where(TagSubscription.user_id == uid)
+    )
+    subscribed_names = {r[0] for r in subs_rows.fetchall()}
+
+    # 该用户的通知 + 对应文章 + 蒸馏产物
+    rows = (
+        await db.execute(
+            select(PushNotification, Article, DistilledArticle)
+            .join(Article, Article.id == PushNotification.article_id)
+            .outerjoin(DistilledArticle, DistilledArticle.article_id == Article.id)
+            .where(PushNotification.user_id == uid)
+        )
+    ).all()
+
+    dead_ids: list[int] = []
+    for pn, art, da in rows:
+        if art.user_id == uid:
+            continue  # 自己的文章，永远可读
+        if da is None or da.status != "done" or not da.audio_url:
+            continue  # 本来就不可读（蒸馏没完成）—— 与退订无关，不走这条路径
+        if subscribed_names & set(_effective_tags(art, da)):
+            continue  # 还有别的订阅撑着，可读 —— 不删
+        dead_ids.append(pn.id)
+
+    # 无目标文章的通知：只能按标签判断（退订了哪个标签，就清掉那个标签的）
+    if unsubscribed_tag_slug:
+        no_article_ids = (
+            (
+                await db.execute(
+                    select(PushNotification.id).where(
+                        PushNotification.user_id == uid,
+                        PushNotification.article_id.is_(None),
+                        PushNotification.tag_slug == unsubscribed_tag_slug,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        dead_ids.extend(no_article_ids)
+
+    if not dead_ids:
+        return 0
+
+    # 限定 id 列表 —— 只删**该用户**自己的通知（通知按 user_id 存，
+    # 同一篇文章给每个订阅者各推一条，删错会波及其他用户）
+    result = await db.execute(
+        delete(PushNotification).where(
+            PushNotification.user_id == uid,
+            PushNotification.id.in_(dead_ids),
+        )
+    )
+    return result.rowcount or 0
+
+
 @app.post("/api/v1/tags/{tag_id_or_slug}/unsubscribe")
 async def unsubscribe_tag(
     tag_id_or_slug: str,
     user: dict = Depends(require_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """用户取消订阅标签（CP5.3b）。"""
+    """用户取消订阅标签（CP5.3b）。
+
+    ## 退订为什么必须连带删掉该用户**已经点不开**的推送通知
+
+    2026-10-27 修的 P0：用户点通知进详情页 → 客户端报「请求失败（403）」。
+
+    根因是**两边的口径不一致**：
+
+    - 写侧：退订只删 `tag_subscriptions` 一行，**不动**已经推给该用户的
+      `push_notifications` ⇒ 通知列表里留着旧通知。
+    - 读侧：`get_article` → `_get_readable_with_task` → `_subscription_grants_access`
+      只认**当前**订阅 —— 非属主必须「此刻仍订阅着文章的有效标签」才放行，
+      否则 403。
+
+    ⇒ 用户一旦退订，他**历史上收到的每一条通知都变成死链**，点哪条都是 403。
+    实测：user 22 的 73 条通知全部指向别人的文章，而他当时一条订阅都没有
+    ⇒ 73 条全是死链。
+
+    现在退订时**一并清掉该用户已经点不开的通知**，两端口径对齐：
+    「列表里有的，点得开」。
+
+    ⚠️ 清的是**该用户自己的**通知 —— 通知按 user_id 存，
+    同一篇文章给每个订阅者各推一条，别人的通知不受影响。
+    ⚠️ 判据是「文章还能不能读」，不是「通知挂在哪个标签下」——
+    理由与实测证据见 [`_purge_unreadable_notifications`] 的 docstring。
+
+    ⚠️ 即使**本来就没订阅**（已经退订过了），也要跑一遍清理：
+    否则「修复前退订过」的用户会永远留着死链（退订那一刻的清理没发生过）。
+    """
     if tag_id_or_slug.isdigit():
         tag = await db.get(Tag, int(tag_id_or_slug))
     else:
@@ -3335,34 +3452,51 @@ async def unsubscribe_tag(
 
     # 埋点失败时 track() 内部会 rollback（expire 掉 ORM 对象），故先取响应字段
     tag_id, tag_slug = tag.id, tag.slug
+    uid = _uid(user)
 
     result = await db.execute(
         delete(TagSubscription).where(
-            TagSubscription.user_id == _uid(user),
+            TagSubscription.user_id == uid,
             TagSubscription.tag_id == tag_id,
         )
     )
-    if result.rowcount == 0:
-        # 无订阅可删，直接返回；delete 未 commit 也无需回滚
-        return {"ok": True, "already_unsubscribed": True}
+    removed = result.rowcount or 0
 
-    await cache_service.invalidate_pending(_uid(user))
+    # 连带清理该用户已经点不开的通知（退订前就已退订的用户也在这里收尾）。
+    # ⚠️ 必须在删订阅行**之后**跑 —— 它读的是「退订之后还订阅哪些标签」。
+    deleted_notifications = await _purge_unreadable_notifications(uid, db, tag_slug)
+
+    await cache_service.invalidate_pending(uid)
+
+    if removed == 0:
+        # 本来就没订阅：没有 TAG_UNSUBSCRIBE 事件可埋，但清理仍要落库
+        await db.commit()
+        return {
+            "ok": True,
+            "already_unsubscribed": True,
+            "deleted_notifications": deleted_notifications,
+        }
 
     # track() 只 flush 不 commit —— 必须在 commit() 之前，否则埋点随 close() 回滚丢失
     try:
         await track(
             db,
             EventName.TAG_UNSUBSCRIBE,
-            user_id=_uid(user),
+            user_id=uid,
             article_id="n/a",  # 标签事件无关联文章，但 feedback.article_id NOT NULL
-            metadata={"tag_slug": tag_slug},
+            metadata={"tag_slug": tag_slug, "deleted_notifications": deleted_notifications},
         )
     except Exception as exc:
         log.warning(f"TAG_UNSUBSCRIBE 埋点异常（忽略）: slug={tag_slug} err={exc}")
 
     await db.commit()
 
-    return {"ok": True, "tag_id": tag_id, "tag_slug": tag_slug}
+    return {
+        "ok": True,
+        "tag_id": tag_id,
+        "tag_slug": tag_slug,
+        "deleted_notifications": deleted_notifications,
+    }
 
 
 # ---------------------------------------------------------------------------

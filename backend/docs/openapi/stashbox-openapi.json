@@ -2343,7 +2343,7 @@
     "/api/v1/admin/tags": {
       "get": {
         "summary": "Admin List Tags",
-        "description": "CP-DELETE：admin 标签列表（含数字 id / is_system / 订阅数）。\n\n用户端 GET /api/v1/tags 的 id 是 slug 且无 is_system，无法驱动删除按钮\n（删除端点按数字 tag_id + 系统标签保护），故给 admin-web 单独一份。",
+        "description": "CP-DELETE：admin 标签列表（含 /api/v1/admin/tags 数字 id / is_system / 订阅数）。\n\n用户端 GET /api/v1/tags 的 id 是 slug 且无 is_system，无法驱动删除按钮\n（删除端点按数字 tag_id + 系统标签保护），故给 admin-web 单独一份。",
         "operationId": "admin_list_tags_api_v1_admin_tags_get",
         "parameters": [
           {
@@ -2392,7 +2392,7 @@
     "/api/v1/admin/tags/{tag_id}": {
       "delete": {
         "summary": "Admin Delete Tag",
-        "description": "CP-DELETE：admin 删除标签。\n\n保护：is_system 系统标签禁删（403）——蒸馏 LLM 输出对齐依赖内置标签集。\n级联：tag_subscriptions（FK ondelete=CASCADE）、push_notifications.tag_slug\n（FK ondelete=SET NULL）由 DB 自动处理，无需应用层清理。\ndistilled_articles.tags 为 JSONB 文本数组（非 FK），历史标签值保留不动。\nreason ≥5 字符必填（审计），同事务写 admin_operation_logs。",
+        "description": "CP-DELETE：admin 删除标签。\n\n保护：is_system 系统标签禁删（403）——蒸馏 LLM 输出对齐依赖内置标签集。\n级联：tag_subscriptions（FK ondelete=CASCADE）、push_notifications.tag_slug\n（FK ondelete=SET NULL）由 DB 自动处理，无需应用层清理。\ndistilled_articles.tags 为 JSONB 文本数组（非 FK）——这里**同事务**把该标签名\n从所有已蒸馏文章的 tags 数组里剥掉，避免「标签已删、文章还挂着幽灵标签名」\n（详情页/订阅流会把一个不存在的标签渲染给用户）。\nreason ≥5 字符必填（审计），同事务写 admin_operation_logs。",
         "operationId": "admin_delete_tag_api_v1_admin_tags__tag_id__delete",
         "parameters": [
           {
@@ -4743,6 +4743,75 @@
         ]
       }
     },
+    "/api/v1/articles/{article_id}/share": {
+      "post": {
+        "summary": "Share Article",
+        "description": "0041：共享一篇剪藏（2026-10-26 产品拍板）。\n\n- **只接受属主**（`_get_owned`）：订阅者不能替别人共享。\n- `req.shared_tags`：手动选的公开标签（中文名，去重），落 `articles.shared_tags`。\n  空数组 ⇒ 取消共享（置 NULL）。\n- 写库后失效 article detail 缓存（订阅流 / 详情页都要看到最新共享态）。",
+        "operationId": "share_article_api_v1_articles__article_id__share_post",
+        "parameters": [
+          {
+            "name": "article_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Article Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShareRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArticleResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
     "/api/v1/articles/{article_id}/skip": {
       "post": {
         "summary": "Skip",
@@ -5002,6 +5071,63 @@
         "summary": "Unfavorite Article",
         "description": "取消收藏（CP9.3）：articles.favorite = False + feedback(type=unfavorite)。\n\n幂等：文章本来就没收藏时直接返回 ok。",
         "operationId": "unfavorite_article_api_v1_articles__article_id__unfavorite_post",
+        "parameters": [
+          {
+            "name": "article_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Article Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service"
+        ]
+      }
+    },
+    "/api/v1/articles/{article_id}/unshare": {
+      "post": {
+        "summary": "Unshare Article",
+        "description": "0041：取消共享（等价于 `POST .../share` 传空 `shared_tags`）。\n\n幂等：本来就没共享时直接返回 ok。只属主可调。",
+        "operationId": "unshare_article_api_v1_articles__article_id__unshare_post",
         "parameters": [
           {
             "name": "article_id",
@@ -6745,7 +6871,7 @@
     "/api/v1/tags": {
       "get": {
         "summary": "List Tags",
-        "description": "CP5.3a：从 DB 读标签（不再用 mock）\nP1-1：LEFT JOIN tag_subscriptions 取每 tag 的\"我是否已订阅\"，客户端 Switch 即时正确显示\nCP-TAG-FILTER：article_count 一次 group by 算完（零 N+1），用户能看到该标签下已蒸馏的文章数",
+        "description": "CP5.3a：从 DB 读标签（不再用 mock）\nP1-1：LEFT JOIN tag_subscriptions 取每 tag 的\"我是否已订阅\"，客户端 Switch 即时正确显示\nCP-TAG-FILTER：article_count 一次 group by 算完（零 N+1），用户能看到该标签下已蒸馏的文章数\n2026-10-26 产品拍板（订阅页数字口径）：标签卡片同时展示两个数字 ——\n· `article_count`：**该用户自己**蒸馏且打了此标签的文章数（`Article.user_id == uid`）；\n· `subscribable_count`：**订阅这个标签后能看到多少篇** —— 全站所有用户的\n  `da.tags ∪ shared_tags` 命中该标签、且已就绪（有音频、未删除）的文章数。\n  **与订阅 feed 的 total 语义完全一致**（feed 就是按订阅标签分发这些内容）。\n  这样「我蒸馏了多少」和「订阅能带来多少」不再混成同一个数。",
         "operationId": "list_tags_api_v1_tags_get",
         "parameters": [
           {
@@ -6908,7 +7034,7 @@
     "/api/v1/tags/{tag_id_or_slug}/unsubscribe": {
       "post": {
         "summary": "Unsubscribe Tag",
-        "description": "用户取消订阅标签（CP5.3b）。",
+        "description": "用户取消订阅标签（CP5.3b）。\n\n## 退订为什么必须连带删掉该用户**已经点不开**的推送通知\n\n2026-10-27 修的 P0：用户点通知进详情页 → 客户端报「请求失败（403）」。\n\n根因是**两边的口径不一致**：\n\n- 写侧：退订只删 `tag_subscriptions` 一行，**不动**已经推给该用户的\n  `push_notifications` ⇒ 通知列表里留着旧通知。\n- 读侧：`get_article` → `_get_readable_with_task` → `_subscription_grants_access`\n  只认**当前**订阅 —— 非属主必须「此刻仍订阅着文章的有效标签」才放行，\n  否则 403。\n\n⇒ 用户一旦退订，他**历史上收到的每一条通知都变成死链**，点哪条都是 403。\n实测：user 22 的 73 条通知全部指向别人的文章，而他当时一条订阅都没有\n⇒ 73 条全是死链。\n\n现在退订时**一并清掉该用户已经点不开的通知**，两端口径对齐：\n「列表里有的，点得开」。\n\n⚠️ 清的是**该用户自己的**通知 —— 通知按 user_id 存，\n同一篇文章给每个订阅者各推一条，别人的通知不受影响。\n⚠️ 判据是「文章还能不能读」，不是「通知挂在哪个标签下」——\n理由与实测证据见 [`_purge_unreadable_notifications`] 的 docstring。\n\n⚠️ 即使**本来就没订阅**（已经退订过了），也要跑一遍清理：\n否则「修复前退订过」的用户会永远留着死链（退订那一刻的清理没发生过）。",
         "operationId": "unsubscribe_tag_api_v1_tags__tag_id_or_slug__unsubscribe_post",
         "parameters": [
           {
@@ -9490,6 +9616,25 @@
                 "type": "null"
               }
             ]
+          },
+          "shared": {
+            "type": "boolean",
+            "title": "Shared",
+            "default": false
+          },
+          "shared_tags": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shared Tags"
           }
         },
         "type": "object",
@@ -10190,6 +10335,21 @@
         "type": "object",
         "title": "RateRequest",
         "description": "评分：1-5 星 + 可选评论。越界走业务 400（非 422）。"
+      },
+      "ShareRequest": {
+        "properties": {
+          "shared_tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Shared Tags",
+            "default": []
+          }
+        },
+        "type": "object",
+        "title": "ShareRequest",
+        "description": "0041：用户**共享**一篇文章时提交的公开标签（2026-10-26 产品拍板）。\n\n- `shared_tags`：中文标签名数组，去重后落 `articles.shared_tags`（JSONB）。\n  空数组 / 缺省 ⇒ **取消共享**（置 NULL，等价于「不再对订阅者公开」）。\n- 只接受**属主**调用；订阅者调共享接口一律 403。\n- 标签是**顺序无关**的集合语义：服务端去重、不保证顺序。"
       },
       "SkipRequest": {
         "properties": {

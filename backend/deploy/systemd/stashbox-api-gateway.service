@@ -1,8 +1,8 @@
 [Unit]
 Description=Stashbox api-gateway（对外统一入口，127.0.0.1:8100）
 Documentation=file:///opt/stashbox/stashbox/backend/deploy/README.md
-After=network-online.target stashbox-migrate.service
-Wants=network-online.target
+After=network-online.target stashbox-migrate.service redis-server.service
+Wants=network-online.target redis-server.service
 # Require=migrate：迁移不过，服务不起来（fail-closed）。
 # After=migrate：保证迁移先跑完再起服务（顺序，不是成败）。
 Requires=stashbox-migrate.service
@@ -114,3 +114,13 @@ ReadWritePaths=-/var/lib/stashbox/data
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=stashbox-api-gateway
+
+[Install]
+# 开机自启。没有这段，`systemctl enable` 会直接报
+# "The unit files have no installation config"，README 里写的
+# `systemctl enable --now ...` 引导命令跑不通，服务只靠人工 start 撑着
+# —— 机器一重启整套后端就全灭（通知推送、蒸馏 worker 全都停摆）。
+#
+# multi-user.target 是 nginx / postgresql / redis 所在的同一层级，
+# 本组 unit 自己用 Requires/After 排好先后（见 [Unit] 段）。
+WantedBy=multi-user.target

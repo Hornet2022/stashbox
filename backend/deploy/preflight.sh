@@ -821,6 +821,99 @@ else
 fi
 
 # ═════════════════════════════════════════════════════════════════════
+# 部署机专属检查（本地跑预检时自动跳过）
+#
+# 背景（2026-10-26 真实事故，本节的两条判据就是从那次的现场提炼的）：
+#
+#   1) 代码同步到生产后，**文件权限不受控**。实测生产代码目录里大量文件是
+#      `501:staff`（rsync 从开发机带过去的 uid），其中一份 alembic 版本文件
+#      落成了服务用户 `stashbox` 读不到的权限 ⇒
+#        stashbox-migrate.service → PermissionError → exit-code 1
+#      ⇒ migrate 单元停在 failed ⇒ 5 个服务因
+#        `Requires=stashbox-migrate.service` **全部 start 失败**（'dependency'）
+#      ⇒ **整套后端一起下线**。
+#      更糟的是：事后只补跑了 migrate，**没人补跑 ai-worker 的 start 作业**
+#      ⇒ Arq 蒸馏队列消费者死了 14 小时 ⇒ 期间**一条新推送都不会产生**
+#      （用户侧表现为「通知列表永远是空的」）。
+#
+#   2) 6 个 unit 全都没有 [Install] 段 ⇒ `systemctl enable` 直接报错 ⇒
+#      服务只靠人工 start 撑着 ⇒ **机器一重启全灭**。
+#
+# 所以这里加两条判据：
+#   · CODE_TREE_READABLE —— 代码树（含 alembic/versions）必须服务用户读得到
+#   · STASHBOX_UNITS     —— 6 个 unit 必须 active 且 enabled
+#
+# 两条都只读，不改任何东西（与本脚本「只读」的设计约束一致）。
+# ═════════════════════════════════════════════════════════════════════
+
+STASHBOX_SERVICE_USER="stashbox"
+STASHBOX_UNITS="stashbox-migrate stashbox-api-gateway stashbox-user-service stashbox-content-service stashbox-ai-service stashbox-ai-worker"
+
+# 只有在**部署机**上才有意义：认这两个标记（unit 目录 + env 文件）。
+if [ -d /etc/systemd/system ] && [ -f /etc/stashbox/stashbox.env ]; then
+  HOST_CODE_DIR="/opt/stashbox/stashbox/backend"
+  [ -d "$HOST_CODE_DIR" ] || HOST_CODE_DIR="$BACKEND_DIR"
+
+  # ── CODE_TREE_READABLE ────────────────────────────────────────────
+  # migrate 以 stashbox 身份跑，alembic 要逐个 import versions/*.py。
+  # 任何一个读不到 ⇒ 迁移失败 ⇒ 整个栈下线（见上面背景 1）。
+  ALEMBIC_VERSIONS="$HOST_CODE_DIR/alembic/versions"
+  if [ ! -d "$ALEMBIC_VERSIONS" ]; then
+    fail "CODE_TREE_READABLE" "$ALEMBIC_VERSIONS 不存在 —— 迁移跑不了（代码没同步全？）"
+  elif [ "$(id -u)" != "0" ] && ! sudo -n true 2>/dev/null; then
+    skip "CODE_TREE_READABLE" "需要 root 或免密 sudo 才能以 $STASHBOX_SERVICE_USER 身份验可读性"
+  else
+    unreadable=""
+    unreadable_count=0
+    for f in "$ALEMBIC_VERSIONS"/*.py; do
+      [ -f "$f" ] || continue
+      if ! sudo -u "$STASHBOX_SERVICE_USER" test -r "$f" >/dev/null 2>&1; then
+        unreadable_count=$((unreadable_count + 1))
+        [ -z "$unreadable" ] && unreadable="$(basename "$f")"
+      fi
+    done
+    if [ "$unreadable_count" -gt 0 ]; then
+      fail "CODE_TREE_READABLE" "$unreadable_count 个迁移文件 $STASHBOX_SERVICE_USER 读不到（如 $unreadable）—— 迁移会 PermissionError 失败，进而拖垮全部服务。修：chown -R $STASHBOX_SERVICE_USER:$STASHBOX_SERVICE_USER $HOST_CODE_DIR"
+    else
+      pass "CODE_TREE_READABLE" "alembic/versions 全部可由 $STASHBOX_SERVICE_USER 读取"
+    fi
+  fi
+
+  # ── STASHBOX_UNITS ────────────────────────────────────────────────
+  # 两条都要查：
+  #   active   —— 跑着吗？（ai-worker 死过一次没人知道，14 小时零推送）
+  #   enabled  —— 开机自启吗？（没有 [Install] 段时 enable 会直接失败）
+  if ! command -v systemctl >/dev/null 2>&1; then
+    skip "STASHBOX_UNITS" "本机没有 systemctl"
+  else
+    inactive_units=""
+    disabled_units=""
+    for u in $STASHBOX_UNITS; do
+      st="$(systemctl is-active "$u" 2>/dev/null || true)"
+      en="$(systemctl is-enabled "$u" 2>/dev/null || true)"
+      case "$st" in
+        active) ;;
+        *) inactive_units="$inactive_units $u($st)" ;;
+      esac
+      [ "$en" = "enabled" ] || disabled_units="$disabled_units $u($en)"
+    done
+    if [ -n "$inactive_units" ]; then
+      fail "STASHBOX_UNITS" "没在跑：$inactive_units —— 补跑 systemctl start <unit>（注意：Requires= 会让停 migrate 连坐停掉全部服务）"
+    else
+      pass "STASHBOX_UNITS" "6 个 unit 全部 active"
+    fi
+    if [ -n "$disabled_units" ]; then
+      fail "STASHBOX_UNITS" "没开机自启：$disabled_units —— 机器一重启全灭。修：unit 文件加 [Install] WantedBy=multi-user.target 后 systemctl enable"
+    else
+      pass "STASHBOX_UNITS" "6 个 unit 全部 enabled（开机自启）"
+    fi
+  fi
+else
+  skip "CODE_TREE_READABLE" "不在部署机上（无 /etc/systemd/system + /etc/stashbox/stashbox.env），跳过"
+  skip "STASHBOX_UNITS" "不在部署机上，跳过"
+fi
+
+# ═════════════════════════════════════════════════════════════════════
 # 输出
 # ═════════════════════════════════════════════════════════════════════
 echo

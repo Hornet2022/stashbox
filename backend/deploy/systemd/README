@@ -94,6 +94,22 @@
 #        sudo systemctl enable --now stashbox-api-gateway.service \
 #             stashbox-user-service.service stashbox-content-service.service \
 #             stashbox-ai-service.service stashbox-ai-worker.service
+#        ⚠️ **migrate 也要 enable**（unit 文件现已带 [Install] 段）。
+#           5 个服务都是 `Requires=stashbox-migrate.service`，
+#           migrate 没开机自启 ⇒ 开机时没人跑迁移 ⇒ 5 个服务全部
+#           'dependency' 失败 ⇒ **整套后端起不来**。
+#        sudo systemctl enable stashbox-migrate.service
+#
+#        ⚠️ 两个 systemd 语义，动手前必须知道（2026-10-26 踩过）：
+#           1) `Requires=` 是**双向传染**的：被依赖单元一停，依赖它的单元
+#              **全部跟着停**。所以 `systemctl stop stashbox-migrate.service`
+#              会把 5 个服务一起停掉（实测：全部 inactive，公网 502）。
+#              ⇒ **永远不要单独 stop/restart migrate**，要重启就 6 个一起重启。
+#           2) `systemctl enable` 需要 unit 文件里有 [Install] 段。
+#              没有它 enable 直接报 "The unit files have no installation config"
+#              —— 6 个 unit 曾经全都没有这一段，README 里写的 enable --now
+#              **从来跑不通**，服务只靠人工 start 撑着 ⇒ 机器一重启全灭。
+#              （现已补上 [Install] WantedBy=multi-user.target。）
 #   7) nginx：
 #        sudo cp backend/deploy/systemd/nginx.conf /etc/nginx/sites-available/stashbox
 #        sudo ln -sf /etc/nginx/sites-available/stashbox /etc/nginx/sites-enabled/stashbox
