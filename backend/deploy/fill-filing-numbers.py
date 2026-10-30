@@ -57,6 +57,7 @@ import argparse
 from datetime import datetime
 import json
 import re
+import shutil
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -184,6 +185,13 @@ def emit_landing(
     LANDING_OUT.write_text(
         render_landing(site_name, copyright_text, icp, psb, psb_icon), encoding="utf-8"
     )
+    # 图标要**跟着产物走**：页面里引的是 /images/psb-icon.png（站点根下的
+    # 绝对路径），只发 index.html 而漏了 images/ ⇒ 线上就是一个裂图。
+    # 所以产物目录里必须带上 images/，发布时整目录 rsync 即可。
+    if psb_icon and PSB_ICON_PATH.exists():
+        out_dir = LANDING_OUT.parent / "images"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(PSB_ICON_PATH, out_dir / PSB_ICON_PATH.name)
     return LANDING_OUT
 
 

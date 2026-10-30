@@ -610,7 +610,9 @@ a.btn { text-decoration: none; }
 .site-footer-filing { margin-top: 4px; }
 .site-footer-sep { margin: 0 10px; opacity: .45; }
 .site-footer-psb { display: inline-flex; align-items: center; gap: 4px; }
-.site-footer-psb-icon { width: 15px; height: 15px; display: inline-block; }
+/* 公安徽章是**竖长**的（官方图标 168×187）——写死 15×15 会把它压扁。
+   所以只定宽，高度自适应，再按基线微调，让它和旁边的文字视觉齐平。 */
+.site-footer-psb-icon { width: 15px; height: auto; display: inline-block; vertical-align: -3px; }
 .site-footer-name { margin-top: 2px; font-size: 12px; }
 </style>
 </head>
