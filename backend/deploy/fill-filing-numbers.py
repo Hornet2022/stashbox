@@ -107,6 +107,21 @@ def load_numbers() -> tuple[str, str, str, str]:
     )
 
 
+def psb_query_url(psb: str) -> str:
+    """公安备案号的**官方查询页**链接。
+
+    公安部要求页脚链接到 beian.mps.gov.cn；阿里云给的图标链接还带查询参数
+    `?code=<编号>` —— 点进去直接落到**这一条备案**的查询结果，
+    而不是备案首页让审核员自己搜一遍。
+
+    编号就是备案号里的连续数字（鄂公网安备42018502009586号 → 42018502009586）。
+    拿不到数字就退回不带参数的官网首页。
+    """
+    digits = re.sub(r"\D", "", psb or "")
+    base = "https://beian.mps.gov.cn"
+    return f"{base}/#/query/webSearch?code={digits}" if digits else base
+
+
 def render_landing(
     site_name: str, copyright_text: str, icp: str, psb: str, psb_icon: str = ""
 ) -> str:
@@ -145,7 +160,7 @@ def render_landing(
         )
         links.append(
             f'<span class="site-footer-sep">·</span>'
-            f'<a class="site-footer-psb" href="https://beian.mps.gov.cn" target="_blank" '
+            f'<a class="site-footer-psb" href="{psb_query_url(psb)}" target="_blank" '
             f'rel="noreferrer noopener" data-psb-number>{icon}<span>{psb}</span></a>'
         )
     filing_html = "\n    ".join(links)
@@ -202,6 +217,12 @@ def check(site_name: str, copyright_text: str, icp: str, psb: str, admin_repo: P
                 problems.append(f"营销页产物缺公安备案号 {psb}")
             if "beian.mps.gov.cn" not in html:
                 problems.append("营销页的公安号没链到 beian.mps.gov.cn")
+            psb_code = re.sub(r"\D", "", psb)
+            if psb_code and psb_code not in html:
+                problems.append(
+                    f"营销页的公安号链接没带查询编号（{psb_code}）—— "
+                    "点了只会落到备案首页，审核员得自己搜一遍"
+                )
 
     # ② admin-web：看源码用的是构建期注入
     admin_path = admin_repo / ADMIN_LAYOUT
