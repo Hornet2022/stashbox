@@ -39,6 +39,7 @@ class OpenAIClient(LLMClient):
         base_url: str = OPENAI_DEFAULT_BASE_URL,
         timeout: float = 60.0,
         max_retries: int = 3,
+        connect_timeout: float = 10.0,
     ):
         if not api_key:
             raise ValueError("api_key required for OpenAIClient")
@@ -47,7 +48,22 @@ class OpenAIClient(LLMClient):
         self.base_url = (base_url or OPENAI_DEFAULT_BASE_URL).rstrip("/")
         self.max_retries = max_retries
         self._client = httpx.AsyncClient(
-            timeout=timeout,
+            # 2026-11-09 事故的教训：**连接超时独立于读超时**。
+            #
+            # 上游整机不可达（TCP 黑洞）时，httpx 拿 60s 的 timeout 去等连接，
+            # 每次尝试白等 60s，3 次重试 = 3 分钟才判死 ⇒ 外面再套 Arq 的
+            # 5 次任务重试 ⇒ 单篇文章等 30 分钟。
+            #
+            # "连不上"和"读得慢"是两件事：连不上 ⇒ TCP 要么秒通要么不通，
+            # 给 10s 足够；连上了但回得慢 ⇒ 才需要 60s 的读超时。
+            # 正常路径连接耗时是毫秒级 ⇒ 这个拆分对成功请求零影响。
+            timeout=httpx.Timeout(
+                timeout,
+                connect=min(connect_timeout, timeout),
+                read=timeout,
+                write=timeout,
+                pool=timeout,
+            ),
             trust_env=False,  # 忽略沙箱/系统代理
             headers={
                 "Authorization": f"Bearer {api_key}",

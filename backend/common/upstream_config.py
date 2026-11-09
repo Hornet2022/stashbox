@@ -48,7 +48,8 @@ from __future__ import annotations
 from typing import Any
 
 from stashbox.backend.common.logging import get_logger
-from stashbox.backend.common.system_config import KEY_LLM, KEY_TTS, get_config
+from stashbox.backend.common import system_config
+from stashbox.backend.common.system_config import KEY_LLM, KEY_TTS
 
 log = get_logger(__name__)
 
@@ -137,9 +138,25 @@ class UpstreamConfigUnavailable(RuntimeError):
       2. 或在服务器上跑 `python backend/deploy/seed_upstream_config.py --env-file <env>`，
          从 env 一次性播种进 DB；
       3. 若本进程刚重启且 DB 还没恢复，等 DB 恢复后重试即可（此时会有 last-good）。
+
+    ## `kind` 有两种，处置方式不同
+
+    · `config_unavailable` —— **DB 读不到**（PG/Redis 抖动）。
+      本进程若曾成功读过 ⇒ 用 last-good（见 `load_llm`）；否则抛本异常。
+    · `config_missing` —— **DB 读得到，但那一行没配**（表里没有 `llm` 行，
+      或整行都是空值）。这不是抖动，**重试没用**：得去后台配。
+      ⇒ 运行期路径**必须点名**（"配置行不存在"），
+        绝不能静默落到代码默认值（那是 `api.openai.com` + 空 key ⇒ 症状是 401，
+        排查方向被带偏到"key 无效"，而真相是"压根没配"）。
+
+    两种都**不允许**回落 env —— env 只是播种时用一次的输入。
     """
 
     kind = "config_unavailable"
+
+    def __init__(self, message: str, *, kind: str = "config_unavailable"):
+        super().__init__(message)
+        self.kind = kind
 
 
 # ── 规范化（纯函数，不碰 DB / env）───────────────────────────────────────
@@ -254,14 +271,94 @@ def reset_for_tests() -> None:
     _last_good.clear()
 
 
-async def _load(key: str, resolver) -> tuple[dict[str, Any], str]:
+def source_of(stored: dict | None) -> str:
+    """这一行的来源标签：`db`（表里配了）/ `defaults`（表里没这一行）。
+
+    ⚠️ 判据必须是"**行存在**"，不是"行非空"。
+    `system_config.value` 是 JSON 列，理论上可以是 `{}` ——
+    那表示"行在、但一个字段都没配"，它**仍然属于 db 来源**
+    （运营在后台存了一个空对象），而**不是**"没这一行"。
+
+    用 truthiness 判（`if stored`）会把 `{}` 误判成 defaults，
+    于是同一个状态在 admin 端点与运行期得到**两个不同的来源标签**
+    —— 这正是"同一个语义有两处实现"的典型漂移。
+    """
+    return "db" if stored is not None else "defaults"
+
+
+def missing_required(key: str, cfg: dict[str, Any]) -> list[str]:
+    """这组配置里**运行期必须**有、但现在没有的字段名列表。
+
+    为什么需要它：DB 里"配了但配残了"（比如 api_key 存成了空串）
+    与"压根没配"是同一类问题 —— 用残缺的配置请求上游，症状是 401/404，
+    排查方向会被带偏到"key 无效"，而真相是"没配全"。
+
+    所以运行期必须**点名缺哪个字段**，而不是拿残缺值去试。
+    """
+    provider = str(cfg.get("provider") or "").lower()
+    missing: list[str] = []
+    if not provider:
+        missing.append("provider")
+        return missing
+
+    if key == KEY_LLM:
+        if not _is_set(cfg.get("base_url")):
+            missing.append("base_url")
+        if provider == "openai" and not _is_set(cfg.get("api_key")):
+            missing.append("api_key")
+        elif provider.startswith("qwen") and not _is_set(cfg.get("qwen_vl_api_key")):
+            missing.append("qwen_vl_api_key")
+    elif key == KEY_TTS:
+        if provider == "openai":
+            if not _is_set(cfg.get("openai_base_url")):
+                missing.append("openai_base_url")
+            if not _is_set(cfg.get("openai_api_key")):
+                missing.append("openai_api_key")
+        elif provider == "doubao":
+            if not _is_set(cfg.get("doubao_api_key")) and not _is_set(cfg.get("doubao_token")):
+                missing.append("doubao_api_key")
+    return missing
+
+
+async def _load(key: str, resolver, *, strict: bool = True) -> tuple[dict[str, Any], str]:
     """读 DB → 规范化 → 记 last-good。
 
     返回 (配置, 来源)：`db` / `last_good` / `defaults`。
-    读失败且没有 last-good ⇒ 抛 `UpstreamConfigUnavailable`。
+
+    ## strict=True（运行期要发请求时用）
+
+    · DB **读失败** ⇒ 有 last-good 就用它（`last_good`），没有就抛
+      `UpstreamConfigUnavailable(kind="config_unavailable")`。
+    · DB **行不存在 / 整行为空** ⇒ 抛 `UpstreamConfigUnavailable(kind="config_missing")`。
+    · DB 行存在但**必填字段缺失**（如 api_key 空）⇒ 同样抛 `config_missing`，
+      消息点名缺哪个字段。
+
+    为什么"行不存在"必须点名，而不是用代码默认值继续跑：
+    代码默认值的 api_key 是空串、base_url 指向 `api.openai.com` ⇒ 请求打过去
+    症状是 **401 / 连不上**，排查方向会被带偏到"key 无效"或"网络问题"，
+    而真相是"**压根没配**"。这与 2026-11-09 的 env 回落是**同一个病**：
+    配置没读到，却伪装成上游的问题。区别只是 env 回落有 last_good 兜底，
+    而"没配"这件事本身没有任何兜底 —— 它必须**当场喊出来**。
+
+    ## strict=False（纯回显 / 元数据读取时用）
+
+    行不存在 ⇒ 返回 (代码默认值, `defaults`)，**不抛**。
+    用于"读一下当前配置长什么样"这类**不发请求**的路径
+    （如音色兜底解析），不该因为配置没配就打断整条链路。
+
+    ⚠️ 读失败（DB 抖动）在两种模式下**都**抛：那是真的读不到，
+    跟"没配"是两回事，不该被默认值掩盖。
     """
     try:
-        stored = await get_config(key)
+        # ⚠️ 用**模块限定**调用（`system_config.get_config(...)`），
+        # 不是 `from ... import get_config` —— 后者会在 import 时把函数**绑死**在本模块，
+        # 于是 `monkeypatch.setattr(system_config, "get_config", ...)` 打不到这里
+        # （pytest 的通行规则：patch where it's looked up）。
+        #
+        # 这个坑不是理论上的：实测 tier-config 的回归用例打桩了
+        # `system_config.get_config`，而 upstream_config 因为提前绑死而**没被打到**
+        # ⇒ 读的是真 DB ⇒ 用例结果与环境相关 ⇒ 变成"偶尔红"的 flaky 用例。
+        stored = await system_config.get_config(key)
     except Exception as exc:  # noqa: BLE001 —— PG/Redis 都可能抛
         cached = _last_good.get(key)
         if cached is not None:
@@ -277,21 +374,61 @@ async def _load(key: str, resolver) -> tuple[dict[str, Any], str]:
             "请在管理后台补齐该配置，或执行 backend/deploy/seed_upstream_config.py 播种。"
         ) from exc
 
+    source = source_of(stored)
+
+    if strict and source == "defaults":
+        raise UpstreamConfigUnavailable(
+            f"上游配置（system_config 表 key={key!r}）**没有配** —— 表里没有这一行，"
+            "或整行是空对象。拒绝用代码默认值（api.openai.com + 空 key）去请求上游："
+            "那样症状会是 401 / 连不上，看不出真正的原因是「压根没配」。"
+            "请在管理后台补齐该配置，或执行 backend/deploy/seed_upstream_config.py 播种。",
+            kind="config_missing",
+        )
+
     cfg = resolver(stored)
-    # 行不存在（stored is None）⇒ 用代码默认值，并**如实**记成 defaults 来源。
-    # 这会覆盖 last-good：配置被人删掉还拿旧值继续跑，只会把问题掩盖掉。
-    _remember(key, cfg)
-    return dict(cfg), ("db" if stored is not None else "defaults")
+
+    if strict:
+        missing = missing_required(key, cfg)
+        if missing:
+            raise UpstreamConfigUnavailable(
+                f"上游配置（system_config 表 key={key!r}）**不完整**：缺 {', '.join(missing)}。"
+                "请在管理后台补齐 —— 用残缺的配置请求上游，症状会伪装成 401 / 404，"
+                "排查方向会被带偏。",
+                kind="config_missing",
+            )
+
+    # 只在真的读到一行时记 last-good。
+    #
+    # ⚠️ 别把"行不存在"的代码默认值记进去：那是"**没配**"，不是"上次成功的配置"。
+    # 记进去会让下一次 DB 抖动时把默认值当成 last-good 用（空 key + api.openai.com），
+    # 又是同一种伪装。
+    if source == "db":
+        _remember(key, cfg)
+    return dict(cfg), source
 
 
 async def load_llm() -> tuple[dict[str, Any], str]:
-    """读 DB 的 llm 行 → (规范化配置, 来源)。"""
-    return await _load(KEY_LLM, resolve_llm)
+    """读 DB 的 llm 行 → (规范化配置, 来源)。**运行期严格**（见 `_load`）。"""
+    return await _load(KEY_LLM, resolve_llm, strict=True)
 
 
 async def load_tts() -> tuple[dict[str, Any], str]:
-    """读 DB 的 tts 行 → (规范化配置, 来源)。"""
-    return await _load(KEY_TTS, resolve_tts)
+    """读 DB 的 tts 行 → (规范化配置, 来源)。**运行期严格**（见 `_load`）。"""
+    return await _load(KEY_TTS, resolve_tts, strict=True)
+
+
+async def peek_llm() -> tuple[dict[str, Any], str]:
+    """宽松读 llm 行：行不存在 ⇒ (代码默认值, 'defaults')，**不抛**。
+
+    只给"纯回显 / 元数据读取"的路径用（不发请求），
+    例如后台把当前配置显示出来。**不要**用它去建 client。
+    """
+    return await _load(KEY_LLM, resolve_llm, strict=False)
+
+
+async def peek_tts() -> tuple[dict[str, Any], str]:
+    """宽松读 tts 行（见 `peek_llm`）。"""
+    return await _load(KEY_TTS, resolve_tts, strict=False)
 
 
 def current_llm() -> dict[str, Any]:
@@ -356,11 +493,15 @@ async def diagnose() -> dict[str, Any]:
 
     目的：把"配置没读到 / 没配全"从**运行期的神秘失败**提前到**启动时可见**。
     生产 DB 明明配好了却没生效、或压根没配，这两种情况都在这里点名。
+
+    ⚠️ 这里用 `peek_*`（宽松）而不是 `load_*`（严格）：
+    自检**不该**因为配置没配就抛异常 —— 它要的是**报告**，
+    而不是自己先炸掉。严格模式留给真正要发请求的运行期路径。
     """
     report: dict[str, Any] = {}
     for name, key, loader, missing_fn in (
-        ("llm", KEY_LLM, load_llm, _missing_required_llm),
-        ("tts", KEY_TTS, load_tts, _missing_required_tts),
+        ("llm", KEY_LLM, peek_llm, _missing_required_llm),
+        ("tts", KEY_TTS, peek_tts, _missing_required_tts),
     ):
         try:
             cfg, source = await loader()
@@ -406,7 +547,11 @@ __all__ = [
     "last_good",
     "load_llm",
     "load_tts",
+    "missing_required",
+    "peek_llm",
+    "peek_tts",
     "reset_for_tests",
     "resolve_llm",
     "resolve_tts",
+    "source_of",
 ]

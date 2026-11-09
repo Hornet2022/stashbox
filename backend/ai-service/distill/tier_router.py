@@ -143,12 +143,24 @@ async def _default_map_following_llm() -> dict[str, dict[str, str]]:
 
     目的：让「换供应商只改管理后台 llm 一处」也不会在蒸馏时 404。
     读不到 llm 配置（无 Redis/PG 的测试环境）时按原样返回。
+
+    ⚠️ 2026-11-10 收敛：这里读的是**规范解析后**的配置
+    （`upstream_config.peek_llm`），不是 DB 原始行。
+
+    为什么：原先直接读原始行再自己取 `provider` / `model` / `base_url` ——
+    那是**第二份解析实现**。DB 里若存的是 provider 专属字段
+    （`openai_llm_model` / `openai_llm_base_url`），原始行里就没有通用的
+    `model` / `base_url` ⇒ 这里拿到空 ⇒ **静默不跟随**当前模型
+    ⇒ 蒸馏时用硬编码的 gpt-4o 打新端点 ⇒ 404。
+    症状是"模型不存在"，而真相是"读配置的地方抄了近路"。
+
+    用 `peek_llm`（宽松）：这一层是**兜底逻辑**，读不到不该打断整条链路。
     """
     base = {tier: dict(provs) for tier, provs in TIER_MODEL_MAP.items()}
     try:
-        from stashbox.backend.common.system_config import KEY_LLM, get_config
+        from stashbox.backend.common.upstream_config import peek_llm
 
-        llm_cfg = await get_config(KEY_LLM) or {}
+        llm_cfg, _source = await peek_llm()
     except Exception as exc:
         log.warning("tier_default_llm_read_failed", error=str(exc))
         return base

@@ -412,12 +412,16 @@ async def admin_tier_config_get(
     # 动作 1（2026-09-24 事故后加）：提示「模型名与当前 LLM 供应商不符」。
     # 事故背景：llm 换成火山方舟 + doubao-*，tier 却留着 gpt-4o →
     # 蒸馏调用 LLM 报 404 UnsupportedModel，整条链路 100% 失败。
+    #
+    # ⚠️ 2026-11-10 收敛：读的是**规范解析后**的配置，不是 DB 原始行。
+    # 原先读原始行再自己取 provider/base_url ⇒ DB 里存 provider 专属字段时
+    # 拿到空值 ⇒ **静默不校验** ⇒ 运营看不到该有的警告 ⇒ 蒸馏时 404。
     try:
-        from stashbox.backend.common.system_config import KEY_LLM, get_config
+        from stashbox.backend.common.upstream_config import peek_llm
 
         from distill.tier_router import check_model_matches_vendor
 
-        llm_cfg = await get_config(KEY_LLM) or {}
+        llm_cfg, _src = await peek_llm()
         active_provider = str(llm_cfg.get("provider") or "openai").lower()
         active_base_url = llm_cfg.get("base_url")
         for tier_map in effective.values():
@@ -467,14 +471,18 @@ async def admin_tier_config_put(
     # 背景：管理后台把 llm 配成火山方舟（doubao-*），tier 却配 gpt-4o →
     # 蒸馏调用 LLM 报 404 UnsupportedModel，整条蒸馏链 100% 失败。
     # 这里在**保存时**就拦掉，而不是等蒸馏跑挂。供应商无法判断时放行。
-    from stashbox.backend.common.system_config import KEY_LLM, get_config
-
+    #
+    # ⚠️ 2026-11-10 收敛：读**规范解析后**的配置（provider 专属字段也认）。
+    # 读原始行时若 DB 存的是专属字段，provider/base_url 会取空 ⇒
+    # 校验拿不到供应商 ⇒ **静默放行** ⇒ 拦不住本该拦的冲突。
     from distill.tier_router import check_model_matches_vendor
 
     try:
-        llm_cfg = await get_config(KEY_LLM) or {}
+        from stashbox.backend.common.upstream_config import peek_llm
+
+        llm_cfg, _src = await peek_llm()
     except Exception:
-        llm_cfg = {}
+        llm_cfg = {}  # 读不到就放行（不阻塞保存）
     active_provider = str(llm_cfg.get("provider") or "openai").lower()
     active_base_url = llm_cfg.get("base_url")
     conflicts = [

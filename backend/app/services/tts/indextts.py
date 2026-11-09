@@ -87,6 +87,10 @@ from .ref_audio import RefAudioError, load_ref_audio_bytes
 
 log = logging.getLogger(__name__)
 
+# 连接超时（秒）—— 独立于读超时（2026-11-09 事故教训，详见 app/services/tts/openai.py）。
+# 传输类参数（不决定"打哪个上游、用什么凭据"）⇒ 按收敛契约留在代码里，不进 DB。
+_CONNECT_TIMEOUT_DEFAULT = 10.0
+
 
 class IndexTTSError(RuntimeError):
     """IndexTTS 合成失败（网络 / 服务 4xx-5xx / 空音频）。"""
@@ -345,7 +349,22 @@ class IndexTTSClient(TTSClient):
         # 所以 TTS 侧和 ARQ_MAX_JOBS 都应保持 1。
         self.chunk_concurrency = max(1, int(os.getenv("INDEXTTS_CONCURRENCY", "1")))
         # trust_env=False：忽略沙箱/系统 HTTP(S)_PROXY（代理漂移会打挂本地 127.0.0.1 请求）
-        self._client = httpx.AsyncClient(timeout=self.timeout, trust_env=False)
+        self._client = httpx.AsyncClient(
+            # 连接超时独立于读超时（2026-11-09 事故教训）。
+            #
+            # 自建端点整机不可达时，httpx 拿 300s 的 timeout 去等连接 ⇒
+            # 每次尝试白等 300s，而 failover 链要靠"超时快失败"才能切下一个端点
+            # —— 连接超时太长 ⇒ failover 迟迟不生效。
+            # 连不上 ⇒ TCP 要么秒通要么不通（本机/内网 10s 绰绰有余）。
+            timeout=httpx.Timeout(
+                self.timeout,
+                connect=min(_CONNECT_TIMEOUT_DEFAULT, self.timeout),
+                read=self.timeout,
+                write=self.timeout,
+                pool=self.timeout,
+            ),
+            trust_env=False,
+        )
         # 参考音频 base64 缓存（文件不重新读盘，除非 ref_audio_path 变化）
         self._ref_b64: str | None = None
         self._ref_b64_for: str | None = None

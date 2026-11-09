@@ -59,12 +59,40 @@ def resolve_config(override: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def build_client(config: dict[str, Any]) -> LLMClient:
+    """按配置造 client。
+
+    ⚠️ 调用预算（timeout / max_retries / connect_timeout）**必须从配置里取**，
+    不能用 client 构造器的默认值。
+
+    为什么（2026-11-10 收敛时发现的缺口）：
+    这层 client（content-service 侧：后台「测试调用」、OCR 等）原先只传
+    api_key / model / base_url ⇒ timeout 永远是构造器默认的 60s、
+    max_retries 永远是 3。而**同一个** DB 行里的预算字段，ai-service 那层
+    （蒸馏）却是在用的 ⇒ **后台改 timeout 只对一半链路生效**。
+
+    这正是"配置收敛到 DB"最容易漏的一环：字段进了 DB，但**消费方没全接上**。
+    判据：DB 里配的值必须对**所有** client 构造路径生效，
+    否则"后台显示 120s，实际 60s"这种不一致会活很久没人发现。
+    """
     provider = str(config.get("provider") or "mock").lower()
+    timeout = config.get("timeout")
+    if timeout is None:
+        timeout = LLM_CODE_DEFAULTS["timeout"]
+    max_retries = config.get("max_retries")
+    if max_retries is None:
+        max_retries = LLM_CODE_DEFAULTS["max_retries"]
+    connect_timeout = config.get("connect_timeout")
+    if connect_timeout is None:
+        connect_timeout = LLM_CODE_DEFAULTS["connect_timeout"]
+
     if provider == "openai":
         return OpenAIClient(
             api_key=config.get("openai_llm_api_key") or "",
             model=config.get("openai_llm_model") or LLM_CODE_DEFAULTS["model"],
             base_url=config.get("openai_llm_base_url") or LLM_CODE_DEFAULTS["base_url"],
+            timeout=timeout,
+            max_retries=max_retries,
+            connect_timeout=connect_timeout,
         )
     if provider == "qwen_vl":
         return QwenVLClient(
@@ -72,6 +100,9 @@ def build_client(config: dict[str, Any]) -> LLMClient:
             model=config.get("qwen_vl_model") or "qwen3.6-flash",
             base_url=config.get("qwen_vl_base_url")
             or "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+            timeout=timeout,
+            max_retries=max_retries,
+            connect_timeout=connect_timeout,
         )
     raise ValueError(f"unsupported llm provider: {provider!r} (supported: openai/qwen_vl)")
 

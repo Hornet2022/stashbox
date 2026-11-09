@@ -67,6 +67,7 @@ from stashbox.backend.app.services.tts import (
     reload as tts_reload,
     resolve_config as tts_resolve_config,
 )
+from stashbox.backend.common.upstream_config import peek_llm, source_of
 
 log = get_logger("content-service.admin")
 
@@ -576,9 +577,7 @@ async def admin_llm_config_get(user: dict = Depends(require_admin_or_operator)):
     """当前生效的 LLM 配置（**只认 DB**；表里没有就是代码默认值）。"""
     stored, updated_at = await system_config.get_config_row(system_config.KEY_LLM)
     config = resolve_config(stored)
-    return _masked_llm_config(
-        config, "db" if stored else "defaults", system_config.as_iso(updated_at)
-    )
+    return _masked_llm_config(config, source_of(stored), system_config.as_iso(updated_at))
 
 
 @router.put("/api/v1/admin/llm/config")
@@ -826,7 +825,19 @@ async def admin_llm_test_with_config(
     #    现在：DB 里没有 key ⇒ 明确报错"没配 key"，让运营去后台补齐。
     effective_key = req.api_key
     if not effective_key:
-        stored_cfg = await system_config.get_config(system_config.KEY_LLM) or {}
+        # ⚠️ 用**规范解析器**取已存的 key，不要直接读原始行。
+        #
+        # 原先 `stored_cfg.get("api_key")` 只认**通用**字段 ⇒ DB 里存的是
+        # provider 专属字段（`openai_llm_api_key`）时取不到 ⇒ 报"缺 key"，
+        # 而生产实际能用同一把 key ⇒ 测出来的红灯是假的。
+        #
+        # 解析器知道"通用 ↔ 专属"的映射（resolve_llm 里只实现一次），
+        # 所以这里直接问它"生效的 key 是什么"。
+        #
+        # 用 `peek_llm`（宽松）而不是 `load_llm`（严格）：
+        # 这是**回显**路径 —— 配置没配时该报的是"缺 key"（下面的校验会给友好提示），
+        # 而不是抛"配置行不存在"把整个测试调用端点打成 500。
+        stored_cfg, _src = await peek_llm()
         effective_key = str(stored_cfg.get("api_key") or "").strip()
 
     # cfg 的键名必须与 `build_client` 读的**完全一致** ——
@@ -1162,9 +1173,7 @@ async def admin_tts_config_get(user: dict = Depends(require_admin_or_operator)):
     """当前生效的 TTS 配置（**只认 DB**；表里没有就是代码默认值）。"""
     stored, updated_at = await system_config.get_config_row(system_config.KEY_TTS)
     config = tts_resolve_config(stored)
-    return _masked_tts_config(
-        config, "db" if stored else "defaults", system_config.as_iso(updated_at)
-    )
+    return _masked_tts_config(config, source_of(stored), system_config.as_iso(updated_at))
 
 
 @router.put("/api/v1/admin/tts/config")

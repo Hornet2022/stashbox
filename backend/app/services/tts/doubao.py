@@ -39,6 +39,10 @@ from .base import TTSClient
 
 log = logging.getLogger(__name__)
 
+# 连接超时（秒）—— 独立于读超时（2026-11-09 事故教训，详见 app/services/tts/openai.py）。
+# 传输类参数（不决定"打哪个上游、用什么凭据"）⇒ 按收敛契约留在代码里，不进 DB。
+_CONNECT_TIMEOUT_DEFAULT = 10.0
+
 
 class DoubaoTTSClient(TTSClient):
     """火山引擎豆包 TTS 客户端（Coding Plan X-Api-Key 鉴权，HTTP POST）。"""
@@ -70,7 +74,21 @@ class DoubaoTTSClient(TTSClient):
         self.voice = voice if voice is not None else self.DEFAULT_VOICE
         self.resource_id = resource_id if resource_id is not None else self.DEFAULT_RESOURCE_ID
         # trust_env=False：忽略沙箱/系统 HTTP(S)_PROXY（代理端口轮换会导致外网请求随机 ConnectError）
-        self._client = httpx.AsyncClient(timeout=timeout, trust_env=False)
+        #
+        # 连接超时独立于读超时（2026-11-09 事故教训）：
+        # 上游整机不可达时，httpx 拿 60s 的 timeout 去等连接 ⇒ 每次白等 60s。
+        # 连不上 ⇒ TCP 要么秒通要么不通，10s 足够；
+        # 连上了但回得慢 ⇒ 才需要读超时兜着。
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                timeout,
+                connect=min(_CONNECT_TIMEOUT_DEFAULT, timeout),
+                read=timeout,
+                write=timeout,
+                pool=timeout,
+            ),
+            trust_env=False,
+        )
 
     @property
     def provider_name(self) -> str:

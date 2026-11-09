@@ -38,6 +38,7 @@ class QwenVLClient(LLMClient):
         base_url: str = QWEN_VL_DEFAULT_BASE_URL,
         timeout: float = 60.0,
         max_retries: int = 3,
+        connect_timeout: float = 10.0,
     ):
         if not api_key:
             raise ValueError("api_key required for QwenVLClient")
@@ -46,7 +47,14 @@ class QwenVLClient(LLMClient):
         self.base_url = base_url.rstrip("/")
         self.max_retries = max_retries
         self._client = httpx.AsyncClient(
-            timeout=timeout,
+            # 连接超时独立于读超时（2026-11-09 事故教训，详见 openai.py 的注释）。
+            timeout=httpx.Timeout(
+                timeout,
+                connect=min(connect_timeout, timeout),
+                read=timeout,
+                write=timeout,
+                pool=timeout,
+            ),
             trust_env=False,  # 忽略沙箱/系统代理
             headers={
                 "Authorization": f"Bearer {api_key}",

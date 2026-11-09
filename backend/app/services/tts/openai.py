@@ -180,6 +180,16 @@ _DEFAULT_BASE_URL = "https://api.openai.com/v1"
 _DEFAULT_MODEL = "tts-1"
 _DEFAULT_VOICE = "alloy"
 
+# 连接超时（秒）—— **独立于读超时**。
+#
+# 2026-11-09 事故教训：上游整机不可达时，httpx 拿读超时（这里是 300s）
+# 去等连接 ⇒ 每次尝试白等 300s。给连接单独一个 10s 足够
+# （TCP 要么秒通要么不通），而合成本身慢（10~60s）仍由读超时兜着。
+#
+# ⚠️ 这是**传输类**参数（不决定"打哪个上游、用什么凭据"）⇒ 按收敛契约留在代码里，
+#    不进 DB。与 LLM 侧的 `connect_timeout` 同源同义，但分属两个 provider 的 client。
+_CONNECT_TIMEOUT_DEFAULT = 10.0
+
 # 「输出疑似被静默截断」的语速阈值（字/秒）。
 #
 # 端点只念了开头时，字数没少、时长偏短 → **语速虚高**。
@@ -579,7 +589,22 @@ class OpenAITTSClient(TTSClient):
             else int(os.getenv("OPENAI_TTS_CONCURRENCY", "1"))
         )
         self._client = httpx.AsyncClient(
-            timeout=self.timeout,
+            # 2026-11-09 事故的教训：**连接超时独立于读超时**。
+            #
+            # 上游整机不可达（TCP 黑洞）时，httpx 拿 300s 的 timeout 去等连接，
+            # 每次尝试白等 300s；而熔断要**连续失败**才开闸 ⇒ 头几段照样白等。
+            # 一篇 8 段稿 = 几十分钟起步。
+            #
+            # "连不上"和"读得慢"是两件事：连不上 ⇒ TCP 要么秒通要么不通，
+            # 给 10s 足够；连上了但合成慢（正常就是 10~60s）⇒ 才需要 300s 读超时。
+            # 正常路径连接耗时是毫秒级 ⇒ 这个拆分对成功请求零影响。
+            timeout=httpx.Timeout(
+                self.timeout,
+                connect=min(_CONNECT_TIMEOUT_DEFAULT, self.timeout),
+                read=self.timeout,
+                write=self.timeout,
+                pool=self.timeout,
+            ),
             trust_env=False,  # 忽略沙箱/系统代理
             headers={
                 "Authorization": f"Bearer {self.api_key}",
