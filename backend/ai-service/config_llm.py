@@ -68,6 +68,17 @@ class LLMSettings(BaseSettings):
     # —— 通用 ——
     timeout: float = Field(default=60.0, validation_alias="LLM_TIMEOUT")
     max_retries: int = Field(default=3, validation_alias="LLM_MAX_RETRIES")
+    # 连接超时（秒），**独立于读超时**。
+    #
+    # 2026-11-09 事故引入：上游整机不可达时，httpx 用同一个 timeout 去等 TCP 连接，
+    # 于是「连不上」要等满 60s 才报错 —— 3 次重试 = 3 分钟才判定，
+    # 外面再套 Arq 的 5 次任务重试 ⇒ 单篇文章等 30 分钟。
+    #
+    # 但"连不上"和"读得慢"是两回事：
+    #   · 连不上 → 几秒内就该判死（TCP 连接要么秒通要么不通）；
+    #   · 连上了但回得慢 → 才需要给足 60s。
+    # ⇒ 连接超时给 10s，读超时仍是 60s。正常路径不受影响（连接耗时是毫秒级）。
+    connect_timeout: float = Field(default=10.0, validation_alias="LLM_CONNECT_TIMEOUT")
 
 
 llm_settings = LLMSettings()

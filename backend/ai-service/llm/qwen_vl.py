@@ -44,6 +44,7 @@ class QwenVLClient(LLMClient):
         base_url: str = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
         timeout: float = 60.0,
         max_retries: int = 3,
+        connect_timeout: float = 10.0,
         _shared: bool = False,  # CP3.6.2: 单例 client 关闭时跳过 httpx aclose
     ):
         if not api_key:
@@ -54,7 +55,15 @@ class QwenVLClient(LLMClient):
         self.max_retries = max_retries
         self._shared = _shared
         self._client = httpx.AsyncClient(
-            timeout=timeout,
+            # 2026-11-09：连接超时独立于读超时 —— "连不上"要快速判死。
+            # 详见 ai-service/config_llm.py 的 connect_timeout 说明。
+            timeout=httpx.Timeout(
+                timeout,
+                connect=min(connect_timeout, timeout),
+                read=timeout,
+                write=timeout,
+                pool=timeout,
+            ),
             trust_env=False,  # 忽略沙箱/系统代理（漂移会打挂外网调用）
             headers={
                 "Authorization": f"Bearer {api_key}",

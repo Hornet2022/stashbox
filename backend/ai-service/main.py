@@ -699,6 +699,14 @@ async def distill_status(
         # 现在两边共用 `common.distill_status.derive_distill_status` ——
         # 口径说明见该模块 docstring。
         "status": derive_distill_status(article, da),
+        # 2026-11-09：**失败原因**（面向用户的一句话）。
+        #
+        # 为什么加：Android 轮询的正是这个端点，而它原来**不返回 error** ⇒
+        # 客户端失败时只能显示写死的「蒸馏失败，请重试」，用户既不知道
+        # 为什么失败（上游挂了？内容有问题？），也不知道该不该马上重试。
+        # 失败原因由 ai-service/tasks/distill_task.py 写进 articles.error
+        # （中文文案，映射见 common/distill_failure_reason.py）。
+        "error": article.error,
         "audio_url": da.audio_url,
         "duration_sec": da.duration_sec,
         "tags": da.tags,

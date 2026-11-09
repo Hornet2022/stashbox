@@ -584,16 +584,30 @@ async def test_persist_failure_lands_feedback_event(isolated_article):
 
     feedback.reason 是 varchar(64)，而 track() 用 SAVEPOINT 兜异常、只留 warning，
     所以「reason 超长 → insert 失败 → 事件消失」在日志之外完全无感。
+
+    ⚠️ 2026-11-09：埋点的**位置变了**。
+    原来在 `_persist_agent_final` 里记 —— 但它每次尝试都会跑（Arq 重试 5 次
+    ⇒ 一次真实失败记 5~6 条）⇒ 失败率统计虚高 6 倍（实测 4 篇真实失败
+    在 feedback 表里是 24 条）。
+    现在**终局失败**由 `distill_task` 的失败处理器记（只在 will_retry=False 时），
+    并且只有它能保证"一篇失败 = 一条记录"。
+
+    本用例因此改成两段断言：
+      ① `_persist_agent_final` **不再**写失败事件（防止虚高回来）；
+      ② 终局失败用的 reason（`_distill_failure_reason`）经 track() 落库后，
+         reason 不超列宽、完整错误在 metadata 里。
     """
     from sqlalchemy import select
 
+    from stashbox.backend.common.analytics import track
     from stashbox.backend.common.database import AsyncSessionLocal
     from stashbox.backend.common.models import Feedback
-    from tasks.distill_task import _persist_agent_final
+    from tasks.distill_task import _distill_failure_reason, _persist_agent_final
 
     article_id = isolated_article
     long_error = "tts_synthesize 未捕获异常: OpenAITTS 错误 401: " + "y" * 400
 
+    # ① _persist_agent_final 不再写失败事件
     await _persist_agent_final(
         "cp_persist_feedback",
         article_id,
@@ -608,16 +622,52 @@ async def test_persist_failure_lands_feedback_event(isolated_article):
     )
 
     async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Feedback).where(
-                Feedback.article_id == article_id,
-                Feedback.type == "distill_failed",
+        rows = (
+            (
+                await db.execute(
+                    select(Feedback).where(
+                        Feedback.article_id == article_id,
+                        Feedback.type == "distill_failed",
+                    )
+                )
             )
+            .scalars()
+            .all()
         )
-        rows = result.scalars().all()
+        assert (
+            len(rows) == 0
+        ), f"_persist_agent_final 又开始写失败事件了（{len(rows)} 行）⇒ 失败率会虚高"
+        await db.rollback()
+
+    # ② 终局失败的 reason 经 track() 落库：列宽内 + 完整原文进 metadata
+    reason = _distill_failure_reason("upstream_unreachable", RuntimeError(long_error))
+    async with AsyncSessionLocal() as db:
+        await track(
+            db,
+            "distill_failed",
+            user_id=1,
+            article_id=article_id,
+            reason=reason,
+        )
+        await db.commit()
+
+    async with AsyncSessionLocal() as db:
+        rows = (
+            (
+                await db.execute(
+                    select(Feedback).where(
+                        Feedback.article_id == article_id,
+                        Feedback.type == "distill_failed",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert len(rows) == 1, f"distill_failed 埋点没落库（{len(rows)} 行）"
         assert len(rows[0].reason) <= 64
-        assert rows[0].metadata_["reason_full"] == long_error, "完整错误必须在 metadata 里"
+        assert rows[0].reason.startswith("upstream_unreachable")
+        assert rows[0].metadata_["reason_full"] == reason, "完整错误必须在 metadata 里"
         await db.rollback()
 
 

@@ -51,6 +51,8 @@ def _env_view() -> dict:
         "qwen_vl_base_url": llm_settings.qwen_vl_base_url,
         "timeout": llm_settings.timeout,
         "max_retries": llm_settings.max_retries,
+        # 2026-11-09：连接超时独立于读超时（"连不上"要快速判死，见 config_llm 说明）
+        "connect_timeout": llm_settings.connect_timeout,
     }
 
 
@@ -117,8 +119,9 @@ def _create_cached_client(
     base_url: str,
     timeout: float,
     max_retries: int,
+    connect_timeout: float = 10.0,
 ) -> LLMClient:
-    """按 6 维参数缓存 client。同 (provider, model, ...) 返回同一实例。
+    """按 7 维参数缓存 client。同 (provider, model, ...) 返回同一实例。
 
     设 `_shared=True` → close() 变 no-op，避免破坏其他任务的 httpx 连接池。
     """
@@ -149,6 +152,7 @@ def _create_cached_client(
             model=model,
             timeout=timeout,
             max_retries=max_retries,
+            connect_timeout=connect_timeout,
             _shared=True,
         )
     elif provider.startswith("qwen"):
@@ -158,6 +162,7 @@ def _create_cached_client(
             model=model,
             timeout=timeout,
             max_retries=max_retries,
+            connect_timeout=connect_timeout,
             _shared=True,
         )
     else:
@@ -190,6 +195,7 @@ def get_llm_client(model_name: str | None = None) -> LLMClient:
             cfg["openai_llm_base_url"],
             cfg["timeout"],
             cfg["max_retries"],
+            cfg.get("connect_timeout", llm_settings.connect_timeout),
         )
     elif model_lower and "qwen" in model_lower:
         return _create_cached_client(
@@ -199,6 +205,7 @@ def get_llm_client(model_name: str | None = None) -> LLMClient:
             cfg["qwen_vl_base_url"],
             cfg["timeout"],
             cfg["max_retries"],
+            cfg.get("connect_timeout", llm_settings.connect_timeout),
         )
     elif provider == "openai":
         return _create_cached_client(
@@ -208,6 +215,7 @@ def get_llm_client(model_name: str | None = None) -> LLMClient:
             cfg["openai_llm_base_url"],
             cfg["timeout"],
             cfg["max_retries"],
+            cfg.get("connect_timeout", llm_settings.connect_timeout),
         )
     elif provider.startswith("qwen"):
         return _create_cached_client(
@@ -217,6 +225,7 @@ def get_llm_client(model_name: str | None = None) -> LLMClient:
             cfg["qwen_vl_base_url"],
             cfg["timeout"],
             cfg["max_retries"],
+            cfg.get("connect_timeout", llm_settings.connect_timeout),
         )
     else:
         raise ValueError(f"unsupported llm provider: {provider!r} (supported: openai/qwen_vl)")
@@ -256,6 +265,7 @@ async def get_openai_client() -> OpenAIClient:
         cfg["openai_llm_base_url"],
         cfg["timeout"],
         cfg["max_retries"],
+        cfg.get("connect_timeout", llm_settings.connect_timeout),
     )
 
 
@@ -269,4 +279,5 @@ async def get_qwen_vl_client() -> QwenVLClient:
         cfg["qwen_vl_base_url"],
         cfg["timeout"],
         cfg["max_retries"],
+        cfg.get("connect_timeout", llm_settings.connect_timeout),
     )

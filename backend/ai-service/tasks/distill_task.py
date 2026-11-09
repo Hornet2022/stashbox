@@ -33,6 +33,7 @@ from stashbox.backend.common.models.distilled_article import DistilledArticle
 from stashbox.backend.common.analytics import track_simple, track
 from stashbox.backend.common.events import EventName
 from stashbox.backend.common.distill_status import mark_distill_task_failed
+from stashbox.backend.common.distill_failure_reason import user_failure_message
 
 # CP-AGENT-RUNNER-INTEGRATION：distill_task.py 走 LangGraph agent（替代 DistillPipeline.run）
 # 向后兼容：pipeline 仍保留（被外部测试 mock / 老 arq 重试 queue 里残留任务可能用到）
@@ -88,6 +89,20 @@ def _retry_after_seconds(exc: BaseException, default: int = 15) -> int:
         cur = cur.__cause__ or cur.__context__
         seen += 1
     return default
+
+
+def _distill_failure_reason(error_kind: str, exc: BaseException) -> str:
+    """失败原因（写进 `feedback.reason`）：**机器可读的 kind + 原文**。
+
+    为什么带 kind 前缀：admin 面板要一眼看出「这批失败是上游挂了」
+    还是「这批内容有问题」，而不是去读一串英文长串。
+
+    为什么**不手工截断**：`analytics.track()` 会统一把 reason 压到列宽
+    （`feedback.reason` 是 varchar(64)），超长部分进 `metadata['reason_full']`。
+    调用点自己截断的话，完整错误会连 metadata 一起丢掉 ——
+    那正是早期"超长 reason → insert 报错 → 整条事件被静默吞掉"事故的根因。
+    """
+    return f"{error_kind}: {exc}"
 
 
 async def _filter_known_tag_names(db: AsyncSession, names: list[str]) -> list[str]:
@@ -592,6 +607,10 @@ async def distill_task(
             # 否则下面的退避只会用固定 15s —— 15s 落在 60s 熔断窗口内，
             # Arq 的重试会全部打在「拒绝服务」上，把重试次数烧光。
             err = RuntimeError(f"agent distill failed at {err_step} ({err_kind}): {err_msg}")
+            # 🔴 2026-11-09：把机器可读的 kind 挂在异常上。
+            # 下游（失败处理器写 articles.error、用户文案映射）读 `e.kind`，
+            # 不用再从英文消息里正则抠 —— 那正是"连不上被当成超时"的翻车点。
+            err.kind = err_kind
             retry_after = (final or {}).get("retry_after")
             if retry_after:
                 try:
@@ -691,6 +710,14 @@ async def distill_task(
         job_try = int(ctx.get("job_try") or 1)
         max_tries = load_arq_config().retry_max + 1
         will_retry = job_try < max_tries
+
+        # 🔴 2026-11-09：**机器可读的失败分类**（挂在我们自己抛的异常上）。
+        # 之前只有一串英文消息，用户看到的是
+        #   "agent distill failed at rewrite (timeout): openai chat failed ..."，
+        # 既看不懂也不知道怎么办。现在：kind 给机器（分类、埋点、熔断），
+        # user_msg 给用户（写进 articles.error，App 直接显示）。
+        error_kind = getattr(e, "kind", None) or "internal"
+        user_msg = user_failure_message(error_kind)
         log.info(
             "arq_distill_attempt_failed",
             task_id=task_id,
@@ -713,9 +740,15 @@ async def distill_task(
             )
             await db.commit()  # track() 只 flush 不 commit
         # CP6.2.1 埋点：distill_failed + distill_quota_refund
-        # feedback.reason 为 VARCHAR(64)，超长会触发 StringDataRightTruncationError，
-        # 导致埋点失败（被忽略）且掩盖真实错误。截断到 60 字符并保留完整信息到 metadata。
-        reason = str(e)[:60]
+        #
+        # reason 的写法见 `_distill_failure_reason`：**不手工截断** ——
+        # analytics.track() 会统一把 reason 压到列宽（超长部分进 metadata），
+        # 手工截断会把完整错误从 metadata 里也一起弄丢（那正是本文件
+        # 早期"整条事件被静默吞掉"事故的根因）。
+        #
+        # 2026-11-09：reason 前面带上 **kind** —— admin 面板要一眼看出
+        # 「这批失败是上游挂了」还是「这批内容有问题」，而不是去读英文长串。
+        reason = _distill_failure_reason(error_kind, e)
         if not will_retry:
             # 只有**最后一次**尝试仍失败才算「这次蒸馏真的失败了」。
             # 中间失败（还会重试）也记 DISTILL_FAILED 会让失败率统计虚高 ——
@@ -748,7 +781,7 @@ async def distill_task(
                     await db.execute(
                         update(Article)
                         .where(Article.id == article_id)
-                        .values(status="distilling", error=str(e)[:200] or None)
+                        .values(status="distilling", error=user_msg)
                     )
                     # ⚠️ **产物表（distilled_articles）这里不动**。
                     #
@@ -775,7 +808,7 @@ async def distill_task(
                     await db.execute(
                         update(Article)
                         .where(Article.id == article_id)
-                        .values(status="failed", audio_url=None, error=str(e)[:200] or None)
+                        .values(status="failed", audio_url=None, error=user_msg)
                     )
                     # 终局失败：**产物表也要落 failed**（同一事务）。
                     # 理由（实测症状，非洁癖）：
@@ -1430,28 +1463,20 @@ async def _persist_agent_final(
         )
 
     # ---- 第二步：埋点（独立 session，失败只丢埋点，不影响上面的数据）----
-    # 失败 → 带 reason，让 admin dashboard 看到"为什么失败"。
-    # 注意：DistilledArticle 没有 metadata 列（见模型定义），错误详情
-    # 通过 feedback（DISTILL_FAILED.reason）持久化，不写在该行上。
     #
-    # reason **不再手工截断**：feedback.reason 只有 varchar(64)，原先这里截到 200
-    # 反而超长 → insert 报错 → 整条埋点被 track() 静默吞掉（只留一行 warning）。
-    # 现在由 analytics.track() 统一压到列宽，原文自动进 metadata['reason_full']。
-    if status == "failed" and final.get("error"):
-        async with AsyncSessionLocal() as fb_db:
-            try:
-                await track(
-                    fb_db,
-                    EventName.DISTILL_FAILED,
-                    user_id=user_id,
-                    article_id=article_id,
-                    reason=str(final["error"]),
-                )
-                await fb_db.commit()
-            except Exception as exc:
-                log.warning(
-                    "agent_persist_feedback_failed",
-                    task_id=task_id,
-                    error=str(exc),
-                )
-                await fb_db.rollback()
+    # 🔴 2026-11-09：**这里原来在失败时记一条 DISTILL_FAILED，现已移除。**
+    #
+    # 为什么必须移除（实测数字）：
+    #   `_persist_agent_final` 在**每次尝试**末尾都会跑（agent 返回失败也会走到），
+    #   而 Arq 会重试 5 次 ⇒ 一次真实失败会记 5~6 条 DISTILL_FAILED。
+    #   2026-11-09 内测事故实测：4 篇真实失败 ⇒ feedback 表里 **24 条** distill_failed
+    #   ⇒ admin 面板的失败率**虚高 6 倍**（会读成 75% 而不是真实值）。
+    #
+    # 为什么"终局失败"已经有人记了：
+    #   `distill_task` 的失败处理器里有一处埋点，且它**只在最后一次尝试**
+    #   （will_retry=False）才记 —— 那才是"这次蒸馏真的失败了"。
+    #   它的 reason 现在还会带上机器可读的 kind（见上面的 error_kind）。
+    #
+    # 同理，"一篇最终成功的稿子"也不再留下失败记录（中间尝试失败过而已）。
+    #
+    # 技术细节（完整错误）仍在：journald（arq_distill_failed）+ feedback.reason。

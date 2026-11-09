@@ -55,7 +55,21 @@ def _tool_calls_response() -> dict:
 
 @pytest.fixture
 def client():
-    return OpenAIClient(api_key="test-key", base_url="https://mock", timeout=10)
+    """一个**不碰网络**的 client。
+
+    ⚠️ 2026-11-09：`_openai_chat` 在「content 空但 completion_tokens>0」时
+    会去试**流式**回退（`_post_stream`），而流式走的是 `client._client.stream(...)`
+    —— 本文件只 patch 了 `post`，于是流式回退会**真的发一次 DNS 请求**。
+    以前这只是个慢且无害的脏点；现在 LLM 客户端有了熔断（上游不可达就开闸），
+    那几次真实 DNS 失败会把熔断打开 ⇒ 后续被 patch 的 `post` 也被熔断拦下
+    ⇒ 用例报 LLMCircuitOpen（实测踩过）。
+
+    所以这里把 `stream` 一并 stub 成"抛错"：既不碰网络，
+    也不会被算成传输级失败（熔断只对传输失败计数）。
+    """
+    c = OpenAIClient(api_key="test-key", base_url="https://mock", timeout=10)
+    c._client.stream = MagicMock(side_effect=RuntimeError("stream not stubbed in this test"))
+    return c
 
 
 @pytest.mark.asyncio

@@ -51,6 +51,59 @@ from llm.types import ChatMessage, ChatRequest
 log = logging.getLogger("agent.runner")
 
 
+def _classify_llm_failure(exc: BaseException) -> tuple[str | None, int | None]:
+    """从异常链里挖出**真实的** LLM 失败分类。
+
+    返回 `(kind, retry_after)`；认不出来时 kind 为 None（交给调用方的旧兜底逻辑）。
+
+    ## 为什么不能只看 str(e)
+
+    2026-11-09 生产事故：上游整机不可达（TCP 连不上），日志却是
+    `TimeoutError()` —— 因为 llm/openai.py 的总墙钟死线
+    `async with asyncio.timeout(...)` 抛的是**裸 TimeoutError**，
+    httpx 的真实异常（`httpx.ConnectTimeout`）只在 `__cause__` 里。
+    只读 `str(e)` ⇒ "连不上"被当成"响应慢" ⇒ 不熔断、继续空转 30 分钟。
+
+    ## kind 取值
+
+    - `upstream_unavailable`：我们自己开的熔断（上游已判定不可用，别再打）
+    - `upstream_unreachable`：根因是连不上（DNS/TCP/连接被拒）
+    - `timeout`：连上了但没在时限内读完（上游还活着）
+    - 其它 LLMError 自带的 kind（客户端已经分类好的）
+    """
+    from llm.exceptions import LLMCircuitOpen
+    from llm.failure import (
+        KIND_TIMEOUT,
+        KIND_UNREACHABLE,
+        classify_transport_error,
+        iter_exception_chain,
+    )
+
+    # 1) 熔断异常：自己抛的，kind 最权威
+    for item in iter_exception_chain(exc):
+        if isinstance(item, LLMCircuitOpen):
+            return "upstream_unavailable", item.retry_after
+
+    # 2) LLMError 自带 kind（客户端已按根因分类过）
+    for item in iter_exception_chain(exc):
+        if isinstance(item, LLMError):
+            kind = getattr(item, "kind", None)
+            if kind == KIND_UNREACHABLE:
+                return "upstream_unreachable", None
+            if kind == KIND_TIMEOUT:
+                return "timeout", None
+            if kind:
+                return kind, None
+
+    # 3) 兜底：沿链找传输层根因
+    kind = classify_transport_error(exc)
+    if kind == KIND_UNREACHABLE:
+        return "upstream_unreachable", None
+    if kind == KIND_TIMEOUT:
+        return "timeout", None
+    return None, None
+
+
 # ---------------------------------------------------------------------------
 # 节点函数
 # ---------------------------------------------------------------------------
@@ -398,47 +451,65 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
         kind = "internal"
         retry_after = None
 
-        # CP-AGENT-LLM-ERR-CLASSIFY：LLMClient 会把底层 httpx 异常包成
+        # 🔴 CP-AGENT-LLM-ERR-CLASSIFY-ROOTCAUSE（2026-11-09 事故修）：
+        #
+        # 事故：上游 tertu.cn 整机不可达（TCP 连不上），4 篇内测文章全挂在
+        # rewrite 步骤，日志写的是 `TimeoutError()`，于是 kind 被判成 **timeout**。
+        #
+        # 根因：`_post` 里的总墙钟死线 `async with asyncio.timeout(...)` 到点抛的是
+        # **裸 TimeoutError**，httpx 的真实异常（httpx.ConnectTimeout）只在
+        # `__cause__` 里。而这里只读 `str(e)`（= "TimeoutError()"）⇒ 根因丢失。
+        #
+        # ⇒ 分类必须**沿异常链找根因**（llm/failure.py 提供），
+        #    并且优先于下面的消息关键字兜底 —— 消息兜底只在链里啥也找不到时用。
+        root_kind, root_retry_after = _classify_llm_failure(e)
+        if root_kind:
+            kind = root_kind
+            retry_after = root_retry_after
+
+        # CP-AGENT-LLM-ERR：LLMClient 会把底层 httpx 异常包成
         # llm.exceptions.LLMError（消息形如 "...: ReadTimeout('')"），
         # 所以先按类型判 httpx 家族，再按消息关键字兜底。
         msg = str(e) or ""
         msg_low = msg.lower()
 
-        if "readtimeout" in msg_low or "timeout" in msg_low or "timed out" in msg_low:
-            kind = "timeout"
-        elif "connecterror" in msg_low or "connection refused" in msg_low:
-            kind = "connect"
-        elif "401" in msg or "unauthorized" in msg_low or "invalid api key" in msg_low:
-            kind = "auth"
-        elif "429" in msg or "rate limit" in msg_low:
-            kind = "ratelimit"
-        elif "404" in msg or "unsupportedmodel" in msg_low:
-            kind = "notfound"
+        if not root_kind:
+            if "readtimeout" in msg_low or "timeout" in msg_low or "timed out" in msg_low:
+                kind = "timeout"
+            elif "connecterror" in msg_low or "connection refused" in msg_low:
+                kind = "connect"
+            elif "401" in msg or "unauthorized" in msg_low or "invalid api key" in msg_low:
+                kind = "auth"
+            elif "429" in msg or "rate limit" in msg_low:
+                kind = "ratelimit"
+            elif "404" in msg or "unsupportedmodel" in msg_low:
+                kind = "notfound"
 
         try:
             import httpx as _httpx
 
-            if isinstance(e, _httpx.TimeoutException):
-                kind = "timeout"
-            elif isinstance(e, _httpx.ConnectError):
-                kind = "connect"
-            elif isinstance(e, _httpx.NetworkError):
-                kind = "network"
-            elif isinstance(e, _httpx.HTTPStatusError):
-                sc = e.response.status_code
-                if sc == 401:
-                    kind = "auth"
-                elif sc == 403:
-                    kind = "forbidden"
-                elif sc == 404:
-                    kind = "notfound"
-                elif sc == 429:
-                    kind = "ratelimit"
-                    retry_after = e.response.headers.get("retry-after")
-                elif sc >= 500:
-                    kind = "internal"
-                else:
-                    kind = "badreq"
+            if not root_kind:
+                if isinstance(e, _httpx.TimeoutException):
+                    kind = "timeout"
+                elif isinstance(e, _httpx.ConnectError):
+                    kind = "connect"
+                elif isinstance(e, _httpx.NetworkError):
+                    kind = "network"
+                elif isinstance(e, _httpx.HTTPStatusError):
+                    sc = e.response.status_code
+                    if sc == 401:
+                        kind = "auth"
+                    elif sc == 403:
+                        kind = "forbidden"
+                    elif sc == 404:
+                        kind = "notfound"
+                    elif sc == 429:
+                        kind = "ratelimit"
+                        retry_after = e.response.headers.get("retry-after")
+                    elif sc >= 500:
+                        kind = "internal"
+                    else:
+                        kind = "badreq"
         except ImportError:
             pass
 
