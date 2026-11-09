@@ -380,13 +380,13 @@ SKIP_NETWORK=1 ./preflight.sh        # 跳过 DB/Redis 连通性（离线校验�
 
 ```bash
 # ① 在**安卓仓**打 release 包（签名凭据在 ~/.stashbox/，仓库外）
-cd ../stashbox-android
+cd ../../stashbox-android   # 两仓是**同级兄弟目录**
 bash scripts/build_release.sh --api-base-url https://api.stashbox.cn/
 
 # ② 回到**后端仓**发版（一条命令做完全部）
 cd ../stashbox/backend
 ./deploy/release_apk.sh \
-  ../stashbox-android/app/build/outputs/apk/release/app-release.apk \
+  ../../stashbox-android/app/build/outputs/apk/release/app-release.apk \
   0.5.3 26 \
   "0.5.3 修复：……（用户在更新弹窗里读到的文字，不能为空）"
 ```
