@@ -207,5 +207,26 @@ else
 fi
 
 echo
+echo "→ 交叉核对三处真相源（与独立巡检同一份判定实现）"
+#
+# 为什么发版脚本自己查完了还要再跑一次巡检：
+#   上面那些校验验的是"**我刚写的**跟接口对不对得上"；
+#   巡检验的是"**三处**（env / 软链 / 磁盘文件）跟接口对不对得上"。
+# 后者能抓到前者抓不到的情况：比如发版过程中有人手改过 env、
+# 或者软链被别人挪走 —— 那时"我写的"仍然是对的，但"现在的状态"是错的。
+#
+# 用同一份判定实现（deploy/release_consistency.py）⇒ 判据不会两份漂移。
+STASHBOX_HOST="$HOST" \
+  STASHBOX_SSH_KEY="$SSH_KEY" \
+  STASHBOX_REMOTE_DIR="$REMOTE_DIR" \
+  STASHBOX_ENV_FILE="$ENV_FILE" \
+  STASHBOX_VERSION_API="https://api.stashbox.cn/api/v1/app/version" \
+  STASHBOX_DOWNLOAD_BASE="$DOWNLOAD_BASE" \
+  bash "$(dirname "$0")/verify_release_consistency.sh" || {
+    echo "✗ 三处真相源不一致（上面列出了每一处）—— 版本已上线，但状态是错的，必须修" >&2
+    exit 1
+  }
+
+echo
 echo "✅ 发版完成：${VERSION_NAME}（code ${VERSION_CODE}）"
 echo "   下载入口：${DOWNLOAD_BASE}/latest.apk"
