@@ -190,10 +190,15 @@ async def seed(key: str, fields: dict[str, Any], *, force: bool, dry_run: bool) 
         return 0
     if dry_run:
         print(f"[{key}] dry-run：将会写入 {changed} 个字段：")
-        for field, value in merged.items():
-            mark = "*" if stored.get(field) in (None, "") else " "
+        # 只列**真正会写**的字段。
+        # ⚠️ 别把 merged 全打出来：DB 里那些"空但本次不写"的字段
+        #    （比如 openai_language=None）混进来，会让运维以为
+        #    "要写一堆 null 进去" —— 那是误导。
+        for field, value in fields.items():
+            if stored.get(field) not in (None, ""):
+                continue  # DB 里已有 ⇒ 不会写
             shown = "***" if "key" in field or "token" in field else value
-            print(f"   {mark} {field} = {shown}")
+            print(f"   * {field} = {shown}")
         return changed
 
     await set_config(key, merged)
@@ -260,11 +265,19 @@ def main() -> int:
 
     print(f"从 env 读到：llm {sorted(llm_fields)} / tts {sorted(tts_fields)}")
 
-    changed = 0
-    if llm_fields:
-        changed += asyncio.run(seed(key_llm, llm_fields, force=args.force, dry_run=args.dry_run))
-    if tts_fields:
-        changed += asyncio.run(seed(key_tts, tts_fields, force=args.force, dry_run=args.dry_run))
+    # ⚠️ 两个种子必须在**同一个** event loop 里跑：
+    #    `asyncio.run()` 每次都新建 loop，而 DB engine / Redis pool 是
+    #    **懒创建并绑定到第一次用的那个 loop** —— 第二次 `asyncio.run()`
+    #    会撞上 "Event loop is closed"（实测：llm 种子跑完，tts 种子崩）。
+    async def _seed_all() -> int:
+        changed = 0
+        if llm_fields:
+            changed += await seed(key_llm, llm_fields, force=args.force, dry_run=args.dry_run)
+        if tts_fields:
+            changed += await seed(key_tts, tts_fields, force=args.force, dry_run=args.dry_run)
+        return changed
+
+    changed = asyncio.run(_seed_all())
 
     if args.dry_run:
         print(f"（dry-run：共 {changed} 个字段会被写入）")
