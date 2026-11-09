@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import base64
 import logging
-import os
 from io import BytesIO
 from typing import Any
 
@@ -130,41 +129,26 @@ class OCRUnavailableError(RuntimeError):
 
 
 async def _resolve_config() -> tuple[str, str, str]:
-    """(base_url, api_key, model) —— DB > env > 默认。
+    """(base_url, api_key, model) —— **只认 DB**（`system_config` 表 key="llm"）。
 
     base_url / api_key **复用 LLM 的那份配置**（同一个 provider、同一个 key）
     ⇒ 运营在后台改 LLM 配置，OCR 自动跟着走，不需要配第二套凭据。
 
-    模型名可以单独覆盖：
-    - `system_config.llm.ocr_model`（后台改，不用重启）；
-    - 环境变量 `STASHBOX_OCR_MODEL`；
-    - 默认 `Qwen/Qwen3-VL-32B-Instruct`。
+    模型名从同一行 DB 里取：`system_config.llm.ocr_model`；
+    没配就用代码默认值 `Qwen/Qwen3-VL-32B-Instruct`。
+
+    ⚠️ 2026-11-10 收敛：这里**不再**回落 env
+    （`OPENAI_LLM_BASE_URL` / `OPENAI_LLM_API_KEY` / `STASHBOX_OCR_MODEL`）。
+    以前回落 env 意味着：DB 读失败 ⇒ 静默用 env 里那个**已下线的端点**，
+    症状是 401/连接失败，**完全看不出是"配置没读到"** ⇒ 排查方向被带偏。
+    现在配置读不到就**读不到**（`UpstreamConfigUnavailable` 由调用方看到明确原因）。
     """
-    base_url = ""
-    api_key = ""
-    try:
-        from stashbox.backend.app.services.llm import current_config
+    from stashbox.backend.common.upstream_config import load_llm
 
-        cfg = await current_config()
-        base_url = str(cfg.get("base_url") or cfg.get("openai_llm_base_url") or "")
-        api_key = str(cfg.get("api_key") or cfg.get("openai_llm_api_key") or "")
-    except Exception as exc:  # pragma: no cover - 配置层异常不该让解析崩
-        log.warning("ocr_config_resolve_failed: %s", exc)
-
-    if not base_url:
-        base_url = os.getenv("OPENAI_LLM_BASE_URL", "") or ""
-    if not api_key:
-        api_key = os.getenv("OPENAI_LLM_API_KEY", "") or ""
-
-    model = ""
-    try:
-        from stashbox.backend.common.system_config import KEY_LLM, get_config
-
-        stored = await get_config(KEY_LLM) or {}
-        model = str(stored.get("ocr_model") or "")
-    except Exception:  # pragma: no cover
-        pass
-    model = model or (os.getenv("STASHBOX_OCR_MODEL", "") or "") or DEFAULT_OCR_MODEL
+    cfg, _source = await load_llm()
+    base_url = str(cfg.get("base_url") or cfg.get("openai_llm_base_url") or "")
+    api_key = str(cfg.get("api_key") or cfg.get("openai_llm_api_key") or "")
+    model = str(cfg.get("ocr_model") or DEFAULT_OCR_MODEL)
 
     return base_url.rstrip("/"), api_key, model
 

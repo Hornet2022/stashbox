@@ -24,13 +24,14 @@
 或单次完整 JSON（按接口和参数选择）。
 
 依赖: httpx（已在 requirements.txt）
-凭证: DOUBAO_TTS_API_KEY（DOUBAO_TTS_APP_ID/TOKEN 旧版兼容，自动 fallback）
+凭证: 由管理后台「TTS 设置页」配置并落 DB（system_config / key="tts"）——
+     DOUBAO_TTS_APP_ID/TOKEN 旧版兼容，构造器里 api_key 优先于 token。
+     构造器**不再回落 env**：只认 DB，避免配置出现两个真相源。
 """
 
 import base64
 import json
 import logging
-import os
 
 import httpx
 
@@ -57,24 +58,17 @@ class DoubaoTTSClient(TTSClient):
         timeout: float = 60.0,
     ):
         # CP9.x：优先 Coding Plan 专属 API Key；旧版 APP_ID/TOKEN 作 fallback
-        self.api_key = (
-            api_key
-            if api_key is not None
-            else (
-                token
-                if token
-                else os.getenv("DOUBAO_TTS_API_KEY", os.getenv("DOUBAO_TTS_TOKEN", ""))
-            )
-        )
+        #
+        # ⚠️ **不再回落 env**（2026-11-10 配置收敛）：api_key / voice /
+        #   resource_id 都是**身份类**字段 —— 决定"用哪把凭据打火山、什么音色、
+        #   哪个资源 ID"。它们由管理后台「TTS 设置页」配置并落进 `system_config`
+        #   表（key="tts"），唯一真相源是 DB。保留 env 兜底会让配置出现两个真相源
+        #   （DB 里配的凭据可能被 env 里的旧凭据静默顶掉，且不报错）。
+        #   取值顺序不变：**api_key 优先于 token**；都没有时落代码默认值（空）。
+        self.api_key = api_key if api_key is not None else (token if token else "")
         self.app_id = app_id  # 旧版专用
-        self.voice = (
-            voice if voice is not None else os.getenv("DOUBAO_TTS_VOICE", self.DEFAULT_VOICE)
-        )
-        self.resource_id = (
-            resource_id
-            if resource_id is not None
-            else os.getenv("DOUBAO_TTS_RESOURCE_ID", self.DEFAULT_RESOURCE_ID)
-        )
+        self.voice = voice if voice is not None else self.DEFAULT_VOICE
+        self.resource_id = resource_id if resource_id is not None else self.DEFAULT_RESOURCE_ID
         # trust_env=False：忽略沙箱/系统 HTTP(S)_PROXY（代理端口轮换会导致外网请求随机 ConnectError）
         self._client = httpx.AsyncClient(timeout=timeout, trust_env=False)
 

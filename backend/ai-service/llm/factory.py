@@ -1,16 +1,23 @@
-"""LLM Client 工厂（基于 llm_settings.provider，CP3.5-pre-1）。
+"""LLM Client 工厂（CP3.5-pre-1）。
 
-CP1.8+ 接 Nacos 动态配置时，provider 的来源从 LLMSettings 换成 Nacos，本文件对外接口不变。
-注意：openai / qwen_vl 实现持有 httpx AsyncClient，用完要 `await client.close()`（或 async with）。
+⚠️ **配置源只有一个：DB**（`system_config` 表 key="llm"）。
+   读取与规范化统一走 `stashbox.backend.common.upstream_config`，
+   本文件**不再**读 env —— 见该模块 docstring 里 2026-11-09/10 事故的完整复盘。
 
-CP11.x：管理后台统一配置入口
-- `await reload()` 读 system_config KEY_LLM（DB，Redis 5s 缓存）→ DB > env。
-- 后台 PUT /admin/llm/config 存的是通用字段 provider / model / api_key / base_url，
-  这里映射回分 provider 字段（openai_llm_* / qwen_vl_*）。
-- `get_llm_client()` 同步签名不变：有 DB 覆盖用覆盖，否则回落 llm_settings（.env）。
+2026-11-10 收敛（单一真相源）：
+- 以前这里是「DB 覆盖 > env 逐字段回落」：DB 读失败就**静默**回落到 env，
+  而 env 里还残留着**已下线的端点** ⇒ 请求打到死端点，日志里看不出"配置没读到"。
+- 现在：DB 读失败 → 用进程内 last-good；本进程从未成功读过 → 抛
+  `UpstreamConfigUnavailable`（明确可操作），**不静默降级**。
+- DB 缺字段 → 用**代码默认值**（不是 env）。
+- 「通用字段 ↔ provider 专属字段」的映射只在 upstream_config 里实现一次。
+
+调用方：
+- `await reload()`：读 DB → 规范化 → 缓存（蒸馏任务启动前调用，热生效）。
+- `get_llm_client()`：同步签名不变，读**进程内缓存**；缓存空 ⇒ 抛明确异常。
 
 CP3.6.2：factory 单例化
-- `_create_cached_client()` 加 `@lru_cache(maxsize=8)` —— 同 (provider, model, api_key, base_url, timeout, max_retries) 返回同一实例。
+- `_create_cached_client()` 加 `@lru_cache(maxsize=8)` —— 同 (provider, model, api_key, base_url, timeout, max_retries, connect_timeout) 返回同一实例。
 - 单例 client 实例化时设 `_shared=True` → `close()` 变 no-op，避免破坏其他任务的 httpx 连接池。
 - 关闭语义改为 `close_all_llm_clients()` 在 FastAPI lifespan shutdown 统一调用。
 - 业务调用方（distill_task.py）改用 `maybe_close_llm_client(llm)` —— 单例 no-op，非单例正常关。
@@ -18,10 +25,13 @@ CP3.6.2：factory 单例化
 
 from functools import lru_cache
 import weakref
-from typing import TYPE_CHECKING
 
-from config_llm import llm_settings
 from stashbox.backend.common.logging import get_logger
+from stashbox.backend.common.upstream_config import (
+    LLM_CODE_DEFAULTS,
+    current_llm,
+    load_llm,
+)
 
 from .base import LLMClient
 from .openai import OpenAIClient
@@ -29,81 +39,42 @@ from .qwen_vl import QwenVLClient
 
 log = get_logger(__name__)
 
-if TYPE_CHECKING:
-    pass
-
-# DB 覆盖配置（reload() 写入；None = 还没读/读失败 → 走 env）
+# 生效配置（reload() 写入；None = 本进程还没成功读过 DB ⇒ 抛明确异常，不回落 env）
 _db_config: dict | None = None
 
 
-def _env_view() -> dict:
-    """llm_settings 的等价 dict 视图（provider 路由用）。"""
-    return {
-        "provider": llm_settings.llm_provider,
-        "model": None,
-        "api_key": None,
-        "base_url": None,
-        "openai_llm_api_key": llm_settings.openai_llm_api_key,
-        "openai_llm_model": llm_settings.openai_llm_model,
-        "openai_llm_base_url": llm_settings.openai_llm_base_url,
-        "qwen_vl_api_key": llm_settings.qwen_vl_api_key,
-        "qwen_vl_model": llm_settings.qwen_vl_model,
-        "qwen_vl_base_url": llm_settings.qwen_vl_base_url,
-        "timeout": llm_settings.timeout,
-        "max_retries": llm_settings.max_retries,
-        # 2026-11-09：连接超时独立于读超时（"连不上"要快速判死，见 config_llm 说明）
-        "connect_timeout": llm_settings.connect_timeout,
-    }
-
-
 async def reload() -> dict:
-    """读 DB 配置（KEY_LLM），合并成生效配置并缓存；返回生效配置。
+    """读 DB 配置（KEY_LLM）→ 规范化 → 缓存；返回生效配置。
 
     蒸馏任务启动前调用（与 tts_reload 对称）→ 管理后台改 LLM 配置热生效。
-    DB 里 provider 之外的字段（model / api_key / base_url）是「通用字段」，
-    按 provider 映射到 openai_llm_* / qwen_vl_*。DB 无值时逐字段回落 env。
+
+    读失败且本进程没有 last-good ⇒ 抛 `UpstreamConfigUnavailable`
+    （**不回落 env**：那正是 2026-11-09 事故里"打到已下线端点"的根因）。
     """
     global _db_config
-    cfg = _env_view()
-    try:
-        from stashbox.backend.common.system_config import KEY_LLM, get_config
-
-        stored = await get_config(KEY_LLM) or {}
-    except Exception:
-        stored = {}
-
-    if stored.get("provider"):
-        cfg["provider"] = str(stored["provider"]).lower()
-    provider = cfg["provider"]
-    if stored.get("model"):
-        cfg["model"] = str(stored["model"])
-    if stored.get("api_key"):
-        cfg["api_key"] = str(stored["api_key"])
-    if stored.get("base_url"):
-        cfg["base_url"] = str(stored["base_url"])
-
-    # 通用字段 → 分 provider 字段（对齐 app/services/llm.resolve_config 的映射）
-    if provider == "openai":
-        if cfg.get("api_key"):
-            cfg["openai_llm_api_key"] = cfg["api_key"]
-        if cfg.get("model"):
-            cfg["openai_llm_model"] = cfg["model"]
-        if cfg.get("base_url"):
-            cfg["openai_llm_base_url"] = cfg["base_url"]
-    elif provider.startswith("qwen"):
-        if cfg.get("api_key"):
-            cfg["qwen_vl_api_key"] = cfg["api_key"]
-        if cfg.get("model"):
-            cfg["qwen_vl_model"] = cfg["model"]
-        if cfg.get("base_url"):
-            cfg["qwen_vl_base_url"] = cfg["base_url"]
-
+    cfg, source = await load_llm()
     _db_config = cfg
+    log.info(
+        "llm_config_loaded",
+        provider=cfg.get("provider"),
+        model=cfg.get("model"),
+        base_url=cfg.get("base_url"),
+        api_key_set=bool(cfg.get("api_key")),
+        source=source,
+    )
     return cfg
 
 
 def _effective() -> dict:
-    return _db_config if _db_config is not None else _env_view()
+    """当前生效配置。
+
+    优先用本模块缓存（reload() 写的）；没有则读 upstream_config 的进程内缓存
+    （content-service 与 ai-service 共用同一份 last-good 语义）。
+    两者都空 ⇒ 抛 `UpstreamConfigUnavailable` —— **不回落 env**。
+    """
+    if _db_config is not None:
+        return _db_config
+    return current_llm()
 
 
 # CP3.6.2：进程级单例池（maxsize=8 个不同配置）
@@ -195,7 +166,7 @@ def get_llm_client(model_name: str | None = None) -> LLMClient:
             cfg["openai_llm_base_url"],
             cfg["timeout"],
             cfg["max_retries"],
-            cfg.get("connect_timeout", llm_settings.connect_timeout),
+            cfg.get("connect_timeout", LLM_CODE_DEFAULTS["connect_timeout"]),
         )
     elif model_lower and "qwen" in model_lower:
         return _create_cached_client(
@@ -205,7 +176,7 @@ def get_llm_client(model_name: str | None = None) -> LLMClient:
             cfg["qwen_vl_base_url"],
             cfg["timeout"],
             cfg["max_retries"],
-            cfg.get("connect_timeout", llm_settings.connect_timeout),
+            cfg.get("connect_timeout", LLM_CODE_DEFAULTS["connect_timeout"]),
         )
     elif provider == "openai":
         return _create_cached_client(
@@ -215,7 +186,7 @@ def get_llm_client(model_name: str | None = None) -> LLMClient:
             cfg["openai_llm_base_url"],
             cfg["timeout"],
             cfg["max_retries"],
-            cfg.get("connect_timeout", llm_settings.connect_timeout),
+            cfg.get("connect_timeout", LLM_CODE_DEFAULTS["connect_timeout"]),
         )
     elif provider.startswith("qwen"):
         return _create_cached_client(
@@ -225,7 +196,7 @@ def get_llm_client(model_name: str | None = None) -> LLMClient:
             cfg["qwen_vl_base_url"],
             cfg["timeout"],
             cfg["max_retries"],
-            cfg.get("connect_timeout", llm_settings.connect_timeout),
+            cfg.get("connect_timeout", LLM_CODE_DEFAULTS["connect_timeout"]),
         )
     else:
         raise ValueError(f"unsupported llm provider: {provider!r} (supported: openai/qwen_vl)")
@@ -265,7 +236,7 @@ async def get_openai_client() -> OpenAIClient:
         cfg["openai_llm_base_url"],
         cfg["timeout"],
         cfg["max_retries"],
-        cfg.get("connect_timeout", llm_settings.connect_timeout),
+        cfg.get("connect_timeout", LLM_CODE_DEFAULTS["connect_timeout"]),
     )
 
 
@@ -279,5 +250,5 @@ async def get_qwen_vl_client() -> QwenVLClient:
         cfg["qwen_vl_base_url"],
         cfg["timeout"],
         cfg["max_retries"],
-        cfg.get("connect_timeout", llm_settings.connect_timeout),
+        cfg.get("connect_timeout", LLM_CODE_DEFAULTS["connect_timeout"]),
     )

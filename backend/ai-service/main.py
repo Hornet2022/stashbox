@@ -62,6 +62,39 @@ async def lifespan(app: FastAPI):
     startup 期间启动队列 poller（try/except 包住，不拖垮服务）。
     shutdown 期间关闭 Arq 连接池。
     """
+    # ---- startup: 上游配置自检（只读）----
+    #
+    # 2026-11-10：上游配置收敛成"只认 DB"之后，"配置没读到 / 没配全"
+    # 不再是运行期的神秘失败（以前会静默回落 env，打到已下线的端点）。
+    # 但**只认 DB**也意味着配错了就是彻底不可用 ⇒ 必须在**启动时**就点名，
+    # 而不是等第一篇稿子跑到一半才炸。
+    #
+    # 自检**不阻塞启动**：配置是可以在管理后台热改的，起不来反而更糟。
+    # 它只负责"大声说出来"。
+    try:
+        from stashbox.backend.common.upstream_config import diagnose
+
+        report = await diagnose()
+        for name, info in report.items():
+            if info.get("ok"):
+                log.info(
+                    "upstream_config_ready name=%s provider=%s base_url=%s source=%s",
+                    name,
+                    info.get("provider"),
+                    info.get("base_url"),
+                    info.get("source"),
+                )
+            else:
+                log.error(
+                    "upstream_config_not_ready name=%s missing=%s source=%s error=%s",
+                    name,
+                    info.get("missing"),
+                    info.get("source"),
+                    info.get("error"),
+                )
+    except Exception as exc:
+        log.warning("upstream_config_diagnose_failed: %s", exc)
+
     # ---- startup: 队列 poller ----
     poll_task = None
     try:

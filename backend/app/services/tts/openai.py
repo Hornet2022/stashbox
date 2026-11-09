@@ -93,7 +93,10 @@ IndexTTS provider 早就因为同类问题做了分段，这套实现现在共�
 - 鉴权：Bearer <ARK_API_KEY>（方舟控制台 → API Key 管理）
 
 依赖: httpx（已在 requirements.txt）
-凭证: OPENAI_TTS_API_KEY（与 LLM 端的 OPENAI_LLM_API_KEY 拆开，CP9.x 决策）
+凭证: 由管理后台「TTS 设置页」配置并落 DB（system_config / key="tts"），
+     与 LLM 端凭据拆开（CP9.x 决策）。构造器**不再回落 env**：身份类字段
+     （api_key / model / voice / instructions / language / base_url）只认 DB，
+     避免配置出现两个真相源。传输类字段（超时 / 分块 / 并发等）仍读 env。
 
 ## ⚠️ 上游到底接受哪些字段（2026-10-23 对生产端点实测，别凭直觉猜）
 
@@ -450,10 +453,19 @@ class OpenAITTSClient(TTSClient):
         language: str | None = None,
         clone_chunk_chars: int | None = None,
     ):
-        # 优先入参；入参缺省时从环境变量读（pydantic Settings 不会接管 .env 加载到这里）
-        self.api_key = api_key if api_key is not None else os.getenv("OPENAI_TTS_API_KEY", "")
-        self.model = model if model is not None else os.getenv("OPENAI_TTS_MODEL", _DEFAULT_MODEL)
-        self.voice = voice if voice is not None else os.getenv("OPENAI_TTS_VOICE", _DEFAULT_VOICE)
+        # 优先入参；入参缺省时用**代码默认值**。
+        #
+        # ⚠️ **不再回落 env**（2026-11-10 配置收敛）：api_key / model / voice /
+        #   instructions / language / base_url 都是**身份类**字段 —— 决定"打哪个
+        #   上游、用什么凭据、用哪个模型、什么音色"。它们由管理后台「TTS 设置页」
+        #   配置并落进 `system_config` 表（key="tts"），唯一真相源是 DB。
+        #   如果这里保留 env 兜底，配置就会有两个真相源：DB 里明明配了 A 端点，
+        #   只要调用方少传一个参数就会静默落到 env 里的 B 端点，且没有任何报错。
+        #   调用方（services/tts/__init__.py::build_client）总是显式传入 DB 解析值，
+        #   这里的默认值只在"确实没配"时生效。
+        self.api_key = api_key if api_key is not None else ""
+        self.model = model if model is not None else _DEFAULT_MODEL
+        self.voice = voice if voice is not None else _DEFAULT_VOICE
         # ── 风格控制 prompt（instructions）────────────────────────────────
         #
         # CustomVoice 模型（Qwen3-TTS-12Hz-1.7B-CustomVoice）的核心能力：
@@ -472,16 +484,13 @@ class OpenAITTSClient(TTSClient):
         #
         # 实测是**实例属性** → 同一篇的每一段读到的都是**逐字相同**的同一份
         # 字符串，这才叫「风格一致」。
-        self.instructions = (
-            instructions if instructions is not None else os.getenv("OPENAI_TTS_INSTRUCTIONS", "")
-        ).strip()
+        # 下面三个同样是**身份类**字段（音色身份/风格/端点），一律落回**代码默认值**
+        # 而不是 env：它们由管理后台 TTS 设置页配、落 DB；env 兜底会让配置有两个
+        # 真相源（DB 配的端点可能被 env 静默顶掉）。
+        self.instructions = (instructions if instructions is not None else "").strip()
         # 语言标签（上游 string 校验）。中文稿一般不用配，留空即不传。
-        self.language = (
-            language if language is not None else os.getenv("OPENAI_TTS_LANGUAGE", "")
-        ).strip()
-        self.base_url = (
-            base_url if base_url is not None else os.getenv("OPENAI_BASE_URL", _DEFAULT_BASE_URL)
-        ).rstrip("/")
+        self.language = (language if language is not None else "").strip()
+        self.base_url = (base_url if base_url is not None else _DEFAULT_BASE_URL).rstrip("/")
         self.timeout = (
             timeout if timeout is not None else float(os.getenv("OPENAI_TTS_TIMEOUT", "300"))
         )

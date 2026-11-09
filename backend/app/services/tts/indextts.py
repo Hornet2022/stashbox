@@ -213,12 +213,22 @@ class IndexTTSClient(TTSClient):
         temperature: float | None = None,
         top_p: float | None = None,
     ):
-        self.base_url = (base_url or os.getenv("INDEXTTS_BASE_URL", self.DEFAULT_BASE_URL)).rstrip(
-            "/"
-        )
-        self.model = model or os.getenv("INDEXTTS_MODEL", self.DEFAULT_MODEL)
-        self.ref_audio_path = ref_audio_path or os.getenv("INDEXTTS_REF_AUDIO", "")
-        self.ref_text = ref_text or os.getenv("INDEXTTS_REF_TEXT", "")
+        # ⚠️ **不再回落 env**（2026-11-10 配置收敛）：base_url / model /
+        #   ref_audio / ref_text / speaker / instruct / temperature / top_p
+        #   都是**身份类**字段 —— 决定"打哪个上游、用哪个模型、克隆哪份音色、
+        #   采样到什么程度"。它们由管理后台「TTS 设置页」配置并落进
+        #   `system_config` 表（key="tts"），唯一真相源是 DB。env 兜底会让配置
+        #   有两个真相源：DB 里明明配了 A 端点，只要这里少传一个参数就静默落到
+        #   env 里的 B 端点。
+        #
+        # ⚠️ **语义变化（刻意）**：base_url / model / ref_audio / ref_text 用的是
+        #   `or` 判定（空串也算"没传"）。原来空串会回落到 env，现在空串回落到
+        #   **代码默认值** —— 因为 DB 里的空串含义就是"没配"，应该落回代码默认
+        #   而不是 env。
+        self.base_url = (base_url or self.DEFAULT_BASE_URL).rstrip("/")
+        self.model = model or self.DEFAULT_MODEL
+        self.ref_audio_path = ref_audio_path or ""
+        self.ref_text = ref_text or ""
 
         # ── 模式：克隆（ref_audio）还是 CustomVoice（speaker + instruct）────
         #
@@ -235,12 +245,11 @@ class IndexTTSClient(TTSClient):
         # 实际一直在走克隆，音色漂移也查不到原因。
         # 所以这里显式定优先级：**CustomVoice 配置优先**，克隆参数被忽略，
         # 并打一条 WARN 说明（静默降级是最难查的一类问题）。
-        self.speaker = (
-            speaker if speaker is not None else os.getenv("INDEXTTS_SPEAKER", "")
-        ).strip()
-        self.instruct = (
-            instruct if instruct is not None else os.getenv("INDEXTTS_INSTRUCT", "")
-        ).strip()
+        # speaker / instruct 同样是身份类字段（音色名 / 风格控制）→ 落代码默认值
+        # （空串），不再回落 env：它们由管理后台 TTS 设置页配、落 DB；
+        # env 兜底会让配置有两个真相源。
+        self.speaker = (speaker if speaker is not None else "").strip()
+        self.instruct = (instruct if instruct is not None else "").strip()
         self.use_custom_voice = bool(self.speaker or self.instruct)
         # ⚠️ 只配了 instruct（风格控制）却没配 speaker（音色名）→ **直接报错**。
         #
@@ -278,12 +287,11 @@ class IndexTTSClient(TTSClient):
         #      （它们是实例属性，_synthesize_once 每次读同一份）；
         #   ② temperature / top_p 固定成低值 → 段间不各自随机；
         #   ③ 克隆模式下 ref_audio / ref_text 同样每段一致。
-        self.temperature = (
-            temperature
-            if temperature is not None
-            else float(os.getenv("INDEXTTS_TEMPERATURE", "0.7"))
-        )
-        self.top_p = top_p if top_p is not None else float(os.getenv("INDEXTTS_TOP_P", "0.9"))
+        # temperature / top_p 是身份类字段（决定采样出的音色/韵律特征）→ 落代码
+        # 默认值（0.7 / 0.9），不再回落 env：这两个由管理后台 TTS 设置页配、落 DB；
+        # env 兜底会让配置有两个真相源。
+        self.temperature = temperature if temperature is not None else 0.7
+        self.top_p = top_p if top_p is not None else 0.9
         # 超时可配：首次加载 1.7GB 权重 / 机器负载高时，单段合成可能远超 120s，
         # 硬编码会让蒸馏在 TTS 阶段必然超时失败（实测「合成超时(120.0s)」）。
         # 默认放宽到 300s，可用 INDEXTTS_TIMEOUT 覆盖。

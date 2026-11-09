@@ -3,8 +3,10 @@
 适用场景：开发 / 内网 / 无云 TTS 凭证时，用 macmini 自带的中文语音合成。
 依赖：macOS 系统 `say` 命令 + ffmpeg（aiff→mp3）。
 
-默认音色：Tingting（中文（中国大陆））。可用 TTS_LOCAL_VOICE 覆盖。
-ffmpeg 路径可用 FFMPEG_BIN 覆盖（默认 /opt/homebrew/bin/ffmpeg）。
+默认音色：Tingting（中文（中国大陆））。音色由管理后台 TTS 设置页配置（落 DB），
+不再回落 TTS_LOCAL_VOICE 环境变量（只认 DB，避免两个真相源）。
+ffmpeg 路径可用 FFMPEG_BIN 覆盖（默认 /opt/homebrew/bin/ffmpeg）——这是传输层
+实现细节，保留 env 兜底。
 返回 mp3 bytes，对接 distill step3/step4 的「真实音频」路径（ffmpeg 拼成可播放 m4a）。
 """
 
@@ -26,7 +28,11 @@ class LocalTTSClient(TTSClient):
     DEFAULT_VOICE = "Tingting"
 
     def __init__(self, voice: str = None, ffmpeg_bin: str = None):
-        self.voice = voice or os.getenv("TTS_LOCAL_VOICE", self.DEFAULT_VOICE)
+        # voice 是**身份类**字段（决定用哪个系统音色）→ 落代码默认值，不再回落
+        # env：它由管理后台「TTS 设置页」配置并落进 `system_config` 表
+        # （key="tts"），唯一真相源是 DB。env 兜底会让配置有两个真相源
+        # （DB 里配的音色可能被 env 里的旧值静默顶掉）。
+        self.voice = voice or self.DEFAULT_VOICE
         self.ffmpeg_bin = ffmpeg_bin or os.getenv("FFMPEG_BIN", "/opt/homebrew/bin/ffmpeg")
 
     @property

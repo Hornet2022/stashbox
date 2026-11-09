@@ -122,8 +122,15 @@ async def test_empty_api_key_falls_back_to_saved_key(llm_test_ep):
 
 
 @pytest.mark.asyncio
-async def test_empty_api_key_falls_back_to_env(llm_test_ep, monkeypatch):
-    """DB 也没有 key → 回落 env。"""
+async def test_empty_api_key_does_not_fall_back_to_env(llm_test_ep, monkeypatch):
+    """DB 也没有 key → **不回落 env**（2026-11-10 收敛）。
+
+    为什么这条断言重要：以前这里会回落 `OPENAI_LLM_API_KEY`。
+    而 env 里残留着**已下线端点**的 key ⇒ 测出来的绿灯**不代表 DB 里的
+    配置能用**，运营以为配好了，实际跑的是另一个端点。
+
+    现在：DB 里没 key ⇒ 如实报"没配 key"，让运营去后台补齐。
+    """
     call, state = llm_test_ep
     state["db"] = {}
     monkeypatch.setenv("OPENAI_LLM_API_KEY", "sk-from-env")
@@ -137,8 +144,10 @@ async def test_empty_api_key_falls_back_to_env(llm_test_ep, monkeypatch):
         }
     )
 
-    assert state["used_key"] == "sk-from-env"
-    assert result["ok"] is True
+    # env 里的 key **没被用**（这是本用例的核心断言）
+    assert state["used_key"] == ""
+    # 且端点如实报失败，不是绿灯
+    assert result["ok"] is False
 
 
 @pytest.mark.asyncio

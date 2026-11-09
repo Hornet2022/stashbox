@@ -511,100 +511,102 @@ fi
 # ═════════════════════════════════════════════════════════════════════
 # 10. LLM / TTS provider
 # ═════════════════════════════════════════════════════════════════════
-llm="$(v LLM_PROVIDER)"; llm="${llm:-openai}"
-if [ "$llm" = "mock" ]; then
-  fail "LLM_PROVIDER" "mock —— 生产不会真的生成内容"
-else
-  pass "LLM_PROVIDER" "$llm"
-fi
+#
+# ⚠️ 2026-11-10：上游配置**只认 DB**（system_config 的 llm / tts 两行）。
+# env 里的 LLM_PROVIDER / TTS_PROVIDER / *_API_KEY **运行时不再参与**，
+# 只在部署播种时用一次（backend/deploy/seed_upstream_config.py）。
+# 所以这里的判据**以 DB 为准**，env 只作为"还没播种"的提示。
 
-# LLM 的 key 必须真的有值：mock provider 已被代码删除（factory 只认 openai/qwen_vl），
-# 所以 key 为空不会在启动时报错，而是等到第一条蒸馏任务才 401 —— 内测时才发现就晚了。
-#
-# ⚠️ key 有**两个来源**，任一有值就算通过：
-#   · env（OPENAI_LLM_API_KEY / DASHSCOPE_API_KEY）
-#   · **管理后台配的**（system_config 的 llm 条目，存在 DB 里）
-#     运行时以 DB > env 生效（ai-service/llm/factory.py:reload()），
-#     蒸馏任务启动前会自动 reload，所以后台改完**立即生效，不用重启**。
-#     只看 env 会误报「key 没配」，而实际上后台已经配好了 —— 这就是
-#     「功能不完善」的真实表现。
-#
-# 这里实际去查一次 DB（不是靠猜）：能连上 PG 就查，查不到就退回只看 env。
+db_cfg() {
+  # 从 system_config 表读某个 key 的某个 JSON 字段（取前 64 字符，够判空）。
+  # $1 = system_config 的 key（llm/tts），$2 = JSON 字段名
+  [ -n "${pg_pw:-}" ] && [ -n "${pg_u:-}" ] && [ -n "${pg_d:-}" ] || return 0
+  PGPASSWORD="$pg_pw" psql -h "${pg_h:-127.0.0.1}" -U "$pg_u" -d "$pg_d" -tAc \
+    "select coalesce((value->>'$2'),'') from system_config where key='$1';" 2>/dev/null \
+    | tr -d '\r\n' | head -c 64
+}
+
+db_llm_provider=""
 db_llm_key=""
+db_llm_base_url=""
+db_tts_provider=""
+db_tts_key=""
 if command -v psql >/dev/null 2>&1; then
   pg_pw="$(v POSTGRES_PASSWORD)"
   pg_u="$(v POSTGRES_USER)"
   pg_d="$(v POSTGRES_DB)"
   pg_h="$(v POSTGRES_HOST)"
   if [ -n "$pg_pw" ] && [ -n "$pg_u" ] && [ -n "$pg_d" ]; then
-    db_llm_key="$(
-      PGPASSWORD="$pg_pw" psql -h "${pg_h:-127.0.0.1}" -U "$pg_u" -d "$pg_d" -tAc \
-        "select coalesce((value->>'api_key'),'') from system_config where key='llm';" 2>/dev/null \
-      | tr -d '\r\n' | head -c 4
-    )"
+    db_llm_provider="$(db_cfg llm provider)"
+    db_llm_key="$(db_cfg llm api_key)"
+    db_llm_base_url="$(db_cfg llm base_url)"
+    db_tts_provider="$(db_cfg tts provider)"
+    db_tts_key="$(db_cfg tts openai_api_key)"
+    [ -z "$db_tts_key" ] && db_tts_key="$(db_cfg tts doubao_api_key)"
+    [ -z "$db_tts_key" ] && db_tts_key="$(db_cfg tts doubao_token)"
   fi
 fi
 
-case "$llm" in
-  qwen*|dashscope*)
-    env_key="$(v DASHSCOPE_API_KEY)$(v QWEN_VL_API_KEY)"
-    ;;
+# provider：DB 优先（唯一真相源）；DB 没配才看 env（播种前的老部署）。
+llm="${db_llm_provider:-$(v LLM_PROVIDER)}"
+llm="${llm:-openai}"
+if [ "$llm" = "mock" ]; then
+  fail "LLM Provider" "mock —— 生产不会真的生成内容"
+elif [ -n "$db_llm_provider" ]; then
+  pass "LLM Provider" "$llm（DB）"
+else
+  warn "LLM Provider" "$llm（来自 env —— 上游配置只认 DB，请跑 backend/deploy/seed_upstream_config.py 播种）"
+fi
+
+# LLM 的 key 必须真的有值：mock provider 已被代码删除（factory 只认 openai/qwen_vl），
+# 所以 key 为空不会在启动时报错，而是等到第一条蒸馏任务才 401 —— 内测时才发现就晚了。
+#
+# ⚠️ 2026-11-10 起 key **只认 DB**。env 里的 key 运行时不再生效，
+# 所以这里以 DB 为准；DB 空但 env 有 ⇒ 说明**还没播种**（env 里的端点/key
+# 可能已是过期的，必须提示，而不是默默放过）。
+if [ -n "$db_llm_key" ]; then
+  pass "LLM API Key" "管理后台已配置（DB，${llm}）"
+elif [ -n "$(v OPENAI_LLM_API_KEY)$(v DASHSCOPE_API_KEY)$(v QWEN_VL_API_KEY)" ]; then
+  fail "LLM API Key" "DB 里没有 key，但 env 里有 —— env 运行时**不再生效**（这正是 2026-11-09 事故的根因：DB 读失败就静默回落到 env 里那个已下线的端点）。请跑 backend/deploy/seed_upstream_config.py 把 env 播种进 DB，或直接在管理后台「LLM 设置」里配"
+else
+  fail "LLM API Key" "DB 里没有 key（${llm}）—— 蒸馏会在运行时才 401。请在管理后台「LLM 设置」里配"
+fi
+
+# base_url：DB 里配了才说明"打哪个上游"是明确的。
+# （代码默认值 api.openai.com 是"没配"的显式表达，不是可用的生产配置。）
+if [ -n "$db_llm_base_url" ]; then
+  pass "LLM Base URL" "$db_llm_base_url（DB）"
+else
+  warn "LLM Base URL" "DB 里没配 —— 会用代码默认值（api.openai.com），国内不可达。请在管理后台「LLM 设置」里配"
+fi
+
+tts="${db_tts_provider:-$(v TTS_PROVIDER)}"
+tts="${tts:-openai}"
+if [ "$tts" = "mock" ]; then
+  fail "TTS Provider" "mock —— 生产不产音频"
+elif [ "$tts" = "local" ]; then
+  fail "TTS Provider" "local —— 走 macOS 的 say，Linux 容器里不可用"
+elif [ "$tts" = "indextts" ]; then
+  warn "TTS Provider" "indextts —— 自建服务 infra/mlx-audio-tts-service 是 macOS 专属，容器里必须另部署一个 TTS 端点（后台「TTS 设置」里的 indextts_base_url）"
+elif [ -n "$db_tts_provider" ]; then
+  pass "TTS Provider" "$tts（DB）"
+else
+  warn "TTS Provider" "$tts（来自 env —— 上游配置只认 DB，请跑 backend/deploy/seed_upstream_config.py 播种）"
+fi
+
+# 同 LLM：需要 key 的 provider（edge 免费无 key）必须查 DB。
+case "$tts" in
+  edge) : ;;   # edge 免费无 key，不需要
   *)
-    env_key="$(v OPENAI_LLM_API_KEY)"
+    if [ -n "$db_tts_key" ]; then
+      pass "TTS API Key" "管理后台已配置（DB，${tts}）"
+    elif [ -n "$(v OPENAI_TTS_API_KEY)$(v DOUBAO_TTS_API_KEY)$(v DOUBAO_TTS_TOKEN)$(v VOLCENGINE_TTS_API_KEY)" ]; then
+      fail "TTS API Key" "DB 里没有 key，但 env 里有 —— env 运行时**不再生效**。请跑 backend/deploy/seed_upstream_config.py 播种，或在管理后台「TTS 设置」里配"
+    else
+      fail "TTS API Key" "DB 里没有 key（${tts}）—— 合成会失败。请在管理后台「TTS 设置」里配"
+    fi
     ;;
 esac
-
-if [ -n "$env_key" ]; then
-  pass "LLM API Key" "env 里已设置（${llm}）"
-elif [ -n "$db_llm_key" ]; then
-  pass "LLM API Key" "管理后台已配置（${llm}，DB 覆盖 env，立即生效）"
-else
-  fail "LLM API Key" "env 与管理后台都没有 key（${llm}）—— 蒸馏会在运行时才 401。要么写 OPENAI_LLM_API_KEY / DASHSCOPE_API_KEY，要么在管理后台「LLM 设置」里配"
-fi
-
-tts="$(v TTS_PROVIDER)"; tts="${tts:-openai}"
-if [ "$tts" = "mock" ]; then
-  fail "TTS_PROVIDER" "mock —— 生产不产音频"
-elif [ "$tts" = "local" ]; then
-  fail "TTS_PROVIDER" "local —— 走 macOS 的 say，Linux 容器里不可用"
-elif [ "$tts" = "indextts" ]; then
-  warn "TTS_PROVIDER" "indextts —— 自建服务 infra/mlx-audio-tts-service 是 macOS 专属，容器里必须另部署一个 TTS 端点并改 INDEXTTS_BASE_URL"
-else
-  pass "TTS_PROVIDER" "$tts"
-  # 同 LLM：edge / openai / doubao 等需要 key 的 provider，
-  # 也能在**管理后台**配（system_config 的 tts 条目，运行时 DB > env）。
-  # 只看 env 会误报 —— 后台配好了却报「没配」，这正是「功能不完善」的表现。
-  case "$tts" in
-    edge) : ;;   # edge 免费无 key，不需要
-    *)
-      tts_env_key="$(v OPENAI_TTS_API_KEY)$(v DOUBAO_TTS_API_KEY)$(v DOUBAO_TTS_TOKEN)$(v VOLCENGINE_TTS_API_KEY)"
-      db_tts_key=""
-      # ⚠️ 这里必须查**多个字段名**（2026-10-27 实测踩到）：
-      # 管理后台「TTS 设置」把 key 存成 `openai_api_key`（见
-      # content-service/admin_router.py 的 TTS 配置字段映射），
-      # 而旧探针只查 `api_key` —— 于是生产明明配好了 key，
-      # 预检却报「env 与管理后台都没有 key」并**阻断发版**。
-      # 一个查错字段名的门禁 = 永远在喊狼来了，真正的故障反而被淹没。
-      #
-      # 另外：**不再**拿 db_llm_key 当开关（那是 LLM 那段留下的耦合）——
-      # DB 里只配了 TTS、没配 LLM 时，这个探针本来根本不会跑。
-      if command -v psql >/dev/null 2>&1 && [ -n "${pg_pw:-}" ] && [ -n "${pg_u:-}" ] && [ -n "${pg_d:-}" ]; then
-        db_tts_key="$(
-          PGPASSWORD="$pg_pw" psql -h "${pg_h:-127.0.0.1}" -U "$pg_u" -d "$pg_d" -tAc \
-            "select coalesce(nullif(value->>'openai_api_key',''), nullif(value->>'api_key',''), nullif(value->>'doubao_api_key',''), nullif(value->>'doubao_token',''), nullif(value->>'volcengine_tts_api_key','')) from system_config where key='tts';" 2>/dev/null \
-          | tr -d '\r\n' | head -c 4
-        )"
-      fi
-      if [ -n "$tts_env_key" ]; then
-        pass "TTS API Key" "env 里已设置（${tts}）"
-      elif [ -n "$db_tts_key" ]; then
-        pass "TTS API Key" "管理后台已配置（${tts}，DB 覆盖 env，立即生效）"
-      else
-        fail "TTS API Key" "env 与管理后台都没有 key（${tts}）—— 合成会失败。要么写对应 env，要么在管理后台「TTS 设置」里配"
-      fi
-      ;;
-  esac
-fi
 
 # ═════════════════════════════════════════════════════════════════════
 # 11. 网关 → 下游接线（端口对不上 = 全量 502）

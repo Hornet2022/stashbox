@@ -10,7 +10,7 @@
     await pipeline.run(ctx)
 
 ai-service 目录名带连字符（不是合法包名），这里把它加进 sys.path ——
-`llm` / `config_llm` 因此作为顶层模块导入（做法同 llm/__init__.py）。
+`llm` 因此作为顶层模块导入（做法同 llm/__init__.py）。
 """
 
 import sys

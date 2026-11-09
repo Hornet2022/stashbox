@@ -1,22 +1,32 @@
 """TTS client 工厂 + 热生效（CP TTS-Config）。
 
-配置来源优先级 **DB(system_config key="tts") > 环境变量 > 代码默认值**。
-DB 那层读走 Redis 5s 缓存（common.system_config），所以每次 reload() 都重读配置
-也不会打爆 DB；只有配置签名真的变了才重建 client —— admin 改完配置，
-下一次调用即生效，不用重启进程。
+⚠️ **配置源只有一个：DB**（`system_config` 表 key="tts"）。
+   读取与规范化统一走 `stashbox.backend.common.upstream_config`，
+   本模块**不再**读 env（2026-11-10 收敛）。
+
+2026-11-10 为什么收敛：
+- 以前这里是「DB 覆盖 > env 逐字段回落」，而 env 里残留着**已下线的端点**。
+  DB 读失败（Redis/PG 抖动）就**静默**回落 env ⇒ 音色从 uncle_fu 悄悄换成
+  zh-CN-XiaoxiaoNeural，**已发布的稿子突然变声**，而且没有任何报错。
+- 现在：DB 读失败 → 进程内 last-good；本进程从未成功读过 → 抛
+  `UpstreamConfigUnavailable`（明确可操作），**不静默降级**。
+- DB 缺字段 → 用**代码默认值**（不是 env）。
 
 调用点：
-- 同步 `get_tts_client()`：旧调用点（ai-service 蒸馏任务）保持不变，
-  没 reload 过时按 env/默认值建一个并缓存。
+- 同步 `get_tts_client()`：读**进程内缓存**（reload() 写）；没 reload 过 ⇒ 抛明确异常。
 - `await reload()`：热生效入口，读 DB 配置后返回 client（配置变了才重建）。
+- `await current_config()`：当前生效的完整配置（不建 client）。
 """
 
 import json
-import os
 from typing import Any
 
 from stashbox.backend.common.logging import get_logger
-from stashbox.backend.common.system_config import KEY_TTS, get_config
+from stashbox.backend.common.upstream_config import (
+    current_tts,
+    load_tts,
+    resolve_tts,
+)
 
 from .base import TTSClient
 from .edge import EdgeTTSClient
@@ -33,66 +43,16 @@ _client: TTSClient | None = None
 _signature: str | None = None
 
 
-def _env_config() -> dict[str, Any]:
-    """第二层：环境变量；第三层：代码默认值。"""
-    return {
-        "provider": os.getenv("TTS_PROVIDER", "indextts").lower(),
-        # edge provider
-        "edge_voice": os.getenv("EDGE_TTS_VOICE", "zh-CN-XiaoxiaoNeural"),
-        # openai 协议 provider（火山方舟/OpenAI/Azure 通用）
-        "openai_api_key": os.getenv("OPENAI_TTS_API_KEY", ""),
-        "openai_base_url": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        "openai_model": os.getenv("OPENAI_TTS_MODEL", "tts-1"),
-        "openai_voice": os.getenv("OPENAI_TTS_VOICE", "alloy"),
-        # 风格控制 prompt（上游字段名就是 `instructions`）。
-        #
-        # ⚠️ 别在这里加 temperature / top_p：生产的托管端点（tertu.cn）
-        # **不收**这两个参数 —— 实测传了被静默丢弃，连 400 都不报。
-        # 「固定采样参数」在自建端点（indextts provider）才成立，见 indextts.py。
-        # 分段一致性在那条链路上靠「固定 voice + 固定 instructions + 后处理对齐」。
-        "openai_instructions": os.getenv("OPENAI_TTS_INSTRUCTIONS", ""),
-        # 语言标签（上游 string 校验）。中文稿一般留空。
-        "openai_language": os.getenv("OPENAI_TTS_LANGUAGE", ""),
-        # doubao provider（Coding Plan HTTP POST）
-        "doubao_api_key": os.getenv("DOUBAO_TTS_API_KEY", os.getenv("DOUBAO_TTS_TOKEN", "")),
-        "doubao_token": os.getenv("DOUBAO_TTS_TOKEN", ""),
-        "doubao_app_id": os.getenv("DOUBAO_TTS_APP_ID", ""),
-        "doubao_voice": os.getenv("DOUBAO_TTS_VOICE", "BV001_streaming"),
-        "doubao_resource_id": os.getenv("DOUBAO_TTS_RESOURCE_ID", "seed-tts-2.0"),
-        # local provider（macOS say + ffmpeg）
-        "local_voice": os.getenv("TTS_LOCAL_VOICE", "Tingting"),
-        "ffmpeg_bin": os.getenv("FFMPEG_BIN", "/opt/homebrew/bin/ffmpeg"),
-        # indextts provider（自建 mlx-audio /v1/audio/speech + ref_audio 零样本克隆）
-        # 8010 由 launchd `com.stashbox.tts-serve` 托管，进程挂了会自动拉起。
-        # oMLX 已从听匣弃用（它的 TTS 引擎内部本来就是 mlx-audio，但封在签名 app 里）。
-        # ⚠️ 真正的坑是「静默截断」：输入过长时返回 HTTP 200 + 合法 WAV，但音频
-        # 只剩开头一小段，所以 indextts.py 里按 INDEXTTS_CHUNK_CHARS 切块，
-        # 并用 _assert_not_truncated 按语速（>7 字/秒）兜底校验。
-        "indextts_base_url": os.getenv("INDEXTTS_BASE_URL", "http://127.0.0.1:8010/v1"),
-        "indextts_model": os.getenv("INDEXTTS_MODEL", "Qwen3-TTS-12Hz-0.6B-Base-bf16"),
-        "indextts_ref_audio": os.getenv("INDEXTTS_REF_AUDIO", ""),
-        "indextts_ref_text": os.getenv("INDEXTTS_REF_TEXT", ""),
-        # CustomVoice 模式（Qwen3-TTS-12Hz-1.7B-CustomVoice）：
-        #   speaker  = 预设音色名（上游要 config.spk_id 里有的那个）
-        #   instruct = 风格控制 prompt（同一篇每段必须逐字相同 → 段间风格一致）
-        # 配了它们就不再传 ref_audio（上游会让克隆路径先命中、instruct 静默失效）。
-        "indextts_speaker": os.getenv("INDEXTTS_SPEAKER", ""),
-        "indextts_instruct": os.getenv("INDEXTTS_INSTRUCT", ""),
-        # 采样参数：分段合成 = 多次独立采样，固定住它们段间才不漂。
-        # 官方「稳定播音」推荐 temperature=0.7 / top_p=0.9；
-        # 上游服务默认 top_p=0.95 偏松，这里显式压到 0.9。
-        "indextts_temperature": float(os.getenv("INDEXTTS_TEMPERATURE", "0.7")),
-        "indextts_top_p": float(os.getenv("INDEXTTS_TOP_P", "0.9")),
-    }
-
-
 def resolve_config(override: dict[str, Any] | None = None) -> dict[str, Any]:
-    """DB > env > 默认值。override 里 None/空串视为「没配」，回落到下一层。"""
-    config = _env_config()
-    for field, value in (override or {}).items():
-        if value not in (None, ""):
-            config[field] = value
-    return config
+    """DB 里 tts 那一行 → 生效配置。
+
+    ⚠️ **只认 DB**（不再有 env 层）：
+    override 里 None/空串视为「没配」，落回**代码默认值**（不是 env）。
+
+    TTS 的 DB 行**本来就是 provider 专属命名**（openai_api_key / indextts_model …），
+    所以这里不需要任何"通用 ↔ 专属"映射 —— 与 LLM 侧不同，别照抄那边的逻辑。
+    """
+    return resolve_tts(override)
 
 
 def build_client(config: dict[str, Any]) -> TTSClient:
@@ -138,15 +98,18 @@ def build_client(config: dict[str, Any]) -> TTSClient:
 
 
 def get_tts_client() -> TTSClient:
-    """根据配置返回对应 client（同步，保持旧调用点不变）。
+    """根据生效配置返回对应 client（同步，保持旧调用点不变）。
 
-    CP TTS-Config 修复：兼容两层行为——
-    1. 启动后没调过 reload() → 走 env/默认值建 client 并缓存；
-    2. 调过 reload() → 用 DB 配置生效（覆盖 env）。
+    ⚠️ 同步路径读**进程内缓存**（`reload()` 写的）。缓存空 ⇒ 抛
+    `UpstreamConfigUnavailable` —— **不回落 env**。
+
+    为什么不能"没 reload 过就按默认值建一个"：
+    那样 TTS 会**静默**用默认音色（zh-CN-XiaoxiaoNeural），
+    而实际生效的是 uncle_fu ⇒ 已发布的稿子突然变声，且没有任何报错。
     """
     global _client, _signature
     if _client is None:
-        config = resolve_config(None)
+        config = current_tts()
         _client = build_client(config)
         _signature = _signature_of(config)
     return _client
@@ -157,9 +120,11 @@ async def reload() -> TTSClient:
 
     PUT /api/v1/admin/tts/config 写完会立刻 await reload() → 下一次蒸馏
     直接用新 client，不需要重启进程。
+
+    DB 读失败且本进程没有 last-good ⇒ 抛 `UpstreamConfigUnavailable`。
     """
     global _client, _signature
-    config = resolve_config(await get_config(KEY_TTS))
+    config, source = await load_tts()
     signature = _signature_of(config)
     if _client is None or signature != _signature:
         _client = build_client(config)
@@ -168,13 +133,15 @@ async def reload() -> TTSClient:
             "tts_client_reloaded",
             provider=config.get("provider"),
             api_key_set=bool(config.get("openai_api_key") or config.get("doubao_api_key")),
+            source=source,
         )
     return _client
 
 
 async def current_config() -> dict[str, Any]:
-    """当前生效的完整配置（DB > env），不建 client。"""
-    return resolve_config(await get_config(KEY_TTS))
+    """当前生效的完整配置（**只认 DB**），不建 client。"""
+    config, _source = await load_tts()
+    return config
 
 
 def _signature_of(config: dict[str, Any]) -> str:

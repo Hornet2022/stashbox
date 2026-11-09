@@ -56,7 +56,7 @@ class QwenVLClient(LLMClient):
         self._shared = _shared
         self._client = httpx.AsyncClient(
             # 2026-11-09：连接超时独立于读超时 —— "连不上"要快速判死。
-            # 详见 ai-service/config_llm.py 的 connect_timeout 说明。
+            # 详见 common/upstream_config.py 的 connect_timeout 说明。
             timeout=httpx.Timeout(
                 timeout,
                 connect=min(connect_timeout, timeout),

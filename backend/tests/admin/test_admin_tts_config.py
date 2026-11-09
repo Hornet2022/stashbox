@@ -255,33 +255,26 @@ async def test_清除用不到的key_不影响生效配置():
 async def test_分provider标志不串台():
     """`api_key_set` 是「任意一把 key 存在」，分 provider 的标志才准。
 
-    实测踩到的显示层说谎：豆包 env 里配了 key 时，openai 那一栏的
+    实测踩到的显示层说谎：豆包那一栏配了 key 时，openai 那一栏的
     「已保存，留空则不变」是**假的**（openai 根本没存）→ 运营以为不用管，
     而真正该清的那把 key 就在那一栏。所以两个标志必须分开。
-    """
-    monkeypatch_env = {"DOUBAO_TTS_API_KEY": "ak-from-env"}
-    import os
 
-    old = os.environ.get("DOUBAO_TTS_API_KEY")
-    os.environ["DOUBAO_TTS_API_KEY"] = monkeypatch_env["DOUBAO_TTS_API_KEY"]
-    try:
-        await _seed_tts_config()
-        admin = await _make_admin()
-        async with _client(_token(admin)) as c:
-            resp = await c.put(
-                "/api/v1/admin/tts/config",
-                json={"provider": "indextts", "openai_api_key": None},
-            )
-        assert resp.status_code == 200, resp.text
-        body = _body(resp)
-        assert body["openai_api_key_set"] is False  # openai 这把确实没了
-        assert body["doubao_api_key_set"] is True  # 豆包那把还在（env 回落）
-        assert body["api_key_set"] is True  # 历史字段：任意一把存在
-    finally:
-        if old is None:
-            os.environ.pop("DOUBAO_TTS_API_KEY", None)
-        else:
-            os.environ["DOUBAO_TTS_API_KEY"] = old
+    ⚠️ 2026-11-10 收敛：豆包那把 key 改用 **DB** 里存（原来靠 env 回落）。
+    用例的**意图**（分 provider 标志不串台）不变，只是脚手架换了地方 ——
+    env 现在不再是配置的真相源。
+    """
+    await _seed_tts_config(doubao_api_key="ak-in-db")
+    admin = await _make_admin()
+    async with _client(_token(admin)) as c:
+        resp = await c.put(
+            "/api/v1/admin/tts/config",
+            json={"provider": "indextts", "openai_api_key": None},
+        )
+    assert resp.status_code == 200, resp.text
+    body = _body(resp)
+    assert body["openai_api_key_set"] is False  # openai 这把确实没了
+    assert body["doubao_api_key_set"] is True  # 豆包那把还在（DB 里存着）
+    assert body["api_key_set"] is True  # 历史字段：任意一把存在
 
 
 # ---------------------------------------------------------------------------

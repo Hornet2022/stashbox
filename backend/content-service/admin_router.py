@@ -514,12 +514,20 @@ class LLMConfigUpdate(BaseModel):
     provider: str
     model: str | None = None
     api_key: str | None = None  # 空/不传 = 不动已存的那把 key
-    # 不传 = 不动已存的 base_url；显式 null / "" = 清空（回落到 env）
+    # 不传 = 不动已存的 base_url；显式 null / "" = 清空（回落到代码默认值）
     base_url: str | None = None
+    # 调用预算（2026-11-10 起纳入 DB —— 以前在 env 里，是配置层的第二真相源）。
+    #
+    # 不传 = 不动已存的值；传了就覆盖。
+    timeout: float | None = None
+    max_retries: int | None = None
+    connect_timeout: float | None = None
+    # OCR 用的视觉模型（与 LLM 同一个端点/key，只是模型不同）。
+    ocr_model: str | None = None
 
 
-# 通用字段缺失时，按 provider 回落到它专属的 env 字段。
-# 与 app/services/llm/__init__.py 的 build_client 读法保持一致。
+# 通用字段缺失时，按 provider 回落到它专属的字段。
+# 与 upstream_config.resolve_llm 的映射保持一致（那里是唯一定义处）。
 _PROVIDER_MODEL_KEY = {"openai": "openai_llm_model", "qwen_vl": "qwen_vl_model"}
 _PROVIDER_BASE_KEY = {"openai": "openai_llm_base_url", "qwen_vl": "qwen_vl_base_url"}
 _PROVIDER_KEY = {"openai": "openai_llm_api_key", "qwen_vl": "qwen_vl_api_key"}
@@ -530,14 +538,17 @@ def _masked_llm_config(config: dict, source: str, updated_at: str | None) -> dic
 
     2026-10-02 修 KeyError: 'model'。
 
-    原来这里是 ``config["model"]`` 硬索引，但 ``_env_config()`` 只产出
+    原来这里是 ``config["model"]`` 硬索引，但配置里只产出
     ``openai_llm_model`` / ``qwen_vl_model`` 这类 **provider 专属** 字段，
     通用 ``model`` 键只有当 system_config 表里配过才会有。而该表在新部署下
-    是空的 → 回落 env → 没有 ``model`` → KeyError → 整个 GET 500。
+    是空的 ⇒ 回落默认值 ⇒ 没有 ``model`` ⇒ KeyError ⇒ 整个 GET 500。
 
     后果不是"少显示一个字段"：**运营在后台打不开 LLM 配置页**，
-    既看不到当前用的哪个模型，也没法改。改法是按 provider 回落到专属字段，
-    与 build_client 的读法一致。
+    既看不到当前用的哪个模型，也没法改。改法是按 provider 回落到专属字段。
+
+    `source` 语义（2026-11-10 收敛后）：
+      · `db`       —— 值来自 system_config 表
+      · `defaults` —— 表里没有这一行，用的是**代码默认值**（不是 env！）
     """
     provider = str(config.get("provider") or "mock").lower()
     api_key = config.get("api_key") or config.get(_PROVIDER_KEY.get(provider, ""), "")
@@ -551,17 +562,23 @@ def _masked_llm_config(config: dict, source: str, updated_at: str | None) -> dic
         or None,
         "api_key_set": bool(api_key),
         "api_key_last4": api_key[-4:] if api_key else None,
-        "source": source,  # db = 表里配了；env = 回落环境变量/默认值
+        "timeout": config.get("timeout"),
+        "max_retries": config.get("max_retries"),
+        "connect_timeout": config.get("connect_timeout"),
+        "ocr_model": config.get("ocr_model"),
+        "source": source,  # db = 表里配了；defaults = 代码默认值（不再是 env）
         "updated_at": updated_at,
     }
 
 
 @router.get("/api/v1/admin/llm/config")
 async def admin_llm_config_get(user: dict = Depends(require_admin_or_operator)):
-    """当前生效的 LLM 配置（DB > env > 默认值）。"""
+    """当前生效的 LLM 配置（**只认 DB**；表里没有就是代码默认值）。"""
     stored, updated_at = await system_config.get_config_row(system_config.KEY_LLM)
     config = resolve_config(stored)
-    return _masked_llm_config(config, "db" if stored else "env", system_config.as_iso(updated_at))
+    return _masked_llm_config(
+        config, "db" if stored else "defaults", system_config.as_iso(updated_at)
+    )
 
 
 @router.put("/api/v1/admin/llm/config")
@@ -574,7 +591,7 @@ async def admin_llm_config_put(
     if provider not in SUPPORTED_PROVIDERS:
         raise InvalidRequest(
             message=f"provider 必须是 {list(SUPPORTED_PROVIDERS)} 之一，当前 {provider!r}"
-            "（deepseek / glm 的 client 还没实现，配了也会回落到 mock）",
+            "（deepseek / glm 的 client 还没实现，配了也会报不支持的 provider）",
         )
 
     stored = dict(await system_config.get_config(system_config.KEY_LLM) or {})
@@ -585,6 +602,11 @@ async def admin_llm_config_put(
         stored["api_key"] = req.api_key
     if "base_url" in req.model_fields_set:  # 显式传了才动（null / "" = 清空）
         stored["base_url"] = (req.base_url or "").strip() or None
+    # 调用预算 + OCR 模型：不传 = 不动已存的值
+    for field in ("timeout", "max_retries", "connect_timeout", "ocr_model"):
+        value = getattr(req, field)
+        if value is not None:
+            stored[field] = value
 
     row = await system_config.set_config(system_config.KEY_LLM, stored, updated_by=_uid(user))
     # 改完即生效，不用重启进程。
@@ -796,17 +818,16 @@ async def admin_llm_test_with_config(
     #    同一个页面两个按钮，一个通一个不通。
     #
     #    合并语义与 PUT 保存端一致：**空/不传 = 不动已存的值**。
+    #
+    # ⚠️ 2026-11-10 收敛：这里**不再**回落 env。
+    #    以前 DB 里没 key 就去读 `OPENAI_LLM_API_KEY` / `DASHSCOPE_API_KEY` ——
+    #    那正是"配置有两个真相源"的最后一处残留：env 里可能还留着
+    #    **已下线端点**的 key，测出来的绿灯不代表 DB 里的配置能用。
+    #    现在：DB 里没有 key ⇒ 明确报错"没配 key"，让运营去后台补齐。
     effective_key = req.api_key
     if not effective_key:
         stored_cfg = await system_config.get_config(system_config.KEY_LLM) or {}
         effective_key = str(stored_cfg.get("api_key") or "").strip()
-        # 仍为空 → 回落 env（可能配在 env 里）
-        if not effective_key:
-            effective_key = (
-                os.getenv("OPENAI_LLM_API_KEY", "")
-                if provider == "openai"
-                else os.getenv("DASHSCOPE_API_KEY", "") or os.getenv("QWEN_VL_API_KEY", "")
-            )
 
     # cfg 的键名必须与 `build_client` 读的**完全一致** ——
     # 这里直接用**规范解析器** `resolve_config`，不再自己拼键名。
@@ -1138,10 +1159,12 @@ def _masked_tts_config(config: dict, source: str, updated_at: str | None) -> dic
 
 @router.get("/api/v1/admin/tts/config")
 async def admin_tts_config_get(user: dict = Depends(require_admin_or_operator)):
-    """当前生效的 TTS 配置（DB > env > 默认值）。"""
+    """当前生效的 TTS 配置（**只认 DB**；表里没有就是代码默认值）。"""
     stored, updated_at = await system_config.get_config_row(system_config.KEY_TTS)
     config = tts_resolve_config(stored)
-    return _masked_tts_config(config, "db" if stored else "env", system_config.as_iso(updated_at))
+    return _masked_tts_config(
+        config, "db" if stored else "defaults", system_config.as_iso(updated_at)
+    )
 
 
 @router.put("/api/v1/admin/tts/config")
@@ -1385,17 +1408,15 @@ async def admin_tts_probe_voices(
     stored = _merge_tts_config(
         dict(await system_config.get_config(system_config.KEY_TTS) or {}), req
     )
-    # probe 要**真发一次请求**，所以必须有一把能用的 key：
-    # 已存没有（从没配过 / 刚被显式清除）→ 回落 env。
+    # probe 要**真发一次请求**，所以必须有一把能用的 key。
     #
-    # 注意这里回落的是**内存态**，不落库 —— probe 端点本来就不写库。
-    for key, env_name in (
-        ("openai_api_key", "OPENAI_TTS_API_KEY"),
-        ("doubao_api_key", "DOUBAO_TTS_API_KEY"),
-    ):
-        if not stored.get(key):
-            stored[key] = os.getenv(env_name, "") or None
-
+    # ⚠️ 2026-11-10 收敛：**不再**回落 env。
+    #    以前已存没有 key 就去读 `OPENAI_TTS_API_KEY` / `DOUBAO_TTS_API_KEY` ——
+    #    env 里可能还留着**已下线端点**的 key ⇒ 探出来的音色列表
+    #    属于一个根本没在用的上游，运营照着填进后台也是错的。
+    #    现在：没有 key 就如实报"没配 key"。
+    #
+    # 注意这里用的是**内存态**，不落库 —— probe 端点本来就不写库。
     effective = tts_resolve_config(stored)
     result: dict[str, Any] = {"provider": provider, "supported_voices": []}
 

@@ -14,7 +14,7 @@
 工厂模式：
 - get_llm_client(model_name) 根据 model_name / provider 返回具体实现
 - 默认走 MockLLMClient（开发环境 + 单测）
-- LLM_PROVIDER=claude / qwen_vl / mock 切换（见 config_llm.py）
+- provider 由 DB `system_config` 表的 llm 行决定（见 common/upstream_config.py）
 """
 
 from abc import ABC, abstractmethod

@@ -1856,7 +1856,7 @@
     "/api/v1/admin/llm/config": {
       "get": {
         "summary": "Admin Llm Config Get",
-        "description": "当前生效的 LLM 配置（DB > env > 默认值）。",
+        "description": "当前生效的 LLM 配置（**只认 DB**；表里没有就是代码默认值）。",
         "operationId": "admin_llm_config_get_api_v1_admin_llm_config_get",
         "parameters": [
           {
@@ -2751,7 +2751,7 @@
     "/api/v1/admin/tts/config": {
       "get": {
         "summary": "Admin Tts Config Get",
-        "description": "当前生效的 TTS 配置（DB > env > 默认值）。",
+        "description": "当前生效的 TTS 配置（**只认 DB**；表里没有就是代码默认值）。",
         "operationId": "admin_tts_config_get_api_v1_admin_tts_config_get",
         "parameters": [
           {
@@ -10222,6 +10222,50 @@
               }
             ],
             "title": "Base Url"
+          },
+          "timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout"
+          },
+          "max_retries": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Retries"
+          },
+          "connect_timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connect Timeout"
+          },
+          "ocr_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ocr Model"
           }
         },
         "type": "object",

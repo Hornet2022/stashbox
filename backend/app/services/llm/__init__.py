@@ -1,22 +1,33 @@
 """LLM client 工厂 + 切换（CP7.1）。
 
-CP7.3：配置来源优先级 **DB(system_config key="llm") > 环境变量 > 代码默认值**。
-DB 那层读走 Redis 5s 缓存（common.system_config），所以每次 reload() 都重读配置
-也不会打爆 DB；只有配置签名真的变了才重建 client —— admin 改完配置，
-下一次调用即生效，不用重启进程。
+⚠️ **配置源只有一个：DB**（`system_config` 表 key="llm"）。
+   读取与规范化统一走 `stashbox.backend.common.upstream_config`，
+   本模块**不再**读 env（2026-11-10 收敛）。
+
+2026-11-10 为什么收敛（这是 2026-11-09 事故的根因所在）：
+- 以前这里是「DB 覆盖 > env 逐字段回落」：DB 读失败（Redis/PG 抖动）就
+  **静默**回落到 env —— 而 env 里残留着**已下线的端点**（旧 provider 的
+  base_url / key）⇒ 请求打到死端点，**日志里看不出"配置没读到"**。
+- 现在：DB 读失败 → 进程内 last-good；本进程从未成功读过 → 抛
+  `UpstreamConfigUnavailable`（明确可操作），**不静默降级**。
+- DB 缺字段 → 用**代码默认值**（不是 env）。
 
 调用点：
-- 同步 `get_llm_client()`：CP7.1 的旧调用点（ai-service 蒸馏任务）保持不变，
-  没 reload 过时按 env/默认值建一个并缓存。
+- 同步 `get_llm_client()`：读**进程内缓存**（reload() 写）；没 reload 过 ⇒ 抛明确异常。
 - `await reload()`：热生效入口，读 DB 配置后返回 client（配置变了才重建）。
+- `await current_config()`：当前生效的完整配置（不建 client）。
 """
 
 import json
-import os
 from typing import Any
 
 from stashbox.backend.common.logging import get_logger
-from stashbox.backend.common.system_config import KEY_LLM, get_config
+from stashbox.backend.common.upstream_config import (
+    LLM_CODE_DEFAULTS,
+    current_llm,
+    load_llm,
+    resolve_llm,
+)
 
 from .base import LLMClient
 from .openai import OpenAIClient
@@ -31,60 +42,20 @@ _client: LLMClient | None = None
 _signature: str | None = None
 
 
-def _env_config() -> dict[str, Any]:
-    """第二层：环境变量；第三层：代码默认值。
-
-    CP9.x 决策：LLM 全 OpenAI 协议栈。OPENAI_LLM_* 与 OPENAI_TTS_* 拆分避免
-    双消费方冲突（详见 .env.example 注释）。
-    """
-    return {
-        "provider": os.getenv("LLM_PROVIDER", "openai").lower(),
-        # OpenAI provider 用的 env（与 TTS 端拆开）
-        "openai_llm_api_key": os.getenv("OPENAI_LLM_API_KEY", ""),
-        "openai_llm_model": os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini"),
-        "openai_llm_base_url": os.getenv("OPENAI_LLM_BASE_URL", "https://api.openai.com/v1"),
-        # CP7.1：qwen_vl（Token Plan 团队版，OpenAI 兼容）
-        "qwen_vl_model": os.getenv("QWEN_VL_MODEL", "qwen3.6-flash"),
-        "qwen_vl_base_url": os.getenv(
-            "QWEN_VL_BASE_URL",
-            "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
-        ),
-        "qwen_vl_api_key": os.getenv("DASHSCOPE_API_KEY", ""),
-    }
-
-
 def resolve_config(override: dict[str, Any] | None = None) -> dict[str, Any]:
-    """DB > env > 默认值。override 里 None/空串视为「没配」，回落到下一层。
+    """DB 里 llm 那一行 → 生效配置。
 
-    CP11.x 修复：管理后台 PUT /admin/llm/config 存的是**通用字段**
+    ⚠️ **只认 DB**（不再有 env 层）：
+    override 里 None/空串视为「没配」，落回**代码默认值**（不是 env）。
+    override 是 **DB 行**（admin 端点传入），或 admin 测试端点传入的
+    「表单值 + 已存值」合并结果 —— 两者都是"想生效的那份配置"。
+
+    CP11.x 修复（保留）：管理后台 PUT /admin/llm/config 存的是**通用字段**
     （provider / model / api_key / base_url），而 build_client 读的是**分 provider
-    字段**（openai_llm_* / qwen_vl_*）。此前两者没接上 —— 后台配的 key/model
-    实际不生效（只有 provider 生效）。这里统一做一次映射归一化。
+    字段**（openai_llm_* / qwen_vl_*）。映射统一由 upstream_config.resolve_llm
+    实现 —— 全仓只有一份，不会漂移。
     """
-    config = _env_config()
-    for field, value in (override or {}).items():
-        if value not in (None, ""):
-            config[field] = value
-
-    provider = str(config.get("provider") or "mock").lower()
-    generic_key = config.get("api_key")
-    generic_model = config.get("model")
-    generic_base = config.get("base_url")
-    if provider == "openai":
-        if generic_key:
-            config["openai_llm_api_key"] = generic_key
-        if generic_model:
-            config["openai_llm_model"] = generic_model
-        if generic_base:
-            config["openai_llm_base_url"] = generic_base
-    elif provider == "qwen_vl":
-        if generic_key:
-            config["qwen_vl_api_key"] = generic_key
-        if generic_model:
-            config["qwen_vl_model"] = generic_model
-        if generic_base:
-            config["qwen_vl_base_url"] = generic_base
-    return config
+    return resolve_llm(override)
 
 
 def build_client(config: dict[str, Any]) -> LLMClient:
@@ -92,8 +63,8 @@ def build_client(config: dict[str, Any]) -> LLMClient:
     if provider == "openai":
         return OpenAIClient(
             api_key=config.get("openai_llm_api_key") or "",
-            model=config.get("openai_llm_model") or "gpt-4o-mini",
-            base_url=config.get("openai_llm_base_url") or "https://api.openai.com/v1",
+            model=config.get("openai_llm_model") or LLM_CODE_DEFAULTS["model"],
+            base_url=config.get("openai_llm_base_url") or LLM_CODE_DEFAULTS["base_url"],
         )
     if provider == "qwen_vl":
         return QwenVLClient(
@@ -106,10 +77,14 @@ def build_client(config: dict[str, Any]) -> LLMClient:
 
 
 def get_llm_client() -> LLMClient:
-    """根据配置返回对应 client（同步，保持 CP7.1 的调用点不变）。"""
+    """根据生效配置返回对应 client（同步，保持 CP7.1 的调用点不变）。
+
+    ⚠️ 同步路径读**进程内缓存**（`reload()` 写的）。缓存空 ⇒ 抛
+    `UpstreamConfigUnavailable` —— **不回落 env**。
+    """
     global _client, _signature
     if _client is None:
-        config = resolve_config(None)
+        config = current_llm()
         _client = build_client(config)
         _signature = _signature_of(config)
     return _client
@@ -133,9 +108,12 @@ def build_adhoc_client(config: dict[str, Any]) -> LLMClient:
 
 
 async def reload() -> LLMClient:
-    """重读配置（Redis 5s 缓存挡 DB 压力），配置变了才重建 client。"""
+    """重读配置（Redis 5s 缓存挡 DB 压力），配置变了才重建 client。
+
+    DB 读失败且本进程没有 last-good ⇒ 抛 `UpstreamConfigUnavailable`。
+    """
     global _client, _signature
-    config = resolve_config(await get_config(KEY_LLM))
+    config, source = await load_llm()
     signature = _signature_of(config)
     if _client is None or signature != _signature:
         _client = build_client(config)
@@ -151,13 +129,15 @@ async def reload() -> LLMClient:
                 or config.get("openai_llm_api_key")
                 or config.get("qwen_vl_api_key")
             ),
+            source=source,
         )
     return _client
 
 
 async def current_config() -> dict[str, Any]:
-    """当前生效的完整配置（DB > env），不建 client。"""
-    return resolve_config(await get_config(KEY_LLM))
+    """当前生效的完整配置（**只认 DB**），不建 client。"""
+    config, _source = await load_llm()
+    return config
 
 
 def _signature_of(config: dict[str, Any]) -> str:
