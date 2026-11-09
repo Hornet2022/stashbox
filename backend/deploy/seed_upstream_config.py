@@ -229,7 +229,13 @@ def main() -> int:
 
     env: dict[str, str] = dict(os.environ)
     if args.env_file:
-        env.update(parse_env_file(args.env_file))
+        parsed = parse_env_file(args.env_file)
+        # ⚠️ 必须把 env 文件的变量**灌进 os.environ**：
+        #    common/system_config.py 走 common/config.py 的 Settings，
+        #    它从**进程环境变量**读 PG/Redis 连接信息 ——
+        #    只 parse 不注入的话，脚本自己连不上 DB。
+        os.environ.update(parsed)
+        env.update(parsed)
 
     llm_fields = collect(env, LLM_ENV_MAP)
     tts_fields = collect(env, TTS_ENV_MAP)
