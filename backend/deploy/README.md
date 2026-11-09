@@ -475,6 +475,9 @@ bash deploy/verify_release_consistency.sh     # 只读，不改任何东西
 > 变异检验：`backend/scripts/_mutation_check_release_consistency.py`（15 条变异，
 > 必须 15/15 全部被抓到）。
 
+> 📄 完整复盘（含本次事故的排查路径与踩过的坑）：
+> [`docs/内测更新失效复盘_2026-11-09.md`](../../docs/内测更新失效复盘_2026-11-09.md)
+
 ---
 
 ## 7. 已知限制 / 需要决策的事
