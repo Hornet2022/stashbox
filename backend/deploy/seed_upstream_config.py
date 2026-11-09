@@ -54,7 +54,19 @@ _REPO_PARENT = str(Path(__file__).resolve().parents[3])
 if _REPO_PARENT not in sys.path:
     sys.path.insert(0, _REPO_PARENT)
 
-from stashbox.backend.common.system_config import KEY_LLM, KEY_TTS  # noqa: E402
+
+# ⚠️ `system_config` **不能**在模块顶层 import：
+#    它的导入链是 system_config → common.database → common.config → settings，
+#    而 settings 在**导入时**就校验 JWT_SECRET 等生产必填项 ——
+#    那时 env 文件还没被灌进来（--env-file 是在 main() 里才 parse 的），
+#    于是脚本会在 import 阶段就崩，连"能不能播种"都来不及判断。
+#    ⇒ 改成**懒导入**：先把 env 灌进 os.environ，再 import。
+def _keys() -> tuple[str, str]:
+    """懒导入 system_config 的两个 key 常量（此时 env 已就绪）。"""
+    from stashbox.backend.common.system_config import KEY_LLM, KEY_TTS
+
+    return KEY_LLM, KEY_TTS
+
 
 # ── env → DB 字段的映射 ─────────────────────────────────────────────────
 #
@@ -224,18 +236,20 @@ def main() -> int:
     parser.add_argument("--verify", action="store_true", help="只检查 DB 配置，不改任何东西")
     args = parser.parse_args()
 
-    if args.verify:
-        return 1 if asyncio.run(verify()) else 0
-
+    # ⚠️ **必须先灌 env，再 import 任何碰 DB 的模块**：
+    #    system_config → common.database → common.config → settings，
+    #    而 settings 在**导入时**就校验生产必填项（JWT_SECRET 等）。
+    #    env 文件还没灌进去就 import ⇒ 脚本在 import 阶段就崩。
     env: dict[str, str] = dict(os.environ)
     if args.env_file:
         parsed = parse_env_file(args.env_file)
-        # ⚠️ 必须把 env 文件的变量**灌进 os.environ**：
-        #    common/system_config.py 走 common/config.py 的 Settings，
-        #    它从**进程环境变量**读 PG/Redis 连接信息 ——
-        #    只 parse 不注入的话，脚本自己连不上 DB。
         os.environ.update(parsed)
         env.update(parsed)
+
+    if args.verify:
+        return 1 if asyncio.run(verify()) else 0
+
+    key_llm, key_tts = _keys()
 
     llm_fields = collect(env, LLM_ENV_MAP)
     tts_fields = collect(env, TTS_ENV_MAP)
@@ -248,9 +262,9 @@ def main() -> int:
 
     changed = 0
     if llm_fields:
-        changed += asyncio.run(seed(KEY_LLM, llm_fields, force=args.force, dry_run=args.dry_run))
+        changed += asyncio.run(seed(key_llm, llm_fields, force=args.force, dry_run=args.dry_run))
     if tts_fields:
-        changed += asyncio.run(seed(KEY_TTS, tts_fields, force=args.force, dry_run=args.dry_run))
+        changed += asyncio.run(seed(key_tts, tts_fields, force=args.force, dry_run=args.dry_run))
 
     if args.dry_run:
         print(f"（dry-run：共 {changed} 个字段会被写入）")
