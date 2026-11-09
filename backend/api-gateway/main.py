@@ -32,7 +32,6 @@ import structlog
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -48,6 +47,16 @@ from stashbox.backend.common.event_collect import router as event_router
 from stashbox.backend.common.analytics import track_simple
 from stashbox.backend.common.events import EventName
 from stashbox.backend.common.database import AsyncSessionLocal
+from stashbox.backend.app.services.audio.stale_key import (
+    MOUNT_PREFIX,
+    is_stale_request,
+    parse_audio_key,
+)
+from stashbox.backend.app.services.audio.resolve import current_audio_key
+from stashbox.backend.app.services.audio.static_files import (
+    AudioFilesWithStaleRedirect,
+    build_stale_resolver,
+)
 
 
 class ErrorTrackingMiddleware(BaseHTTPMiddleware):
@@ -160,13 +169,41 @@ app.add_middleware(
 # 此时需要 gateway 挂 /audio/ 静态路由兜底。开启条件（任一）：
 #   - STORAGE_PROVIDER=local
 #   - ENABLE_LOCAL_AUDIO_MOUNT=1（生产也可手动开，但默认关闭）
+
+
+class _AudioFilesWithStaleRedirect(AudioFilesWithStaleRedirect):
+    """接上 DB 解析器的音频静态目录（判定逻辑在 app/services/audio/ 里，不在这里）。"""
+
+
+async def _lookup_current_audio_key(article_id: str) -> str | None:
+    """文章当前的音频存储 key（查 DB；查不到就 None）。"""
+    async with AsyncSessionLocal() as session:
+        return await current_audio_key(session, article_id)
+
+
+_stale_audio_resolver = build_stale_resolver(
+    _lookup_current_audio_key,
+    parse=parse_audio_key,
+    is_stale=is_stale_request,
+    mount_prefix=MOUNT_PREFIX,
+)
+
+
 if (
     os.getenv("STORAGE_PROVIDER", "oss").lower() == "local"
     or os.getenv("ENABLE_LOCAL_AUDIO_MOUNT") == "1"
 ):
     _audio_dir = os.getenv("LOCAL_AUDIO_DIR", "/tmp/audio")
     if os.path.isdir(_audio_dir):
-        app.mount("/audio", StaticFiles(directory=_audio_dir, check_dir=False), name="local-audio")
+        app.mount(
+            "/audio",
+            _AudioFilesWithStaleRedirect(
+                directory=_audio_dir,
+                check_dir=False,
+                stale_resolver=_stale_audio_resolver,
+            ),
+            name="local-audio",
+        )
         structlog.get_logger("api-gateway").info("local_audio_mounted", directory=_audio_dir)
 
 
