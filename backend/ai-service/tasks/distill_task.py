@@ -649,6 +649,14 @@ async def distill_task(
                     # 会让文章保持 pending，等真实 TTS/ffmpeg 路径覆盖
                     art.status = "ready"
                     art.audio_url = da.audio_url
+                    # 🔴 2026-11-09：**成功时必须清掉 error**。
+                    #
+                    # 实测：文章失败过（error = "AI 服务这次响应超时了，请稍后重试。"），
+                    # 后来重跑成功了 → status 变 ready，但 error **留在库里没清** ⇒
+                    # App 读到的是「已就绪 + 一句失败提示」⇒ 用户以为还没成功。
+                    #
+                    # error 的语义是「**当前**为什么失败」；一旦成功就没有失败原因了。
+                    art.error = None
                     await db.commit()
                     log.info("articles.status_updated_to_ready", article_id=art.id)
                 elif art is not None and da.audio_url:

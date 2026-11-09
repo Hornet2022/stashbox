@@ -251,3 +251,121 @@ async def test_intermediate_attempt_tracks_no_distill_failed(failed_run):
         await dt_module.distill_task(ctx, "dst_1", "art_1", 7, "https://x.com/a")
 
     assert not [e for e in events if "distill_failed" in e]
+
+
+@pytest.mark.asyncio
+async def test_success_clears_stale_error(monkeypatch):
+    """🔴 护栏：**成功时必须清掉 articles.error**。
+
+    实测（2026-11-09）：文章失败过 → error 写着「AI 服务这次响应超时了，
+    请稍后重试。」；后来重跑成功 → status 变 ready，但 error **留在库里** ⇒
+    App 读到「已就绪 + 一句失败提示」，用户以为还没成功。
+
+    error 的语义是「**当前**为什么失败」；一旦成功就没有失败原因了。
+    """
+    from stashbox.backend.common.models import Article as ArticleModel
+    from stashbox.backend.common.models.distilled_article import DistilledArticle as DAModel
+
+    captured: dict = {}
+
+    class _OkResult:
+        """按调用顺序返回产物行 / 文章行。"""
+
+        def __init__(self, *rows):
+            self._rows = list(rows)
+
+        def scalar_one_or_none(self):
+            return self._rows.pop(0) if self._rows else None
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
+
+    class _OkSession:
+        def __init__(self, recorder: list):
+            self.recorder = recorder
+            self._queue = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, stmt):
+            self.recorder.append(stmt)
+            if self._queue:
+                return _OkResult(self._queue.pop(0))
+            return _OkResult()
+
+        async def scalar(self, stmt):
+            return "art_1"
+
+        async def commit(self):
+            return None
+
+        def begin_nested(self):
+            @asynccontextmanager
+            async def _savepoint():
+                yield self
+
+            return _savepoint()
+
+    da = DAModel(id="dst_1", article_id="art_1", status="done", audio_url="https://cdn/a.mp3")
+    art = ArticleModel(id="art_1", user_id=7, status="distilling")
+    art.error = "AI 服务这次响应超时了，请稍后重试。"  # 上一次失败的残留
+
+    factory_sessions = []
+
+    @asynccontextmanager
+    async def _fake_session_local():
+        s = _OkSession([])
+        s._queue.extend([da, art])
+        factory_sessions.append(s)
+        yield s
+
+    async def _fake_agent(*args, **kwargs):
+        return {
+            "status": "done",
+            "rewritten_script": "改写稿",
+            "tts_audio_url": "https://cdn/a.mp3",
+            "tts_duration_sec": 60,
+        }
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    async def _raw_content(db, article_id):
+        return "正文"
+
+    async def _source(db, article_id):
+        return "wechat_mp"
+
+    async def _title(db, article_id):
+        return "标题"
+
+    async def _reload():
+        return {}
+
+    monkeypatch.setattr(dt_module, "AsyncSessionLocal", _fake_session_local)
+    monkeypatch.setattr(dt_module, "_run_distill_via_agent", _fake_agent)
+    monkeypatch.setattr(dt_module, "_persist_agent_final", _noop)
+    monkeypatch.setattr(dt_module, "_load_raw_content", _raw_content)
+    monkeypatch.setattr(dt_module, "_load_material_source", _source)
+    monkeypatch.setattr(dt_module, "_load_article_title", _title)
+    monkeypatch.setattr(dt_module, "fill_article_captions", _noop)
+    monkeypatch.setattr(dt_module, "llm_reload", _reload)
+    monkeypatch.setattr(dt_module, "mark_distill_task_failed", _noop)
+    monkeypatch.setattr(dt_module, "_refund_quota_once", _noop)
+    monkeypatch.setattr(dt_module, "load_arq_config", lambda: SimpleNamespace(retry_max=2))
+
+    result = await dt_module.distill_task(
+        {"job_id": "job-1", "redis": None}, "dst_1", "art_1", 7, "https://x.com/a"
+    )
+    assert result["status"] == "done"
+
+    captured["art"] = art
+    assert art.status == "ready"
+    assert art.error is None, "成功了却留着上一轮的失败文案 ⇒ 用户看到「已就绪 + 失败提示」"
