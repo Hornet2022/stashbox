@@ -88,6 +88,9 @@ ROUTES: list[Route] = [
     Route("POST", "/api/v1/articles/add", "content-service", _url("content-service")),
     Route("GET", "/api/v1/articles/pending", "content-service", _url("content-service")),
     Route("GET", "/api/v1/articles/listened", "content-service", _url("content-service")),
+    # 2026-11-11：按 URL 幂等回查（客户端剪藏失败时用来确认"是不是其实成功了"）。
+    # ⚠️ 必须注册在 `{article_id}` **之前** —— 否则 "by-url" 会被当成 article_id。
+    Route("GET", "/api/v1/articles/by-url", "content-service", _url("content-service")),
     Route("GET", "/api/v1/articles/{article_id}", "content-service", _url("content-service")),
     # 2026-10-22：剪藏与重试这两个**最核心的写端点**原来不在路由表里，
     # 靠 proxy_fallback 按首段前缀猜下游（articles → content-service）。

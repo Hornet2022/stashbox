@@ -1655,6 +1655,39 @@ async def list_listened(user: dict = Depends(require_user), db: AsyncSession = D
     return {"articles": items, "count": len(items)}
 
 
+@app.get("/api/v1/articles/by-url")
+async def find_article_by_url(
+    url: str,
+    user: dict = Depends(require_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """按 URL 查当前用户是否已经剪藏过这个链接（**幂等回查**）。
+
+    ## 为什么需要这个端点（2026-11-11 内测实测）
+
+    剪藏是**同步长请求**：服务端当场抓取（几秒到几十秒）才返回。
+    客户端在等这个响应时，任何客户端侧抖动（切网 / NAT 回收 / HTTP2 流重置）
+    都会变成「**服务端成功、客户端报错**」。
+
+    实测（uid 23，2026-11-11 17:40~17:43）：4 次剪藏服务端**全部 200**、
+    文章**全部建好并进入蒸馏**，而客户端弹了「网络不给力」——
+    用户以为 4 次都失败了，重启 App 后才发现文章都在。
+
+    ⇒ 客户端失败时**回查一次**：文章在 ⇒ 告诉用户「已提交，正在蒸馏」，
+    而不是再报一次失败。**服务端答不上来的问题，就该由服务端给出答案。**
+
+    口径：同用户 + 同 URL + 未删除 —— 与剪藏时的早查重**同一份**实现
+    （`_find_existing_clip`），否则两处口径会漂。
+
+    ⚠️ 必须声明在 `/api/v1/articles/{article_id}` **之前**：
+    FastAPI 按声明顺序匹配，否则 "by-url" 会被当成 article_id。
+    """
+    dup = await _find_existing_clip(url, _uid(user), db)
+    if dup is None:
+        return {"exists": False, "article_id": None, "status": None}
+    return {"exists": True, "article_id": dup.id, "status": dup.status}
+
+
 @app.get("/api/v1/articles/{article_id}", response_model=ArticleResponse)
 async def get_article(
     article_id: str, user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)

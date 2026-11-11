@@ -3844,6 +3844,64 @@
         ]
       }
     },
+    "/api/v1/articles/by-url": {
+      "get": {
+        "summary": "Find Article By Url",
+        "description": "按 URL 查当前用户是否已经剪藏过这个链接（**幂等回查**）。\n\n## 为什么需要这个端点（2026-11-11 内测实测）\n\n剪藏是**同步长请求**：服务端当场抓取（几秒到几十秒）才返回。\n客户端在等这个响应时，任何客户端侧抖动（切网 / NAT 回收 / HTTP2 流重置）\n都会变成「**服务端成功、客户端报错**」。\n\n实测（uid 23，2026-11-11 17:40~17:43）：4 次剪藏服务端**全部 200**、\n文章**全部建好并进入蒸馏**，而客户端弹了「网络不给力」——\n用户以为 4 次都失败了，重启 App 后才发现文章都在。\n\n⇒ 客户端失败时**回查一次**：文章在 ⇒ 告诉用户「已提交，正在蒸馏」，\n而不是再报一次失败。**服务端答不上来的问题，就该由服务端给出答案。**\n\n口径：同用户 + 同 URL + 未删除 —— 与剪藏时的早查重**同一份**实现\n（`_find_existing_clip`），否则两处口径会漂。\n\n⚠️ 必须声明在 `/api/v1/articles/{article_id}` **之前**：\nFastAPI 按声明顺序匹配，否则 \"by-url\" 会被当成 article_id。",
+        "operationId": "find_article_by_url_api_v1_articles_by_url_get",
+        "parameters": [
+          {
+            "name": "url",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Url"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "content-service",
+          "api-gateway"
+        ]
+      }
+    },
     "/api/v1/articles/document": {
       "post": {
         "summary": "Submit Document",
