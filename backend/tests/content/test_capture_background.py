@@ -57,12 +57,24 @@ capture_pipeline = content_main.capture_pipeline
 # 抓取层 mock
 # ---------------------------------------------------------------------------
 class _FakeFetcher:
-    """可控的抓取替身：成功 / 失败两种结局。"""
+    """可控的抓取替身：成功 / 失败两种结局。
 
-    def __init__(self, *, fail: bool = False) -> None:
+    `error_code` / `error_source` 控制失败时抛的 `FetcherError` ——
+    用于验证「后台抓取失败 → 文章 error 透传按 source 细分的文案」这条链路。
+    """
+
+    def __init__(
+        self,
+        *,
+        fail: bool = False,
+        error_code=FetcherErrorCode.NETWORK,
+        error_source="wechat_mp",
+    ) -> None:
         self.calls: list[str] = []
         self.fail = fail
         self.delay: float = 0.0
+        self.error_code = error_code
+        self.error_source = error_source
 
     async def fetch(self, url: str, timeout: float | None = None, budget: float | None = None):
         self.calls.append(url)
@@ -71,7 +83,7 @@ class _FakeFetcher:
 
             await asyncio.sleep(self.delay)
         if self.fail:
-            raise FetcherError(FetcherErrorCode.NETWORK, "timeout", source="wechat_mp")
+            raise FetcherError(self.error_code, "boom", source=self.error_source)
         return FetchResult(
             url=url,
             title="测试文章",
@@ -218,9 +230,42 @@ async def test_后台抓不到_标记失败且不扣配额(fake_fetcher, fake_ai
     art = await article_row(r.json()["article_id"])
     assert art is not None
     assert art.status == "failed"
-    assert art.error, "失败必须点名（写面向用户的中文原因），不能是空的"
+    # ⚠️ 必须是**按错误码细分的文案**，不是笼统的「抓取失败，请稍后重试」。
+    # 后台抓取失败 → `_prefetch_for_capture` 把 FetcherError 转成带细分文案的
+    # BizException → `capture_failure_message` 透传。这条链路要有钉子，
+    # 否则未来有人把透传改坏（一律返回通用文案）测试不会红。
+    assert (
+        art.error == "没能连上这个网站，可能是网络不通或对方站点暂时不可用，请稍后重试"
+    ), f"抓取失败应透传细分文案，实际是 {art.error!r}"
+    assert art.error != capture_pipeline.MSG_FETCH_FAILED, "不该回落到通用文案"
     assert await quota_used(uid) == 0, "抓不到正文不能扣配额（先抓后扣）"
     assert fake_ai_client.calls == [], "没有正文不许派蒸馏（会拿占位串喂 LLM）"
+
+
+@pytest.mark.asyncio
+async def test_后台抓取失败_按source分流专属文案(monkeypatch):
+    """同一错误码，不同 source 的文案不同 —— 后台路径也要分流。
+
+    微信 AUTH 的专属建议是「请在微信里打开后重新复制链接」；对 PDF / 普通网页说
+    这句话是胡话（fetchers/__init__.py 实测踩过）。这条钉子证明后台抓取失败时，
+    `articles.error` 带的是按 source 细分的文案，而不是笼统的通用文案。
+    """
+    fetcher = _FakeFetcher(fail=True, error_code=FetcherErrorCode.AUTH, error_source="wechat_mp")
+    monkeypatch.setattr(content_main, "get_fetcher", lambda _url: fetcher)
+    uid, token = await new_user(monthly_quota=5)
+
+    async with client(token) as c:
+        r = await c.post(ARTICLES, json={"url": "https://mp.weixin.qq.com/s/abc"})
+    await drain_capture_tasks()
+
+    art = await article_row(r.json()["article_id"])
+    assert art is not None
+    assert art.status == "failed"
+    assert art.error == (
+        "对方网站限制了非官方客户端访问，微信文章请在微信里打开后重新复制链接"
+    ), f"微信 AUTH 失败应透传微信专属文案，实际是 {art.error!r}"
+    assert art.error != capture_pipeline.MSG_FETCH_FAILED, "不该回落到通用文案"
+    assert await quota_used(uid) == 0, "抓不到正文不能扣配额"
 
 
 @pytest.mark.asyncio

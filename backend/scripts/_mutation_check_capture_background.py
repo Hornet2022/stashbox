@@ -77,8 +77,8 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]], list[str]]] = [
         "content-service/capture_pipeline.py",
         [
             (
-                "                        NO_RAW_CONTENT,",
-                "                        Article.raw_content.is_(None),",
+                "                    NO_RAW_CONTENT,",
+                "                    Article.raw_content.is_(None),",
             )
         ],
         [f"{TEST_FILE}::test_兜底定时器_把孤儿标记为失败"],
