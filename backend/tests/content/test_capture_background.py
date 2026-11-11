@@ -71,9 +71,7 @@ class _FakeFetcher:
 
             await asyncio.sleep(self.delay)
         if self.fail:
-            raise FetcherError(
-                FetcherErrorCode.NETWORK, "timeout", source="wechat_mp"
-            )
+            raise FetcherError(FetcherErrorCode.NETWORK, "timeout", source="wechat_mp")
         return FetchResult(
             url=url,
             title="测试文章",
@@ -136,12 +134,8 @@ def test_超时判定_很久以前的算孤儿():
 
 def test_超时判定_阈值只有一处():
     """阈值是**一个常量**（FETCH_TIMEOUT_SECONDS），不是散落在各处的字面量。"""
-    assert capture_pipeline.is_fetch_stale(
-        capture_pipeline.FETCH_TIMEOUT_SECONDS + 1
-    ) is True
-    assert capture_pipeline.is_fetch_stale(
-        capture_pipeline.FETCH_TIMEOUT_SECONDS
-    ) is False
+    assert capture_pipeline.is_fetch_stale(capture_pipeline.FETCH_TIMEOUT_SECONDS + 1) is True
+    assert capture_pipeline.is_fetch_stale(capture_pipeline.FETCH_TIMEOUT_SECONDS) is False
 
 
 def test_失败文案_业务异常用它的中文文案():
@@ -425,3 +419,144 @@ async def test_重试_没有正文时重新抓取而不是派蒸馏(fake_fetcher
     # 抓到正文**之后**才派蒸馏（一次，且只这篇）
     assert len(fake_ai_client.calls) == 1, "抓到正文后应该派一次蒸馏"
     assert fake_ai_client.calls[0]["article_id"] == art_id
+
+
+# ---------------------------------------------------------------------------
+# 10. 并发闸门（2026-11-11 §9 遗留项）：信号量 + 拒绝快返
+# ---------------------------------------------------------------------------
+#
+# ⚠️ 并发上限 `CAPTURE_MAX_CONCURRENCY` 在**模块 import 期**从 env 读，测试里
+# 不能改 env 再 import（模块已被 conftest 加载）。⇒ 用例直接 monkeypatch
+# `capture_pipeline.CAPTURE_MAX_CONCURRENCY` 与 `_capture_inflight_count`，
+# 把闸门调成「并发 1」来验「满则拒绝」。
+#
+# 每例都要把计数归零、用例结束把在跑任务 drain 掉 —— 否则计数残留会
+# 影响后面的用例（闸门越收越紧）。
+
+
+@pytest.fixture
+def one_slot_gate(monkeypatch):
+    """把并发闸门调到 1 个槽，并归零计数（每例独立）。"""
+    monkeypatch.setattr(capture_pipeline, "CAPTURE_MAX_CONCURRENCY", 1)
+    monkeypatch.setattr(capture_pipeline, "_capture_inflight_count", 0)
+    yield
+    monkeypatch.setattr(capture_pipeline, "_capture_inflight_count", 0)
+
+
+def test_闸门_占用一个槽后判忙(one_slot_gate):
+    """并发满时 `capture_busy` 为真、`acquire_capture_slot` 拒绝（不阻塞）。"""
+    assert capture_pipeline.capture_busy() is False
+    assert capture_pipeline.acquire_capture_slot() is True
+    assert capture_pipeline.capture_busy() is True
+    # 满 ⇒ 拒绝（不阻塞）
+    assert capture_pipeline.acquire_capture_slot() is False
+    # 释放后恢复
+    capture_pipeline.release_capture_slot()
+    assert capture_pipeline.capture_busy() is False
+    assert capture_pipeline.acquire_capture_slot() is True
+
+
+def test_闸门_释放不会把计数减到负(one_slot_gate):
+    """防御：空槽时 release 不把计数减成负（否则闸门永久「未满」）。"""
+    capture_pipeline.release_capture_slot()
+    assert capture_pipeline.capture_busy() is False
+
+
+@pytest.mark.asyncio
+async def test_并发满_新剪藏被拒绝且标繁忙(fake_fetcher, one_slot_gate):
+    """闸门满时，新的剪藏**立即返回失败**（不排队），写明「繁忙」。
+
+    这是「拒绝快返」的核心：不把任务丢进后台排队（那会积压、抬内存），
+    而是当场告诉用户「现在抓取忙，稍后再试」。
+    """
+    fake_fetcher.delay = 5.0  # 第一篇故意抓很久，占住唯一一个槽
+    uid, token = await new_user(monthly_quota=5)
+
+    # 第一篇：占住槽位（后台在抓）
+    async with client(token) as c:
+        r1 = await c.post(ARTICLES, json={"url": "https://example.com/busy-1"})
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["fetch_pending"] is True
+
+    # 第二篇（不同 URL）：闸满 ⇒ 拒绝快返
+    async with client(token) as c:
+        r2 = await c.post(ARTICLES, json={"url": "https://example.com/busy-2"})
+    assert r2.status_code == 200, r2.text
+    body = r2.json()
+    assert body["fetch_pending"] is False, "被拒的文章不是「正在抓」"
+    assert body["status"] == "failed", "被拒的文章标成 failed"
+
+    art = await article_row(body["article_id"])
+    assert art is not None
+    assert art.error == capture_pipeline.MSG_CAPTURE_BUSY, "被拒要写明「繁忙」原因"
+    assert await quota_used(uid) == 0, "被拒不扣配额（先抓后扣，抓取没发生）"
+
+    await drain_capture_tasks()
+
+
+@pytest.mark.asyncio
+async def test_并发满_不影响正在抓的重复提交(fake_fetcher, one_slot_gate):
+    """同一 URL 正在抓时重复提交 ⇒ 返回同一篇（await），不该被并发闸拒绝。
+
+    闸门只限「新发起的抓取」；已抓的在跑文章重复提交是幂等复用，不占新槽。
+    """
+    fake_fetcher.delay = 5.0
+    uid, token = await new_user(monthly_quota=5)
+    url = "https://example.com/busy-dup"
+
+    async with client(token) as c:
+        r1 = await c.post(ARTICLES, json={"url": url})
+    async with client(token) as c:
+        r2 = await c.post(ARTICLES, json={"url": url})
+
+    assert r1.json()["article_id"] == r2.json()["article_id"], "同一链接必须是同一篇"
+    assert r2.json()["fetch_pending"] is True, "正在抓的重复提交不该被拒"
+    assert r2.json()["status"] == "pending"
+    await drain_capture_tasks()
+    assert await quota_used(uid) == 1, "只扣一次（不重复计费）"
+
+
+@pytest.mark.asyncio
+async def test_闸_抓取结束槽位释放_后续剪藏可继续(fake_fetcher, one_slot_gate):
+    """抓取结束后槽位必须释放：否则闸门越收越紧，最终所有剪藏都被拒。"""
+    fake_fetcher.delay = 0.0  # 第一抓立刻结束 → 槽位归还
+    uid, token = await new_user(monthly_quota=5)
+
+    async with client(token) as c:
+        await c.post(ARTICLES, json={"url": "https://example.com/slot-1"})
+    await drain_capture_tasks()
+
+    # 槽位已释放 ⇒ 第二篇能正常抓
+    async with client(token) as c:
+        r2 = await c.post(ARTICLES, json={"url": "https://example.com/slot-2"})
+    assert r2.json()["fetch_pending"] is True, "槽位释放后第二篇应被接受"
+    await drain_capture_tasks()
+
+    art2 = await article_row(r2.json()["article_id"])
+    assert art2 is not None and art2.raw_content is not None, "第二篇应抓到正文"
+    assert await quota_used(uid) == 2, "两篇都成功抓到 ⇒ 扣两次"
+
+
+@pytest.mark.asyncio
+async def test_并发满_retry被拒返回繁忙原因(fake_fetcher, one_slot_gate):
+    """闸满时点「重试」⇒ 不派抓取，返回繁忙原因，文章标 failed。"""
+    fake_fetcher.delay = 5.0
+    uid, token = await new_user(monthly_quota=5)
+
+    # 占住槽位
+    async with client(token) as c:
+        r1 = await c.post(ARTICLES, json={"url": "https://example.com/retry-busy"})
+    assert r1.json()["fetch_pending"] is True
+
+    # 造一篇失败文章（无正文），retry 应被并发闸拒
+    art_id = await new_article(uid, status="failed")
+    async with client(token) as c:
+        rr = await c.post(f"/api/v1/articles/{art_id}/retry")
+    assert rr.status_code == 200, rr.text
+    assert rr.json()["distill_triggered"] is False
+    assert rr.json()["status"] == "failed", "被拒后文章应保持 failed"
+    assert rr.json()["error"] == capture_pipeline.MSG_CAPTURE_BUSY, "要写明繁忙原因"
+
+    art = await article_row(art_id)
+    assert art is not None and art.error == capture_pipeline.MSG_CAPTURE_BUSY
+    await drain_capture_tasks()

@@ -182,9 +182,15 @@ async def test_concurrent_consume_no_over_sell():
                 for i in range(100)
             ]
         )
-    success = sum(1 for r in responses if r.status_code == 200)
-    assert success > 0
-    assert await db_quota_used(uid) == success  # 不超卖、不漏扣
+    # ⚠️ 2026-11-11 并发闸门（§9 遗留项）：100 个并发里**只有并发上限个**会被
+    # **接受**（`fetch_pending=true`），其余被「拒绝快返」（HTTP 200 但文章
+    # 标 failed/繁忙、**不扣配额**）。⇒ HTTP 200 ≠ 抓到正文 ≠ 扣了配额。
+    # 这里只统计**被接受**的（它们会真正抓取并扣 1 次配额），断言不超卖不漏扣。
+    accepted = [r for r in responses if r.status_code == 200 and r.json().get("fetch_pending")]
+    assert accepted, "并发请求里至少有一个被接受（闸门上限不该是 0）"
+    # 配额在后台抓取成功之后才扣 ⇒ 先等后台任务跑完再断言。
+    await sys.modules["_cp16_content_main"]._drain_capture_tasks()
+    assert await db_quota_used(uid) == len(accepted)  # 不超卖、不漏扣
 
 
 # ---------------------------------------------------------------------------

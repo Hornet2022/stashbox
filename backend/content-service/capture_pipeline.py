@@ -91,10 +91,32 @@ INFLIGHT_TTL_SECONDS = int(os.environ.get(_ENV_INFLIGHT_TTL) or 900)
 ENV_SWEEP_INTERVAL = "STASHBOX_CAPTURE_SWEEP_INTERVAL"
 SWEEP_INTERVAL_SECONDS = int(os.environ.get(ENV_SWEEP_INTERVAL) or 60)
 
+#: 后台抓取的并发上限（并发闸门，2026-11-11 §9 遗留项）。
+#:
+#: 取 4 的依据：content-service 内存上限 224MiB（`MemoryMax`），后台抓取与
+#: 请求共享同一进程。每次抓取会占用内存（HTML 原样 + 解析后的 raw_content，
+#: 最坏浏览器兜底还要起无头浏览器）。4 条并发足够容纳正常剪藏节奏，又不会
+#: 在极端情况下把峰值抬到内存红线之上。
+#:
+#: ⚠️ 这是「拒绝快返」的闸门：并发满 ⇒ **拒绝**（不排队）。排队会让后台任务
+#: 积压、内存持续抬升，违背「加闸门防内存峰值」的初衷。
+_ENV_MAX_CONCURRENCY = "STASHBOX_CAPTURE_MAX_CONCURRENCY"
+CAPTURE_MAX_CONCURRENCY = int(os.environ.get(_ENV_MAX_CONCURRENCY) or 4)
+
+#: 当前在跑的后台抓取数（并发闸门的计数）。
+#:
+#: 用普通 int 而不是 `asyncio.Semaphore`：Semaphore 绑定事件循环，而测试里
+#: 每个用例是**独立 loop**（pytest-asyncio 默认 function scope，实测两个用例
+#: 的 `id(asyncio.get_running_loop())` 不同）⇒ 模块级 Semaphore 会在跨用例时
+#: 因「loop 已绑定」而炸。单进程 asyncio 里「检查 + 自增」是**同步段**（无
+#: `await`，不会让出事件循环）⇒ 没有竞态，普通 int 计数就够。
+_capture_inflight_count = 0
+
 #: 面向用户的中文原因（失败时写进 `articles.error`）。
 MSG_FETCH_TIMEOUT = "抓取超时，请重试"
 MSG_FETCH_FAILED = "抓取失败，请稍后重试"
 MSG_QUOTA_EXHAUSTED = "本月免费额度已用完，剪藏未生效（未扣费）"
+MSG_CAPTURE_BUSY = "当前抓取繁忙，请稍后重试"
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +189,42 @@ def capture_failure_message(exc: BaseException) -> str:
         if msg:
             return msg
     return MSG_FETCH_FAILED
+
+
+# ---------------------------------------------------------------------------
+# 并发闸门（拒绝快返）
+# ---------------------------------------------------------------------------
+
+
+def capture_busy() -> bool:
+    """并发抓取是否已满（拒绝快返的判据）。
+
+    ⚠️ 只在**调度前**用（`_schedule_capture_fetch`）：满了就不派任务，
+    而不是把任务丢进后台再让它在队列里等 —— 那等于把「并发峰值」换成了
+    「后台积压」，内存照样抬升。
+    """
+    return _capture_inflight_count >= CAPTURE_MAX_CONCURRENCY
+
+
+def acquire_capture_slot() -> bool:
+    """尝试占一个抓取并发槽。成功返回 ``True``，满则返回 ``False``（不阻塞）。
+
+    与 `capture_busy` 的区别：这个**真的占位**（自增计数）。
+    因为「检查 + 自增」是同步段（无 `await`），单进程 asyncio 里不会有两个
+    协程同时通过 —— 所以不需要锁。
+    """
+    global _capture_inflight_count
+    if _capture_inflight_count >= CAPTURE_MAX_CONCURRENCY:
+        return False
+    _capture_inflight_count += 1
+    return True
+
+
+def release_capture_slot() -> None:
+    """释放一个抓取并发槽（抓取结束，无论成败）。"""
+    global _capture_inflight_count
+    if _capture_inflight_count > 0:
+        _capture_inflight_count -= 1
 
 
 # ---------------------------------------------------------------------------
@@ -254,13 +312,19 @@ async def run_capture_fetch(
     `raw_content` 已有值 ⇒ 直接 ``skipped``（别的路径已经抓过）。
     """
     try:
-        return await _run_capture_fetch_inner(article_id, fetch=fetch, to_raw=to_raw, distill=distill)
+        return await _run_capture_fetch_inner(
+            article_id, fetch=fetch, to_raw=to_raw, distill=distill
+        )
     finally:
         # ⚠️ 在跑标记**必须清掉**（成功/失败/跳过都一样）。
         # 漏清的后果很具体：这篇文章会被永久当成「正在抓」⇒
         # ① 用户再提交同一链接时判定成 `await` ⇒ 永远不会重新驱动抓取；
         # ② 兜底定时器也会跳过它 ⇒ 失败的文章永远停在 failed/pending。
         await clear_inflight(article_id)
+        # 并发槽也**必须还掉**（与 `_schedule_capture_fetch` 里的 acquire 配对，
+        # 成功/失败/跳过都一样）。漏还 ⇒ 槽位被永久占住 ⇒ 闸门越收越紧，
+        # 最终所有剪藏都被拒。
+        release_capture_slot()
 
 
 async def _run_capture_fetch_inner(
@@ -379,17 +443,14 @@ async def sweep_stale_captures() -> int:
             "epoch", func.now() - func.coalesce(Article.updated_at, Article.created_at)
         ).label("age_sec")
         rows = (
-            (
-                await session.execute(
-                    select(Article, age_expr).where(
-                        Article.status == "pending",
-                        NO_RAW_CONTENT,
-                        Article.deleted_at.is_(None),
-                    )
+            await session.execute(
+                select(Article, age_expr).where(
+                    Article.status == "pending",
+                    NO_RAW_CONTENT,
+                    Article.deleted_at.is_(None),
                 )
             )
-            .all()
-        )
+        ).all()
         touched_users: set[int] = set()
         count = 0
         for art, age_sec in rows:

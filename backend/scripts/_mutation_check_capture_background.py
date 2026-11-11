@@ -26,8 +26,8 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]], list[str]]] = [
         "content-service/capture_pipeline.py",
         [
             (
-                "    if in_flight:\n        return \"await\"",
-                "    if in_flight:\n        return \"refetch\"",
+                '    if in_flight:\n        return "await"',
+                '    if in_flight:\n        return "refetch"',
             )
         ],
         [
@@ -40,8 +40,8 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]], list[str]]] = [
         "content-service/capture_pipeline.py",
         [
             (
-                "    if in_flight:\n        return \"await\"\n    return \"refetch\"",
-                "    if in_flight:\n        return \"await\"\n    return \"reuse\"",
+                '    if in_flight:\n        return "await"\n    return "refetch"',
+                '    if in_flight:\n        return "await"\n    return "reuse"',
             )
         ],
         [
@@ -99,8 +99,8 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]], list[str]]] = [
         "content-service/main.py",
         [
             (
-                "        reused=False,\n        fetch_pending=True,\n        quota_pending=True,",
-                "        reused=False,\n        fetch_pending=False,\n        quota_pending=True,",
+                "        fetch_pending=accepted,\n        quota_pending=accepted,",
+                "        fetch_pending=False,\n        quota_pending=accepted,",
             )
         ],
         [f"{TEST_FILE}::test_剪藏接口立即返回_不等抓取"],
@@ -121,11 +121,55 @@ MUTATIONS: list[tuple[str, str, list[tuple[str, str]], list[str]]] = [
         "content-service/capture_pipeline.py",
         [
             (
-                "            art.status = \"failed\"\n            art.error = msg",
-                "            art.status = \"failed\"\n            art.error = None",
+                '            art.status = "failed"\n            art.error = msg',
+                '            art.status = "failed"\n            art.error = None',
             )
         ],
         [f"{TEST_FILE}::test_后台抓不到_标记失败且不扣配额"],
+    ),
+    (
+        "M10: 并发闸门失效（满时不再拒绝，任务照样派出去 ⇒ 内存峰值抬升）",
+        "content-service/main.py",
+        [
+            (
+                "    if not capture_pipeline.acquire_capture_slot():",
+                "    if False:  # 变异：并发闸门失效",
+            )
+        ],
+        [f"{TEST_FILE}::test_并发满_新剪藏被拒绝且标繁忙"],
+    ),
+    (
+        "M11: 抓取结束不归还并发槽（槽位被永久占住 ⇒ 闸门越收越紧，最终全拒）",
+        "content-service/capture_pipeline.py",
+        [
+            (
+                "        release_capture_slot()",
+                "        pass  # 变异：不归还并发槽",
+            )
+        ],
+        [f"{TEST_FILE}::test_闸_抓取结束槽位释放_后续剪藏可继续"],
+    ),
+    (
+        "M12: 被拒的文章不写明「繁忙」原因（用户只看到「失败」两个字）",
+        "content-service/main.py",
+        [
+            (
+                "    art.error = capture_pipeline.MSG_CAPTURE_BUSY",
+                "    art.error = None",
+            )
+        ],
+        [f"{TEST_FILE}::test_并发满_新剪藏被拒绝且标繁忙"],
+    ),
+    (
+        "M13: 被拒的文章保持 pending 不标 failed（用户看到「一直处理中」）",
+        "content-service/main.py",
+        [
+            (
+                '    art.status = "failed"\n    art.error = capture_pipeline.MSG_CAPTURE_BUSY',
+                '    art.status = "pending"\n    art.error = capture_pipeline.MSG_CAPTURE_BUSY',
+            )
+        ],
+        [f"{TEST_FILE}::test_并发满_新剪藏被拒绝且标繁忙"],
     ),
 ]
 

@@ -337,11 +337,7 @@ def _to_response(
         fetch_pending=(
             fetch_pending
             if fetch_pending is not None
-            else (
-                a.status == "pending"
-                and "raw_content" in a.__dict__
-                and a.raw_content is None
-            )
+            else (a.status == "pending" and "raw_content" in a.__dict__ and a.raw_content is None)
         ),
         favorite=a.favorite,
         skip=a.skip,
@@ -1148,8 +1144,18 @@ async def _trigger_distill_for(article_id: str, auth_token: str):
 _CAPTURE_TASKS: set[asyncio.Task] = set()
 
 
-def _schedule_capture_fetch(article_id: str) -> None:
-    """把后台抓取任务丢出去跑（不阻塞响应）。"""
+def _schedule_capture_fetch(article_id: str) -> bool:
+    """把后台抓取任务丢出去跑（不阻塞响应）。
+
+    返回是否**接受**了这次抓取：并发闸门满（`capture_busy`）时返回 ``False``
+    （拒绝快返，不派任务），调用方据此把文章标记为「繁忙」并返回给用户。
+
+    ⚠️ 并发槽**在这里 acquire**、在 `run_capture_fetch` 的 `finally` 里 release
+    —— 配对不能拆散（漏还 ⇒ 槽位被永久占住 ⇒ 闸门越收越紧）。
+    """
+    if not capture_pipeline.acquire_capture_slot():
+        log.warning("capture_busy_rejected: article=%s", article_id)
+        return False
     task = asyncio.create_task(
         capture_pipeline.run_capture_fetch(
             article_id,
@@ -1160,6 +1166,29 @@ def _schedule_capture_fetch(article_id: str) -> None:
     )
     _CAPTURE_TASKS.add(task)
     task.add_done_callback(_CAPTURE_TASKS.discard)
+    return True
+
+
+async def _reject_capture_busy(art: Article, db: AsyncSession) -> Article:
+    """并发闸门满时，把文章标记为「繁忙」并返回（用户能看到原因，可稍后重试）。
+
+    ## 为什么标 failed 而不是保持 pending
+
+    拒绝时**没有任务在跑**这篇文章（并发满没派出去）。若保持 `pending`，
+    兜底定时器会把它当孤儿收尾（也是 failed）—— 但用户会先看到「一直处理中」
+    很久。直接标 failed + 写明原因，用户立刻知道发生了什么，点「重试」即可
+    （重试会重新驱动抓取）。
+
+    ## 不扣配额
+
+    先抓后扣：抓取根本没发生，自然不扣。这与「抓取失败不扣费」同口径。
+    """
+    art.status = "failed"
+    art.error = capture_pipeline.MSG_CAPTURE_BUSY
+    await db.commit()
+    await cache_service.invalidate_article(art.id)
+    await cache_service.invalidate_pending(art.user_id)
+    return art
 
 
 async def _drain_capture_tasks(timeout: float = 20.0) -> None:
@@ -1259,8 +1288,16 @@ async def _clip_link(
         dup.error = None
         await db.commit()
         await capture_pipeline.mark_inflight(dup.id)
-        _schedule_capture_fetch(dup.id)
-        return ClipResult(article=dup, reused=True, fetch_pending=True)
+        accepted = _schedule_capture_fetch(dup.id)
+        if not accepted:
+            # 并发闸门满：拒绝快返，标成「繁忙」让用户看到原因（可稍后重试）。
+            dup = await _reject_capture_busy(dup, db)
+        return ClipResult(
+            article=dup,
+            reused=True,
+            fetch_pending=accepted,
+            quota_pending=accepted,
+        )
 
     # -- 配额：请求时**只读**检查（用尽 ⇒ 立刻拒，不建行）。--
     #
@@ -1273,9 +1310,7 @@ async def _clip_link(
             "clip_quota_exhausted",
             extra={"url": url, "user_id": uid},
         )
-        raise quota_service.QuotaExceededError(
-            message="本月免费额度已用完，请下月再试或升级会员"
-        )
+        raise quota_service.QuotaExceededError(message="本月免费额度已用完，请下月再试或升级会员")
 
     # -- 建 pending 行（**不抓**）：raw_content 留空 = 「抓取中」。--
     art = await _create_article(
@@ -1292,7 +1327,10 @@ async def _clip_link(
 
     # -- 派后台抓取，**立即返回**。--
     await capture_pipeline.mark_inflight(art.id)
-    _schedule_capture_fetch(art.id)
+    accepted = _schedule_capture_fetch(art.id)
+    if not accepted:
+        # 并发闸门满：拒绝快返，把文章标成「繁忙」让用户看到原因（可稍后重试）。
+        art = await _reject_capture_busy(art, db)
 
     return ClipResult(
         article=art,
@@ -1303,8 +1341,9 @@ async def _clip_link(
         monthly_quota=int(quota.get("monthly_quota", 0)),
         remaining=remaining,
         reused=False,
-        fetch_pending=True,
-        quota_pending=True,
+        # 被并发闸门拒掉时文章已 failed ⇒ 不是「正在抓取」。
+        fetch_pending=accepted,
+        quota_pending=accepted,
     )
 
 
@@ -2139,13 +2178,21 @@ async def user_retry_distill(
     # 还产出一篇垃圾稿），而状态会被标成 failed ⇒ 用户点了「重试」却得到另一篇垃圾。
     #
     # ⇒ 没有正文 ⇒ **重新驱动抓取**（这才是用户点「重试」想要的东西）。
+    final_status = "pending"
+    final_error = None
     if art.raw_content is None:
         log.info(
             "retry_refetch_instead_of_distill",
             extra={"article_id": article_id, "user_id": art_user_id},
         )
         await capture_pipeline.mark_inflight(article_id)
-        _schedule_capture_fetch(article_id)
+        accepted = _schedule_capture_fetch(article_id)
+        if not accepted:
+            # 并发闸门满：拒绝快返，把文章标回「繁忙」（用户可稍后再试）。
+            # ⚠️ 上面已把 status 改成 pending 并 commit，这里要改回 failed。
+            art = await _reject_capture_busy(art, db)
+            final_status = art.status
+            final_error = art.error
         queued = None
     else:
         queued = await get_ai_client().trigger_distill(
@@ -2166,7 +2213,8 @@ async def user_retry_distill(
 
     return {
         "article_id": article_id,
-        "status": "pending",
+        "status": final_status,
+        "error": final_error,
         "retry_count": retry_count,
         "queued_at": datetime.now(timezone.utc).isoformat(),
         "distill_triggered": queued is not None,
