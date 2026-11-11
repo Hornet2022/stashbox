@@ -582,6 +582,21 @@ async def distill_article(
     url = art.url
     title = art.title
 
+    # 2026-11-11：**没有正文就不派蒸馏**（剪藏改成后台抓取之后的关键守卫）。
+    #
+    # 剪藏改成「后台抓取」后，抓取失败的文章 `raw_content` 是空的（正文从没抓到）。
+    # 这种文章如果照常派蒸馏 ⇒ ai-service 的 `_load_raw_content` 拿不到正文 ⇒
+    # 会用占位串 `"[empty article] title=… url=…"` **当正文喂给 LLM**
+    # ⇒ 白烧 token，还产出一篇垃圾稿，最后状态还标成 failed
+    # ⇒ 用户点「重试」得到的是另一篇垃圾。
+    #
+    # ⚠️ 这个守卫必须放在**扣配额之前** —— 否则用户会为一次「根本没跑」的蒸馏付费。
+    if not art.raw_content:
+        raise InvalidRequest(
+            message="原文还没抓到，稍后重试（剪藏失败请在剪藏页重新提交）",
+            code=4004,
+        )
+
     # 已有蒸馏产物行（复用旧行，CP-DISTILL-DUP）
     existed_da = await db.scalar(
         select(DistilledArticle).where(DistilledArticle.article_id == article_id)

@@ -27,12 +27,14 @@ CP1.7：D9 端到端 —— 不要求登录态 → 建文章 → 自动触发 ai
   app = FastAPI(...) 仍保留在 main.py（lifespan / middleware / CORS 集中管理）。
 """
 
+import asyncio
 import json
 import os
 import re
 import sys
 import time
 import uuid
+from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +52,10 @@ from sqlalchemy.orm import defer
 
 # content-service 目录名带连字符，不能当包导入，故把自身目录加入 sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # noqa: E402
+
+# 剪藏后台抓取（2026-11-11）。放在 sys.path 之后 import —— 它是**同级模块**
+# （不是包），与 fetchers/ schemas.py 同一套导入方式。
+import capture_pipeline  # noqa: E402
 
 from clients.ai_client import get_ai_client  # noqa: E402
 from fetchers import (  # noqa: E402
@@ -98,6 +104,7 @@ from stashbox.backend.common.exceptions import (
 from stashbox.backend.common.logging import get_logger, setup_logging
 from stashbox.backend.common.middleware import MemoryTrimMiddleware, RequestIDMiddleware
 from stashbox.backend.common.models import (
+    NO_RAW_CONTENT,
     AdminOperationLog,
     Article,
     DistilledArticle,
@@ -128,7 +135,46 @@ def _uid(user: dict) -> int:
 
 setup_logging("content-service")
 log = get_logger(__name__)
-app = FastAPI(title="stashbox-content-service", version="0.3.0")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """进程生命周期：起**兜底定时器**（孤儿 pending 收尾），退出时收掉。
+
+    ## 为什么必须有它
+
+    剪藏改成后台抓取后，抓取任务是**进程内**的 asyncio 任务 ⇒ 进程重启 /
+    OOM kill / 机器重启会让任务凭空消失，那篇文章会**永远**停在 pending
+    （用户看到「一直处理中」，永远等不到结果）。这个定时器就是给这种孤儿收尾的。
+
+    ## 为什么是 lifespan 而不是独立线程
+
+    定时器要访问 DB 与 Redis（异步客户端），放进事件循环里最简单；
+    独立线程要自己再开一套事件循环，容易出「两个 loop 抢同一个连接池」的问题。
+
+    ⚠️ 本单元是**单进程**（systemd unit 没传 --workers）⇒ 只有一个定时器。
+    若将来上多 worker，这个定时器会跑多份 —— 判定是幂等的
+    （同一条文章只会被标一次 failed），但要记得把它挪到独立进程/定时任务里。
+    """
+    # 启动时先扫一次：上一次进程留下的孤儿 pending 立刻收尾，
+    # 而不是等第一个扫描周期（60s）—— 用户重开 app 就该看到结论。
+    try:
+        swept = await capture_pipeline.sweep_stale_captures()
+        if swept:
+            log.warning("capture_sweep_on_startup_marked_failed: count=%s", swept)
+    except Exception as exc:  # noqa: BLE001
+        log.error("capture_sweep_on_startup_error: %s: %s", type(exc).__name__, exc)
+
+    task = asyncio.create_task(capture_pipeline.stale_capture_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+app = FastAPI(title="stashbox-content-service", version="0.3.1", lifespan=lifespan)
 register_exception_handlers(app)
 app.add_middleware(RequestIDMiddleware)
 # 内存回收（2026-10-25 生产事故）：content-service 被 cgroup memory.high
@@ -251,6 +297,7 @@ def _to_response(
     tts_voice: TTSVoiceBrief | None = None,
     stage: str | None = None,
     for_owner: bool = True,
+    fetch_pending: bool | None = None,
 ) -> ArticleResponse:
     """CP9.x dev 兜底：本地模式（STORAGE_PROVIDER=local）下 audio_url 用
     PUBLIC_GATEWAY_URL 拼，避免真机客户端连到 localhost（设备本机）。
@@ -278,6 +325,24 @@ def _to_response(
         title=a.title,
         owner_id=str(a.user_id),
         status=_derive_status(a, task),
+        # 2026-11-11：失败原因（面向用户的中文文案；技术细节只进日志）
+        error=a.error,
+        # 2026-11-11：抓取在后台进行中（pending 且还没有正文）
+        #
+        # ⚠️ 这里**不能直接读 a.raw_content**：列表端点用 `defer` 跳过了这一列
+        # （raw_content 可达 ~250KB，见 _LISTING_DEFER 的说明），
+        # 一旦在这里访问就会触发 lazy load ⇒ async 上下文抛 MissingGreenlet（500）。
+        # ⇒ 列表端点把「正文是否为空」用 SQL 表达式算出来传进来（fetch_pending 参数）；
+        # 详情端点整行都加载了，可以自己算。
+        fetch_pending=(
+            fetch_pending
+            if fetch_pending is not None
+            else (
+                a.status == "pending"
+                and "raw_content" in a.__dict__
+                and a.raw_content is None
+            )
+        ),
         favorite=a.favorite,
         skip=a.skip,
         stage=stage,
@@ -1029,6 +1094,16 @@ class ClipResult:
     monthly_quota: int = 0
     remaining: int = 0
     reused: bool = False
+    #: 抓取在**后台**进行中（2026-11-11）。
+    #:
+    #: ⚠️ 与它一起出现的 `quota_used` 是**提交这一刻的用户配额快照**，
+    #: **不含**本次剪藏的扣减 —— 后台抓取**成功之后**才扣（先抓后扣），
+    #: 那一刻还没发生。`quota_pending=true` 就是把这件事说出来。
+    fetch_pending: bool = False
+    #: 本次的配额**尚未扣除**（后台抓取还没成功）。
+    #:
+    #: ⚠️ 别把它当成「免费」：抓取成功后就会扣，客户端应以刷新后的配额为准。
+    quota_pending: bool = False
 
     def to_payload(self) -> dict:
         """提交回执（`POST /api/v1/articles` 与 `/api/v1/articles/document` 同形）。
@@ -1048,7 +1123,67 @@ class ClipResult:
             "monthly_quota": self.monthly_quota,
             "remaining": self.remaining,
             "reused": self.reused,
+            # 2026-11-11：抓取在后台进行中（客户端据此显示「正在抓取」而不是「失败」）
+            "fetch_pending": self.fetch_pending,
+            # 2026-11-11：本次配额**尚未扣除**（后台抓到正文才扣）
+            "quota_pending": self.quota_pending,
         }
+
+
+async def _trigger_distill_for(article_id: str, auth_token: str):
+    """派蒸馏的薄封装（后台抓取任务的钩子）。
+
+    单独抽出来是为了让 `get_ai_client()` 保持**一处**调用点：
+    单测替换 `content_main.get_ai_client` 就能覆盖到后台路径，
+    不用去替换 `capture_pipeline` 里的东西。
+    """
+    return await get_ai_client().trigger_distill(article_id=article_id, auth_token=auth_token)
+
+
+#: 在跑的后台抓取任务（保留引用，防止被 GC 提前回收）。
+#:
+#: ⚠️ `asyncio.create_task` 的任务只被 event loop 弱引用 ⇒ 不留强引用的话
+#: 它可能在跑完前被回收掉（表现为「抓取莫名其妙没发生」）。这是 asyncio 的
+#: 已知坑，必须留集合。
+_CAPTURE_TASKS: set[asyncio.Task] = set()
+
+
+def _schedule_capture_fetch(article_id: str) -> None:
+    """把后台抓取任务丢出去跑（不阻塞响应）。"""
+    task = asyncio.create_task(
+        capture_pipeline.run_capture_fetch(
+            article_id,
+            fetch=_prefetch_for_capture,
+            to_raw=_to_raw_content,
+            distill=_trigger_distill_for,
+        )
+    )
+    _CAPTURE_TASKS.add(task)
+    task.add_done_callback(_CAPTURE_TASKS.discard)
+
+
+async def _drain_capture_tasks(timeout: float = 20.0) -> None:
+    """等所有在跑的后台抓取任务结束（**仅供测试**：让用例能断言后台结果）。
+
+    ⚠️ **必须有超时**：某个用例如果没把抓取层 mock 掉，后台任务会真的去访问
+    外网（最坏几十秒）⇒ 没有超时的话，整轮测试会挂在一条用例的**收尾**上，
+    而且报错点离原因很远（看起来像「pytest 卡住了」）。
+    ⇒ 超时后**取消**这些任务并打日志（取消是安全的：任务只写自己的文章行）。
+    """
+    while _CAPTURE_TASKS:
+        pending = list(_CAPTURE_TASKS)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "capture_drain_timeout: %s 个后台抓取任务超时未结束，已取消（多半是某条用例没 mock 抓取层）",
+                len(pending),
+            )
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
 
 async def _clip_link(
@@ -1059,74 +1194,117 @@ async def _clip_link(
     title: str | None,
     db: AsyncSession,
 ) -> ClipResult:
-    """**链接**剪藏的完整流程：早查重 → 抓取 → 公共后半程。
+    """**链接**剪藏：早查重 → 建 pending 行 → **后台抓取** → 立即返回。
 
-    ## 为什么要有「早查重」这一步
+    ## 2026-11-11：抓取从「请求里」挪到「后台」
 
-    抓取一次要几秒到几十秒，而重复剪藏同一链接是**用户自己会做的事**
-    （没看到结果就再点一次）。早查重 = 命中重复时**不抓、不扣费**，
-    只把已有文章再派一次蒸馏。
+    改造前这里是**同步长请求**：服务端当场抓取（整条降级链最坏 ~40s），
+    客户端一直等这个响应 ⇒ 客户端侧任何抖动都会变成
+    「**服务端成功、客户端报错**」。实测（uid 23）：4 次剪藏服务端全部 200、
+    文章全部建好，客户端却反复弹「网络连接失败」。
 
-    ## 为什么它和 `_clip_after_fetch` 里那次查重不是重复
+    现在：接口只做「建一条 pending 行」就返回（毫秒级），
+    抓取在后台跑 ⇒ 客户端等的是自己的**短请求**，失败面小得多。
 
-    两次查重看的都是「同用户 + 同 URL + 未删除」，但**时点不同**：
+    ## 早查重命中时的三种动作（`capture_pipeline.decide_existing_clip_action`）
 
-      · 这里在**抓取之前** —— 目的是**省掉一次抓取**（抓取有外部成本）；
-      · `_clip_after_fetch` 里那次在**扣配额之前** —— 目的是**不重复计费**。
+    · `reuse` —— 已有正文：沿用旧行为（复用 + 重派蒸馏）。
+    · `await` —— 没正文但**正在抓**：返回同一篇，**不重复驱动**（否则抓两次扣两次）。
+    · `refetch` —— 没正文且**没人在抓**（失败过 / 进程重启留下的孤儿）：
+      **重新驱动抓取**。⚠️ 不能直接复用失败的那篇 —— 那会让用户永远剪不进去。
 
-    中间可能隔了几十秒（抓取耗时），期间别人（或同一个用户的另一个端）
-    可能已经建了同一篇 —— 所以**两次都要查**。第一次省抓取，第二次保计费。
+    ## 配额口径（不变）
 
-    ⚠️ 这段逻辑曾经**只写在 `submit_article` 里**，而旧版 `POST /api/v1/articles/add`
-    绕过了整条链（自己调 `_create_article`）⇒ 那个端点不扣配额、不埋点、
-    不打缓存标记，是一条免费剪藏的口子。现在两个入口共用这一份实现。
+    * 请求时**只读检查**配额：用尽 ⇒ 立刻 403/3001（不建行、不留垃圾文章）。
+    * 真正的扣费在**后台抓取成功之后**（先抓后扣，2026-10-03 定的口径）：
+      抓不到正文 ⇒ 不计费，文章 `status=failed` 且带面向用户的中文原因。
+    ⇒ 因此回执里的 `quota_used` 在这条路径上恒为 0（还没扣），
+      `fetch_pending=true` 表示「抓取在后台进行中」。
     """
-    # CP-DUPLICATE-CLIP：先查重再抓，重复提交同一链接不重复计费。
+    # -- CP-DUPLICATE-CLIP：先查重再抓，重复提交同一链接不重复计费。--
     dup = await _find_existing_clip(url, uid, db)
     if dup is not None:
-        log.info(
-            "clip_duplicate_reuse",
-            extra={"url": url, "user_id": uid, "article_id": dup.id},
+        action = capture_pipeline.decide_existing_clip_action(
+            status=dup.status,
+            has_content=dup.raw_content is not None,
+            in_flight=await capture_pipeline.is_inflight(dup.id),
         )
-        try:
-            await get_ai_client().trigger_distill(
-                article_id=dup.id, auth_token=create_access_token(str(uid))
+        if action == "reuse":
+            log.info(
+                "clip_duplicate_reuse",
+                extra={"url": url, "user_id": uid, "article_id": dup.id},
             )
-        except Exception as exc:
-            log.warning("auto_distill_trigger_failed (dup): article=%s error=%s", dup.id, exc)
-        return ClipResult(article=dup, reused=True)
+            try:
+                await get_ai_client().trigger_distill(
+                    article_id=dup.id, auth_token=create_access_token(str(uid))
+                )
+            except Exception as exc:
+                log.warning("auto_distill_trigger_failed (dup): article=%s error=%s", dup.id, exc)
+            return ClipResult(article=dup, reused=True)
 
-    # 2026-10-03：**先抓后扣**。
-    #
-    # 原来是「先扣配额 → 再建库（内部抓取）」，而抓取失败是软降级的，于是
-    # 一次网络抖动 = 扣掉 1 次配额 + 建一条无正文的文章 + 派一个注定失败的
-    # 蒸馏任务，而接口返回 200。用户什么都没得到，还少了配额。
-    #
-    # 现在先做一次纯读的抓取：失败直接 2001/2002 返回，既不建库也不计费。
-    # 抓到了再扣配额建库 —— 这时建库只差一次 DB insert。
-    fr = await _prefetch_for_capture(url)
+        if action == "await":
+            # 正在后台抓：返回同一篇即可，**不能再驱动一次**（会抓两次、扣两次）。
+            log.info(
+                "clip_duplicate_fetch_inflight",
+                extra={"url": url, "user_id": uid, "article_id": dup.id},
+            )
+            return ClipResult(article=dup, reused=True, fetch_pending=True)
 
-    # 2026-10-23：GitHub 走**专属 fetcher** 时，来源要用**真实来源**。
-    #
-    # 为什么只改这一个：`articles.source` 落的是**请求体里传的** source
-    # （默认 "web"），而真正解析它的是 fetcher（`raw_content["source"]`）。
-    # 剪藏一个 GitHub 仓库若存 "web"，列表里就显示「通用」—— 用户分不清
-    # 自己剪的是网页还是代码库，admin 的来源筛选也跟着失真。
-    #
-    # ⚠️ 只对**新增的**专属来源改，不动既有映射（wechat/wechat_mp/douyin/pdf
-    # 的既有口径保持不变）—— 那几个的历史数据里两种写法都存在，
-    # 现在统一会让老数据的来源显示突变。
-    source = "github" if fr.source == "github" else source
+        # action == "refetch"：失败过 / 孤儿 → 重新驱动抓取。
+        log.info(
+            "clip_refetch_restart",
+            extra={"url": url, "user_id": uid, "article_id": dup.id, "prev_status": dup.status},
+        )
+        dup.status = "pending"
+        dup.error = None
+        await db.commit()
+        await capture_pipeline.mark_inflight(dup.id)
+        _schedule_capture_fetch(dup.id)
+        return ClipResult(article=dup, reused=True, fetch_pending=True)
 
-    # 后半程（去重 → 扣配额 → 建库 → 派蒸馏 → 失效缓存）与文档剪藏**共用一份**
-    # 实现，见 _clip_after_fetch 的说明。
-    return await _clip_after_fetch(
-        url=url,
-        uid=uid,
-        source=source,
-        title=title or fr.title or None,
-        raw_content=_to_raw_content(fr),
-        db=db,
+    # -- 配额：请求时**只读**检查（用尽 ⇒ 立刻拒，不建行）。--
+    #
+    # 为什么不是在这里 consume：先抓后扣 —— 抓不到就不该计费。
+    # 真正的扣费在后台抓取成功之后（capture_pipeline.run_capture_fetch）。
+    quota = await quota_service.get_quota(db, uid)
+    remaining = int(quota.get("remaining", 0))
+    if remaining <= 0:
+        log.info(
+            "clip_quota_exhausted",
+            extra={"url": url, "user_id": uid},
+        )
+        raise quota_service.QuotaExceededError(
+            message="本月免费额度已用完，请下月再试或升级会员"
+        )
+
+    # -- 建 pending 行（**不抓**）：raw_content 留空 = 「抓取中」。--
+    art = await _create_article(
+        url,
+        uid,
+        source,
+        title,
+        db,
+        raw_content=None,
+        event=EventName.ARTICLE_SUBMIT,
+        fetch_on_create=False,  # 抓取挪到后台
+        dedup=False,  # 上面已经查过重了；这里再查一次会命中"自己"（还没建）
+    )
+
+    # -- 派后台抓取，**立即返回**。--
+    await capture_pipeline.mark_inflight(art.id)
+    _schedule_capture_fetch(art.id)
+
+    return ClipResult(
+        article=art,
+        # ⚠️ 这是**提交这一刻**的用户配额快照，**不含**本次的扣减
+        # （后台抓到正文才扣）。别写成 1 —— 那样等于宣称「已经扣了」，
+        # 而抓取失败时其实**不会**扣。
+        quota_used=int(quota.get("quota_used", 0)),
+        monthly_quota=int(quota.get("monthly_quota", 0)),
+        remaining=remaining,
+        reused=False,
+        fetch_pending=True,
+        quota_pending=True,
     )
 
 
@@ -1577,7 +1755,7 @@ async def list_articles(
     total = await db.scalar(select(func.count()).select_from(Article).where(*base_filter))
 
     result = await db.execute(
-        select(Article, DistilledArticle)
+        select(Article, DistilledArticle, NO_RAW_CONTENT.label("raw_is_null"))
         .outerjoin(DistilledArticle, DistilledArticle.article_id == Article.id)
         .options(_LISTING_DEFER)  # 见 _LISTING_DEFER：_to_response 不读 raw_content
         .where(*base_filter)
@@ -1602,7 +1780,10 @@ async def list_articles(
             log.warning(f"TAG_FILTER 埋点异常（忽略）: slug={tag} err={exc}")
 
     return {
-        "items": [_to_response(art, task).model_dump() for art, task in rows],
+        "items": [
+            _to_response(art, task, fetch_pending=bool(raw_is_null)).model_dump()
+            for art, task, raw_is_null in rows
+        ],
         "total": total or 0,
         "tag": tag,
         "tag_id": tag_id if tag and tag_row else None,
@@ -1617,7 +1798,7 @@ async def list_pending(user: dict = Depends(require_user), db: AsyncSession = De
         return {"articles": cached, "count": len(cached), "cached": True}
 
     result = await db.execute(
-        select(Article, DistilledArticle)
+        select(Article, DistilledArticle, NO_RAW_CONTENT.label("raw_is_null"))
         .outerjoin(DistilledArticle, DistilledArticle.article_id == Article.id)
         .options(_LISTING_DEFER)  # 见 _LISTING_DEFER
         .where(
@@ -1630,7 +1811,10 @@ async def list_pending(user: dict = Depends(require_user), db: AsyncSession = De
         .limit(_LIST_PAGE_CAP + 1)  # +1 用于判别是否触发截断
     )
     rows = _truncate_for_list(result.all(), _LIST_PAGE_CAP, endpoint="list_pending", uid=uid)
-    items = [_to_response(art, task).model_dump() for art, task in rows]
+    items = [
+        _to_response(art, task, fetch_pending=bool(raw_is_null)).model_dump()
+        for art, task, raw_is_null in rows
+    ]
     await cache_service.set_pending(uid, items)  # 回填（ttl 60s）
     return {"articles": items, "count": len(items), "cached": False}
 
@@ -1639,7 +1823,7 @@ async def list_pending(user: dict = Depends(require_user), db: AsyncSession = De
 async def list_listened(user: dict = Depends(require_user), db: AsyncSession = Depends(get_db)):
     uid = _uid(user)
     result = await db.execute(
-        select(Article, DistilledArticle)
+        select(Article, DistilledArticle, NO_RAW_CONTENT.label("raw_is_null"))
         .outerjoin(DistilledArticle, DistilledArticle.article_id == Article.id)
         .options(_LISTING_DEFER)  # 见 _LISTING_DEFER
         .where(
@@ -1651,7 +1835,10 @@ async def list_listened(user: dict = Depends(require_user), db: AsyncSession = D
         .limit(_LIST_PAGE_CAP + 1)  # +1 用于判别是否触发截断
     )
     rows = _truncate_for_list(result.all(), _LIST_PAGE_CAP, endpoint="list_listened", uid=uid)
-    items = [_to_response(art, task).model_dump() for art, task in rows]
+    items = [
+        _to_response(art, task, fetch_pending=bool(raw_is_null)).model_dump()
+        for art, task, raw_is_null in rows
+    ]
     return {"articles": items, "count": len(items)}
 
 
@@ -1944,9 +2131,26 @@ async def user_retry_distill(
         raise
 
     # 触发蒸馏
-    queued = await get_ai_client().trigger_distill(
-        article_id, auth_token=create_access_token(str(art_user_id))
-    )
+    #
+    # ⚠️ 2026-11-11：**没有正文的文章不能派蒸馏**。
+    # 剪藏改成后台抓取后，失败的文章 `raw_content` 是空的（正文从没抓到）。
+    # 这种情况派蒸馏 ⇒ ai-service 拿不到正文 ⇒ 会用占位串
+    # `"[empty article] title=… url=…"` 当正文喂给 LLM（白烧 token，
+    # 还产出一篇垃圾稿），而状态会被标成 failed ⇒ 用户点了「重试」却得到另一篇垃圾。
+    #
+    # ⇒ 没有正文 ⇒ **重新驱动抓取**（这才是用户点「重试」想要的东西）。
+    if art.raw_content is None:
+        log.info(
+            "retry_refetch_instead_of_distill",
+            extra={"article_id": article_id, "user_id": art_user_id},
+        )
+        await capture_pipeline.mark_inflight(article_id)
+        _schedule_capture_fetch(article_id)
+        queued = None
+    else:
+        queued = await get_ai_client().trigger_distill(
+            article_id, auth_token=create_access_token(str(art_user_id))
+        )
 
     # 写推送"换源重试"卡片（CP5.4b push 队列）
     await push_retry_message(art_user_id, article_id)

@@ -64,6 +64,20 @@ class ArticleResponse(BaseModel):
     title: str | None = None
     owner_id: str
     status: str  # pending | distilling | ready | listened | failed
+    # 2026-11-11：失败原因（**面向用户的中文文案**）。
+    #
+    # 剪藏改成后台抓取后，抓取失败不再在 HTTP 响应里当场返回 ——
+    # 文章会落成 `status=failed`，原因写在这里。没有它的话，
+    # 用户只会看到「失败」两个字，不知道是该重试还是该换个源。
+    #
+    # ⚠️ 只放**面向用户**的文案；技术细节进日志，不进响应体
+    # （与 BizException.detail 的口径一致）。
+    error: str | None = None
+    # 2026-11-11：抓取在后台进行中（status=pending 且还没有正文）。
+    #
+    # 客户端据此显示「正在抓取原文」而不是笼统的「待蒸馏」——
+    # 后台抓取这段通常是几秒到几十秒，用户需要知道它在动。
+    fetch_pending: bool = False
     # 蒸馏当前阶段（fetch/rewrite/tts/concat），仅 distilling 时非空。
     #
     # 为什么需要：蒸馏是异步长任务，TTS 合成占了总时延的大头

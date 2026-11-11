@@ -90,7 +90,11 @@ async def get_quota(user_id: int, token: str) -> dict:
 
 async def submit(token: str, url: str = "https://example.com/a") -> httpx.Response:
     async with client(content_app, token) as c:
-        return await c.post("/api/v1/articles", json={"url": url})
+        r = await c.post("/api/v1/articles", json={"url": url})
+    # 2026-11-11：剪藏改成**后台抓取** ⇒ 配额是在**后台任务**里扣的
+    # （先抓后扣：抓到正文才计费）⇒ 断言配额前必须等后台任务跑完。
+    await sys.modules["_cp16_content_main"]._drain_capture_tasks()
+    return r
 
 
 @pytest.fixture(autouse=True)
@@ -139,8 +143,12 @@ async def test_happy_path_three_consumes():
     for i in range(3):
         r = await submit(token, f"https://example.com/{i}")
         assert r.status_code == 200, r.text
-        used.append(r.json()["quota_used"])
-    assert used == [1, 2, 3]
+        # 2026-11-11：剪藏改成**后台抓取** ⇒ 扣费发生在**后台**（抓到正文才扣），
+        # 提交回执那一刻还没扣 ⇒ 「扣了没有」只有**库**知道。
+        # 回执里的 quota_used 是「提交这一刻的快照」，quota_pending 标明本次未扣。
+        assert r.json()["quota_pending"] is True, "后台抓取的剪藏必须标明配额尚未扣除"
+        used.append(await db_quota_used(uid))
+    assert used == [1, 2, 3], "每次剪藏（抓到正文）扣 1 次配额"
     assert await db_quota_used(uid) == 3
 
     q = await get_quota(uid, token)

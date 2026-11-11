@@ -24,7 +24,9 @@ from helpers import client, new_article, new_user
 async def test_retry_failed_article_succeeds(fake_ai_client):
     """正常路径：failed → pending，retry_count 自增，触发蒸馏。"""
     uid, token = await new_user()
-    art_id = await new_article(uid, status="failed")
+    # with_content=True：**有正文**的失败文章 = 蒸馏失败（TTS 超时等）
+    # ⇒ 重试应该重新派蒸馏。
+    art_id = await new_article(uid, status="failed", with_content=True)
 
     async with client(token) as c:
         resp = await c.post(f"/api/v1/articles/{art_id}/retry")
@@ -101,7 +103,10 @@ async def test_retry_already_ready_returns_409(fake_ai_client):
 async def test_retry_writes_push_notification(fake_ai_client):
     """重试成功后写一条 push_notifications 记录。"""
     uid, token = await new_user()
-    art_id = await new_article(uid, status="failed")
+    # with_content=True：**有正文**的失败文章（= 蒸馏失败）⇒ 重试派蒸馏。
+    # ⚠️ 不能用「没有正文」的文章：那种重试会**重新驱动抓取**（去访问真实网络），
+    # 这里要验的是「蒸馏失败重试」这条路径。
+    art_id = await new_article(uid, status="failed", with_content=True)
 
     async with client(token) as c:
         resp = await c.post(f"/api/v1/articles/{art_id}/retry")

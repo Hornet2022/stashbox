@@ -80,7 +80,26 @@ def client(token: str | None = None, **extra_headers) -> httpx.AsyncClient:
     )
 
 
-async def new_article(user_id: int, status: str = "pending", error: str | None = None) -> str:
+async def new_article(
+    user_id: int,
+    status: str = "pending",
+    error: str | None = None,
+    with_content: bool = False,
+) -> str:
+    """建一篇文章。
+
+    `with_content=True` ⇒ 带上 `raw_content`（**有正文**）。
+
+    ⚠️ 为什么要有这个开关（2026-11-11）：剪藏改成后台抓取后，
+    「有正文」成了**两种失败的区别**：
+
+      · `raw_content` 有值 ⇒ 抓取成功过 ⇒ 失败只可能是蒸馏失败 ⇒ 重试派蒸馏；
+      · `raw_content` 为空 ⇒ 抓取从没成功 ⇒ 重试必须**重新抓取**
+        （派蒸馏只会拿占位串喂 LLM，见 ai-service 的守卫）。
+
+    默认**不带**正文（与改造前的 helper 行为一致），
+    需要「有正文的蒸馏失败文章」时显式传 `with_content=True`。
+    """
     async with AsyncSessionLocal() as session:
         art = Article(
             id=f"art_{uuid.uuid4().hex[:24]}",
@@ -89,12 +108,26 @@ async def new_article(user_id: int, status: str = "pending", error: str | None =
             source="d9",
             status=status,
             error=error,
+            raw_content=(
+                {"url": "https://mp.weixin.qq.com/s/cp17", "title": "测试", "content_text": "正文" * 50}
+                if with_content
+                else None
+            ),
             favorite=False,
             skip=False,
         )
         session.add(art)
         await session.commit()
         return art.id
+
+
+async def drain_capture_tasks() -> None:
+    """等后台抓取任务跑完（剪藏改成后台抓取之后）。
+
+    配额是在**后台抓取成功之后**才扣的（先抓后扣），
+    所以断言配额的用例必须先等后台任务结束，否则读到的是「还没扣」。
+    """
+    await content_main._drain_capture_tasks()
 
 
 async def new_task(

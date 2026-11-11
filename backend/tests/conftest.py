@@ -118,3 +118,59 @@ async def _dispose_pools():
         except Exception:
             pass
         redis_client._redis_pool = None
+
+
+# ---------------------------------------------------------------------------
+# 后台抓取任务排空（2026-11-11）
+# ---------------------------------------------------------------------------
+#
+# 剪藏改成**后台抓取**之后，抓取跑在 `asyncio.create_task` 出来的独立任务里。
+# 用例结束时它可能还在跑 ⇒ 事件循环一关，它会在**下一个**用例的循环里继续用
+# 上一个循环的 DB session ⇒ 报「got Future attached to a different loop」/
+# 「Event loop is closed」，而且报错点离真正的原因很远。
+#
+# ⇒ 每条用例结束前把在跑的后台任务等完（超时则取消，见 `_drain_capture_tasks`）。
+#
+# 为什么放在**根 conftest** 而不是 tests/content/：触发剪藏的用例散在
+# tests/content、tests/gateway、tests/observability、tests/ 根目录等多个地方，
+# 只在一个目录里排空 ⇒ 其它目录漏排 ⇒ 同样的错在别处复现。
+@pytest.fixture(autouse=True)
+async def _drain_background_capture():
+    yield
+    # content-service 的 main 模块在不同测试里以不同模块名加载
+    # （生产是 `main`，单测是 `_cp17_content_main`）⇒ 按「有没有后台抓取
+    # 编排模块」这个特征来找，不依赖模块名。
+    for mod in list(sys.modules.values()):
+        if getattr(mod, "capture_pipeline", None) is None:
+            continue
+        drain = getattr(mod, "_drain_capture_tasks", None)
+        if drain is not None:
+            await drain()
+            break
+
+
+@pytest.fixture(autouse=True)
+async def _reset_redis_pool_per_test():
+    """每条用例**开始前**把 Redis 连接池里的连接全部断开。
+
+    ## 为什么需要（2026-11-11 实测踩到）
+
+    `common/redis_client.get_redis_pool()` 是**模块级全局**池，而
+    redis-py 的连接绑定**创建它的事件循环**。pytest 每条用例跑在**新的**
+    事件循环里 ⇒ 池里可能还留着上一个循环建的连接 ⇒ 在新循环里用它就会报：
+
+        RuntimeError: got Future attached to a different loop
+        RuntimeError: Event loop is closed
+
+    报错点在业务代码里（实测是 `require_user` → `revocation.is_revoked`
+    的 `client.get`），看起来像「Redis 挂了」，其实只是**连接属于旧循环**。
+
+    ⚠️ 生产不受影响：uvicorn 单进程单事件循环，连接从头到尾在同一个循环里。
+    这是**测试环境**的结构性问题（一个进程里跑几百个用例 = 几百个事件循环）。
+
+    ⇒ 每条用例前 `disconnect()` 一下 ⇒ 下次使用时按当前循环重建连接。
+    """
+    from stashbox.backend.common.redis_client import reset_redis_pool
+
+    reset_redis_pool()
+    yield

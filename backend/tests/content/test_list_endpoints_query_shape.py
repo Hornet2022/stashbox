@@ -23,6 +23,8 @@ title / user_id / status / favorite / skip / created_at / updated_at，
 重写一遍的话，测试通过与生产查询是否被 defer 完全无关。
 """
 
+import re
+
 import pytest
 from sqlalchemy.dialects import postgresql
 
@@ -73,8 +75,35 @@ class RecordingSession:
         return None
 
 
+def _assert_raw_content_value_not_selected(sql: str) -> None:
+    """列表 SELECT 不得**取回** `raw_content` 的值（单行可达 250KB）。
+
+    ⚠️ 2026-11-11 起允许出现**空值判定**：
+    `articles.raw_content IS NULL` 与 `jsonb_typeof(articles.raw_content) = 'null'`。
+    它们只取 jsonb 的**类型标签**（在头部，不 detoast）
+    ⇒ 那 250KB 一个字节都不会被搬进进程。
+
+    ⚠️ 为什么要有 `jsonb_typeof` 那一条：JSONB 列存 Python `None` 时落的是
+    **JSON null**（不是 SQL NULL）—— 只判 `IS NULL` 会把「从没抓到正文」
+    判成「有正文」（见 common/models/article.py 的 NO_RAW_CONTENT 注释）。
+
+    也就是说：这里守的是「不搬运」，不是「SQL 里不许出现这个列名」。
+    判据用正则把「取列值」和「判空」分开 —— 两者在 SQL 里的形状不同。
+    """
+    hits = re.findall(
+        r"articles\.raw_content(?!" r"\s+IS\s+NULL|\))", sql
+    )
+    assert not hits, (
+        "列表 SELECT 里仍取回 raw_content 的值（单行可达 250KB）—— _to_response 又不读它"
+    )
+
+
 def _make_rows(n: int = 1):
-    """造 n 组 (Article, DistilledArticle) 瞬态对象（不入库）。"""
+    """造 n 组 (Article, DistilledArticle, raw_is_null) 瞬态对象（不入库）。
+
+    第三个元素对应列表 SELECT 里的 `articles.raw_content IS NULL AS raw_is_null`
+    （2026-11-11：告诉客户端「正在后台抓取」的空值判定，不搬运正文）。
+    """
     rows = []
     for i in range(n):
         art = Article(
@@ -96,7 +125,7 @@ def _make_rows(n: int = 1):
             duration_sec=60,
             tags=["科技"],
         )
-        rows.append((art, task))
+        rows.append((art, task, False))
     return rows
 
 
@@ -134,9 +163,8 @@ async def test_articles_列表不拉_raw_content():
     # 断言，而不是假定只有一条。
     sqls = db.sqls()
     assert sqls, "端点一条语句都没发，判据失效"
-    assert not any(
-        "raw_content" in s for s in sqls
-    ), "列表 SELECT 里仍带 raw_content（单行可达 250KB）—— _to_response 又不读它"
+    for s in sqls:
+        _assert_raw_content_value_not_selected(s)
     assert any("articles.id" in s for s in sqls), "判据失效：连 id 都没 select"
 
 
@@ -146,7 +174,7 @@ async def test_pending_列表不拉_raw_content(pending_cache_off):
     await content_main.list_pending(user=USER, db=db)
 
     (sql,) = db.sqls()
-    assert "raw_content" not in sql
+    _assert_raw_content_value_not_selected(sql)
 
 
 @pytest.mark.asyncio
@@ -155,7 +183,7 @@ async def test_listened_列表不拉_raw_content():
     await content_main.list_listened(user=USER, db=db)
 
     (sql,) = db.sqls()
-    assert "raw_content" not in sql
+    _assert_raw_content_value_not_selected(sql)
 
 
 # ---------------------------------------------------------------------------

@@ -75,6 +75,15 @@ async def owner_and_article():
                 source="wechat_mp",
                 title="BUG#12 探针",
                 status="pending",
+                # ⚠️ 必须**有正文**（2026-11-11）：剪藏改成后台抓取后，
+                # 「没有正文」的文章会被服务端**拒绝派蒸馏**（否则占位串
+                # `"[empty article] …"` 会被当正文喂给 LLM，白烧 token）。
+                # 这条守卫是故意的 ⇒ 测试数据要符合现实：蒸馏一篇**已抓到**的文章。
+                raw_content={
+                    "url": "https://mp.weixin.qq.com/s/bug12",
+                    "title": "BUG#12 探针",
+                    "content_text": "正文内容。" * 50,
+                },
                 favorite=False,
                 skip=False,
             )
@@ -298,3 +307,50 @@ async def test_文章级端点幂等时返回真实在跑状态(owner_and_articl
         "running",
     ), f"幂等分支应回报真实在跑状态，实际 {r2.json()['status']!r}"
     assert r2.json()["quota_consumed"] is False, "幂等分支不该再报扣了配额"
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-11：没有正文的文章**不许派蒸馏**
+# ---------------------------------------------------------------------------
+#
+# 剪藏改成后台抓取之后，抓取失败的文章 `raw_content` 是空的（正文从没抓到）。
+# 这种文章如果照常派蒸馏 ⇒ ai-service 的 `_load_raw_content` 拿不到正文 ⇒
+# 用占位串 `"[empty article] title=… url=…"` **当正文喂给 LLM**
+# ⇒ 白烧 token、产出一篇垃圾稿、状态还标成 failed。
+#
+# ⚠️ 这个守卫必须放在**扣配额之前** —— 否则用户会为一次「根本没跑」的蒸馏付费。
+@pytest.mark.asyncio
+async def test_没有正文的文章不派蒸馏(client, dispatcher_spy):
+    """没有正文 ⇒ 明确拒绝（4004），且**不入队**。"""
+    import uuid as _uuid
+
+    async with AsyncSessionLocal() as db:
+        user = User(
+            open_id="cp_nocontent_" + _uuid.uuid4().hex[:20],
+            nickname="pytest",
+            tier="free",
+        )
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+        uid = int(user.id)
+        aid = f"art_{_uuid.uuid4().hex[:24]}"
+        db.add(
+            Article(
+                id=aid,
+                user_id=uid,
+                url="https://mp.weixin.qq.com/s/nocontent",
+                source="wechat_mp",
+                title="没抓到正文",
+                status="pending",
+                raw_content=None,  # ⚠️ 关键：正文从没抓到
+                favorite=False,
+                skip=False,
+            )
+        )
+        await db.commit()
+
+    r = await client.post(f"/api/v1/articles/{aid}/distill", headers=_auth(uid))
+    assert r.status_code == 400, r.text
+    assert r.json()["code"] == 4004, r.text
+    assert dispatcher_spy == [], "没有正文却入了队 ⇒ 占位串会被当正文喂给 LLM"

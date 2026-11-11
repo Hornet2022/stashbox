@@ -43,6 +43,7 @@ from helpers import (
     article_row,
     client,
     content_main,
+    drain_capture_tasks,
     feedback_count,
     new_user,
     quota_used,
@@ -98,6 +99,10 @@ async def test_旧端点剪藏要扣配额():
     data = r.json()
     assert data["id"].startswith("art_"), "旧端点仍返回文章本体（ArticleResponse）"
 
+    # 2026-11-11：抓取挪到后台 ⇒ **扣配额发生在后台任务里**（先抓后扣），
+    # 所以断言配额前必须等后台任务跑完。
+    await drain_capture_tasks()
+
     assert await quota_used(uid) == 1, "旧端点剪藏必须扣 1 次配额"
 
     art = await article_row(data["id"])
@@ -123,6 +128,7 @@ async def test_旧端点与新端点扣同一个配额池():
 
     assert r_old.status_code == 200, r_old.text
     assert r_new.status_code == 200, r_new.text
+    await drain_capture_tasks()  # 扣配额在后台任务里（先抓后扣）
     assert await quota_used(uid) == 2, "两个端点应累计扣 2 次"
 
 
@@ -160,6 +166,7 @@ async def test_旧端点重复剪藏同一链接不重复扣费():
     assert r1.status_code == 200, r1.text
     assert r2.status_code == 200, r2.text
     assert r1.json()["id"] == r2.json()["id"], "同一链接应复用同一篇文章"
+    await drain_capture_tasks()  # 扣配额在后台任务里（先抓后扣）
     assert await quota_used(uid) == 1, "复用不该再扣配额"
 
 

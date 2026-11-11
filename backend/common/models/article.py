@@ -8,6 +8,8 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    func,
+    or_,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -92,3 +94,31 @@ class Article(Base, TimestampMixin):
         # 复合索引一次搞定。
         Index("idx_articles_user_created", "user_id", text("created_at DESC")),
     )
+
+
+#: 「这篇**还没有正文**」的**唯一** SQL 判据（2026-11-11）。
+#:
+#: ⚠️⚠️ 为什么不能只写 `raw_content IS NULL`：
+#:
+#: `raw_content` 是 JSONB，而 SQLAlchemy 的 JSON 类型默认 **`none_as_null=False`**
+#: ⇒ 写进去的 Python `None` 存成的是 **JSON null**（`'null'::jsonb`），
+#: **不是 SQL NULL**！实测（本地 PG）：
+#:
+#:     SELECT raw_content, raw_content IS NULL FROM articles ...
+#:     → (None, False)     # 值读回来是 None，但 IS NULL 是 false
+#:
+#: ⇒ 只判 `IS NULL` 会把「**从没抓到正文**」的文章判成「**有正文**」
+#: ⇒ 后台抓取会以为已经抓过而跳过 ⇒ 文章永远停在 pending
+#: ⇒ 兜底定时器也永远不会收尾它。
+#:
+#: ⇒ 必须**同时**判「SQL NULL」与「JSON null」两种。
+#:
+#: `jsonb_typeof()` 取的是 jsonb 的类型标签（在头部，不 detoast）⇒
+#: 即使单行正文有 250KB 也只是常数级开销。
+#:
+#: Python 侧同一语义用 `article.raw_content is None`（JSON null 与 SQL NULL
+#: 读回来都是 None）—— 两者必须一起改，别只改一边。
+NO_RAW_CONTENT = or_(
+    Article.raw_content.is_(None),
+    func.jsonb_typeof(Article.raw_content) == "null",
+)

@@ -2,7 +2,7 @@
 
 from .base import Base, TimestampMixin
 from .user import User
-from .article import Article
+from .article import NO_RAW_CONTENT, Article
 from .distilled_article import DistilledArticle
 from .feedback import Feedback
 from .feedback_v2 import FeedbackV2

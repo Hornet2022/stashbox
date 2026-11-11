@@ -9550,6 +9550,22 @@
             "type": "string",
             "title": "Status"
           },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "fetch_pending": {
+            "type": "boolean",
+            "title": "Fetch Pending",
+            "default": false
+          },
           "stage": {
             "anyOf": [
               {

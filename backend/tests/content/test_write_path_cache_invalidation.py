@@ -104,7 +104,7 @@ async def test_mark_listened_refreshes_cached_detail_payload():
 
 async def test_retry_makes_article_appear_in_cached_pending_list():
     uid, token = await new_user()
-    article_id = await new_article(uid, status="failed", error="tts timeout")
+    article_id = await new_article(uid, status="failed", error="tts timeout", with_content=True)
     await new_task(article_id, status="failed")
     await _prime_caches(uid, token, article_id)
     # failed 不在待听过滤条件里，缓存里本来就没有它
@@ -129,7 +129,7 @@ async def test_retry_detail_still_readable_after_cache_invalidation():
     这里只保证「读得到、不是 5xx」。
     """
     uid, token = await new_user()
-    article_id = await new_article(uid, status="failed", error="tts timeout")
+    article_id = await new_article(uid, status="failed", error="tts timeout", with_content=True)
     await new_task(article_id, status="failed")
     await _prime_caches(uid, token, article_id)
 
