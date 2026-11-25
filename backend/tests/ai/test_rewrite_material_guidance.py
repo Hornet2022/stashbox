@@ -78,9 +78,22 @@ def test_改写调用显式给了_max_tokens():
     解析失败 → 降级成纯文本 → 稿子的结构全丢（hook/sections/三类全糊成一坨）。
 
     这个失败是**静默**的：稿子照样生成、照样能播，只是质量塌了。
+
+    ⚠️ 上限不是 4096 也不是 8192：
+      · 8192 仍会被顶到（生产实测 2026-11-24 有稿子的 JSON 在尾部被截断
+        ⇒ 四段全空）；
+      · 上游**实测**接受 8192 / 16384 / 32768（scripts/exp_llm_max_tokens.py），
+        所以 16384 是安全的。
+    ⇒ 这里按**下限**判（≥16384），不写死具体值 ——
+      将来有人再调高或微调，这条守卫不该失效。
     """
+    import re
+
     src = (BACKEND_DIR / "ai-service" / "agent" / "runner.py").read_text(encoding="utf-8")
-    assert "max_tokens=8192" in src, "改写调用必须显式给 max_tokens"
+    match = re.search(r"max_tokens=(\d+)", src)
+    assert match, "改写调用必须显式给 max_tokens（不给就吃默认 4096 ⇒ JSON 被截断）"
+    limit = int(match.group(1))
+    assert limit >= 16384, f"改写的 max_tokens 上限太（{limit}）—— 8192 实测会截断 JSON"
 
 
 @pytest.mark.parametrize(

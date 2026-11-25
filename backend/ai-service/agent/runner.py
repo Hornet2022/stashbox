@@ -275,8 +275,17 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
             # （hook/sections/insights/related/follow_ups 全部糊成一坨）。
             #
             # 这个失败是**静默**的：稿子照样生成、照样能播，只是质量塌了。
-            # 8192 足够一篇长文档的完整结构化输出。
-            max_tokens=8192,
+            #
+            # 8192 → **16384**（2026-11-25）：8192 仍会被顶到 ——
+            # 生产实测：2026-11-24 有一篇稿子的 JSON 在尾部被截断
+            # ⇒ 解析失败 ⇒ 降级 ⇒ **四段全空**（见 _salvage_json_object）。
+            #
+            # ⚠️ 上游**实测接受** 8192 / 16384 / 32768（scripts/exp_llm_max_tokens.py），
+            #   所以抬高上限是安全的。
+            # ⚠️ 这只是**上限**，不是目标长度：实际输出由 prompt 的字数规格
+            #   （1900-2600 字 ≈ 3000-4000 token）决定 ⇒ 不会多花成本，
+            #   只是给「模型话多」留出余量。
+            max_tokens=16384,
         )
         # 结构化解析（CP-AGENT-REWRITE-STRUCTURED）：LLM 必须回 JSON
         # {hook, sections, outro}，这样 script_text 的段落边界才是可靠的。
