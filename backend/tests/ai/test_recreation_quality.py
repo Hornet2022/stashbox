@@ -156,3 +156,67 @@ def test_group_profile_reports_counts(quality):
     assert profile["ok"] == len(GOOD_ITEMS)
     assert profile["issues"], "应该统计出各类问题"
     assert len(profile["offenders"]) == len(BAD_ITEMS)
+
+
+# ── `topic_label_open`（2026-11-25 新增）────────────────────────────────────
+#
+# 生产实测（95 篇稿子）：以选题动词开头的条目 **94 条**，其中 **16 条的第一句
+# 是纯选题标签**（8~18 字，无任何判断结构）—— 念出来就是一串清单。
+#
+# 这条判据补的是「判据落后于产品定义」那个洞：prompt 第 9 条早就写了
+# 「不许写成"关注X""研究Y"这种选题清单」，但 `imperative_start` 只**记信号**
+# ⇒ 违反 prompt 的条目永远不会被补救。
+#
+# 样本全部取自**生产真实产出**。
+
+# 生产真实命中样本（第一句是纯选题标签）
+TOPIC_OPEN_BAD = [
+    "关注知识废弃机制。",
+    "关注“权限沙箱”技术的演进。",
+    "关注“案例资产化”的过程。",
+    "留意Agent路由器的设计模式。",
+    "关注‘混合检索’的工程落地细节。",
+    "关注‘验收自动化’的工具链。",
+    "关注“模型网关”的开源化趋势。",
+    "关注“本体工程”岗位的兴起。",
+]
+
+# 生产真实「长首句带判断」的好内容 —— 绝不能被误伤
+TOPIC_OPEN_GOOD = [
+    "留意Router层的‘线程订阅’机制怎么处理冲突：如果用户在GitHub和IM里同时说两套方案，"
+    "Router靠什么裁决？这直接决定Agent会不会‘精神分裂’。",
+    "关注LobeHub的Agent协作机制能否在非研发场景（如编辑、运营、客服）中复现。"
+    "量子位实测已验证了编辑场景的可行性，但跨行业推广时，Agent需要对接不同领域的知识库和工具链。",
+    "对比手机行业的5G普及历程，C-V2X的渗透率曲线可能更为陡峭，"
+    "因为车路协同的收益要等基础设施铺开之后才会集中释放。",
+    "关注知识废弃机制能不能成真，关键不在模型能不能删掉旧知识，"
+    "而在删除之后系统还认不认那些已经被纠正过的判断——这决定了纠错是修好了还是换了个地方出问题。",
+]
+
+
+@pytest.mark.parametrize("item", TOPIC_OPEN_BAD)
+def test_topic_label_open_flags_pure_topic_openings(quality, item):
+    """第一句是纯选题标签 ⇒ 必须判缺陷（否则永远不会被补救）。"""
+    codes = quality.check_item(item, body_text="")
+    assert "topic_label_open" in codes, f"应该判 topic_label_open：{item!r} → {codes}"
+
+
+@pytest.mark.parametrize("item", TOPIC_OPEN_GOOD)
+def test_topic_label_open_does_not_fire_on_judgement_sentences(quality, item):
+    """带判断结构的好内容绝不能被误伤（实测误伤率必须是 0）。"""
+    codes = quality.check_item(item, body_text="")
+    assert "topic_label_open" not in codes, f"被误伤了：{item!r} → {codes}"
+
+
+def test_topic_label_open_is_a_hard_defect_not_a_signal(quality):
+    """它是**硬缺陷**（会触发补救），不是信号（只记不丢）。
+
+    判据落后于产品定义是根因 ⇒ 必须升级成硬缺陷，
+    否则「prompt 禁止 + 判据只记」= 违反 prompt 的条目永远留在稿子里。
+    """
+    item = "关注知识废弃机制。"
+    profile = quality.check_group([item], body_text="")
+    assert profile["issues"].get("topic_label_open") == 1
+    assert profile["ok"] == 0
+    # 「只记不丢」的性质不变：条目本身仍在 offenders 里（补救会重写它）
+    assert profile["offenders"] == [item]

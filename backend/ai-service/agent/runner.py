@@ -341,10 +341,26 @@ async def rewrite_node(state: AgentState) -> dict[str, Any]:
         # 不是整篇重来 —— 成本低一个量级。
         #
         # ⚠️ 失败时**保留原条目**（只记不丢）：删内容比内容浅更糟。
-        if _REMEDIATE_ENABLED and not parts.degraded:
+        # ⚠️ 2026-11-25：**降级稿也要补救**。
+        # 原来写的是 `and not parts.degraded` —— 降级时三段再创作内容全空，
+        # 而降级恰恰是**最需要**补救的场景（补齐三段 = 救回整篇的结构）。
+        # 降级稿的正文要点本身可能是坏的，所以**不按字数补**（见下），
+        # 只按「缺段 / 条数不足 / 单条不合格」补。
+        if _REMEDIATE_ENABLED:
             _body = "\n".join([parts.hook] + list(parts.sections))
             try:
-                _accepted = await _remediate_recreation(llm, parts, _body, fetched_content)
+                _accepted = await _remediate_recreation(
+                    llm,
+                    parts,
+                    _body,
+                    fetched_content,
+                    # 降级稿的正文要点不可信 ⇒ 不能拿它去算「四段合计字数缺口」
+                    # （那会差出一个正文的量 ⇒ 一口气要求补十几条，见
+                    #  recreation_quality.chars_shortfall 的说明）。
+                    skip_chars_gap=parts.degraded,
+                    # 补救也要注入用户偏好与 few-shot（风格与主稿一致）
+                    state=state,
+                )
             except Exception as exc:  # noqa: BLE001 —— 补救失败不许拖垮整篇稿
                 log.warning("agent_rewrite_recreation_remediate_error err=%s", repr(exc))
                 _accepted = {}
@@ -1000,6 +1016,7 @@ _REWRITE_SYSTEM = """你是一个中文播客主理人。任务：把原文改�
      · **四段都要有**：实在写不出来就写得浅一点、写得保守一点，
        但**不要整段留空** ——「宁缺毋滥」约束的是**单条的质量**
        （没推理 / 复述原文 / 名词短语），不是「这段干脆不写」。
+
 10. **长度自适应**：原文 < 500 字 → 900-1200 字；500-2000 字 → 1400-1900 字；> 2000 字 → 1900-2600 字
     （sections + insights + related + follow_ups 合计）
 
@@ -1011,12 +1028,36 @@ _REWRITE_SYSTEM = """你是一个中文播客主理人。任务：把原文改�
     不是模型写不动。实测把规格抬到上面这档，同一篇原文的产出从 1308 字
     涨到 1866 字（+43%），条数从 2/3/2 涨到 3/4/3。
 
-11. **具体性**：每一条都要落到**具体对象**上 —— 公司、产品、协议、版本号、数字、
+11. **第一句不许是选题标签**（2026-11-25 新增，生产实测补上的洞）：
+
+    听众只听声音、看不到列表。**每条的第一句就是他对这条的第一印象** ——
+    第一句若是「关注X」「留意Y」，他听到的就是**一串清单**，内容再对也像浮在表面。
+
+    ⚠️ 这不是「不许以『关注』开头」：带了判断结构的就是好内容
+    （「关注LobeHub的Agent协作机制**能否**在非研发场景中复现」是对的）。
+
+    **要避免的是：第一句只是一个选题名，后面才补理由。**
+
+    ✗ 错：「关注知识废弃机制。」
+    ✗ 错：「关注"权限沙箱"技术的演进。」
+    ✗ 错：「留意Agent路由器的设计模式。」
+        （这三句都是生产上真实产出的条目 —— 第一句是纯选题标签，
+          念出来就是清单，不是判断句）
+    ✓ 对：「知识废弃机制能不能成真，关键不在模型能不能删掉旧知识，
+          而在删除之后系统还认不认那些已经被纠正过的判断——
+          这直接决定了纠错到底是修好了，还是换了个地方出问题。」
+
+    ✓ 对：「Agent路由器真正要解决的不是选模型，而是同一个Agent被多个入口
+          同时驱动时怎么裁决——没有裁决，多Agent并行就会变成精神分裂。」
+
+    ⇒ **把选题写进判断里**：第一句就要让听众知道「你在让他盯什么、为什么」，
+      而不是先报一个题目再解释。
+12. **具体性**：每一条都要落到**具体对象**上 —— 公司、产品、协议、版本号、数字、
     时间、某次事故或某个具体做法。不许整段停在抽象名词（「行业」「生态」「趋势」
     「范式」「格局」「浪潮」）。写完自检：这条里有没有一个**听众能去查的名字或数字**？
     没有就换一条。
 
-12. **正文里出现的「图表：xxx」是配图里读出来的文字**，也就是说，
+13. **正文里出现的「图表：xxx」是配图里读出来的文字**，也就是说，
     这句话原本写在**插图/截图/流程图**上。它是**素材**，不是正文本身。
 
     · 图上是**数据、清单、流程、对比**（比如「营收增速 30%」「落地前的 15 个问题」
@@ -1274,6 +1315,12 @@ _REMEDIATE_SYSTEM = """你是一个中文播客主理人，负责**重写稿子�
 ③ **是给听众的一句话判断**，不是标签、不是选题清单、不是短语。
 ④ **具体**：要落到具体对象（公司、产品、协议、版本号、数字、时间）上，
    不许停在「行业」「生态」「趋势」「范式」这类抽象名词。
+⑤ **第一句不许是选题标签**（2026-11-25）：听众只听声音，第一句就是第一印象。
+   第一句若是「关注X」「留意Y」这种纯选题名（后面才补理由），他听到的就是一串清单。
+   ⚠️ 带判断结构的不算：「关注LobeHub的Agent协作机制**能否**在非研发场景中复现」是对的。
+   ✗「关注知识废弃机制。」「留意Agent路由器的设计模式。」
+   ✓「知识废弃机制能不能成真，关键不在模型能不能删旧知识，而在删完之后系统还认不认
+       那些已经被纠正过的判断——这决定了纠错是修好了，还是换了个地方出问题。」
 
 【分段的分工，不要混】
 · related（关联思考）—— 这件事和**什么**相关/矛盾/互相印证？
@@ -1339,8 +1386,19 @@ async def _remediate_recreation(
     fetched_content: str,
     *,
     step: str = "agent_rewrite_remediate",
+    skip_chars_gap: bool = False,
+    state: "AgentState | None" = None,
 ) -> dict[str, list[str]]:
     """重写不合格的再创作者条目 + 补齐缺段/条数不足的段。
+
+    Args:
+        skip_chars_gap: **不按整稿字数缺口补**（降级稿用）。
+            字数下限是「四段合计」⇒ 正文要点坏掉时，缺口会被算得很大
+            ⇒ 一口气要求补十几条（实测会触发这种误补）。
+            降级稿只按「缺段 / 条数不足 / 单条不合格」补。
+        state: agent 状态。**补救也要注入用户偏好与 few-shot** ——
+            补救产出的就是稿子的一部分，风格必须与主稿一致
+            （2026-11-25：降级稿开始走补救后暴露的缺口）。
 
     Returns:
         ``{"related": [...], "insights": [...], "follow_ups": [...]}`` ——
@@ -1356,8 +1414,12 @@ async def _remediate_recreation(
     under = recreation_quality.underfilled(groups)
     # ⚠️ 字数阶梯是「四段合计」⇒ 必须把**正文要点**一起算进去；
     # 只算三段会拿三段去比四段的下限 ⇒ 差出一个正文的量 ⇒ 补救被误触发。
-    gap_chars, gap_items = recreation_quality.chars_shortfall(
-        {**groups, "sections": list(parts.body_sections)}, len(fetched_content or "")
+    gap_chars, gap_items = (
+        (0, 0)
+        if skip_chars_gap
+        else recreation_quality.chars_shortfall(
+            {**groups, "sections": list(parts.body_sections)}, len(fetched_content or "")
+        )
     )
     if not weak and not under and not gap_items:
         return {}
@@ -1383,9 +1445,15 @@ async def _remediate_recreation(
             needs[part] = (n_rewrite, n_new + 1)
 
     try:
+        _remediate_user_prompt = _remediate_prompt(fetched_content, weak, under, needs, gap_chars)
+        # ⚠️ 补救也要注入用户偏好与 few-shot（2026-11-25）——
+        # 补救产出的就是稿子的一部分，风格必须与主稿一致。
+        # 之前只给主改写注入 ⇒ 补救补出来的段落与主稿不是一个调子。
+        if state is not None:
+            _remediate_user_prompt = _maybe_inject_memory(state, _remediate_user_prompt)
         raw = await _chat_text(
             llm,
-            _remediate_prompt(fetched_content, weak, under, needs, gap_chars),
+            _remediate_user_prompt,
             system_prompt=_REMEDIATE_SYSTEM,
             step=step,
             max_tokens=4096,
@@ -1529,6 +1597,68 @@ def _extract_json_object(raw: str) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
+def _salvage_string_array(text: str, key: str) -> list[str]:
+    """从**不完整**的 JSON 里抢救某个字符串数组里**已经写完**的元素。
+
+    为什么需要（2026-11-25）：LLM 输出被 `max_tokens` 截断 ⇒
+    `json.loads` 失败 ⇒ 走降级路径（按 `\\n\\n` 切段）⇒ 而 JSON 缩进是
+    **单换行**，切不开 ⇒ 整个 JSON 变成 1 段 ⇒ sections 与三段再创作
+    **全部丢失**（生产实测：95 篇里 1 篇四段全空）。
+
+    ⇒ 截断只发生在**尾部** ⇒ 前面写完的字段是好的 ⇒ 逐元素抢救。
+
+    扫到没闭合的字符串就停（那一条确实没写完）。
+    """
+    m = re.search(rf'"{re.escape(key)}"\s*:\s*\[', text)
+    if not m:
+        return []
+    i = m.end()
+    n = len(text)
+    items: list[str] = []
+    while i < n:
+        while i < n and text[i] in " \t\r\n,":
+            i += 1
+        if i >= n or text[i] == "]":
+            break
+        if text[i] != '"':
+            break  # 不是字符串元素（对象/数字）→ 这段放弃
+        try:
+            val, i = json.decoder.scanstring(text, i + 1)
+        except ValueError:
+            break  # 字符串没闭合 ⇒ 被截断在这里
+        items.append(val)
+    return items
+
+
+def _salvage_string(text: str, key: str) -> str:
+    """抢救单个字符串字段（没闭合就当没有）。"""
+    m = re.search(rf'"{re.escape(key)}"\s*:\s*"', text)
+    if not m:
+        return ""
+    try:
+        val, _end = json.decoder.scanstring(text, m.end())
+    except ValueError:
+        return ""
+    return val
+
+
+def _salvage_json_object(text: str) -> dict | None:
+    """抢救**被截断**的 JSON 里已经写完的部分。
+
+    返回 None 表示连一个字段都没救回来（那就老实走降级路径）。
+    """
+    out: dict = {}
+    for key in ("sections", "related", "insights", "follow_ups"):
+        items = _salvage_string_array(text, key)
+        if items:
+            out[key] = items
+    for key in ("hook", "outro"):
+        val = _salvage_string(text, key)
+        if val:
+            out[key] = val
+    return out or None
+
+
 def _parse_rewrite(raw: str) -> _RewriteParts:
     """解析 LLM 改写输出，降级但不崩。
 
@@ -1541,6 +1671,16 @@ def _parse_rewrite(raw: str) -> _RewriteParts:
     值得关联的关键点、可拓展关注的方向）是稿子的组成部分，要被念出来。
     """
     obj = _extract_json_object(raw)
+    if obj is None:
+        # ⚠️ 完整解析失败 ⇒ **多半是被 max_tokens 截断了**（2026-11-25）。
+        # 截断只发生在尾部 ⇒ 前面写完的字段是好的 ⇒ 逐元素抢救，
+        # 别让「尾部截断」把整篇稿子的结构（正文要点 + 三段再创作）全带走。
+        obj = _salvage_json_object(raw)
+        if obj is not None:
+            log.warning(
+                "agent_rewrite_json_salvaged keys=%s",
+                ",".join(sorted(obj)),
+            )
     if obj is not None:
         hook = _flatten_para(str(obj.get("hook") or ""))
         raw_sections = obj.get("sections") or []
@@ -1653,7 +1793,11 @@ def _parse_rewrite(raw: str) -> _RewriteParts:
         if tags:
             log.info("agent_rewrite_tags tags=%s", tags)
 
-        if hook or sections or outro:
+        # ⚠️ 条件里必须包含三段再创作内容（2026-11-25）：
+        #   截断抢救可能只救回 `related/insights/follow_ups`（正文要点那部分
+        #   正好在截断点之前写、但没写完）⇒ 只看 hook/sections/outro 会把它
+        #   踢进降级路径 ⇒ **三段再创作内容又全丢了**（白救一场）。
+        if hook or sections or outro or insights or related or follow_ups:
             return _RewriteParts(
                 hook=hook,
                 sections=sections,

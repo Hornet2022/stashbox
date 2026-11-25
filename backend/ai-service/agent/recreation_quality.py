@@ -34,14 +34,46 @@
 | `too_short` | 太短，塞不下一个论证 | 字符数 < 40 | ✅ |
 | `no_reasoning` | **没有推论**（只是陈述/定义/标签） | 不含任何推理连接词 | ✅ |
 | `topic_label` | 名词化的选题短语 | 末尾是「…的设计/的影响/的差异/如何…」等 | ✅ |
+| `topic_label_open` | **开头就是选题标签**（2026-11-25 新增） | 以选题动词开头 + 第一句是纯标签 | ✅ |
 | `imperative_start` | 以「关注/研究/对比…」开头（**信号**） | 开头匹配 | ❌ 只记 |
 | `restates_body` | 与正文重合度高（**信号**，不是缺陷） | 与正文的字二元组重合度 > 阈值 | ❌ 只记 |
 | `no_sentence_end` | 落在「清单模式」（**信号**，不是缺陷） | 末尾不是 。！？ | ❌ 只记 |
 
-`imperative_start` 为什么只算信号：以「关注/研究…」开头只有在**整条都是选题**
-时才是毛病；后面跟着三句推理的条目（实测：「关注'数据清洗'对回测真实性的影响。
+`imperative_start` 为什么只算信号：**整条**都是选题才是毛病；后面跟着三句推理的条目（实测：「关注'数据清洗'对回测真实性的影响。
 很多回测漂亮得不真实，根子常在数据里没有退市公司。判断一个AI交易工具，
 先看它有没有吃退市的账…」）是**好内容**，只是开头用了「关注」。
+
+## `topic_label_open` —— 为什么它必须单独成一条（2026-11-25 新增）
+
+**它补的是「判据落后于产品定义」那个洞。**
+
+prompt 第 9 条早就写着（`_REWRITE_SYSTEM`）：
+「follow_ups —— 必须是**给听众的判断句**……不许写成"关注X""研究Y"这种选题清单」。
+
+但 `imperative_start` 只**记信号、不当缺陷** ⇒ 违反 prompt 的条目
+**永远不会被补救**（补救只重写 `weak_items` 里的硬缺陷）。
+
+**生产实测（95 篇稿子）**：以选题动词开头的条目 **94 条**，
+其中 **16 条的第一句是纯选题标签**（8~18 字，无任何判断/推理结构）：
+
+    关注知识废弃机制
+    关注"权限沙箱"技术的演进
+    关注"案例资产化"的过程
+    留意Agent路由器的设计模式
+
+⇒ 用户听到的就是**一串选题清单**。这正是「内容浮于表面」的听感来源。
+
+### 为什么只判「第一句是**纯**标签」，而不是一律判「以选题动词开头」
+
+因为长首句里带判断结构的那些**内容是好内容**，误杀它们是净损失：
+
+    留意Router层的'线程订阅'机制怎么处理冲突：如果用户在GitHub和IM里
+    同时说两套方案，Router靠什么裁决？          ← 含「怎么/裁决」⇒ 放过
+    关注LobeHub的Agent协作机制能否在非研发场景中复现。  ← 含「能否」⇒ 放过
+
+⇒ 判据 = **以选题动词开头** **且** **第一句 ≤ 20 字** **且** **第一句不含判断/提问标记**。
+  实测：命中 16 条，**误伤 0**。
+
 
 `no_reasoning` 是最核心的一条：上面 5 个坏例子**全部**没有任何推理连接词
 （因为/所以/但/反而/这意味着/值得/前提/区别在于…），而合格的样本都有。
@@ -142,6 +174,50 @@ _RESTATE_THRESHOLD = 0.34
 _MIN_ITEM_CHARS = 40
 
 
+# 选题清单 / 判断句的标记词
+#
+# ⚠️ 「判断/提问标记」的作用是**区分两种开头**：
+#   · 「关注知识废弃机制」      → 纯选题标签（浅）⇒ 缺陷
+#   · 「关注LobeHub的Agent协作机制能否在非研发场景中复现」
+#                            → 选题 + 判断结构（好内容）⇒ 放过
+_JUDGE_MARK = re.compile(
+    r"(可能|会|意味着|因为|所以|但|反而|更|值得|关键|问题|前提|决定|取决于"
+    r"|其实|却|才|怎么|能否|是否|为什么|如何|什么|谁|哪|而非|并不|不是)"
+)
+
+#: 「第一句是纯选题标签」的**长度上限**（字符）。
+#:
+#: 为什么是 20 而不是更长：20 字以内几乎只剩「选题名 + 修饰」，
+#: 放不下任何判断结构；再长就可能带「能否/怎么/是否」这类判断（实测长首句里
+#: 全是好内容）。
+_TOPIC_OPEN_MAX_CHARS = 20
+
+
+def _first_sentence(text: str) -> str:
+    """第一句（按 。！？!? 断）。"""
+    parts = re.split(r"[。！？!?]", (text or "").strip())
+    return parts[0] if parts else ""
+
+
+def topic_label_open(item: str) -> bool:
+    """开头就是**纯选题标签**（不是判断句）。
+
+    机械判定（三条同时成立）：
+      1. 以选题动词开头（关注/研究/留意/对比/…）；
+      2. 第一句 ≤ 20 字；
+      3. 第一句不含任何判断/提问标记。
+
+    生产实测（95 篇稿子，94 条以选题动词开头）：命中 16 条，**误伤 0**。
+    """
+    text = (item or "").strip()
+    if not _IMPERATIVE_START.match(text):
+        return False
+    first = _first_sentence(text)
+    if not first or len(first) > _TOPIC_OPEN_MAX_CHARS:
+        return False
+    return not _JUDGE_MARK.search(first)
+
+
 def _bigrams(text: str) -> set[str]:
     cleaned = re.sub(r"[^\w一-鿿]+", "", text)
     return {cleaned[i : i + 2] for i in range(len(cleaned) - 1)} if len(cleaned) > 1 else set()
@@ -170,6 +246,10 @@ def check_item(item: str, body_text: str = "") -> list[str]:
         issues.append("no_reasoning")
     if _TOPIC_TAIL.search(text):
         issues.append("topic_label")
+    # 2026-11-25：开头就是纯选题标签（prompt 明令禁止，却一直只记信号
+    # ⇒ 永远不会被补救）。实测命中 16 条 / 误伤 0（见模块 docstring）。
+    if topic_label_open(text):
+        issues.append("topic_label_open")
     return issues
 
 
