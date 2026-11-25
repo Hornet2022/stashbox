@@ -123,11 +123,20 @@ async def _run_group(
     ref_text: str,
     *,
     contextual: bool,
+    ref_max_sec: float = 30.0,
 ) -> dict:
-    """跑一组，返回 {p25s, spreads, shifts}。
+    """跑一组，返回 {p25s, spread, shifts}。
 
     A 组：每块都用**同一份**原始参考音。
     B 组：块 N+1 用块 N 的**输出音频 + 块 N 的文本**当参考。
+
+    ⚠️ **参考音有长度上限**（2026-11-25 实测）：
+       上游报 `Reference audio too long (114.7s). Maximum 30s supported`
+       —— 一块 800 字约 120 秒，**整块输出当参考会被拒**。
+       ⇒ B 组只取上一块的**前 ref_max_sec 秒**（+ 对应的前段文本）当参考。
+
+    ⚠️ 参考文本必须与参考音频**内容对应**（上游要求两者一致），
+       所以文本也要按同一比例截断。
     """
     from stashbox.backend.app.services.tts.openai import _CloneSpec
     from stashbox.backend.app.services.tts.ref_audio import load_ref_audio_data_url
@@ -145,9 +154,10 @@ async def _run_group(
 
     for i, chunk in enumerate(chunks, 1):
         if contextual and prev_audio is not None and prev_text:
-            # 块 N 的输出 + 块 N 的文本 ⇒ 自洽的「参考音频 + 参考文本」
+            # ① 取上一块的前 ref_max_sec 秒（上游硬上限 30s）
+            clip, prev_text = _clip_for_ref(prev_audio, prev_text, ref_max_sec)
             fpath = tmpdir / f"ref_{i}.mp3"
-            fpath.write_bytes(prev_audio)
+            fpath.write_bytes(clip)
             spec = _CloneSpec(
                 source=str(fpath),
                 data_url=await load_ref_audio_data_url(str(fpath)),
@@ -178,6 +188,46 @@ async def _run_group(
         "shifts": shifts,
         "max_shift": max((abs(s) for s in shifts), default=0.0),
     }
+
+
+def _clip_for_ref(audio: bytes, text: str, max_sec: float) -> tuple[bytes, str]:
+    """把上一块的输出裁成「前 max_sec 秒 + 对应的前段文本」。
+
+    ⚠️ 文本必须与音频**对应**（上游要求参考文本与参考音频内容一致），
+    所以按时长比例截断文本。
+    """
+    import subprocess
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as fh:
+        fh.write(audio)
+        src = fh.name
+    out = src + ".clip.mp3"
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", src, "-t", str(max_sec), out],
+            check=True,
+        )
+        with open(out, "rb") as fh:
+            clipped = fh.read()
+    finally:
+        for p in (src, out):
+            try:
+                Path(p).unlink()
+            except OSError:
+                pass
+
+    # 时长比例 → 文本比例
+    try:
+        from stashbox.backend.app.services.tts.voice_align import _decode_pcm
+
+        samples = _decode_pcm(audio)
+        total = len(samples) / 16000.0 if samples else max_sec
+    except Exception:  # noqa: BLE001
+        total = max_sec
+    ratio = min(1.0, max_sec / total) if total > 0 else 1.0
+    n_chars = max(20, int(len(text) * ratio))
+    return clipped, text[:n_chars]
 
 
 async def _run(args) -> int:

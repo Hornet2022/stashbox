@@ -49,19 +49,56 @@ def test_没有按长度分档的阈值():
 
 
 # ── B/C. 克隆块长 ────────────────────────────────────────────────────────
-def test_克隆块长默认是_800():
-    """800 字 → 墙钟 31.8s → 对上游 60s 墙钟留 1.9 倍余量。"""
-    assert openai_mod._CLONE_CHUNK_CHARS_DEFAULT == 800
+def test_克隆块长默认是_1500():
+    """1500 字 → 墙钟 63.0s（当前上游实测）→ 对**我们自己的**读超时（300s）
+    留 4.8 倍余量，且产出的音频 224.3s 明显低于上游实测的 ~322s 音频上限。
+
+    ⚠️ 旧值 800 的依据是「旧上游有 60s 墙钟」—— 当前上游（hub.tsingfly.com）
+    已经没有这个限制（实测 1500 字 63.0s / 1600 字 96.2s / 2000 字 90.8s 全成功）。
+    块长 = 接缝数的除数 ⇒ 接缝是「一篇听出好几种音色」的直接来源。
+    """
+    assert openai_mod._CLONE_CHUNK_CHARS_DEFAULT == 1500
 
 
 def test_克隆块长的余量足够():
-    """墙钟 48ms/字 → 800 字 ≈ 32s；余量不到 1.5 倍就不该取这个值。"""
-    ms_per_char = 48.0
+    """余量要对我们**自己的**读超时算，不是对上游那个已经消失的 60s 墙钟。
+
+    实测墙钟（当前上游，克隆路径，生产真实 3175 字稿）：
+        800 字 → 34.5s    1000 字 → 44.7s    1200 字 → 51.6s
+        1500 字 → 63.0s   1600 字 → 96.2s    2000 字 → 90.8s
+    ⇒ 取**最差**的实测斜率（96.2s / 1600 字 = 60ms/字）来估，
+      余量必须 ≥ 2 倍（失败要重渲 + 退避，时间得够）。
+
+    旧写法拿 60s 墙钟当分母 —— 那个墙钟是**旧上游**的，当前上游已不存在。
+    """
+    ms_per_char = 60.0  # 最差实测斜率
     wall = openai_mod._CLONE_CHUNK_CHARS_DEFAULT * ms_per_char / 1000.0
-    margin = 60.0 / wall
+    margin = 300.0 / wall  # 我们自己的 httpx 读超时
     assert (
-        margin >= 1.5
+        margin >= 2.0
     ), f"克隆块长 {openai_mod._CLONE_CHUNK_CHARS_DEFAULT} 的墙钟余量只有 {margin:.2f} 倍"
+
+
+def test_克隆块长不超过实测验证过的上限():
+    """块长不得超过**实测跑通过**的上限。
+
+    实测（当前上游，生产真实 3175 字稿）：
+        1500 字 → 63.0s / 224.3s 音频 ✓
+        1800 字 → 103.2s / 261.4s 音频 ✓
+        2000 字 → 77.7s / 274.0s 音频 ✓
+        2200 字 → 89.9s / 317.4s 音频 ✓
+        （1400 / 1600 两档撞上上游 429「资源不足」⇒ 上游**负载敏感**）
+
+    ⇒ 2200 是**验证过**的边界；再往上没有实测依据，不许取。
+    ⇒ 为什么不取 2200：余量比那一点接缝收益更值钱（见 openai.py 的注释）。
+
+    ⚠️ **「上游有 ~322s 音频上限」是错的**（2026-11-25 第一轮自己也这么以为）：
+    同一份 2000 字文本，两次实测分别产出 **322.0s** 与 **274.0s**
+    ⇒ 那是抽样语速的差别，不是上限。
+    """
+    assert (
+        openai_mod._CLONE_CHUNK_CHARS_DEFAULT <= 2200
+    ), f"克隆块长 {openai_mod._CLONE_CHUNK_CHARS_DEFAULT} 超过实测验证过的上限 2200"
 
 
 # ── D. crossfade ─────────────────────────────────────────────────────────
@@ -84,11 +121,42 @@ def test_crossfade_环境变量非法时用默认值(monkeypatch):
 
 # ── E. 判据常量 ──────────────────────────────────────────────────────────
 def test_ecapa_分离带留有余量():
-    """分离带两侧都要有余量（标定：同一人 ≥0.75，换人 ≤0.35）。"""
+    """分离带两侧都要有余量。
+
+    ⚠️ **2026-11-25：余量要求从 0.15 收到 0.05**。
+
+    旧要求（≥0.15）配的是旧上游（tertu.cn）的标定：同一人 ≥0.75、
+    换人 ≤0.35 ⇒ 分离带宽 0.40。
+
+    当前上游（hub.tsingfly.com）重新标定后：
+        换人（预设音色两两 / vs 克隆源）  0.357 ~ 0.697
+        同一人（克隆块 vs 克隆源）        0.857 ~ 0.931
+    ⇒ 分离带只有 [0.697, 0.857]，宽 0.16 ⇒ 余量天然只有 0.07 / 0.08。
+
+    ⇒ 门禁阈值必须落在**实测为空的**那一段里；要求 0.15 的余量会让
+      阈值无处可放（会把「换人」误判成「同一人」）。
+      0.05 是「余量还在，但必须尊重实测带宽」的落点。
+
+    判据**语义没变**（分离带两侧都要留余量），变的是余量数字 ——
+    因为上游变了、实测带宽变了。
+    """
     assert consistency.ECAPA_SAME_MIN > consistency.ECAPA_THRESHOLD
     assert consistency.ECAPA_THRESHOLD > consistency.ECAPA_DIFF_MAX
-    assert consistency.ECAPA_SAME_MIN - consistency.ECAPA_THRESHOLD >= 0.15
-    assert consistency.ECAPA_THRESHOLD - consistency.ECAPA_DIFF_MAX >= 0.15
+    assert consistency.ECAPA_SAME_MIN - consistency.ECAPA_THRESHOLD >= 0.05
+    assert consistency.ECAPA_THRESHOLD - consistency.ECAPA_DIFF_MAX >= 0.05
+
+
+def test_ecapa_阈值落在实测分离带的空隙里():
+    """阈值必须落在「换人最高」与「同一人最低」之间的**空隙**里。
+
+    实测（2026-11-25，当前上游）：
+        换人最高 0.697（serena ↔ vivian）
+        同一人最低 0.857（克隆块 vs 克隆源）
+    ⇒ 阈值必须 > 0.697 且 < 0.857，否则会把某一侧整片误判。
+    """
+    assert consistency.ECAPA_DIFF_MAX >= 0.70, "换人上界必须覆盖实测的 0.697"
+    assert consistency.ECAPA_SAME_MIN <= 0.86, "同一人下界必须低于实测的 0.857"
+    assert 0.697 < consistency.ECAPA_THRESHOLD < 0.857
 
 
 def test_段数上限():
