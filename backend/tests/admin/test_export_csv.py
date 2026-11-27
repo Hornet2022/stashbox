@@ -10,6 +10,7 @@
 
 依赖真实 PG。表由 fixture 幂等建（绕过 broken 0008 迁移链，仅建本测试相关表）。
 """
+
 import csv
 import importlib.util
 import io
@@ -144,7 +145,9 @@ async def _get(path: str, headers: dict | None = None):
 @pytest.mark.asyncio
 async def test_export_users_csv():
     admin = await _make_user(tier="admin", nickname="cp56_admin_users")
-    resp = await _get("/api/v1/admin/export/users.csv", {"Authorization": f"Bearer {_token(admin)}"})
+    resp = await _get(
+        "/api/v1/admin/export/users.csv", {"Authorization": f"Bearer {_token(admin)}"}
+    )
 
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "text/csv; charset=utf-8"
@@ -155,9 +158,20 @@ async def test_export_users_csv():
     assert resp.content.startswith(b"\xef\xbb\xbf")
 
     rows = _parse_csv(resp)
+    # username 列（迁移 0043）：display_name 可重名（内测期全是「听友」），
+    # 导出表里没有它就没法区分两个同名账号 ⇒ 必须有这一列。
     assert rows[0] == [
-        "id", "email", "display_name", "role", "tier", "status",
-        "monthly_quota", "used_quota", "last_active_at", "created_at",
+        "id",
+        "email",
+        "display_name",
+        "username",
+        "role",
+        "tier",
+        "status",
+        "monthly_quota",
+        "used_quota",
+        "last_active_at",
+        "created_at",
     ]
     assert len(rows) >= 2  # header + 至少 seed 的 admin
 
@@ -165,9 +179,17 @@ async def test_export_users_csv():
     assert len(mine) == 1
     row = mine[0]
     assert row[2] == "cp56_admin_users"  # display_name <- nickname
-    assert row[3] == row[4] == "admin"  # role / tier
-    assert row[5] == "active"
-    assert row[6] == "42" and row[7] == "7"  # monthly_quota / used_quota
+    assert row[4] == row[5] == "admin"  # role / tier
+    assert row[6] == "active"
+    assert row[7] == "42" and row[8] == "7"  # monthly_quota / used_quota
+
+    # username 列的值 = 库里的用户名（不是空串、不是昵称）
+    async with AsyncSessionLocal() as s:
+        db_uname = (
+            await s.execute(text("SELECT username FROM users WHERE id = :i"), {"i": admin})
+        ).scalar()
+    assert db_uname
+    assert row[3] == db_uname
 
     # 每次导出写一条 admin_operation_logs（target_id 形如 users-YYYY-MM-DD.csv）
     async with AsyncSessionLocal() as s:
@@ -200,8 +222,16 @@ async def test_export_articles_csv():
     assert resp.headers["content-type"] == "text/csv; charset=utf-8"
     rows = _parse_csv(resp)
     assert rows[0] == [
-        "id", "user_id", "title", "source", "url", "status",
-        "tags", "quality_score", "listened_at", "created_at",
+        "id",
+        "user_id",
+        "title",
+        "source",
+        "url",
+        "status",
+        "tags",
+        "quality_score",
+        "listened_at",
+        "created_at",
     ]
     assert len(rows) >= 2
 
@@ -228,7 +258,14 @@ async def test_export_feedback_csv():
     assert resp.headers["content-type"] == "text/csv; charset=utf-8"
     rows = _parse_csv(resp)
     assert rows[0] == [
-        "id", "user_id", "article_id", "type", "rating", "reason", "metadata", "created_at",
+        "id",
+        "user_id",
+        "article_id",
+        "type",
+        "rating",
+        "reason",
+        "metadata",
+        "created_at",
     ]
     mine = [r for r in rows[1:] if r[0] == str(fb_id)]
     assert len(mine) == 1
@@ -250,7 +287,13 @@ async def test_export_audit_log_csv():
     assert resp.headers["content-type"] == "text/csv; charset=utf-8"
     rows = _parse_csv(resp)
     assert rows[0] == [
-        "id", "actor_id", "action_type", "target_type", "target_id", "payload", "created_at",
+        "id",
+        "actor_id",
+        "action_type",
+        "target_type",
+        "target_id",
+        "payload",
+        "created_at",
     ]
     assert len(rows) >= 2  # header + 本次导出日志
     assert any(
@@ -271,7 +314,13 @@ async def test_export_subscriptions_csv():
     assert resp.headers["content-type"] == "text/csv; charset=utf-8"
     rows = _parse_csv(resp)
     assert rows[0] == [
-        "id", "user_id", "tier", "started_at", "expires_at", "status", "auto_renew",
+        "id",
+        "user_id",
+        "tier",
+        "started_at",
+        "expires_at",
+        "status",
+        "auto_renew",
     ]
     assert len(rows) >= 1  # 至少 header；表存在时还有数据行
 

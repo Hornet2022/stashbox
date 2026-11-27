@@ -36,6 +36,7 @@ from stashbox.backend.common.exceptions import (
 )
 from stashbox.backend.common.logging import setup_logging
 from stashbox.backend.common.middleware import RequestIDMiddleware
+from stashbox.backend.common.username import assign_username
 from stashbox.backend.common.auth_admin import require_admin, require_admin_or_operator
 from stashbox.backend.common.models import User
 from stashbox.backend.common.models.article import Article
@@ -160,6 +161,20 @@ install_health_endpoints(app)
 
 class WechatLoginRequest(BaseModel):
     code: str
+    # ── 唯一用户名的设备特征（2026-11-27，暂用形态）────────────────────
+    #
+    # 微信登录尚未上线，nickname 只能落成常量「听友」⇒ 所有账号同名，
+    # 后台无法区分"是哪一个"。⇒ 登录时顺带上报**设备特征**，服务端据此生成
+    # **唯一用户名**（`d-<机型>_<设备指纹>`，见 common/username.py）。
+    #
+    # · device_id：客户端 `DeviceId.androidIdSuffix()`（SHA-256(ANDROID_ID) 前缀）
+    #   或 `analyticsDeviceId()`（`and-…` / `rnd-…`）—— 同一台设备恒定。
+    # · device_model：客户端 `Build.MANUFACTURER + Build.MODEL` —— 具备特征性。
+    #
+    # 两者都是**可选**的：旧版本客户端不传 ⇒ 服务端回落到 `t-<id>` 形态，
+    # 唯一性照样成立（不留 null、不破唯一索引）。
+    device_id: str | None = None
+    device_model: str | None = None
 
 
 class WechatLoginResponse(BaseModel):
@@ -172,6 +187,9 @@ class WechatLoginResponse(BaseModel):
 class UserInfo(BaseModel):
     user_id: str
     nickname: str
+    #: 唯一用户名（迁移 0043）。与 nickname 分工：nickname 是显示名（可重复），
+    #: username 是唯一标识（全局唯一）—— 后台靠它区分两个同名「听友」。
+    username: str = ""
     avatar: str | None = None
 
 
@@ -214,6 +232,9 @@ class AdminUserItem(BaseModel):
     id: int
     email: str | None = None
     display_name: str | None = None
+    #: 唯一用户名（迁移 0043）。display_name（昵称）**可以重名** —— 内测期所有账号
+    #: 的昵称都是常量「听友」⇒ 运营靠这一列区分"是哪一个"。
+    username: str = ""
     role: str
     tier: str
     status: str
@@ -392,6 +413,8 @@ class UserInfoResponse(BaseModel):
 
     user_id: str
     nickname: str
+    #: 唯一用户名（迁移 0043）—— 与 GET /api/v1/user 同一口径。
+    username: str = ""
     tier: str
 
 
@@ -428,6 +451,7 @@ async def me(user: dict = Depends(require_user), db: AsyncSession = Depends(get_
     return UserInfoResponse(
         user_id=str(row.id),
         nickname=row.nickname or "听友",
+        username=row.username,
         tier=row.tier,
     )
 
@@ -482,8 +506,16 @@ async def wechat_login(
             quota_reset_at=quota_service.next_reset_at_naive(),
         )
         db.add(user)
-        await db.flush()  # 先拿 user.id 供埋点
+        await db.flush()  # 先拿 user.id 供埋点与 username 兜底候选
         await db.refresh(user)
+        # 唯一用户名：优先用**设备特征**形态（暂用），取不到则回落 `t-<id>`。
+        # 唯一索引冲突时自动换下一个候选（SAVEPOINT，不影响外层事务）。
+        await assign_username(
+            db,
+            user,
+            device_id=req.device_id,
+            device_model=req.device_model,
+        )
 
     token = create_access_token(str(user.id))
     refresh = create_refresh_token(str(user.id))
@@ -574,6 +606,7 @@ async def get_user(user: dict = Depends(require_user), db: AsyncSession = Depend
     return UserInfo(
         user_id=str(u.id),
         nickname=u.nickname or f"听友_{u.id}",
+        username=u.username,
         avatar=u.avatar_url,
     )
 
@@ -1580,7 +1613,15 @@ async def admin_list_users(
     # 计数 + 查询共用过滤条件
     filters = []
     if kw:
-        filters.append(or_(User.nickname.ilike(kw), User.email.ilike(kw)))
+        # username 一并纳入搜索（2026-11-27）：昵称全是「听友」时，
+        # 运营手里唯一的区分手段就是唯一用户名 ⇒ 必须能按它搜到。
+        filters.append(
+            or_(
+                User.nickname.ilike(kw),
+                User.email.ilike(kw),
+                User.username.ilike(kw),
+            )
+        )
     if tier:
         filters.append(User.tier == tier)
     if status == "deleted":
@@ -1622,6 +1663,7 @@ async def admin_list_users(
             id=u.id,
             email=u.email,
             display_name=u.nickname,
+            username=u.username,
             # role 表达「是不是管理员」，tier 表达「等级」——拆开后两列不再重复。
             role=u.tier if u.tier in {"admin", "operator"} else "user",
             tier=u.tier,

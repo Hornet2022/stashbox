@@ -8845,6 +8845,11 @@
             ],
             "title": "Display Name"
           },
+          "username": {
+            "type": "string",
+            "title": "Username",
+            "default": ""
+          },
           "role": {
             "type": "string",
             "title": "Role"
@@ -9244,6 +9249,11 @@
             "type": "string",
             "title": "Nickname"
           },
+          "username": {
+            "type": "string",
+            "title": "Username",
+            "default": ""
+          },
           "avatar": {
             "anyOf": [
               {
@@ -9272,6 +9282,11 @@
           "nickname": {
             "type": "string",
             "title": "Nickname"
+          },
+          "username": {
+            "type": "string",
+            "title": "Username",
+            "default": ""
           },
           "tier": {
             "type": "string",
@@ -9320,6 +9335,28 @@
           "code": {
             "type": "string",
             "title": "Code"
+          },
+          "device_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Id"
+          },
+          "device_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Model"
           }
         },
         "type": "object",

@@ -1827,6 +1827,9 @@ async def admin_export_users_csv(
         "id",
         "email",
         "display_name",
+        # 唯一用户名（迁移 0043）：display_name 可重名（全是「听友」），
+        # 导出表里没有它就没法区分两个同名账号。
+        "username",
         "role",
         "tier",
         "status",
@@ -1845,6 +1848,7 @@ async def admin_export_users_csv(
                 u.id,
                 u.email,
                 u.nickname,
+                u.username,
                 u.tier,
                 u.tier,
                 "active",
