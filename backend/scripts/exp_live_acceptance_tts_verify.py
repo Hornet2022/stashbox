@@ -8,15 +8,21 @@
 （生产日志逐块字节 / 仓内切块复现 / ASR 转写对照），每次重跑成本高。
 
 ⇒ 把三者的口径固化成脚本：
-  ① **字节口径（主判据，不依赖 ASR）**：生产日志逐块「请求 UTF-8 字节 / 上游响应字节」
-     ⇒ 块时长 = 响应字节 ÷ 上游码率（码率由「上游总字节 ÷ 实测总时长」反推）
-     ⇒ 语速 = 块字数 ÷ 块时长，超过阈值 ⇒ 该块疑似被截断。
+  ① **块级语速（主判据，不依赖 ASR）**：取服务端 `OpenAITTS 块校验:` 日志行 ——
+     那是 `audio_duration_exact_sec` 对**上游返回 mp3** 的**逐帧精测**时长，
+     是块级语速**唯一的权威来源**。
+     ⚠️ **不要再自己反推块时长**（2026-11-27 实测踩坑，已修正）：
+     老写法用「上游总字节 ÷ 实测总时长」反推码率再算块时长，但最终 mp3 是
+     `crossfade_concat` **重编码**（libmp3lame 64k）的产物，字节数与上游各块
+     之和对不上（实测 4,774,509 vs 4,208,592，差 13.4%）⇒ 反推时长系统性偏短
+     ⇒ 真实 5.997 字/秒的块被算成 6.21 ⇒ **假红**（art_67f7fa22… chunk1）。
   ② **块↔日志映射自校准**：用仓内 `split_into_chunks(script_text, 700)` 复现块边界，
      每块 UTF-8 字节必须与日志的 `bytes=` **逐条吻合** —— 不吻合说明日志与块错位，
      后面所有判定都不可信（fail-closed）。
   ③ **阈值从仓内既有定义 import**（不另造常量）：
      `openai._TRUNCATION_CPS_PRESET_LONG` / `_TRUNCATION_CHARS_PER_SEC` /
-     `_TRUNCATION_STRICT_MIN_CHARS`，与线上跑的判据**同源**。
+     `_TRUNCATION_STRICT_MIN_CHARS`，并与**服务端日志里的 limit 对账** ——
+     两边不一致说明阈值漂了，也判失败。
 
 用法
 ----
@@ -95,15 +101,20 @@ def fetch_log(since: str, until: str) -> str:
     )
 
 
-def parse_log(log: str) -> tuple[dict, list[tuple[int, int]], bool]:
-    """返回 (元信息, [(请求字节, 响应字节)], 是否走了预设路径)。
+def parse_log(log: str) -> tuple[dict, list[tuple[int, int]], bool, list[dict]]:
+    """返回 (元信息, [(请求字节, 响应字节)], 是否走了预设路径, 逐块精测记录)。
 
     一个时间窗里可能有多篇的蒸馏记录 ⇒ 按「分段合成」切分成多组，
     调用方用 total_chars 匹配挑出目标那组（见 pick_group）。
+
+    **逐块精测记录**来自服务端的 `OpenAITTS 块校验:` 行 —— 那是
+    `audio_duration_exact_sec` 对**上游返回 mp3** 的逐帧精测时长，
+    是块级语速判据**唯一的权威来源**（见 main() 里的口径说明）。
     """
     groups: list[dict] = []
     cur: dict | None = None
     preset = False
+    checks: list[dict] = []
     for ln in log.splitlines():
         m = re.search(r"分段合成: total_chars=(\d+) chunks=(\d+).*clone=(\w+)", ln)
         if m:
@@ -118,6 +129,16 @@ def parse_log(log: str) -> tuple[dict, list[tuple[int, int]], bool]:
         if "tts_voice_resolved" in ln and "preset=" in ln:
             pm = re.search(r"preset=(\S+)", ln)
             preset = bool(pm and pm.group(1) not in ("None", "none", ""))
+        m = re.search(r"OpenAITTS 块校验: chars=(\d+) dur=([\d.]+) cps=([\d.]+) limit=([\d.]+)", ln)
+        if m:
+            checks.append(
+                {
+                    "chars": int(m.group(1)),
+                    "dur": float(m.group(2)),
+                    "cps": float(m.group(3)),
+                    "limit": float(m.group(4)),
+                }
+            )
         m = re.search(r"OpenAITTS synthesize: .* bytes=(\d+)", ln)
         if m:
             cur = cur or {"pairs": []}
@@ -127,7 +148,7 @@ def parse_log(log: str) -> tuple[dict, list[tuple[int, int]], bool]:
         if m and cur is not None and cur.get("pending") is not None:
             cur["pairs"].append((cur.pop("pending"), int(m.group(1))))
             continue
-    return groups, groups[0] if groups else {}, preset
+    return groups, groups[0] if groups else {}, preset, checks
 
 
 def pick_group(groups: list[dict], total_chars: int) -> tuple[dict, list[tuple[int, int]]]:
@@ -159,6 +180,74 @@ def shutil_which(bin: str) -> str | None:
     return r.stdout.strip() or None
 
 
+def judge_chunks(
+    chunks: list[str],
+    pairs: list[tuple[int, int]],
+    checks: list[dict],
+    strict: bool,
+) -> tuple[list[dict], bool]:
+    """按**服务端逐帧精测值**判定每块，返回 (每块的判定行, 是否有失败)。
+
+    口径（2026-11-27 修正，理由见模块 docstring）：
+      · 块时长/语速**只取服务端 `OpenAITTS 块校验:` 的实测值**；本脚本不反推。
+      · 阈值从仓内 import，并与服务端日志里的 limit **对账**（不一致 ⇒ 失败）。
+      · 块↔日志的 UTF-8 字节必须逐条吻合（映射自校准，fail-closed）。
+      · 同文本重渲 ⇒ 取**最后一条**精测记录（那才是发出去的那次）。
+      · 无精测记录（可能二分自愈 / 时间窗没覆盖）⇒ **不可判定**，整体判失败。
+    """
+    by_chars: dict[int, list[dict]] = {}
+    for c in checks:
+        by_chars.setdefault(c["chars"], []).append(c)
+
+    rows: list[dict] = []
+    bad = False
+    for i, (ch, (rb, sb)) in enumerate(zip(chunks, pairs)):
+        n = len(ch)
+        u8 = len(ch.encode("utf-8"))
+        limit = (
+            _TRUNCATION_CPS_PRESET_LONG
+            if strict and n >= _TRUNCATION_STRICT_MIN_CHARS
+            else _TRUNCATION_CHARS_PER_SEC
+        )
+        ok_bytes = u8 == rb
+        cands = by_chars.get(n, [])
+        row = {
+            "i": i,
+            "chars": n,
+            "utf8_bytes": u8,
+            "req_bytes": rb,
+            "resp_bytes": sb,
+            "ok_bytes": ok_bytes,
+            "limit": limit,
+        }
+        if not cands:
+            bad = True
+            row.update(
+                {
+                    "dur": None,
+                    "cps": None,
+                    "agree": None,
+                    "healed": 0,
+                    "verdict": "❌ 无精测记录 ⇒ 不可判定",
+                }
+            )
+            rows.append(row)
+            continue
+        chk = cands[-1]
+        healed = len(cands) - 1
+        dur, cps = chk["dur"], chk["cps"]
+        agree = abs(chk["limit"] - limit) < 1e-6
+        ok = cps <= limit
+        if not ok or not ok_bytes or not agree:
+            bad = True
+        verdict = "OK" if (ok and ok_bytes and agree) else "⚠️ 疑似截断"
+        if healed:
+            verdict += f"（同文本重渲 {healed} 次）"
+        row.update({"dur": dur, "cps": cps, "agree": agree, "healed": healed, "verdict": verdict})
+        rows.append(row)
+    return rows, bad
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("article_id")
@@ -176,7 +265,7 @@ def main() -> int:
     since = args.since or "2026-11-27 00:00"
     until = args.until or "2026-11-27 23:59"
     log = fetch_log(since, until)
-    groups, _, preset = parse_log(log)
+    groups, _, preset, checks = parse_log(log)
     lmeta, pairs = pick_group(groups, len(script))
 
     mp3 = OUT / f"{args.article_id}.mp3"
@@ -197,41 +286,64 @@ def main() -> int:
 
     total_resp = sum(r for _, r in pairs)
     actual = ffprobe_duration(mp3) or float(meta.get("duration_sec") or 0)
-    upstream_bps = total_resp / actual if actual else 6800.0
 
     # 阈值：预设路径长块走严格档，其余走宽松档（从仓内 import，与线同源）
     strict = preset and lmeta.get("clone") == "off"
 
-    print(f"上游总字节 = {total_resp}   实测总时长 = {actual}s   反推码率 = {upstream_bps:.0f} B/s")
+    # ── 逐块精测记录：服务端算好的**权威值** ──────────────────────
+    #
+    # ⚠️ 为什么不能自己反推块时长（2026-11-27 实测踩坑）：
+    #   老写法用「上游总字节 ÷ 整篇实测时长」反推码率，再算每块时长。
+    #   **前提是错的**：最终 mp3 是 `crossfade_concat` **重编码**（libmp3lame 64k）
+    #   的产物，字节数与上游各块之和对不上（实测 4,774,509 vs 4,208,592，差 13.4%）
+    #   ⇒ 反推出的块时长系统性偏短 ⇒ 真实 5.997 字/秒的块被算成 6.21 ⇒ **假红**。
+    #
+    #   ⇒ 块级语速只有一个权威来源：服务端对**上游返回 mp3** 的逐帧精测
+    #     （`audio_duration_exact_sec`），也就是日志里的 `OpenAITTS 块校验:` 行。
+    #     本脚本只做**对账**（服务端算的 limit 与仓内阈值是否一致），
+    #     不再自己造第二个尺子。
+    print(f"上游总字节 = {total_resp}   实测总时长 = {actual}s")
+    final_bytes = mp3.stat().st_size if mp3.exists() else 0
+    ratio = final_bytes / total_resp if total_resp else 0.0
+    print(
+        f"最终 mp3 字节 = {final_bytes}（= 上游之和的 {ratio:.4f} 倍"
+        f" ⇒ 经响度归一/交叉淡化**重编码** ⇒ 不可反推块时长）"
+    )
+    print(f"服务端逐块精测记录 = {len(checks)} 条（块数 {len(chunks)}）")
     print()
     print(
         f"{'块':<8}{'字数':>6}{'请求字节':>10}{'日志':>8}{'吻合':>6}{'响应字节':>12}"
-        f"{'时长s':>9}{'语速':>7}{'阈值':>6}  判定"
+        f"{'实测时长s':>11}{'实测语速':>10}{'阈值':>6}{'对账':>6}  判定"
     )
-    bad = False
-    for i, (ch, (rb, sb)) in enumerate(zip(chunks, pairs)):
-        n = len(ch)
-        u8 = len(ch.encode("utf-8"))
-        dur = sb / upstream_bps
-        cps = n / dur
-        limit = (
-            _TRUNCATION_CPS_PRESET_LONG
-            if strict and n >= _TRUNCATION_STRICT_MIN_CHARS
-            else _TRUNCATION_CHARS_PER_SEC
-        )
-        ok_bytes = u8 == rb
-        verdict = "OK" if cps <= limit else "⚠️ 疑似截断"
-        if cps > limit or not ok_bytes:
-            bad = True
+    rows, bad = judge_chunks(chunks, pairs, checks, strict)
+    for row in rows:
+        if row["dur"] is None:
+            print(
+                f"chunk{row['i']:<3}{row['chars']:>6}{row['utf8_bytes']:>10}"
+                f"{row['req_bytes']:>8}{'✓' if row['ok_bytes'] else '✗':>6}"
+                f"{row['resp_bytes']:>12}{'—':>11}{'—':>10}{row['limit']:>6.1f}"
+                f"{'—':>6}  {row['verdict']}"
+            )
+            continue
         print(
-            f"chunk{i:<3}{n:>6}{u8:>10}{rb:>8}{'✓' if ok_bytes else '✗':>6}{sb:>12}"
-            f"{dur:>9.2f}{cps:>7.2f}{limit:>6.1f}  {verdict}"
+            f"chunk{row['i']:<3}{row['chars']:>6}{row['utf8_bytes']:>10}"
+            f"{row['req_bytes']:>8}{'✓' if row['ok_bytes'] else '✗':>6}"
+            f"{row['resp_bytes']:>12}{row['dur']:>11.3f}{row['cps']:>10.3f}"
+            f"{row['limit']:>6.1f}{'✓' if row['agree'] else '✗':>6}  {row['verdict']}"
         )
     print()
+    healed_total = sum(r["healed"] for r in rows)
+    if len(checks) != len(chunks):
+        print(
+            f"⚠️ 精测记录数 {len(checks)} ≠ 块数 {len(chunks)}"
+            f"（自愈 {healed_total} 次 / 可能发生二分自愈 ⇒ 块↔记录不再 1:1）"
+        )
     print(f"整篇：{len(script)} 字 / {actual}s = {len(script)/actual:.2f} 字/秒" if actual else "")
-    print(
-        f"判定：{'❌ 有块超阈值或字节不吻合' if bad else '✅ 全部块在阈值内，且块↔日志字节逐条吻合'}"
-    )
+    if bad:
+        print("判定：❌ 有块超阈值、字节不吻合、阈值对账不一致，或存在不可判定的块")
+    else:
+        print("判定：✅ 每块实测语速在阈值内，且块↔日志字节逐条吻合、阈值与服务端同源")
+    print("（口径：块级语速取服务端逐帧精测值；反推码率不再作判据）")
     print("（内容完整性只是第一道；音色零换人与 ASR 对照见另外两条链路）")
     return 1 if bad else 0
 

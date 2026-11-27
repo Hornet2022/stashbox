@@ -1127,6 +1127,24 @@ class OpenAITTSClient(TTSClient):
         cps = len(text) / dur
 
         limit = self._truncation_cps_limit(text, clone)
+        # ⚠️ 这里必须把**实测值**落进日志（2026-11-27 加）：
+        #
+        # 离线验收脚本曾经用「上游总字节 ÷ 整篇实测时长」反推每块时长，
+        # 但最终 mp3 是 `crossfade_concat` **重编码**（libmp3lame 64k）的产物
+        # —— 字节数与上游各块之和**对不上**（实测 4,774,509 vs 4,208,592，
+        # 差 13.4%）⇒ 反推出的块时长系统性偏短 ⇒ 真实 5.997 字/秒的块
+        # 被算成 6.21 ⇒ **假红**（2026-11-27 实测：art_67f7fa22… chunk1）。
+        #
+        # ⇒ 块级语速判据**只有一个权威来源**：上游返回 mp3 的逐帧精测时长
+        #   （`audio_duration_exact_sec`），也就是这里算出来的 dur。
+        #   把它落进日志，离线验收脚本才能取到真值，而不是再反推一次。
+        log.info(
+            "OpenAITTS 块校验: chars=%d dur=%.3fs cps=%.3f limit=%.2f",
+            len(text),
+            dur,
+            cps,
+            limit,
+        )
         if cps > limit:
             # ⚠️ **短到没法再切的块不上抛**（2026-10-25 新增）：
             #   误判一次 = 整篇蒸馏失败（实测：47 字的块被判 9.40 字/秒

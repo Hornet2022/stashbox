@@ -240,3 +240,66 @@ async def test_克隆路径不做同文本重渲():
     assert all(
         len(c) < 190 for c in calls[1:]
     ), "克隆路径**不能**同文本重渲（会换人）⇒ 第一步就必须切小"
+
+
+def test_块校验日志必须落盘实测值(caplog):
+    """块级语速的权威来源 = 上游 mp3 **逐帧精测**时长 ⇒ 必须落进日志。
+
+    为什么这是契约而不是调试信息（2026-11-27 实测）：
+    离线验收脚本曾用「上游总字节 ÷ 整篇实测时长」反推块时长，但最终 mp3 是
+    `crossfade_concat` **重编码**（libmp3lame 64k）的产物，字节数与上游各块
+    之和对不上（实测 4,774,509 vs 4,208,592，差 13.4%）
+    ⇒ 反推时长系统性偏短 ⇒ 真实 5.997 字/秒的块被算成 6.21 ⇒ **假红**
+    （art_67f7fa22ef5c419680748072 的 chunk1）。
+
+    ⇒ 脚本要拿到真值，只能从这里取 ⇒ 这行日志是**对外契约**：
+       少了它，验收脚本就退回反推 ⇒ 假红复发。
+    """
+    import logging
+
+    from app.services.tts.audio_duration import audio_duration_exact_sec
+
+    client = _client()
+    audio = _fake_mp3_of_seconds(112.0)
+    exact = audio_duration_exact_sec(audio)
+    assert exact, "测试用的假 mp3 必须能被逐帧解析出时长"
+
+    with caplog.at_level(logging.INFO, logger="app.services.tts.openai"):
+        client._assert_not_truncated("这" * 667, audio)
+
+    lines = [m for m in caplog.messages if "OpenAITTS 块校验" in m]
+    assert len(lines) == 1, f"每块必须恰好落一条块校验日志（实际 {len(lines)} 条）"
+    line = lines[0]
+
+    # 落的是**实测**时长，不是任何反推值
+    assert "chars=667" in line
+    assert f"dur={exact:.3f}" in line, f"必须落精测时长 {exact:.3f}：{line}"
+    assert f"cps={667 / exact:.3f}" in line
+    # 阈值与仓内定义同源：预设路径 + 长块 ⇒ 严格档 6.0
+    assert "limit=6.00" in line, f"预设长块的 limit 必须是严格档 6.0：{line}"
+
+
+def test_块校验日志里的limit与仓内阈值必须一致(caplog):
+    """服务端日志的 limit 必须等于仓内 `_truncation_cps_limit` 算出来的值。
+
+    验收脚本靠这个做**对账**（两边不一致 ⇒ 阈值漂了 ⇒ 判失败）。
+    """
+    import logging
+
+    client = _client()
+    for chars, clone, expect in (
+        (190, None, 6.0),  # 预设长块
+        (190, _clone_spec(), 11.0),  # 克隆路径
+        (100, None, 11.0),  # 短块
+    ):
+        with caplog.at_level(logging.INFO, logger="app.services.tts.openai"):
+            caplog.clear()
+            try:
+                client._assert_not_truncated("这" * chars, _fake_mp3_of_seconds(60), clone)
+            except openai_module._TruncatedOutput:
+                pass  # 60s 装 190 字会被判截断，这里只关心 limit 对不对
+        line = [m for m in caplog.messages if "OpenAITTS 块校验" in m]
+        assert line, f"chars={chars} 必须留下块校验日志"
+        assert (
+            f"limit={expect:.2f}" in line[0]
+        ), f"chars={chars} clone={'clone' if clone else 'preset'} 的 limit 应为 {expect}：{line[0]}"
