@@ -1,0 +1,206 @@
+[
+  {
+    "aid": "art_30fb7dca3fa94b7ea0eed503",
+    "dur": 489,
+    "cps": 4.51,
+    "rows": [
+      {
+        "i": 0,
+        "chars": 695,
+        "bytes": 1854,
+        "ascii_pct": 16.5,
+        "req_bytes": 1854,
+        "resp_bytes": 1024128,
+        "dur_est": 150.6,
+        "cps": 4.61,
+        "verdict": "正常"
+      },
+      {
+        "i": 1,
+        "chars": 688,
+        "bytes": 1725,
+        "ascii_pct": 24.6,
+        "req_bytes": 1725,
+        "resp_bytes": 980976,
+        "dur_est": 144.3,
+        "cps": 4.77,
+        "verdict": "正常"
+      },
+      {
+        "i": 2,
+        "chars": 647,
+        "bytes": 1767,
+        "ascii_pct": 13.4,
+        "req_bytes": 1767,
+        "resp_bytes": 1009224,
+        "dur_est": 148.4,
+        "cps": 4.36,
+        "verdict": "正常"
+      },
+      {
+        "i": 3,
+        "chars": 171,
+        "bytes": 379,
+        "ascii_pct": 39.2,
+        "req_bytes": 379,
+        "resp_bytes": 233184,
+        "dur_est": 34.3,
+        "cps": 4.99,
+        "verdict": "正常"
+      }
+    ]
+  },
+  {
+    "aid": "art_a7ebe143cc4143bd9f97fad0",
+    "dur": 414,
+    "cps": 5.46,
+    "rows": [
+      {
+        "i": 0,
+        "chars": 680,
+        "bytes": 1760,
+        "ascii_pct": 20.6,
+        "req_bytes": 1760,
+        "resp_bytes": 1032360,
+        "dur_est": 151.8,
+        "cps": 4.48,
+        "verdict": "正常"
+      },
+      {
+        "i": 1,
+        "chars": 690,
+        "bytes": 1760,
+        "ascii_pct": 22.5,
+        "req_bytes": 1760,
+        "resp_bytes": 497136,
+        "dur_est": 73.1,
+        "cps": 9.44,
+        "verdict": "⚠️ 疑似截断"
+      },
+      {
+        "i": 2,
+        "chars": 692,
+        "bytes": 1882,
+        "ascii_pct": 14.0,
+        "req_bytes": 1882,
+        "resp_bytes": 1001472,
+        "dur_est": 147.3,
+        "cps": 4.7,
+        "verdict": "正常"
+      },
+      {
+        "i": 3,
+        "chars": 195,
+        "bytes": 537,
+        "ascii_pct": 12.3,
+        "req_bytes": 537,
+        "resp_bytes": 305952,
+        "dur_est": 45.0,
+        "cps": 4.33,
+        "verdict": "正常"
+      }
+    ]
+  },
+  {
+    "aid": "art_d00811fbb8e247c08b9f9d9a",
+    "dur": 407,
+    "cps": 5.46,
+    "rows": [
+      {
+        "i": 0,
+        "chars": 670,
+        "bytes": 1558,
+        "ascii_pct": 33.7,
+        "req_bytes": 1558,
+        "resp_bytes": 889896,
+        "dur_est": 130.9,
+        "cps": 5.12,
+        "verdict": "正常"
+      },
+      {
+        "i": 1,
+        "chars": 577,
+        "bytes": 1437,
+        "ascii_pct": 25.5,
+        "req_bytes": 1437,
+        "resp_bytes": 899352,
+        "dur_est": 132.3,
+        "cps": 4.36,
+        "verdict": "正常"
+      },
+      {
+        "i": 2,
+        "chars": 679,
+        "bytes": 1939,
+        "ascii_pct": 7.2,
+        "req_bytes": 1939,
+        "resp_bytes": 567336,
+        "dur_est": 83.4,
+        "cps": 8.14,
+        "verdict": "⚠️ 疑似截断"
+      },
+      {
+        "i": 3,
+        "chars": 294,
+        "bytes": 746,
+        "ascii_pct": 23.1,
+        "req_bytes": 746,
+        "resp_bytes": 408480,
+        "dur_est": 60.1,
+        "cps": 4.89,
+        "verdict": "正常"
+      }
+    ]
+  },
+  {
+    "aid": "art_dc2c2e3283f94663857a73f6",
+    "dur": 528,
+    "cps": 4.37,
+    "rows": [
+      {
+        "i": 0,
+        "chars": 697,
+        "bytes": 1867,
+        "ascii_pct": 16.1,
+        "req_bytes": 1867,
+        "resp_bytes": 1056696,
+        "dur_est": 155.4,
+        "cps": 4.49,
+        "verdict": "正常"
+      },
+      {
+        "i": 1,
+        "chars": 669,
+        "bytes": 1863,
+        "ascii_pct": 10.8,
+        "req_bytes": 1863,
+        "resp_bytes": 1033512,
+        "dur_est": 152.0,
+        "cps": 4.4,
+        "verdict": "正常"
+      },
+      {
+        "i": 2,
+        "chars": 649,
+        "bytes": 1839,
+        "ascii_pct": 8.3,
+        "req_bytes": 1839,
+        "resp_bytes": 1027944,
+        "dur_est": 151.2,
+        "cps": 4.29,
+        "verdict": "正常"
+      },
+      {
+        "i": 3,
+        "chars": 289,
+        "bytes": 847,
+        "ascii_pct": 3.5,
+        "req_bytes": 847,
+        "resp_bytes": 479976,
+        "dur_est": 70.6,
+        "cps": 4.09,
+        "verdict": "正常"
+      }
+    ]
+  }
+]

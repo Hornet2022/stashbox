@@ -396,14 +396,32 @@ def test_真截断仍然被抓(openai_mod):
 
 
 def test_今天上游的正常语速不再被误判(openai_mod):
-    """今天实测的正常样本（含 9.65 字/秒那个）**不得**被判成截断。
+    """今天实测的正常样本**不得**被判成截断 —— **按路径分档**。
 
     这条是 2026-10-25 误判 107 次的直接对策：
     阈值低于正常上界 ⇒ 正常块被劈开 ⇒ 凭空多出音色接缝。
+
+    ⚠️ **2026-11-27 重标定**：旧标定把「自然上界 9.65」当成健康值，
+    但 9.65 正是「音频只剩一半」的语速签名（≈5.0×2）——
+    那份样本里**混进了被截断的样本**，于是阈值被抬到 11.0，
+    真截断（实测 8.14 / 9.44）反而从阈值下面溜过去（生产实证：2 篇丢内容）。
+
+    ⇒ 现在按路径分档：
+      · 预设路径（clone=off，固定说话人）健康带 4.09~5.12 ⇒ 阈值 6.0；
+      · 克隆路径（每次重采样说话人，带更宽）⇒ 沿用 11.0，9.65 不误判。
     """
     client = openai_mod.OpenAITTSClient(api_key="k", base_url="http://x", model="m")
-    # 250 字 / 25.9s = 9.65 字/秒（今天实测的正常上界）
-    client._assert_not_truncated("这" * 250, _fake_mp3_of_seconds(25.9))
+    clone = openai_mod._CloneSpec(
+        source="default", data_url="data:audio/mp3;base64,AA", text="参考"
+    )
+
+    # ── 预设路径：自己的自然上界（5.12）不得误判 ──
+    client._assert_not_truncated("这" * 190, _fake_mp3_of_seconds(37))  # 190/37 = 5.14
+    # ── 预设路径：旧的"正常上界" 9.65 现在是**截断签名** ⇒ 必须报出来 ──
+    with pytest.raises(openai_mod._TruncatedOutput):
+        client._assert_not_truncated("这" * 250, _fake_mp3_of_seconds(25.9))  # 250/25.9 = 9.65
+    # ── 克隆路径：9.65 仍不得误判（宽松档 11.0）──
+    client._assert_not_truncated("这" * 250, _fake_mp3_of_seconds(25.9), clone)
 
 
 @pytest.mark.asyncio
@@ -443,7 +461,12 @@ async def test_truncated_chunk_is_detected_and_split(openai_mod):
 
     assert audio, "自愈后应该拼出音频"
     assert len(calls) > 1, "应该被二分重试，而不是一次就放弃"
-    assert all(len(c) < 60 for c in calls[1:]), "自愈应该把块切小后重渲"
+    # ⚠️ **2026-11-27：自愈的第一步改成「同文本重渲」**——
+    # 上游的短响应是**偶发**的（同一段文本重渲 3 次全部拿到完整音频），
+    # ⇒ 先用同一段文本重渲一次（**不新增接缝**），仍截断才切小。
+    assert calls[1] == calls[0], "同文本重渲应当发生在切小之前（同一段文本再渲一次）"
+    assert all(len(c) < 60 for c in calls[2:]), "同文本重渲仍失败后应当切小重渲"
+    assert min(len(c) for c in calls) < 60, "自愈最终必须落到更小的块上"
 
 
 def _fake_mp3_of_seconds(seconds: int) -> bytes:

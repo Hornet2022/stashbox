@@ -1,0 +1,110 @@
+[
+  {
+    "file": "art_a7ebe143cc4143bd9f97fad0_c0_1",
+    "article": "art_a7ebe143cc4143bd9f97fad0",
+    "chunk": 0,
+    "chars": 680,
+    "dur": 153.92,
+    "cps": 4.42,
+    "similarity": 0.7239,
+    "missing": 243,
+    "verdict": "缺 243 字",
+    "notes": "seg_01:try0:code=500:audio analysis failed: content was rejected by"
+  },
+  {
+    "file": "art_a7ebe143cc4143bd9f97fad0_c0_2",
+    "article": "art_a7ebe143cc4143bd9f97fad0",
+    "chunk": 0,
+    "chars": 680,
+    "dur": 118.96,
+    "cps": 5.72,
+    "similarity": 0.9116,
+    "missing": 77,
+    "verdict": "缺 77 字",
+    "notes": ""
+  },
+  {
+    "file": "art_a7ebe143cc4143bd9f97fad0_c0_3",
+    "article": "art_a7ebe143cc4143bd9f97fad0",
+    "chunk": 0,
+    "chars": 680,
+    "dur": 166.24,
+    "cps": 4.09,
+    "similarity": 0.0,
+    "missing": 608,
+    "verdict": "缺 608 字",
+    "notes": "seg_00:try0:code=500:audio analysis failed: content was rejected by;seg_01:try0:code=500:audio analysis failed: content was rejected by;seg_02:try0:code=500:audio analysis failed: content was rejected by"
+  },
+  {
+    "file": "art_a7ebe143cc4143bd9f97fad0_c1_1",
+    "article": "art_a7ebe143cc4143bd9f97fad0",
+    "chunk": 1,
+    "chars": 673,
+    "dur": 166.96,
+    "cps": 4.03,
+    "similarity": 0.0795,
+    "missing": 498,
+    "verdict": "缺 498 字",
+    "notes": ""
+  },
+  {
+    "file": "art_a7ebe143cc4143bd9f97fad0_c1_2",
+    "article": "art_a7ebe143cc4143bd9f97fad0",
+    "chunk": 1,
+    "chars": 673,
+    "dur": 137.12,
+    "cps": 4.91,
+    "similarity": 0.1311,
+    "missing": 475,
+    "verdict": "缺 475 字",
+    "notes": "seg_01:try0:code=500:audio analysis failed: content was rejected by"
+  },
+  {
+    "file": "art_a7ebe143cc4143bd9f97fad0_c1_3",
+    "article": "art_a7ebe143cc4143bd9f97fad0",
+    "chunk": 1,
+    "chars": 673,
+    "dur": 173.12,
+    "cps": 3.89,
+    "similarity": 0.0,
+    "missing": 572,
+    "verdict": "缺 572 字",
+    "notes": "seg_00:try0:code=500:audio analysis failed: content was rejected by;seg_01:try0:code=500:audio analysis failed: content was rejected by;seg_02:try0:code=500:audio analysis failed: content was rejected by"
+  },
+  {
+    "file": "art_d00811fbb8e247c08b9f9d9a_c2_1",
+    "article": "art_d00811fbb8e247c08b9f9d9a",
+    "chunk": 2,
+    "chars": 683,
+    "dur": 144.24,
+    "cps": 4.74,
+    "similarity": 0.0451,
+    "missing": 581,
+    "verdict": "缺 581 字",
+    "notes": "seg_00:try0:code=500:audio analysis failed: content was rejected by"
+  },
+  {
+    "file": "art_d00811fbb8e247c08b9f9d9a_c2_2",
+    "article": "art_d00811fbb8e247c08b9f9d9a",
+    "chunk": 2,
+    "chars": 683,
+    "dur": 33.92,
+    "cps": 20.14,
+    "similarity": 0.0,
+    "missing": 612,
+    "verdict": "缺 612 字",
+    "notes": "seg_00:try0:code=500:audio analysis failed: content was rejected by"
+  },
+  {
+    "file": "art_d00811fbb8e247c08b9f9d9a_c2_3",
+    "article": "art_d00811fbb8e247c08b9f9d9a",
+    "chunk": 2,
+    "chars": 683,
+    "dur": 157.2,
+    "cps": 4.34,
+    "similarity": 0.0467,
+    "missing": 572,
+    "verdict": "缺 572 字",
+    "notes": "seg_00:try0:code=500:audio analysis failed: content was rejected by"
+  }
+]

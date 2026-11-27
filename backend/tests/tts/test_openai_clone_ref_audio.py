@@ -497,10 +497,14 @@ async def test_生产实测那条不会拖死整篇():
 
     assert audio, "自愈后应该合成出音频"
     assert len(calls) > 1, (
-        "47 字的块比 min_chunk_chars(60) 还小，但**仍应触发二分自愈** —— "
+        "47 字的块比 min_chunk_chars(60) 还小，但**仍应触发自愈重渲** —— "
         "老写法在这里直接放弃，导致整篇蒸馏失败"
     )
-    assert all(len(c) < 47 for c in calls[1:]), "自愈应该把块切小后重渲"
+    # ⚠️ **2026-11-27：自愈第一步改成「同文本重渲」**（上游短响应是偶发的：
+    #   同一段文本重渲 3 次全部拿到完整音频 ⇒ 同文本重渲命中率高且不新增接缝）。
+    assert calls[1] == calls[0], "同文本重渲应当发生在切小之前（同一段文本再渲一次）"
+    assert all(len(c) < 47 for c in calls[2:]), "同文本重渲仍失败后应当切小重渲"
+    assert min(len(c) for c in calls) < 47, "自愈最终必须落到更小的块上"
 
 
 def test_短块的明确缺失仍然被抓():
@@ -516,24 +520,44 @@ def test_短块的明确缺失仍然被抓():
 
 
 def test_长块在实测自然上界不误判():
-    """长块的自然上界**不能**被判成截断（阈值回归）。
+    """长块的自然上界**不能**被判成截断（阈值回归）—— **按路径分档**。
 
-    ⚠️ **2026-10-25：自然上界从 6.45 变成 9.65**（上游换成 CustomVoice 后语速快了约 1.5 倍）。
-    实测（生产真实分块 + 生产克隆段，2026-10-25）：
-        250 字克隆块      5.15 ~ 9.65
-        700~900 字块     5.43 ~ 6.51
-    阈值取 **11.0**（离上界 9.65 有 14% 余量）。
+    ⚠️ **2026-11-27 重标定**（生产实证：4 篇重生成音频里 2 篇整块丢内容，
+    ASR 实证 ≈590 字在音频里消失；用生产日志逐块算语速定位到
+    art_a7ebe143 chunk1 = 9.44 字/秒、art_d00811fb chunk2 = 8.14 字/秒）：
 
-    老阈值 6.8 落在正常带**内部** ⇒ 正常块被劈开 ⇒ 每天凭空多出上百个接缝。
+        旧标定（2026-10-25）的"自然上界 9.65"**混进了被截断的样本** ——
+        9.65 正是"音频只剩一半"的语速签名（≈5.0×2）。
+        ⇒ 阈值取 11.0 ⇒ 真截断（8.14 / 9.44）**从阈值下面溜过去**。
+
+        重标定的干净样本（**预设路径** clone=off，字数取自生产稿件真实切分，
+        时长由响应字节/上游码率推得，码率经实测时长校验 ±3%；
+        样本 = 4 篇 × 4 块 + 11-26 标定 7 块 + 重放 5 次）：
+            健康带 **4.09 ~ 5.12 字/秒**（n=26）
+            截断签名 **5.81 / 8.14 / 9.44**
+        ⇒ 预设路径长块阈值 **6.0**；克隆路径（每次请求重采样说话人 ⇒
+          语速带天然更宽，且 2026-11-25 起生产已停用）沿用 **11.0**。
     """
     client = _client()
-    # 190 字 / 29 秒 → 6.55 字/秒（自然带内）
-    client._assert_not_truncated("这" * 190, _fake_mp3_of_seconds(29))
-    # 250 字 / 25.9 秒 → 9.65 字/秒（**今天的自然上界**）→ 仍不得误判
-    client._assert_not_truncated("这" * 250, _fake_mp3_of_seconds(25.9))
-    # 190 字 / 16 秒 → 11.9 字/秒（明显缺内容）→ 必须报出来
+    clone = openai_module._CloneSpec(
+        source="default", data_url="data:audio/mp3;base64,AA", text="参考"
+    )
+
+    # ── 预设路径长块：自然上界（5.12）不得误判 ──
+    client._assert_not_truncated("这" * 190, _fake_mp3_of_seconds(37))  # 190/37 = 5.14
+
+    # ── 预设路径长块：截断签名（8.14 / 9.44）必须报出来 ──
     with pytest.raises(openai_module._TruncatedOutput):
-        client._assert_not_truncated("这" * 190, _fake_mp3_of_seconds(16))
+        client._assert_not_truncated("这" * 190, _fake_mp3_of_seconds(23))  # 190/23 = 8.26
+    with pytest.raises(openai_module._TruncatedOutput):
+        client._assert_not_truncated("这" * 190, _fake_mp3_of_seconds(20))  # 190/20 = 9.50
+
+    # ── 克隆路径：历史自然上界 9.65 仍不得误判（带更宽 ⇒ 宽松档 11.0）──
+    client._assert_not_truncated("这" * 250, _fake_mp3_of_seconds(25.9), clone)  # 250/25.9 = 9.65
+
+    # ── 克隆路径：明显缺内容（11.9）必须报出来 ──
+    with pytest.raises(openai_module._TruncatedOutput):
+        client._assert_not_truncated("这" * 190, _fake_mp3_of_seconds(16), clone)  # 190/16 = 11.9
 
 
 @pytest.mark.asyncio

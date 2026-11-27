@@ -1,0 +1,30 @@
+
+===== art_a7ebe143cc4143bd9f97fad0 =====
+FETCH_OK art_a7ebe143cc4143bd9f97fad0 script_chars=2160 mp3_bytes=3530541 dur=441
+SPLIT_OK art_a7ebe143cc4143bd9f97fad0 segments=9
+  [1/9] seg_000 len=0 try0:code=500:audio analysis failed: content was rejected by the safety filter; rephrase the prompt to remove 
+  [2/9] seg_001 len=0 try0:code=500:audio analysis failed: content was rejected by the safety filter; rephrase the prompt to remove 
+  [3/9] seg_002 len=0 try0:code=500:audio analysis failed: content was rejected by the safety filter; rephrase the prompt to remove 
+  [4/9] seg_003 len=211 
+  [5/9] seg_004 len=0 try0:code=500:audio analysis failed: content was rejected by the safety filter; rephrase the prompt to remove 
+  [6/9] seg_005 len=234 
+  [7/9] seg_006 len=234 
+  [8/9] seg_007 len=248 
+  [9/9] seg_008 len=0 try0:code=500:audio analysis failed: content was rejected by the safety filter; rephrase the prompt to remove 
+ASR_DONE art_a7ebe143cc4143bd9f97fad0 segments=9 total_chars=927 rejected=5
+
+===== art_d00811fbb8e247c08b9f9d9a =====
+FETCH_OK art_d00811fbb8e247c08b9f9d9a script_chars=2234 mp3_bytes=4033581 dur=504
+SPLIT_OK art_d00811fbb8e247c08b9f9d9a segments=11
+  [1/11] seg_000 len=221 
+  [2/11] seg_001 len=232 
+  [3/11] seg_002 len=0 try0:code=500:audio analysis failed: content was rejected by the safety filter; rephrase the prompt to remove 
+  [4/11] seg_003 len=208 
+  [5/11] seg_004 len=210 
+  [6/11] seg_005 len=218 
+  [7/11] seg_006 len=205 
+  [8/11] seg_007 len=212 
+  [9/11] seg_008 len=221 
+  [10/11] seg_009 len=225 
+  [11/11] seg_010 len=13 
+ASR_DONE art_d00811fbb8e247c08b9f9d9a segments=11 total_chars=1965 rejected=1

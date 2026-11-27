@@ -238,7 +238,91 @@ _CONNECT_TIMEOUT_DEFAULT = 10.0
 #   读得偏快 → cps 虚高（实测同一档位：碎片 6.93，真实分块 6.45），
 #   拿它定阈值会把阈值**定得过紧**。
 #   正确取法见 scripts/calibrate_tts_chunk_rate.py（清洗换行 + 生产切块逻辑）。
+#
+# ⚠️⚠️ **2026-11-27 重标定：11.0 这个阈值把真截断放过去了**（生产实证）。
+#
+#   事件：2026-11-27 生产重生成 4 篇文章，**2 篇的音频整块丢内容**
+#   （ASR 实证：稿里 ~590 字在音频里消失）。用生产日志逐块算语速定位到：
+#       art_a7ebe143 chunk1  690字 → 9.44 字/秒（同篇其他块 4.3~4.7）
+#       art_d00811fb chunk2  679字 → 8.14 字/秒（同篇其他块 4.4~5.1）
+#   ⇒ **8.14 / 9.44 < 11.0 ⇒ 这道防线一次都没响** ⇒ 静默截断照旧上线。
+#
+#   **为什么 11.0 这么松**：它的基线（"正常带 5.15~9.65"）是 2026-10-25 标的，
+#   而那份样本里**混进了被截断的样本** —— 同一个 250 字块两次实测 5.96 与 9.65，
+#   而 9.65 正是"音频只剩一半"的语速签名（≈5.0 × 2）。
+#   ⇒ **坏统计量把防线抬高了**：阈值取在污染后的上界之上 ⇒ 真截断反而无人守。
+#
+#   **重标定的干净样本**（预设路径 clone=off，字数取自生产稿件真实切分，
+#   时长由「响应字节 / 上游码率」推得，码率经实测时长校验 ±3%；
+#   样本 = 4 篇 × 4 块 + 11-26 标定 7 块 + 重放 9 次 + 二分 6 块）：
+#       健康带 **4.07 ~ 5.72 字/秒**（n=33）
+#       截断签名 **5.81**（丢 26%）/ **8.14** / **9.44** / **19.97**（丢 ~50%~75%）
+#   ⇒ 预设路径长块阈值取 **6.0**：**抓得住全部实测的"丢一半"级截断**
+#     （8.14 / 9.44 / 19.97，高于阈值 19%~24%）；健康侧余量 **~5%**（上界 5.72）。
+#
+#   ⚠️ **为什么宁可余量只 ~5% 也不放宽**：误报与漏报的代价**不对称** ——
+#     误报 = 多一次上游请求（自愈的同文本重渲，预设路径**不新增接缝**）；
+#     漏报 = **把缺内容的音频发上线**。⇒ 取严。
+#
+#   ⚠️ **轻截断（丢 26% ⇒ 5.81）抓不到**（5.81 < 6.0）：这是**已知能力边界**，
+#     已显式钉在守卫 `test_轻截断是已知能力边界` 里 ——
+#     谁想收紧到能抓它，必须同时更新契约与守卫。
+#
+#   ⚠️ **健康上界 5.72 的样本标签存疑**：它出自「同一段文本重渲」实验，
+#     而该实验做完后稿件被重生成改写过 ⇒ 拿新稿对齐旧渲染、相似度失真
+#     ⇒ 那次标注实验已作废。5.72 若实为轻截断，健康上界就是 5.49、余量 +9.3%；
+#     两种情况下 6.0 都成立。
+#     ⇒ **教训**：标定样本必须**先冻结稿件再渲染**（否则对齐的是另一版稿）。
+#
+# ⚠️ **为什么分档（路径 + 块长）**：
+#   · **块长**：短块（< 150 字）的语速被**首尾留白与句读停顿**主导，
+#     天然带宽（实测 13 字测试句 → 2.0s ⇒ 6.5 字/秒；40~60 字块带宽 19.9%），
+#     用同一阈值会把 admin 的 TTS 测试按钮判红 ⇒ 短块沿用宽松档。
+#   · **路径**：预设路径是**固定说话人**（voice=uncle_fu），渲染稳定 ⇒ 语速集中；
+#     克隆路径**每次请求重新采样说话人** ⇒ 语速带天然更宽（历史标定 5.15~9.65），
+#     且该路径 2026-11-25 20:18 起生产已不再使用（音色库迁移 0042 全量转预设）。
+#     ⇒ 克隆路径沿用 11.0 保守档，不因预设路径的收紧而被误伤。
+#
+#   标定脚本：scripts/calibrate_tts_truncation_band.py（生产日志 + 生产稿件重建样本）
 _TRUNCATION_CHARS_PER_SEC = 11.0
+
+# 预设路径（clone=off，固定说话人）**长块**的截断语速阈值（字/秒）。
+# 取值依据见上：健康带 4.09~5.12，实测截断签名 5.81/8.14/9.44。
+_TRUNCATION_CPS_PRESET_LONG = 6.0
+
+# 「长块」的门槛（字）。短于此 ⇒ 语速被首尾留白主导 ⇒ 走宽松档。
+_TRUNCATION_STRICT_MIN_CHARS = 150
+
+# 检出截断后，**同文本重渲**的次数上限。
+#
+# ⚠️ 为什么先重渲同一段文本，而不是直接二分（2026-11-27 实测）：
+#   上游的短响应是**偶发**的 —— 把同一段文本重渲 3 次，3 次都拿到完整音频
+#   （4.47 / 4.81 / 4.11 字/秒，而出事那次是 9.44）。
+#   ⇒ 同文本重渲的命中率远高于"切小"（切小只是把概率摊薄），
+#     而且**不新增接缝**（预设路径音色固定，重渲还是同一个人）。
+#   ⇒ 顺序：**先同文本重渲 → 仍截断才二分**（二分在克隆路径上会重采样说话人，
+#     代价更高，所以克隆路径直接走二分）。
+_MAX_SAME_TEXT_RETRIES = 1
+
+# 单次请求的**内容完整性**上限（字）。
+#
+# ⚠️ **这个上限和墙钟/超时是两回事** —— 上游对超长请求会**静默截断**：
+#    返回 HTTP 200、音频更短、**看起来完全成功**（比 504 更危险）。
+#    ⇒ 墙钟余量、429/504 重试、cps 虚高阈值，**全都测不出它**
+#    （实测 1484 字块被截掉 26% 后 cps=5.84，仍落在正常区间 5.15~9.65 内）。
+#
+# 📌 2026-11-26 标定（scripts/exp_tts_chunk_integrity.py，生产真稿逐块合成 + ASR 抽查）：
+#     块长 700  → 4 块，总 508.4s，整体 cps 4.61  ✅ 完整
+#     块长 1000 → 3 块，总 523.7s，整体 cps 4.47  ✅ 完整
+#     块长 1500 → 2 块，总 440.5s，整体 cps 5.33  ❌ **比 1000 少 ~83s ≈ 370 字**
+#         （ASR 实证：稿里 related[2]+related[3]+insights[0] 共 ~397 字在音频里整块消失）
+#     已知截断点（本文件历史实测）：1158 字（产出 124s，应有 276s）。
+#
+# ⇒ 上限取 **1000**：低于已知截断点 1158（留 14% 余量），且实测完整。
+#   env 只能在这个上限**以下**调；超过会被 clamp（见 __init__）。
+#   —— 这正是 IndexTTS 路径早有的那道防线（indextts.py 的 CHUNK_CHARS 上界 400），
+#      本路径此前**缺**它，2026-11-25 把块长从 700 调到 1500 后静默丢内容。
+_MAX_SAFE_CHUNK_CHARS = 1000
 
 # 二分自愈的最大递归深度（2^6 = 64 段，兜底防无限递归）。
 _MAX_SPLIT_DEPTH = 6
@@ -285,6 +369,25 @@ _MIN_SPLIT_CHARS = 12
 #      （1~3 个接缝），块长 800 → 1500 后，2500 字的稿子 4 块 → 2 块。
 #      接缝正是「一篇听出好几种音色」的来源（`consistency.py` 结构性判据）。
 #
+# ⚠️⚠️ **2026-11-26 推翻：以上全部是「墙钟余量」论证，不能证明内容完整。**
+#
+#    上游对超长请求会**静默截断**：返回 HTTP 200、音频更短、**看起来成功**
+#    （比 504 更危险）。⇒ 墙钟、429/504 重试、cps 虚高阈值，**全都测不出它**。
+#
+#    2026-11-26 生产实证（scripts/exp_tts_chunk_integrity.py + ASR 逐段对照）：
+#        块长 700  → 4 块，总 508.4s，整体 cps 4.61   ✅ 完整
+#        块长 1000 → 3 块，总 523.7s，整体 cps 4.47   ✅ 完整
+#        块长 1500 → 2 块，总 440.5s，整体 cps 5.33   ❌ **比 1000 少 ~83s ≈ 370 字**
+#            ASR 实证：稿里 related[2]+related[3]+insights[0] 共 ~397 字在音频里整块消失
+#            （1484 字块被截掉 26% 后 cps=5.84，**仍落在正常区间 5.15~9.65 内**
+#              ⇒ _TRUNCATION_CHARS_PER_SEC=11.0 这条防线对它完全无效）
+#
+#    ⇒ **块长的真约束是内容完整性，不是墙钟**：取 **1000**（低于已知截断点
+#      1158，见上），且两条路径都受 _MAX_SAFE_CHUNK_CHARS 硬上限约束。
+#      接缝数变多（4 块 vs 2 块）是可以接受的代价 ——
+#      预设音色路径下接缝不再换人（voice 是固定说话人，见 §2.5），
+#      而「丢内容」是直接的内容缺陷，量级完全不同。
+#
 #    ⚠️ **不取 2200**：收益只多一点点（3175 字的稿子 3 块 → 2 块），
 #      代价是单请求墙钟 90~103s、上游一有负载就 429 ⇒ 失败要重渲 + 退避，
 #      而重渲的 90s 墙钟又正好是它下一次更容易被限流的时段。
@@ -294,12 +397,15 @@ _MIN_SPLIT_CHARS = 12
 #      同一份 2000 字文本，两次实测分别产出 **322.0s** 与 **274.0s**
 #      ⇒ 那是**抽样语速**的差别，不是上限。别拿它当依据。
 #
-#    **安全网还在**：块放大后若撞上上游 429/504 或被静默截断，
-#    分块重试 + 二分自愈会把那块拆小重渲（见 `synthesize` / `_synthesize_chunk`）。
+#    **安全网只在 429/504 上是真的**（2026-11-26 更正）：
+#    分块重试 + 二分自愈能处理「上游报错/超时」，
+#    但**接不住静默截断** —— 截断后 cps 仍落在正常区间（实测 5.84），
+#    _assert_not_truncated 不会触发 ⇒ 块被丢内容后照样「成功」返回。
+#    ⇒ 静默截断的**唯一防线是块长上限**（_MAX_SAFE_CHUNK_CHARS），不是自愈。
 #
 #    不克隆的路径保持原样（700 字）：音色本来就是随机的，块多块少都一样糟，
 #    而块少能少几次请求、少几次接缝。
-_CLONE_CHUNK_CHARS_DEFAULT = 1500
+_CLONE_CHUNK_CHARS_DEFAULT = 1000
 
 # ⚠️ **2026-10-25：按长度分档被撤掉了** —— 重新标定后，
 #    **实测 cps 与块长无关**（250 字块 5.15~9.65、短块 6.56~9.40、
@@ -566,6 +672,19 @@ class OpenAITTSClient(TTSClient):
             if chunk_chars is not None
             else int(os.getenv("OPENAI_TTS_CHUNK_CHARS", "700"))
         )
+        # ⚠️ **内容完整性上限**（2026-11-26）：超过它上游会静默截断，
+        #    而墙钟/超时/cps 全都测不出来（见 _MAX_SAFE_CHUNK_CHARS 的实测）。
+        #    env 是"上限以下可调"，不是"随便调" —— 越界一律 clamp 并留痕。
+        if self.chunk_chars > _MAX_SAFE_CHUNK_CHARS:
+            log.warning(
+                "tts_chunk_chars_clamped requested=%d max=%d "
+                "(上游对超长请求静默截断：返回 200 但内容被丢)",
+                self.chunk_chars,
+                _MAX_SAFE_CHUNK_CHARS,
+            )
+            self.chunk_chars = _MAX_SAFE_CHUNK_CHARS
+        if self.chunk_chars <= 0:
+            self.chunk_chars = 700
         # 克隆路径的块长上限（**单独一套**：见 _CLONE_CHUNK_CHARS_DEFAULT 的实测）。
         #
         # ⚠️ 2026-10-25：**不再**取 min(普通块长, 这个值)。
@@ -576,6 +695,18 @@ class OpenAITTSClient(TTSClient):
             if clone_chunk_chars is not None
             else int(os.getenv("OPENAI_TTS_CLONE_CHUNK_CHARS", str(_CLONE_CHUNK_CHARS_DEFAULT)))
         )
+        # 克隆路径同样受**内容完整性**上限约束（2026-11-26）：
+        # 它与普通路径的上游墙钟斜率不同，但「静默截断」是端点行为，与路径无关。
+        if self.clone_chunk_chars > _MAX_SAFE_CHUNK_CHARS:
+            log.warning(
+                "tts_clone_chunk_chars_clamped requested=%d max=%d "
+                "(上游对超长请求静默截断：返回 200 但内容被丢)",
+                self.clone_chunk_chars,
+                _MAX_SAFE_CHUNK_CHARS,
+            )
+            self.clone_chunk_chars = _MAX_SAFE_CHUNK_CHARS
+        if self.clone_chunk_chars <= 0:
+            self.clone_chunk_chars = _CLONE_CHUNK_CHARS_DEFAULT
         # 分段并行度。**默认 1（串行）** —— 不是为了性能，是为了让每一段的
         # 计时器从「真正开始被上游处理」起算。
         #
@@ -870,7 +1001,7 @@ class OpenAITTSClient(TTSClient):
         """
         try:
             audio = await self._synthesize_once(text, voice, output_format, clone=clone)
-            self._assert_not_truncated(text, audio)
+            self._assert_not_truncated(text, audio, clone)
             return audio
         except (TimeoutError, httpx.TimeoutException, _UpstreamTimeout) as exc:
             if len(text) <= self.min_chunk_chars or depth >= _MAX_SPLIT_DEPTH:
@@ -890,6 +1021,34 @@ class OpenAITTSClient(TTSClient):
             ]
             return concat_audio(pieces)
         except _TruncatedOutput:
+            # ── ① 先同文本重渲（2026-11-27 新增）────────────────────
+            #
+            # 上游的短响应是**偶发**的：同一段文本重渲 3 次全部拿到完整音频
+            # （4.47 / 4.81 / 4.11 字/秒，而出事那次是 9.44）。
+            # ⇒ 同文本重渲命中率高，且**不新增接缝**（预设路径音色固定）。
+            #
+            # ⚠️ **克隆路径不做同文本重渲**：克隆每次请求都**重新采样说话人**
+            #   ⇒ 重渲出来的这一块会是另一个人（正是"一篇听出好几种音色"的来源）。
+            #   ⇒ 克隆路径直接走二分（既有行为）。
+            if clone is None and depth < _MAX_SPLIT_DEPTH:
+                for _ in range(_MAX_SAME_TEXT_RETRIES):
+                    try:
+                        audio = await self._synthesize_once(text, voice, output_format, clone=clone)
+                        self._assert_not_truncated(text, audio, clone)
+                    except _TruncatedOutput:
+                        continue
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "OpenAITTS 同文本重渲失败，回落二分自愈: chars=%d err=%s",
+                            len(text),
+                            exc,
+                        )
+                        break
+                    log.info("OpenAITTS 分块疑似被截断，同文本重渲恢复: chars=%d", len(text))
+                    return audio
+
+            # ── ② 回落：二分自愈（既有路径）─────────────────────────
+            #
             # ⚠️ **这里不能拿 min_chunk_chars 当地板**（2026-10-24 实测踩到）：
             #   块**本来就可能比它小** —— 250 字分块的最后一块常常只剩 40~60 字。
             #   老写法 `len(text) <= self.min_chunk_chars → raise` 于是变成：
@@ -920,26 +1079,37 @@ class OpenAITTSClient(TTSClient):
             ]
             return concat_audio(pieces)
 
-    def _assert_not_truncated(self, text: str, audio: bytes) -> None:
+    def _truncation_cps_limit(self, text: str, clone: "_CloneSpec | None" = None) -> float:
+        """这一块该用哪个截断语速阈值（字/秒）。
+
+        分档依据见模块常量区的注释（2026-11-27 重标定）：
+          · 预设路径（clone=off，固定说话人）+ 长块（≥ 150 字）⇒ 严格档 6.0；
+          · 克隆路径（每次重采样说话人，语速带更宽）⇒ 宽松档 11.0；
+          · 短块（语速被首尾留白主导，带宽 19.9%）⇒ 宽松档 11.0。
+        """
+        if clone is None and len(text) >= _TRUNCATION_STRICT_MIN_CHARS:
+            return _TRUNCATION_CPS_PRESET_LONG
+        return _TRUNCATION_CHARS_PER_SEC
+
+    def _assert_not_truncated(
+        self,
+        text: str,
+        audio: bytes,
+        clone: "_CloneSpec | None" = None,
+    ) -> None:
         """语速校验：识别「HTTP 200 但内容被静默截断」。
 
         判据与 IndexTTS 的 _assert_not_truncated 同源（语速），
         但这里用的是 mp3，所以用 audio_duration 的时长算。
 
-        ## 两条分支，各按各自的长度尺度（2026-10-24 实测标定）
+        ## 阈值分档（2026-11-27 重标定，理由见 _TRUNCATION_CPS_PRESET_LONG 的注释）
 
-        **长文本（≥ 150 字）→ 语速判据，阈值 6.8**：
-        语速 = 字数 / 时长，超过 `_TRUNCATION_CHARS_PER_SEC` 判截断。
-        实测这一档的自然带是 5.35~6.45（182~199 字块），
-        阈值 6.8 与真截断样本（7.14~8.67）分得开，两侧各留约 5%。
-        而且**上游 60s 墙钟只可能砍到这一档的块**（150 字 ≈ 24s）。
+        **预设路径（clone=off，固定说话人）长块（≥ 150 字）→ 阈值 6.0**：
+        干净样本健康带 **4.09~5.12**（n=26），实测截断签名 5.81/8.14/9.44。
 
-        **短文本（< 150 字）→ 语速判据，阈值 8.0**：
-        实测自然带是 4.80~6.12（波动最高 19.9%），比长文本宽 ——
-        所以阈值必须**按这一档的自然带上界另定**，不能用 6.8
-        （短块误伤的代价是整篇失败）。
-        8.0 对自然上界留足余量，同时仍高于生产实测的异常值 9.40 ——
-        即 9.40 那个异常**会被抓出来**（然后交给自愈重渲）。
+        **其余一律走宽松档 11.0**（克隆路径 / 短块）：
+        · 克隆路径每次请求重采样说话人 ⇒ 语速带天然更宽；
+        · 短块语速被首尾留白主导 ⇒ 带宽 19.9%，同一阈值会把短块判红。
 
         ## 判据抓出来之后呢：自愈必须能救短块
 
@@ -956,7 +1126,7 @@ class OpenAITTSClient(TTSClient):
             return
         cps = len(text) / dur
 
-        limit = _TRUNCATION_CHARS_PER_SEC
+        limit = self._truncation_cps_limit(text, clone)
         if cps > limit:
             # ⚠️ **短到没法再切的块不上抛**（2026-10-25 新增）：
             #   误判一次 = 整篇蒸馏失败（实测：47 字的块被判 9.40 字/秒

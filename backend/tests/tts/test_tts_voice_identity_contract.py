@@ -186,33 +186,43 @@ def test_默认关闭时各段不被差异化变调():
 # ③ 块长 → 接缝数（接缝 = 独立采样次数 = 「听出好几种音色」的来源）
 # ---------------------------------------------------------------------------
 def test_块长放大后接缝数下降():
-    """2500 字的稿子 ⇒ 块长 1500 时 **≤2 块**（接缝 ≤1）。
+    """块长放大 ⇒ 接缝数下降（**结构性质**，与块长的具体取值无关）。
 
-    生产实测（当前上游）：1500 字 → 墙钟 63.0s / 音频 224.3s，
-    对我们自己的 httpx 读超时（300s）留 4.8 倍余量，
-    且远低于上游实测的 ~322s 音频上限（1600/2000/2600 三档音频时长都精确等于 322.0s）。
+    ⚠️ **2026-11-26 改口径**：旧版钉「块长 1500 ⇒ 2550 字 ≤2 块」，
+    而 1500 的依据是**墙钟余量** —— 上游在那个档位会**静默丢内容**
+    （生产实证丢 ~370 字）⇒ 1500 已被推翻为不安全值。
+
+    ⇒ 保留**原判据意图**（接缝数随块长增大而减少），
+      并加上**内容完整性上限**这条更硬的约束：
+      块长的合法取值空间是 (0, _MAX_SAFE_CHUNK_CHARS]，
+      在这个空间里放大块长必须让接缝数下降。
     """
     from app.services.tts.audio_chunks import split_into_chunks
-    from app.services.tts.openai import _CLONE_CHUNK_CHARS_DEFAULT
+    from app.services.tts.openai import _CLONE_CHUNK_CHARS_DEFAULT, _MAX_SAFE_CHUNK_CHARS
 
-    # 17 字 × 150 = 2550 字：块长 1500 ⇒ 2 块；块长 800 ⇒ 4 块（这条会红）
+    # 17 字 × 150 = 2550 字：块长 700 ⇒ 4 块；块长 1000 ⇒ 3 块（接缝下降）
     text = "这是一段用来测分块的中文测试文本。" * 150
-    chunks = split_into_chunks(text, _CLONE_CHUNK_CHARS_DEFAULT)
+    chunks_small = split_into_chunks(text, 700)
+    chunks_big = split_into_chunks(text, _CLONE_CHUNK_CHARS_DEFAULT)
 
-    assert len(chunks) <= 2, (
-        f"{len(text)} 字在块长 {_CLONE_CHUNK_CHARS_DEFAULT} 下切了 {len(chunks)} 块 —— "
+    assert len(chunks_big) < len(chunks_small), (
+        f"块长放大后接缝数没下降：700 → {len(chunks_small)} 块，"
+        f"{_CLONE_CHUNK_CHARS_DEFAULT} → {len(chunks_big)} 块 —— "
         "接缝是「一篇听出好几种音色」的直接来源"
     )
-    assert all(len(c) <= _CLONE_CHUNK_CHARS_DEFAULT for c in chunks)
+    assert all(
+        len(c) <= _MAX_SAFE_CHUNK_CHARS for c in chunks_big
+    ), f"块长 {_CLONE_CHUNK_CHARS_DEFAULT} 超出内容完整性上限 {_MAX_SAFE_CHUNK_CHARS}"
+    assert all(len(c) <= _MAX_SAFE_CHUNK_CHARS for c in chunks_small)
 
 
 def test_接缝数不超过结构上限():
-    """块长 1500 ⇒ 3000 字的稿子 ≤ 3 块，仍在 `MAX_SEGMENTS = 4` 以内。"""
+    """块长取内容完整性上限时，3000 字的稿子仍在 `MAX_SEGMENTS = 4` 以内。"""
     from app.services.tts.audio_chunks import split_into_chunks
     from app.services.tts.consistency import MAX_SEGMENTS
     from app.services.tts.openai import _CLONE_CHUNK_CHARS_DEFAULT
 
-    # 17 字 × 180 = 3060 字：块长 1500 ⇒ 3 块；块长 800 ⇒ 4 块（这条会红）
+    # 17 字 × 180 = 3060 字：块长 1000 ⇒ 4 块；块长 700 ⇒ 5 块（这条会红）
     text = "这是一段用来测分块的中文测试文本。" * 180
     chunks = split_into_chunks(text, _CLONE_CHUNK_CHARS_DEFAULT)
 
