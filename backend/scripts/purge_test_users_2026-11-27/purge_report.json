@@ -1,0 +1,345 @@
+{
+  "db": "stashbox",
+  "kept": [
+    0,
+    1,
+    23
+  ],
+  "users": {
+    "2": {
+      "nickname": "已注销用户",
+      "open_id": "del_2_8cfb6f99",
+      "deleted_at": "2026-10-22 20:40:50.199096",
+      "articles": 0,
+      "tables": {
+        "feedback": 1
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "3": {
+      "nickname": "已注销用户",
+      "open_id": "del_3_ff886fbe",
+      "deleted_at": "2026-10-22 20:40:50.199096",
+      "articles": 0,
+      "tables": {
+        "device_tokens": 1,
+        "feedback": 1
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "4": {
+      "nickname": "已注销用户",
+      "open_id": "del_4_a0d4ef72",
+      "deleted_at": "2026-10-22 20:40:50.199096",
+      "articles": 0,
+      "tables": {
+        "feedback": 1
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "5": {
+      "nickname": "已注销用户",
+      "open_id": "del_5_8926a819",
+      "deleted_at": "2026-10-22 20:40:50.199096",
+      "articles": 0,
+      "tables": {
+        "feedback": 1
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "6": {
+      "nickname": "已注销用户",
+      "open_id": "del_6_a55a9eaa",
+      "deleted_at": "2026-10-22 20:40:50.199096",
+      "articles": 0,
+      "tables": {
+        "feedback": 1
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "7": {
+      "nickname": "已注销用户",
+      "open_id": "del_7_605ec530",
+      "deleted_at": "2026-10-22 20:40:50.199096",
+      "articles": 0,
+      "tables": {
+        "feedback": 13
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "8": {
+      "nickname": "已注销用户",
+      "open_id": "del_8_f9f00fea",
+      "deleted_at": "2026-10-22 20:40:50.199096",
+      "articles": 0,
+      "tables": {
+        "feedback": 7
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "9": {
+      "nickname": "已注销用户",
+      "open_id": "del_9_7ef62deb",
+      "deleted_at": "2026-10-22 20:41:07.600295",
+      "articles": 1,
+      "tables": {
+        "feedback": 35
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "10": {
+      "nickname": "已注销用户",
+      "open_id": "del_10_0f5b399c",
+      "deleted_at": "2026-10-22 20:41:07.600295",
+      "articles": 1,
+      "tables": {
+        "feedback": 31
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "11": {
+      "nickname": "已注销用户",
+      "open_id": "del_11_bba5f275",
+      "deleted_at": "2026-10-22 20:41:07.600295",
+      "articles": 1,
+      "tables": {
+        "feedback": 65
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "12": {
+      "nickname": "听友",
+      "open_id": "wx_dev_wechat_5017ffc98ec7",
+      "deleted_at": null,
+      "articles": 3,
+      "tables": {
+        "device_tokens": 1,
+        "user_consents": 1,
+        "feedback": 163
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "13": {
+      "nickname": "已注销用户",
+      "open_id": "del_13_228495ad",
+      "deleted_at": "2026-10-22 20:41:07.600295",
+      "articles": 1,
+      "tables": {
+        "feedback": 55
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "14": {
+      "nickname": "已注销用户",
+      "open_id": "del_14_45853225",
+      "deleted_at": "2026-10-22 20:41:07.600295",
+      "articles": 0,
+      "tables": {
+        "feedback": 1
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "15": {
+      "nickname": "听友",
+      "open_id": "wx_dev_wechat_51febf26ea0b",
+      "deleted_at": null,
+      "articles": 1,
+      "tables": {
+        "device_tokens": 1,
+        "user_consents": 1,
+        "feedback": 55
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "16": {
+      "nickname": "听友",
+      "open_id": "wx_dev_wechat_7d835d23a0ab",
+      "deleted_at": null,
+      "articles": 6,
+      "tables": {
+        "device_tokens": 1,
+        "user_consents": 1,
+        "user_listening_patterns": 1,
+        "few_shot_examples": 2,
+        "user_tts_preferences": 1,
+        "distillation_evaluations": 2,
+        "feedback": 187
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "17": {
+      "nickname": "已注销用户",
+      "open_id": "del_17_c39c159c",
+      "deleted_at": "2026-10-22 20:40:50.199096",
+      "articles": 0,
+      "tables": {
+        "device_tokens": 1,
+        "feedback": 1
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "18": {
+      "nickname": "已注销用户",
+      "open_id": "del_18_2724fda6",
+      "deleted_at": "2026-10-22 20:40:50.199096",
+      "articles": 0,
+      "tables": {
+        "device_tokens": 1,
+        "feedback": 1
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "19": {
+      "nickname": "已注销用户",
+      "open_id": "del_19_d325f437",
+      "deleted_at": "2026-10-22 20:40:50.199096",
+      "articles": 0,
+      "tables": {
+        "device_tokens": 1,
+        "feedback": 2
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "20": {
+      "nickname": "已注销用户",
+      "open_id": "del_20_b73c7541",
+      "deleted_at": "2026-10-22 20:40:50.199096",
+      "articles": 2,
+      "tables": {
+        "device_tokens": 1,
+        "feedback": 21
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "21": {
+      "nickname": "已注销用户",
+      "open_id": "del_21_ebbec117",
+      "deleted_at": "2026-10-22 20:40:50.199096",
+      "articles": 0,
+      "tables": {
+        "feedback": 9
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "22": {
+      "nickname": "听友",
+      "open_id": "wx_dev_wechat_9f954b3a658f",
+      "deleted_at": null,
+      "articles": 5,
+      "tables": {
+        "device_tokens": 1,
+        "user_consents": 1,
+        "listening_statuses": 2,
+        "user_tts_preferences": 1,
+        "feedback": 204
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "30": {
+      "nickname": "听友",
+      "open_id": "wx_18044444444",
+      "deleted_at": null,
+      "articles": 0,
+      "tables": {
+        "device_tokens": 3,
+        "feedback": 7
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "31": {
+      "nickname": "听友",
+      "open_id": "wx_smoke_probe_audit",
+      "deleted_at": null,
+      "articles": 0,
+      "tables": {
+        "feedback": 10
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "36": {
+      "nickname": "已注销用户",
+      "open_id": "del_36_36eefd746aecbf6f",
+      "deleted_at": "2026-10-25 08:03:29.962527",
+      "articles": 0,
+      "tables": {
+        "feedback": 3
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "37": {
+      "nickname": "已注销用户",
+      "open_id": "del_37_6a0ce5de02462733",
+      "deleted_at": "2026-10-25 08:03:12.961441",
+      "articles": 0,
+      "tables": {
+        "feedback": 2
+      },
+      "users_row": 1,
+      "failed_tables": []
+    },
+    "38": {
+      "nickname": "听友",
+      "open_id": "wx_dev_wechat_28d7556df015",
+      "deleted_at": null,
+      "articles": 0,
+      "tables": {
+        "device_tokens": 2,
+        "user_consents": 1,
+        "feedback": 3
+      },
+      "users_row": 1,
+      "failed_tables": []
+    }
+  },
+  "verify": {
+    "target_users_left": 0,
+    "target_articles_left": 0,
+    "target_feedback_left": 0,
+    "kept_users": 3,
+    "kept_articles": 80,
+    "kept_feedback": 1444,
+    "residual_by_table": {
+      "users": 0,
+      "articles": 0,
+      "distilled_articles": 0,
+      "audio_variants": 0,
+      "feedback": 0,
+      "device_tokens": 0,
+      "user_consents": 0,
+      "listening_statuses": 0,
+      "user_listening_patterns": 0,
+      "few_shot_examples": 0,
+      "feedback_v2": 0,
+      "later_listens": 0,
+      "favorites": 0,
+      "user_tts_preferences": 0,
+      "tag_subscriptions": 0,
+      "push_notifications": 0
+    },
+    "ok": true
+  }
+}

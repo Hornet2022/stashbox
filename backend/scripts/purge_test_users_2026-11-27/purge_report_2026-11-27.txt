@@ -1,0 +1,160 @@
+═══ 生产环境内测/已注销用户信息清理（2026-11-27）═══
+
+一句话：把生产上 **26 个非真实注册的内测/已注销账号** 及其全部关联数据物理删除，
+保留 3 个账号（系统占位 / 管理员 / 真人内测用户），逐表残留校验全 0，保留数据完好。
+
+─── 为什么这是「运营侧批量清理任务」，不是新造一套 ──────────────────────────
+
+`user-service` 的注销端点（POST /api/v1/users/me/account/delete）做的是**软删**，
+它的 docstring 已把话说明白了：
+
+    「为什么是软删而不是硬删 … 审计与计费口径需要保留'曾经有过这个人'的痕迹
+      （但不含个人内容）… **真要物理删除，是运营侧的批量清理任务（30 天期限），
+      不在用户请求里做**」
+
+⇒ 本次执行的就是那个**运营侧批量清理任务**。工具入仓：
+`backend/scripts/purge_test_users.py`（判据全部参数化，不写死"谁是谁"）。
+
+─── 范围（用户拍板：25 个候选 + id30 = 26 个；彻底删，连 feedback 埋点一起删）──
+
+清理前生产 users 共 29 个，分三类：
+
+  · 保留 3 个：
+      id=0  anonymous      open_id=__anonymous__        系统占位（17 篇文章 + 556 埋点）
+      id=1  Hornet (Admin) open_id=admin_seed           管理员
+      id=23 听友            open_id=wx_dev_wechat_fcdb4b423f4e  真人内测用户（63 篇文章 + 887 埋点）
+  · 已注销 19 个：open_id=del_<uid>_<hash>，deleted_at 非空（注销流程匿名化的产物）
+  · 测试/探针 6 个：wx_dev_wechat_*（12/15/16/22/38）、wx_smoke_probe_audit（31）
+  · 真人形态但按用户拍板一并清理：id=30 wx_18044444444
+
+目标集合 = `users.id NOT IN (0,1,23)` ⇒ 26 个，dry-run 清单与盘点逐条一致。
+
+影响面：26 个用户 / 21 篇文章 / 21 个蒸馏产物 / 21 个主档音频 + 4 个变体音频 /
+884 条 feedback 埋点 / 14 个设备令牌 / 5 条同意记录 / 若干收藏、稍后听、收听状态、
+音色偏好、少样本、蒸馏评分。
+
+**没有已分享到社区的公开内容**：目标账号里 shared_tags 非空的 6 篇**全部是已软删的**
+（注销流程删的），未软删的 21 篇 shared_tags 均为 None ⇒ 删除不破坏任何公开链接。
+
+─── 备份（清理前已完成，fail-closed 的前提）────────────────────────────────
+
+目录 `/root/backup/stashbox_2026-11-27/`（共 359MB）：
+
+  · stashbox_full_2026-11-27.dump   2.4MB  全库 pg_dump（22 张表 TABLE DATA，
+                                       已校验含 users/articles/distilled_articles/feedback；
+                                       排除 push_notifications_bak_* —— 该表对 stashbox
+                                       角色无 LOCK 权限）
+  · target_audio_2026-11-27.tar.gz   46MB   目标音频 25 个文件（21 主档 + 4 变体），
+                                       全部命中（tar.err 无 Cannot stat）
+  · audio_dir_full_2026-11-27.tar.gz  327MB  整个音频目录兜底快照（防漏孤儿文件）
+  · target_users_2026-11-27.txt / target_articles_*.txt / purge_report.json  清单与报告
+
+─── 执行（2026-11-27 15:09:22 起）──────────────────────────────────────────
+
+脚本：`scripts/purge_test_users.py --scope all-but-keep --keep-ids 0,1,23 --execute
+       --i-have-a-backup --json-out purge_report.json`
+
+删除顺序（按 **FK 实测依赖**，不是按表名猜）：
+users 的子表只有 push_notifications / tag_subscriptions / user_tts_preferences 是
+ON DELETE CASCADE；articles / device_tokens / favorites / feedback_v2 / later_listens /
+listening_statuses / user_consents / user_listening_patterns / few_shot_examples /
+distillation_evaluations 都是 NO ACTION ⇒ 必须应用层按序清。
+
+  1. 文章：**复用** content-service 的 `purge_article`（不重写）—— 它按序清
+     favorites/later_listens/listening_statuses、断评分引用、删蒸馏产物与音频变体；
+     带内容 hash 的新格式 audio key 在**删行前**收集（否则音频文件会成孤儿）
+  2. commit → `finish_purge`：失效 Redis 缓存 + 删磁盘音频文件（best-effort）
+  3. 用户级关联表：device_tokens / user_consents / listening_statuses /
+     user_listening_patterns / few_shot_examples / feedback_v2 / later_listens /
+     favorites / user_tts_preferences / tag_subscriptions / push_notifications /
+     distillation_evaluations（user_id 与 evaluator_id 两列）
+  4. feedback（v1 埋点，无 FK ⇒ 应用层显式删）
+  5. 删 users 行
+  6. **吊销该用户已签发的 token**
+  7. 清用户态缓存（quota / pending）
+
+实际删除量：用户行 26、文章 21、feedback 880、device_tokens 14、user_consents 5
+（另含收藏/稍后听/收听状态/音色偏好/少样本/蒸馏评分若干）。
+音频：21 个主档 + 4 个变体全部删除（日志逐条 audio_file_deleted）。
+
+─── 清理后校验（逐表，fail-closed）──────────────────────────────────────────
+
+  目标 users 残留 = 0            目标 articles 残留 = 0      目标 feedback 残留 = 0
+  保留 users = 3                 保留文章数 = 80             保留埋点数 = 1444
+
+  逐表残留（目标集合）：
+    users 0 · articles 0 · distilled_articles 0 · audio_variants 0 · feedback 0 ·
+    device_tokens 0 · user_consents 0 · listening_statuses 0 · user_listening_patterns 0 ·
+    few_shot_examples 0 · feedback_v2 0 · later_listens 0 · favorites 0 ·
+    user_tts_preferences 0 · tag_subscriptions 0 · push_notifications 0     ⇒ 全 0
+
+保留数据完好（独立复查，非脚本自证）：
+  剩余 users = 3（0 / 1 / 23）；uid=23 的文章 63 篇；anonymous 17 篇；
+  剩余埋点 1444（23:887 / 0:556 / 1:1）；audio_variants 9；user_consents 1；
+  device_tokens 3；listening_statuses 74；later_listens 1；favorites 1。
+
+孤儿埋点补清：user_id=35 的 4 条（该用户本就不在 users 表）已删 ⇒ feedback 剩 1444，
+全部属于保留用户。
+
+音频目录：126 → 101 个文件（317MB → 272MB），逐个确认目标音频已不存在。
+
+─── 关键：token 吊销为什么不能漏 ────────────────────────────────────────────
+
+`require_user` **只验 JWT 签名 + 吊销态，不查库**（common/auth.py:125，
+注释明说「这一步只多一次 Redis GET，不查库 —— 鉴权在热路径上」）。
+
+⇒ **只删 users 行是不够的**：那些测试账号的旧 access token 在 TTL 内仍然有效，
+仍能调接口建新数据（用户行删了，但鉴权不看它）。
+⇒ 必须对每个目标用户调 `revocation.revoke(user_id)`，把已签发的 token 全部作废。
+
+端到端验证（造"签发于吊销之前"的真实旧 token，iat_ms 比吊销时刻早 1 小时）：
+
+    uid=12 wx_dev_wechat 测试账号   → HTTP 401 {"message":"Token has been revoked"}
+    uid=30 wx_18044444444           → HTTP 401 Token has been revoked
+    uid=22 wx_dev_wechat 账号        → HTTP 401 Token has been revoked
+    uid=31 smoke probe              → HTTP 401 Token has been revoked
+    uid=23 保留：内测用户本人         → HTTP 200（文章列表正常）
+    uid=1  保留：Hornet Admin       → HTTP 200
+
+Redis 侧核对：`auth:revoked_after:*` 共 **26** 个键，值形如 `ms:1795763362926`，
+与清理时刻吻合（之前用 `redis-cli` 查为 0，是因为 pattern 写错且 redis-cli 的密码
+与应用实际使用的不同 —— 核对 Redis 必须用应用自己的连接配置）。
+
+─── 服务冒烟 ────────────────────────────────────────────────────────────────
+
+  systemctl is-active：stashbox-ai-worker / stashbox-content-service /
+  stashbox-user-service ⇒ 三者均 active
+  保留用户取文章详情（uid=23, art_df30fdc4aeec4752811a34e9）：
+    HTTP 200，audio_url = …/art_df30fdc4aeec4752811a34e9.48139786.mp3，
+    duration_sec = 573，status = ready ⇒ 播放列表链路未受影响。
+
+─── 踩坑（留档，防重犯）────────────────────────────────────────────────────
+
+  1. **脚本首版有 bug，第一次执行在"零改动"处中止**：
+     `delete(text("表名"))` 在 SQLAlchemy 2.0 会被拒
+     （「subject table for an INSERT, UPDATE or DELETE expected, got TextClause」）。
+     幸运的是异常发生在任何实际删除之前（第一个目标用户恰好没有文章）⇒
+     **DB 零副作用**，事后复查 users 29 / articles 101 / feedback 2328 全部原样。
+     ⇒ 修法：用户级关联表一律走**原始 SQL**（表名来自硬编码白名单，无注入面），
+     并给每个表的失败加 `rollback` + 记账，最终校验逐表查残留。
+     ⇒ 教训：**清理脚本要先 dry-run 跑一遍真实库**，再让删库语句有机会跑。
+
+  2. pg_dump 缺 PGPASSWORD → 「no password supplied」；且 `push_notifications_bak_*`
+     对 stashbox 角色无 LOCK 权限 ⇒ 整库 dump 必须 `--exclude-table` 掉它。
+
+  3. 音频文件名带**内容 hash**（`art_xxx.<hash8>.mp3`），按 article_id 打包会
+     「Cannot stat」⇒ 必须从 DB 的 audio_url / oss_key 反推真实文件名。
+     变体 oss_key 带 `audio/` 前缀，对应根是 `/var/lib/stashbox/data/`（不是 audio 目录）。
+
+  4. 查 Redis 必须用**应用自己的连接配置**（common.redis_client.get_redis_pool），
+     `redis-cli -u $REDIS_URL` 的密码与应用实际用的对不上 ⇒ 会误判成"没吊销"。
+
+  5. 验证吊销要用**签发于吊销之前**的 token（iat_ms 更早）；
+     刚签发的 token（iat 更晚）本来就不该被吊销判据命中 —— 测错方向会误判成"没生效"。
+
+─── 相关文件 ───────────────────────────────────────────────────────────────
+
+  工具      backend/scripts/purge_test_users.py
+  报告      backend/scripts/purge_test_users_2026-11-27/purge_report.json
+  清单      backend/scripts/purge_test_users_2026-11-27/target_users_2026-11-27.txt
+  生产备份  /root/backup/stashbox_2026-11-27/（全库 dump + 两份音频包 + 清单）
