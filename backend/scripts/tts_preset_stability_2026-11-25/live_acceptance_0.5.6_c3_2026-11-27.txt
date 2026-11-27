@@ -1,0 +1,131 @@
+═══ 0.5.6 C3 播放列表闭环 活体验收 + 标题截断缺陷（2026-11-27 16:47）═══
+
+背景
+----
+内测用户又剪藏了一篇。这一篇用来做两件事：
+  ① **0.5.6 的 C3 闭环**（蒸馏完成 → 写回播放列表快照）的活体验收样本；
+  ② 复验「内容完整性（静默截断）」防线在生产上是否仍然生效。
+
+本轮**意外发现一个与 TTS 无关的抓取层缺陷**：文章标题被截成 "Search"（见 §5），
+已定位根因、修复、补守卫、跑变异。
+
+样本
+----
+article_id   = art_8d63abc0fbd942b6bc8a9aaa
+url          = https://mp.weixin.qq.com/s/eAo3dHnNK6-k1pb-eB7Llg
+落库 title   = Search                       ← 缺陷，见 §5
+真实标题     = Search-RSI：让检索世界随智能体同步生长
+              （在 articles.raw_metadata.og_title 里，**抓到了但被剥掉**）
+公众号/作者   = AI Paper Daily
+user_id      = 23（内测用户）
+剪藏时刻      = 2026-11-27 16:47:31
+蒸馏窗口      = 16:47:33 → 16:51:17（224.28s，arq distill_task）
+articles.status = ready，audio_url 已回填
+distilled_articles.duration_sec = 518
+audio_url    = https://api.stashbox.cn/audio/audio/art_8d63abc0fbd942b6bc8a9aaa.e8c44b01.mp3
+稿字数        = 2359（script_text）　标签 = ['科技']
+音色          = ttsv_f6eeb0e6f91d4ecbb17093b0（婷婷行，preset_voice=uncle_fu ⇒ 走预设）
+
+─── 链路一：字节口径（主判据，不依赖 ASR）───────────────────────────────────
+
+生产日志（journalctl -u stashbox-ai-worker 16:47:00~16:52:30）：
+
+  16:47:33 arq.worker: 0.31s → distill_task(article_id='art_8d63abc0fbd942b6bc8a9aaa', quota_charged=True)
+  16:48:30 agent.tools: tts_voice_resolved article=art_8d63abc0fbd942b6bc8a9aaa user=23
+      voice_id=ttsv_f6eeb0e6f91d4ecbb17093b0 voice=婷婷 source=default preset=uncle_fu applied=True
+  16:48:30 openai: OpenAITTS 分段合成: total_chars=2359 chunks=4 chunk_chars<=700 concurrency=1 clone=off
+  16:48:30 openai: OpenAITTS synthesize: ... voice=uncle_fu bytes=1981 ... clone=off
+  16:49:11 openai: OpenAITTS synthesized: 990024 bytes
+  16:49:11 openai: OpenAITTS synthesize: ... voice=uncle_fu bytes=1613 ... clone=off
+  16:49:52 openai: OpenAITTS synthesized: 1010376 bytes
+  16:49:52 openai: OpenAITTS synthesize: ... voice=uncle_fu bytes=1855 ... clone=off
+  16:50:33 openai: OpenAITTS synthesized: 1021248 bytes
+  16:50:33 openai: OpenAITTS synthesize: ... voice=uncle_fu bytes=968 ... clone=off
+  16:50:55 openai: OpenAITTS synthesized: 534120 bytes
+  16:51:17 openai: OpenAITTS 分段合成完成: chunks=4 bytes=4145517
+  16:51:17 arq.worker: 224.28s ← distill_task ● {'status': 'done'}
+
+⇒ **preset=uncle_fu / clone=off** ⇒ 走预设路径 ⇒ 内容完整性判据取严格档（阈值 6.0）。
+
+块↔日志映射自校准（fail-closed 的第一道）：
+  块边界 = 仓内 split_into_chunks(script_text, 700) 复现；
+  每块 UTF-8 字节必须与日志 `bytes=` **逐条吻合**（不吻合 ⇒ 日志与块错位，后面全不可信）。
+
+  块        字数   请求字节  日志字节  吻合   响应字节     时长s    语速    阈值   判定
+  chunk0    691    1981     1981     ✓     990024     144.25   4.79    6.0   OK
+  chunk1    649    1613     1613     ✓     1010376    147.22   4.41    6.0   OK
+  chunk2    675    1855     1855     ✓     1021248    148.80   4.54    6.0   OK
+  chunk3    344    968      968      ✓     534120     77.82    4.42    6.0   OK
+
+  整篇：2359 字 / 518.1s = 4.55 字/秒
+  上游总字节 = 3555768   实测总时长 = 518.1s   反推码率 = 6863 B/s（误差 0.00%）
+
+判定：✅ 全部块在阈值内，且块↔日志字节逐条吻合（脚本 exp_live_acceptance_tts_verify.py 跑的）
+
+─── 链路二：音色零换人（ECAPA）──────────────────────────────────────────────
+
+voice_check.py（整段 vs 预设/克隆源 + 四分段整段互比）：
+
+  art_8d63abc0fbd942b6bc8a9aaa.mp3  dur=518.1s
+    vs 婷婷(克隆源)=0.8911   vs 预设(uncle_fu)=0.9774
+    四分段互比 min=0.8749 med=0.9323 max=0.9889（6 对）=> 零换人 ✅
+
+判据（沿用仓内 verify_round2 口径）：vs 预设 ≥0.85 且 四分段 min ≥0.85。
+⇒ 走的是**预设音色**，且跨块不换人。
+
+─── 链路三：服务端就绪条件（C3 闭环的服务端侧）──────────────────────────────
+
+  articles.status        = ready
+  distilled_articles.status = done，duration_sec = 518
+  audio_url 可达         = HTTP 206（Range 请求），content-type = audio/mpeg
+  音频落盘               = 4145517 B，本地 ffprobe 实测时长 518.100000s（与 DB 一致）
+
+⇒ 服务端侧条件**全部满足**。C3 的客户端侧（写回播放列表快照）只能真机验（见 §6）。
+
+─── §5 新发现：微信文章标题被截成 "Search"（抓取层缺陷，已修）────────────────
+
+现象
+  落库 articles.title = "Search"；而 raw_metadata.og_title 里躺着完整标题
+  "Search-RSI：让检索世界随智能体同步生长"。
+  ⇒ 蒸馏稿开头也照搬了「本期分享的标题是：Search。」
+
+根因
+  backend/content-service/fetchers/wechat.py 的 _clean_title()：
+    _TITLE_SUFFIX_RE = re.compile(r"\s*[|\-–—]\s*[^|\-–—]{1,30}$")
+  这个启发式是"剥掉最后一个 `-`/`|` 段（≤30 字）"，本意是剥掉
+  「标题 - 公众号名」的**公众号名**。但它被**同时套用到了 og:title** 上：
+    · og:title 是**作者自己写的分享标题**，格式不受控、常常含 "-"；
+    · 公众号名已知（"AI Paper Daily"）但标题**不以它结尾**
+      ⇒ 走不到精确匹配分支 ⇒ 落到启发式 ⇒ "Search-RSI：让检索世界随智能体同步生长"
+      被剥成 "Search"（尾部 17 字 ≤30，命中）。
+
+修法（content-service/fetchers/wechat.py）
+  · _clean_title 增加 is_og_title 开关；
+  · **公众号名精确匹配**（endswith）的剥后缀，两种来源都保留；
+  · **启发式剥后缀只对 html `<title>` 用**；og:title 一律不剥。
+
+守卫（content-service/tests/fetchers/test_wechat.py，+3 例，共 23 例）
+  · test_og标题含短横线不被截断      ← 锁住本次缺陷
+  · test_og标题以公众号名结尾时仍精确剥后缀
+  · test_无og标题时html标题仍剥公众号名后缀（老行为不变）
+
+变异检查（必须真跑）
+  把 `if is_og_title: return title` 改成 `if is_og_title and False:`
+  ⇒ test_og标题含短横线不被截断 变红，报错显示 期望完整标题 vs 实际 "Search"
+  ⇒ 唯一命中；恢复后 23 例全绿。
+
+数据订正
+  本篇 articles.title 已订正为完整标题（真实值来自 raw_metadata.og_title）。
+  ⚠️ 已生成的 script_text 开头那句「本期分享的标题是：Search。」**不会**因订正而变
+  —— 要让播报稿也对，得重蒸馏（重生成存量，需另行拍板）。
+
+─── §6 待真机确认（C3 闭环的客户端侧）──────────────────────────────────────
+
+服务端条件已满足（§4）。客户端侧的验收动作（0.5.6 C3）：
+  1. 剪藏这篇时**立刻**把它加进播放列表；
+  2. 蒸馏完成（≈4 分钟）后**不点任何东西**，直接打开播放列表；
+  3. 该条应显示**时长**、处于**可播**态；
+  4. 点它 ⇒ **直接播**（不必先点一次报错）。
+
+⚠️ 若第 1 步没做（没加进播放列表），C3 的写回**不会发生**（判定"不在列表里 ⇒ 不写"，
+避免造幽灵条目）—— 那种情况下会走 backfillMissingMetadata 兜底路径，是另一条链路。

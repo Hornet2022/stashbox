@@ -208,6 +208,54 @@ async def test_wechat_fetch_happy_path():
     assert result.raw_metadata["status_code"] == 200
 
 
+# ==========================================================================
+# 5.4 标题：og:title 不得被「剥公众号名后缀」的启发式吃掉（2026-11-27 实测）
+# ==========================================================================
+#
+# 生产真实案例（内测用户剪藏的微信文章）：
+#   og:title = "Search-RSI：让检索世界随智能体同步生长"
+#   公众号名 = "AI Paper Daily"（已知，且标题**不以**它结尾）
+# ⇒ 旧实现（无论 og:title 还是 html <title> 都套「剥最后一个 - 段（≤30 字）」）
+#    把标题本体吃掉 ⇒ articles.title 变成 "Search"
+# ⇒ 连蒸馏稿开头都变成「本期分享的标题是：Search。」，用户看到的是无意义标题。
+
+
+@pytest.mark.asyncio
+async def test_og标题含短横线不被截断():
+    """og:title 含 "-" 且不以公众号名结尾 ⇒ 标题**完整保留**。"""
+    og = "Search-RSI：让检索世界随智能体同步生长"
+    html = WECHAT_HTML.replace("<title>", f'<meta property="og:title" content="{og}" /><title>', 1)
+    fetcher = _fetcher(html)
+    result = await fetcher.fetch(ARTICLE_URL)
+
+    assert result.title == og
+    assert result.raw_metadata["og_title"] == og
+    # 公众号名仍然取到（只是不拿它去猜标题后缀）
+    assert result.raw_metadata["wechat_id"] == "听匣专栏"
+
+
+@pytest.mark.asyncio
+async def test_og标题以公众号名结尾时仍精确剥后缀():
+    """公众号名**精确匹配**时照剥（精确匹配不是启发式，两种来源都适用）。"""
+    html = WECHAT_HTML.replace(
+        "<title>",
+        '<meta property="og:title" '
+        'content="为什么我们需要一个「稍后听」的盒子 - 听匣专栏" /><title>',
+        1,
+    )
+    fetcher = _fetcher(html)
+    result = await fetcher.fetch(ARTICLE_URL)
+    assert result.title == "为什么我们需要一个「稍后听」的盒子"
+
+
+@pytest.mark.asyncio
+async def test_无og标题时html标题仍剥公众号名后缀():
+    """没有 og:title 时，html `<title>` 的「- 公众号名」后缀**照旧**要剥（老行为不变）。"""
+    fetcher = _fetcher(WECHAT_HTML)
+    result = await fetcher.fetch(ARTICLE_URL)
+    assert result.title == "为什么我们需要一个「稍后听」的盒子"
+
+
 @pytest.mark.asyncio
 async def test_wechat_fetch_blocked_raises_auth():
     """fixture 是"环境异常"反爬页 → FetcherError(AUTH, source='wechat_mp')，且拿不到正文。"""

@@ -269,13 +269,30 @@ def _strip_tags(html: str, images: MediaImageCollector | None = None) -> str:
     return stripper.text()
 
 
-def _clean_title(raw: str, account_name: str = "") -> str:
-    """剥掉公众号 `<title>` 的 " - 公众号名" 后缀（保留标题本体）。"""
+def _clean_title(raw: str, account_name: str = "", *, is_og_title: bool = False) -> str:
+    """标题规范化：剥掉公众号 `<title>` 的 " - 公众号名" 后缀（保留标题本体）。
+
+    ⚠️ **启发式剥后缀只对 html `<title>` 用；og:title 一律不剥**（2026-11-27 实测）。
+
+    原因：og:title 是**作者自己写的分享标题**，格式不受控、常常含 "-"
+    （生产真实案例：og:title = "Search-RSI：让检索世界随智能体同步生长"）。
+    而启发式是「剥掉最后一个 `-`/`|` 段（≤30 字）」——
+    它对 og:title 会把**标题本体**吃掉 ⇒ 那篇文章的标题只剩 "Search"，
+    连蒸馏稿开头都变成「本期分享的标题是：Search。」。
+
+    公众号名**已知**时按**精确匹配**剥（标题确实以公众号名结尾 ⇒ 剥掉它就是对的，
+    两种来源都适用）；公众号名**未知**时才退回启发式，且启发式只用于 html `<title>`。
+    """
     title = _norm(raw)
+    if not title:
+        return title
     if account_name and title.endswith(account_name):
         head = title[: -len(account_name)].rstrip().rstrip("|-–— ")
         if head:
             return _norm(head)
+    # og:title 到这里说明"不以公众号名结尾" ⇒ 它就是作者写的完整标题，不许再剥。
+    if is_og_title:
+        return title
     stripped = _TITLE_SUFFIX_RE.sub("", title)
     return _norm(stripped) or title
 
@@ -566,7 +583,13 @@ class WechatFetcher(Fetcher):
 
         return FetchResult(
             url=url,
-            title=_clean_title(title_ex.best or "", account_name) or final_url,
+            title=_clean_title(
+                title_ex.best or "",
+                account_name,
+                # og:title 是作者自己的分享标题 ⇒ 不套「剥公众号名后缀」的启发式。
+                is_og_title=bool(title_ex.og_title),
+            )
+            or final_url,
             content_html=content_html,
             content_text=content_text,
             author=author,
