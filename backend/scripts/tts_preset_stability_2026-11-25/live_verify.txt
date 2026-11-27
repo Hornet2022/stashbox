@@ -1,0 +1,38 @@
+活体验证（2026-11-25 19:57，生产真实链路，部署后）
+====================================================
+
+目的：证明部署后的声明式预设音色路由 + 全长渲染在生产成立（不写任何文章）。
+脚本：backend/scripts/exp_tts_preset_live_verify.py（只读 DB 取真实稿 →
+resolve_voice_for_user(None) → use_preset → client.synthesize(script, voice=uncle_fu)，
+产物落 /tmp/tts_preset_live，不进 storage / 不改文章）。
+
+路由（生产日志一手）：
+  article=art_aaecf44a18104de0990ed6d9 chars=2611
+  resolved voice_id=ttsv_f6eeb0e6f91d4ecbb17093b0 name=婷婷 source=default preset_voice=uncle_fu
+  provider=openai chunk_chars=1500 clone_chunk_chars=1500
+  use_preset=True
+  rendered bytes=4206573 wall=153.1s fmt=mp3  → LIVE_OK
+  ⇒ 婷婷声明预设 ⇒ use_preset=True ⇒ synthesize(voice=uncle_fu) 不带 ref_audio/ref_text。
+  ⇒ env OPENAI_TTS_CHUNK_CHARS=1500 已被 worker 拾取。
+
+身份判定（本机 ECAPA 离线，整段口径＝内容平滑，校准）：
+  整段(525.7s) vs 克隆源(婷婷) = 0.8570   （同人带 ≥0.85）
+  整段 vs 预设参考 uncle_fu    = 0.9423
+  四分段整段 vs 克隆源: Q1=0.8463 Q2=0.8424 Q3=0.8359 Q4=0.8565
+  四分段整段 vs 预设参考: Q1=0.9259 Q2=0.9201 Q3=0.9293 Q4=0.9383
+  四分段整段两两互比（6 对）: min=0.9283 med=0.9505 max=0.9892
+    ≤0.70（换人带）: 0 对
+  ⇒ 裁决：同一人，无持续换人区。预设固定说话人在生产真实稿上成立。
+
+口径再教训（与契约 §2.4.2 同源，本轮活体再次重演）：
+  · 逐 6s 窗 vs 短克隆源、或拼接件全局滑窗 min，都是**内容/韵律/静音敏感**的错误口径：
+    本轮活体逐窗 min 低至 0.3713@483s，但 480-486s dip → 486-492s 立即恢复 0.8497
+    （单窗 dip 立即恢复＝块内韵律变异，非换人）；许多 0.47~0.70 的窗散布全篇，
+    是短窗对短参考音的内容敏感，不是说话人变化。
+  · 用自然停顿（295.5s 处 2.15s 静音）当接缝做 ±4s 窗对，窗重叠静音 ⇒ 嵌入不稳 ⇒
+    min 0.5552 是**静音伪影**，非换人。块间真实 gap 仅 0.3s，与自然停顿不可区分。
+  · 正确口径＝**整段（内容平滑）身份**：整段 vs 克隆源 0.8570、四分段互比 min 0.9283、
+    零换人带 ⇒ 同一人。短窗全局 min 量错了对象（再次取证推翻）。
+
+结论：部署后预设路由 + 全长渲染 + 身份稳定全部成立。固化音色根治上线生效。
+对照：克隆路径生产接缝失败率 ≈12%；预设活体整段零换人。

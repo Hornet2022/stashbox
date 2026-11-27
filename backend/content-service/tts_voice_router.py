@@ -131,6 +131,9 @@ class AdminVoiceOut(VoiceOut):
 
     ref_audio_url: str
     ref_text: str
+    #: 声明式预设音色名（迁移 0042）：非空 = 固定说话人（走预设路径）；
+    #: None = 零样本克隆音色。管理端据此区分两类音色，试听也按它分流。
+    preset_voice: Optional[str] = None
     is_active: bool = True
     sort_order: int = 0
     updated_at: Optional[str] = None
@@ -157,6 +160,8 @@ class VoiceCreateIn(BaseModel):
     ref_audio_b64: Optional[str] = None
     ref_text: str
     description: Optional[str] = None
+    #: 上游预设音色名（固定说话人，迁移 0042）；不传/空 = 零样本克隆音色
+    preset_voice: Optional[str] = None
     is_default: bool = False
     is_active: bool = True
     sort_order: int = 0
@@ -168,6 +173,8 @@ class VoiceUpdateIn(BaseModel):
     ref_audio_b64: Optional[str] = None
     ref_text: Optional[str] = None
     description: Optional[str] = None
+    #: 不传 = 不动；传空串 = 清空（退回克隆）；传预设名 = 声明为固定说话人
+    preset_voice: Optional[str] = None
     is_active: Optional[bool] = None
     is_default: Optional[bool] = None
     sort_order: Optional[int] = None
@@ -220,6 +227,7 @@ def _to_admin_out(v, selected_users: int = 0) -> AdminVoiceOut:
         is_default=v.is_default,
         ref_audio_url=v.ref_audio_url,
         ref_text=v.ref_text,
+        preset_voice=v.preset_voice,
         is_active=v.is_active,
         sort_order=v.sort_order,
         updated_at=v.updated_at.isoformat() if v.updated_at else None,
@@ -393,6 +401,7 @@ async def admin_create_voice(req: VoiceCreateIn, user: dict = Depends(require_ad
             is_default=req.is_default,
             is_active=req.is_active,
             sort_order=req.sort_order,
+            preset_voice=req.preset_voice,
         )
     except VoiceError as exc:
         raise InvalidRequest(message=str(exc)) from exc
@@ -420,6 +429,9 @@ async def admin_update_voice(
             is_active=req.is_active if "is_active" in fields else None,
             is_default=req.is_default if "is_default" in fields else None,
             sort_order=req.sort_order if "sort_order" in fields else None,
+            # 三态与 description 同口径：不传/null=不动，空串=清空（退回克隆），
+            # 预设名=声明。靠 model_fields_set 区分「没传」与「传了空串」。
+            preset_voice=req.preset_voice if "preset_voice" in fields else None,
         )
     except VoiceError as exc:
         raise InvalidRequest(message=str(exc)) from exc
@@ -493,13 +505,20 @@ async def admin_preview_voice(
     from stashbox.backend.app.services.tts import reload as tts_reload
 
     client = await tts_reload()
+    # CP-TTS-PRESET（迁移 0042）：声明了预设的音色走**预设路径**试听，
+    # 与生产蒸馏同一条路径（试听=生产渲染）—— 只带 voice、不带 ref_audio/ref_text。
+    # 未声明预设（或非 openai provider）仍走克隆试听。
+    use_preset = bool(voice.preset_voice) and client.provider_name == "openai"
     try:
-        audio = await client.synthesize(
-            req.text,
-            voice=getattr(client, "voice", None),
-            ref_audio=voice.ref_audio_url,
-            ref_text=voice.ref_text,
-        )
+        if use_preset:
+            audio = await client.synthesize(req.text, voice=voice.preset_voice)
+        else:
+            audio = await client.synthesize(
+                req.text,
+                voice=getattr(client, "voice", None),
+                ref_audio=voice.ref_audio_url,
+                ref_text=voice.ref_text,
+            )
     except TypeError:
         # provider 的 synthesize() 没有 ref_audio/ref_text 形参
         raise InvalidRequest(

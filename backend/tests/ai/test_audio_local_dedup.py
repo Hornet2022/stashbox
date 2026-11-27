@@ -67,6 +67,9 @@ class _Resolved:
     voice_id = None
     display_name = None
     source = "global_config"
+    # ResolvedVoice 契约新增字段（迁移 0042）：global_config 兜底级无音色行 ⇒ 恒 None。
+    # 本替身镜像该字段，保持走 global_config 路径（use_preset=False），与原本意图一致。
+    preset_voice = None
 
 
 @pytest.mark.asyncio

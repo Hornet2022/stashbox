@@ -74,6 +74,8 @@ MAX_SLUG_LEN = 64
 MAX_DISPLAY_NAME_LEN = 64
 MAX_DESCRIPTION_LEN = 255
 MAX_REF_AUDIO_URL_LEN = 512
+# 预设音色名长度上限，**必须与表结构 String(64) 对齐**（迁移 0042）。
+MAX_PRESET_VOICE_LEN = 64
 
 
 def _check_len(value: str, limit: int, field: str) -> str:
@@ -91,6 +93,11 @@ class ResolvedVoice:
     """蒸馏时要用的音色。
 
     voice_id 为 None = 回落到全局 TTS 配置（来源不可溯源）。
+
+    preset_voice 非空 = 这个音色声明了**上游预设名**（固定说话人，迁移 0042）。
+    调用方（tools.py）据此在 provider=openai 时走预设路径（不带参考音）；
+    为 None = 零样本克隆音色（既有行为）。global_config 兜底级没有音色行，
+    故 preset_voice 恒 None。
     """
 
     ref_audio: str
@@ -98,6 +105,7 @@ class ResolvedVoice:
     voice_id: str | None
     display_name: str | None
     source: str  # 'user' | 'default' | 'global_config'
+    preset_voice: str | None = None
 
 
 def _new_voice_id() -> str:
@@ -178,6 +186,7 @@ async def create_voice(
     is_default: bool = False,
     is_active: bool = True,
     sort_order: int = 0,
+    preset_voice: str | None = None,
 ) -> TTSVoice:
     slug = (slug or "").strip().lower()
     display_name = (display_name or "").strip()
@@ -201,6 +210,10 @@ async def create_voice(
     _check_len(ref_audio, MAX_REF_AUDIO_URL_LEN, "参考音频地址")
     if description:
         _check_len(description.strip(), MAX_DESCRIPTION_LEN, "描述")
+    # 预设音色名：空串归一为 None（= 克隆音色），与 description 同口径。
+    preset_voice = (preset_voice or "").strip() or None
+    if preset_voice:
+        _check_len(preset_voice, MAX_PRESET_VOICE_LEN, "预设音色名")
 
     async with AsyncSessionLocal() as db:
         if (await db.execute(select(TTSVoice).where(TTSVoice.slug == slug))).scalar_one_or_none():
@@ -213,6 +226,7 @@ async def create_voice(
             description=(description or "").strip() or None,
             ref_audio_url=ref_audio,
             ref_text=ref_text,
+            preset_voice=preset_voice,
             is_default=False,  # 下面统一走 _apply_default，保证「至多一条」
             is_active=is_active,
             sort_order=sort_order,
@@ -235,6 +249,7 @@ async def update_voice(
     is_active: bool | None = None,
     is_default: bool | None = None,
     sort_order: int | None = None,
+    preset_voice: str | None = None,
 ) -> TTSVoice:
     async with AsyncSessionLocal() as db:
         voice = (
@@ -264,6 +279,15 @@ async def update_voice(
             voice.ref_text = text
         if description is not None:
             voice.description = description.strip() or None
+        if preset_voice is not None:
+            # 三态（与 description 同口径，靠调用方传不传区分「不动」）：
+            #   不传（None）  → 不动预设声明
+            #   传空串        → 清空 = 退回零样本克隆音色
+            #   传 "uncle_fu" → 声明为上游预设（固定说话人）
+            pv = preset_voice.strip()
+            if pv:
+                _check_len(pv, MAX_PRESET_VOICE_LEN, "预设音色名")
+            voice.preset_voice = pv or None
         if is_active is not None:
             voice.is_active = is_active
         if sort_order is not None:
@@ -453,6 +477,7 @@ async def resolve_voice_for_user(user_id: int | None) -> ResolvedVoice:
                     voice_id=voice.id,
                     display_name=voice.display_name,
                     source="user",
+                    preset_voice=voice.preset_voice,
                 )
             log.info(
                 "tts_voice_user_pref_invalid_fallback",
@@ -483,6 +508,7 @@ async def resolve_voice_for_user(user_id: int | None) -> ResolvedVoice:
             voice_id=default.id,
             display_name=default.display_name,
             source="default",
+            preset_voice=default.preset_voice,
         )
 
     # 3) 全局 TTS 配置（历史兜底）

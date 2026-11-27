@@ -45,7 +45,7 @@ MAX_PLAYBACK_SPEED = 3.0
 
 
 class TTSVoice(Base):
-    """一个预设音色 = 一份参考音频 + 参考文本 + 展示名。
+    """一个音色 = 一份参考音频 + 参考文本 + 展示名（+ 可选的上游预设名）。
 
     - `slug`：稳定业务标识，App 侧可缓存；改名不影响它
     - `is_default`：**至多一条为真**（DB 层用部分唯一索引兜住，
@@ -53,6 +53,11 @@ class TTSVoice(Base):
       多条为真会导致随机命中
     - `is_active`：软下架。已选中的音色下架后，用户偏好行经 FK SET NULL
       变 NULL，自动回落默认音色，而不是让蒸馏直接报错
+    - `preset_voice`：**声明式预设音色**（迁移 0042）。非空 = 这个音色就是上游
+      预设名（如 `uncle_fu`），是**固定说话人**，蒸馏走预设路径（不带参考音）；
+      NULL = 零样本克隆音色（音色由参考音频决定，逐请求概率性采样说话人）。
+      为什么需要它见迁移 0042 的说明：克隆 ≈12% 接缝换人，预设跨请求身份稳定。
+      参考音频/文本仍保留：非 openai provider 回落克隆时要用它。
     """
 
     __tablename__ = "tts_voices"
@@ -71,6 +76,11 @@ class TTSVoice(Base):
     )
     ref_text: Mapped[str] = mapped_column(
         Text(), nullable=False, comment="参考文本，须与音频内容一致"
+    )
+    # 声明式预设音色（迁移 0042）：非空 = 上游预设名（固定说话人），走预设路径；
+    # NULL = 零样本克隆音色（既有行为）。与表结构 String(64) 对齐。
+    preset_voice: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment="上游预设音色名（固定说话人）；NULL=零样本克隆音色"
     )
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

@@ -1,0 +1,667 @@
+[
+ {
+  "id": "art_7cd3e28b32a145e8acb7420c",
+  "created_at": "2026-10-21T16:33:42.599809",
+  "file": "art_7cd3e28b32a145e8acb7420c.902082a1.mp3",
+  "dur": 190,
+  "ver": "V0"
+ },
+ {
+  "id": "art_a4adbca13bbd47a98d0dd936",
+  "created_at": "2026-10-21T16:35:52.128160",
+  "file": "art_a4adbca13bbd47a98d0dd936.4f722ef2.mp3",
+  "dur": 153,
+  "ver": "V0"
+ },
+ {
+  "id": "art_dd82b6cc4be54fdc83b80ba2",
+  "created_at": "2026-10-21T16:38:38.658861",
+  "file": "art_dd82b6cc4be54fdc83b80ba2.ac69575a.mp3",
+  "dur": 172,
+  "ver": "V0"
+ },
+ {
+  "id": "art_caa542dfb5ea4b489aa45728",
+  "created_at": "2026-10-21T18:00:10.823172",
+  "file": "art_caa542dfb5ea4b489aa45728.4b2271b0.mp3",
+  "dur": 196,
+  "ver": "V0"
+ },
+ {
+  "id": "art_acbe2f8d4833472e83b110c2",
+  "created_at": "2026-10-21T18:04:36.818658",
+  "file": "art_acbe2f8d4833472e83b110c2.cdb8a2a3.mp3",
+  "dur": 202,
+  "ver": "V0"
+ },
+ {
+  "id": "art_260758b8889240bf87326117",
+  "created_at": "2026-10-21T18:30:23.194470",
+  "file": "art_260758b8889240bf87326117.950e8839.mp3",
+  "dur": 193,
+  "ver": "V0"
+ },
+ {
+  "id": "art_8bbe9bf67796447fbe293f78",
+  "created_at": "2026-10-21T20:09:18.526096",
+  "file": "art_8bbe9bf67796447fbe293f78.bcbe0e4a.mp3",
+  "dur": 170,
+  "ver": "V0"
+ },
+ {
+  "id": "art_881ed5393d9d47248ed48271",
+  "created_at": "2026-10-21T21:48:15.031435",
+  "file": "art_881ed5393d9d47248ed48271.6c85dc37.mp3",
+  "dur": 143,
+  "ver": "V0"
+ },
+ {
+  "id": "art_a32c80cf94d04f67b435a80b",
+  "created_at": "2026-10-21T22:08:27.668108",
+  "file": "art_a32c80cf94d04f67b435a80b.d4bb0aae.mp3",
+  "dur": 166,
+  "ver": "V0"
+ },
+ {
+  "id": "art_78832151cd844759b4252a13",
+  "created_at": "2026-10-21T22:13:14.089197",
+  "file": "art_78832151cd844759b4252a13.7dae3b89.mp3",
+  "dur": 173,
+  "ver": "V0"
+ },
+ {
+  "id": "art_78b44134c9fa49af9ecb0363",
+  "created_at": "2026-10-21T22:16:54.678658",
+  "file": "art_78b44134c9fa49af9ecb0363.33412785.mp3",
+  "dur": 238,
+  "ver": "V0"
+ },
+ {
+  "id": "art_b9ae99a410c5411d82180b4a",
+  "created_at": "2026-10-22T07:35:39.691962",
+  "file": "art_b9ae99a410c5411d82180b4a.f1ff5277.mp3",
+  "dur": 174,
+  "ver": "V0"
+ },
+ {
+  "id": "art_e044b3b1bd6c4fbe90d4c628",
+  "created_at": "2026-10-22T07:42:12.496231",
+  "file": "art_e044b3b1bd6c4fbe90d4c628.ce3048eb.mp3",
+  "dur": 215,
+  "ver": "V0"
+ },
+ {
+  "id": "art_8f52de93146b4c45baf1c80e",
+  "created_at": "2026-10-22T07:43:34.493133",
+  "file": "art_8f52de93146b4c45baf1c80e.7717b21b.mp3",
+  "dur": 208,
+  "ver": "V0"
+ },
+ {
+  "id": "art_1ed13969ad884bd9aafd3164",
+  "created_at": "2026-10-22T19:26:51.093445",
+  "file": "art_1ed13969ad884bd9aafd3164.66ee49bf.mp3",
+  "dur": 362,
+  "ver": "V0"
+ },
+ {
+  "id": "art_4197eecd6cf9445db3d2243a",
+  "created_at": "2026-10-22T19:26:52.056522",
+  "file": "art_4197eecd6cf9445db3d2243a.7d9872f1.mp3",
+  "dur": 333,
+  "ver": "V0"
+ },
+ {
+  "id": "art_6bf654c047654ec8bd1d9d64",
+  "created_at": "2026-10-22T21:54:04.460107",
+  "file": "art_6bf654c047654ec8bd1d9d64.4f249135.mp3",
+  "dur": 309,
+  "ver": "V0"
+ },
+ {
+  "id": "art_470217e39000450dbe853311",
+  "created_at": "2026-10-22T22:17:18.237925",
+  "file": "art_470217e39000450dbe853311.2421538a.mp3",
+  "dur": 328,
+  "ver": "V0"
+ },
+ {
+  "id": "art_fc555b2985924e4f8508d7e3",
+  "created_at": "2026-10-22T22:17:36.768689",
+  "file": "art_fc555b2985924e4f8508d7e3.08a0f0aa.mp3",
+  "dur": 355,
+  "ver": "V0"
+ },
+ {
+  "id": "art_89ff6e0f1d24430f9601bca9",
+  "created_at": "2026-10-22T22:18:01.115116",
+  "file": "art_89ff6e0f1d24430f9601bca9.1b891eea.mp3",
+  "dur": 327,
+  "ver": "V0"
+ },
+ {
+  "id": "art_248128c873ff4606856152f7",
+  "created_at": "2026-10-22T22:33:29.500435",
+  "file": "art_248128c873ff4606856152f7.9107d7de.mp3",
+  "dur": 191,
+  "ver": "V0"
+ },
+ {
+  "id": "art_59b96bce88b548b0bbaeee4c",
+  "created_at": "2026-10-22T23:40:35.008394",
+  "file": "art_59b96bce88b548b0bbaeee4c.60c0b5c4.mp3",
+  "dur": 219,
+  "ver": "V0"
+ },
+ {
+  "id": "art_c660c59176a1447d8dacdbce",
+  "created_at": "2026-10-23T09:32:12.664110",
+  "file": "art_c660c59176a1447d8dacdbce.abef473b.mp3",
+  "dur": 137,
+  "ver": "V0"
+ },
+ {
+  "id": "art_ff3c7960c1574eb49790ec91",
+  "created_at": "2026-10-23T19:00:09.276902",
+  "file": "art_ff3c7960c1574eb49790ec91.852bacbb.mp3",
+  "dur": 423,
+  "ver": "V0"
+ },
+ {
+  "id": "art_1b7999b837da40e787aead89",
+  "created_at": "2026-10-23T19:35:43.469482",
+  "file": "art_1b7999b837da40e787aead89.307976e9.mp3",
+  "dur": 179,
+  "ver": "V0"
+ },
+ {
+  "id": "art_f24b649150eb4d14b1ee3722",
+  "created_at": "2026-10-24T01:28:27.998127",
+  "file": "art_f24b649150eb4d14b1ee3722.5d309ebf.mp3",
+  "dur": 144,
+  "ver": "V0"
+ },
+ {
+  "id": "art_488fc6622e9442849a7be149",
+  "created_at": "2026-10-24T02:12:58.334751",
+  "file": "art_488fc6622e9442849a7be149.b72c72a1.mp3",
+  "dur": 135,
+  "ver": "V0"
+ },
+ {
+  "id": "art_1a259c1a090e42198d04050a",
+  "created_at": "2026-10-24T09:18:04.853903",
+  "file": "art_1a259c1a090e42198d04050a.bc2fe073.mp3",
+  "dur": 152,
+  "ver": "V0"
+ },
+ {
+  "id": "art_6d0d007edf3b4bc59def36c9",
+  "created_at": "2026-10-24T11:15:53.221029",
+  "file": "art_6d0d007edf3b4bc59def36c9.2761a0da.mp3",
+  "dur": 228,
+  "ver": "V0"
+ },
+ {
+  "id": "art_13d29ced47c9472c9b734fa3",
+  "created_at": "2026-10-24T20:37:45.861532",
+  "file": "art_13d29ced47c9472c9b734fa3.5c1c13df.mp3",
+  "dur": 192,
+  "ver": "V1"
+ },
+ {
+  "id": "art_a7f9ed74f5114f3ba9c15236",
+  "created_at": "2026-10-24T20:38:08.664469",
+  "file": "art_a7f9ed74f5114f3ba9c15236.f92d6322.mp3",
+  "dur": 318,
+  "ver": "V1"
+ },
+ {
+  "id": "art_72647b498ef34899b428fcc2",
+  "created_at": "2026-10-24T20:38:39.726840",
+  "file": "art_72647b498ef34899b428fcc2.aa4086ba.mp3",
+  "dur": 235,
+  "ver": "V1"
+ },
+ {
+  "id": "art_f9818121105a40e0af0bf22e",
+  "created_at": "2026-10-25T10:06:36.377303",
+  "file": "art_f9818121105a40e0af0bf22e.74c3e628.mp3",
+  "dur": 347,
+  "ver": "V2"
+ },
+ {
+  "id": "art_f07e808723204869a90bd2ba",
+  "created_at": "2026-10-25T10:48:51.561190",
+  "file": "art_f07e808723204869a90bd2ba.c9ae434b.mp3",
+  "dur": 350,
+  "ver": "V2"
+ },
+ {
+  "id": "art_caafc6ed66364872bbbd51fb",
+  "created_at": "2026-10-26T00:31:52.996468",
+  "file": "art_caafc6ed66364872bbbd51fb.050db38d.mp3",
+  "dur": 375,
+  "ver": "V3"
+ },
+ {
+  "id": "art_fdf36f10bec6492b907541d9",
+  "created_at": "2026-10-26T00:32:52.948255",
+  "file": "art_fdf36f10bec6492b907541d9.a751fa96.mp3",
+  "dur": 392,
+  "ver": "V3"
+ },
+ {
+  "id": "art_ace06bd949c44672a14e0ffa",
+  "created_at": "2026-10-26T00:33:41.399997",
+  "file": "art_ace06bd949c44672a14e0ffa.9c2c8bc4.mp3",
+  "dur": 339,
+  "ver": "V3"
+ },
+ {
+  "id": "art_63a6853c5c5e4bf4acb63d03",
+  "created_at": "2026-10-26T00:34:16.206113",
+  "file": "art_63a6853c5c5e4bf4acb63d03.d207d0ef.mp3",
+  "dur": 396,
+  "ver": "V3"
+ },
+ {
+  "id": "art_5c5efa7940d64b54b54f2a0e",
+  "created_at": "2026-10-26T00:34:37.399422",
+  "file": "art_5c5efa7940d64b54b54f2a0e.32fafe21.mp3",
+  "dur": 306,
+  "ver": "V3"
+ },
+ {
+  "id": "art_b572913c49c648ad9e520f0c",
+  "created_at": "2026-10-26T07:23:53.628797",
+  "file": "art_b572913c49c648ad9e520f0c.66db941c.mp3",
+  "dur": 325,
+  "ver": "V3"
+ },
+ {
+  "id": "art_cacfcb651b42419cab4cbb59",
+  "created_at": "2026-10-26T16:18:27.080343",
+  "file": "art_cacfcb651b42419cab4cbb59.d7449454.mp3",
+  "dur": 382,
+  "ver": "V3"
+ },
+ {
+  "id": "art_9d7bcdd8587246acbf8f3497",
+  "created_at": "2026-10-27T09:29:35.815208",
+  "file": "art_9d7bcdd8587246acbf8f3497.3c259b8d.mp3",
+  "dur": 312,
+  "ver": "V3"
+ },
+ {
+  "id": "art_e06816c348cf4085939475a1",
+  "created_at": "2026-10-27T09:52:57.503587",
+  "file": "art_e06816c348cf4085939475a1.392cdbfb.mp3",
+  "dur": 361,
+  "ver": "V3"
+ },
+ {
+  "id": "art_70c8fe41f38b4cd3a900ec58",
+  "created_at": "2026-10-27T15:00:04.638782",
+  "file": "art_70c8fe41f38b4cd3a900ec58.38e55fb6.mp3",
+  "dur": 331,
+  "ver": "V3"
+ },
+ {
+  "id": "art_603dd17c3d6a45059d9ee077",
+  "created_at": "2026-10-29T07:42:44.292251",
+  "file": "art_603dd17c3d6a45059d9ee077.788fbe94.mp3",
+  "dur": 348,
+  "ver": "V3"
+ },
+ {
+  "id": "art_7d2b1aa4533e47b499287612",
+  "created_at": "2026-10-29T07:43:11.701546",
+  "file": "art_7d2b1aa4533e47b499287612.51e1cc9b.mp3",
+  "dur": 323,
+  "ver": "V3"
+ },
+ {
+  "id": "art_8ae288e9ba3d41e2a509d80f",
+  "created_at": "2026-10-29T07:44:54.897903",
+  "file": "art_8ae288e9ba3d41e2a509d80f.acd62535.mp3",
+  "dur": 366,
+  "ver": "V3"
+ },
+ {
+  "id": "art_245bf42951014d869de55c27",
+  "created_at": "2026-10-29T07:45:51.090622",
+  "file": "art_245bf42951014d869de55c27.3a308638.mp3",
+  "dur": 291,
+  "ver": "V3"
+ },
+ {
+  "id": "art_a42b7b8e6dc34e26ba861ffc",
+  "created_at": "2026-10-29T07:47:54.999743",
+  "file": "art_a42b7b8e6dc34e26ba861ffc.d11976f5.mp3",
+  "dur": 446,
+  "ver": "V3"
+ },
+ {
+  "id": "art_12d2df6688ec456080fa2fed",
+  "created_at": "2026-10-29T08:22:13.486158",
+  "file": "art_12d2df6688ec456080fa2fed.8a604b87.mp3",
+  "dur": 328,
+  "ver": "V3"
+ },
+ {
+  "id": "art_521aa61292584300999fdebb",
+  "created_at": "2026-10-29T10:52:28.430387",
+  "file": "art_521aa61292584300999fdebb.6d63cc61.mp3",
+  "dur": 387,
+  "ver": "V3"
+ },
+ {
+  "id": "art_5c82c012f2e2479a97f46998",
+  "created_at": "2026-10-29T14:13:23.710494",
+  "file": "art_5c82c012f2e2479a97f46998.b50f4199.mp3",
+  "dur": 245,
+  "ver": "V3"
+ },
+ {
+  "id": "art_2e401250dd354bc6992c8e4f",
+  "created_at": "2026-10-30T07:34:50.793644",
+  "file": "art_2e401250dd354bc6992c8e4f.97a3d4a2.mp3",
+  "dur": 346,
+  "ver": "V3"
+ },
+ {
+  "id": "art_0bbe4ad75c2748a1a3d83ea9",
+  "created_at": "2026-10-30T07:37:00.290097",
+  "file": "art_0bbe4ad75c2748a1a3d83ea9.e419bcd1.mp3",
+  "dur": 419,
+  "ver": "V3"
+ },
+ {
+  "id": "art_5a05130ce8a8493e97909e95",
+  "created_at": "2026-10-30T07:38:28.382727",
+  "file": "art_5a05130ce8a8493e97909e95.17b68e26.mp3",
+  "dur": 345,
+  "ver": "V3"
+ },
+ {
+  "id": "art_d262de5b9c144885b4f37381",
+  "created_at": "2026-10-30T07:38:58.709381",
+  "file": "art_d262de5b9c144885b4f37381.ceef35b0.mp3",
+  "dur": 309,
+  "ver": "V3"
+ },
+ {
+  "id": "art_758b7918b25042d8a9fa90e6",
+  "created_at": "2026-10-30T13:10:45.482589",
+  "file": "art_758b7918b25042d8a9fa90e6.7258079e.mp3",
+  "dur": 458,
+  "ver": "V3"
+ },
+ {
+  "id": "art_7e0cc0d6c3394414bdaafa9e",
+  "created_at": "2026-10-30T13:12:10.570824",
+  "file": "art_7e0cc0d6c3394414bdaafa9e.0c731c56.mp3",
+  "dur": 437,
+  "ver": "V3"
+ },
+ {
+  "id": "art_5c93000bfc5948389069a0bc",
+  "created_at": "2026-10-30T15:26:58.099826",
+  "file": "art_5c93000bfc5948389069a0bc.91fbd4d7.mp3",
+  "dur": 302,
+  "ver": "V3"
+ },
+ {
+  "id": "art_6ae0fd52c4df4cb185940fde",
+  "created_at": "2026-10-30T16:42:56.160397",
+  "file": "art_6ae0fd52c4df4cb185940fde.386b1f1c.mp3",
+  "dur": 353,
+  "ver": "V3"
+ },
+ {
+  "id": "art_4e4e19ea2a804ee2a5a43e05",
+  "created_at": "2026-10-30T17:06:57.408055",
+  "file": "art_4e4e19ea2a804ee2a5a43e05.81022668.mp3",
+  "dur": 348,
+  "ver": "V3"
+ },
+ {
+  "id": "art_7092848e5127433d970758bd",
+  "created_at": "2026-10-30T17:11:19.832468",
+  "file": "art_7092848e5127433d970758bd.8c0405b5.mp3",
+  "dur": 363,
+  "ver": "V3"
+ },
+ {
+  "id": "art_947ce71ff3694e53b0357ea0",
+  "created_at": "2026-10-31T14:22:53.104674",
+  "file": "art_947ce71ff3694e53b0357ea0.908f988f.mp3",
+  "dur": 331,
+  "ver": "V3"
+ },
+ {
+  "id": "art_c34db5fde22143bb8a370a82",
+  "created_at": "2026-11-01T11:02:54.413704",
+  "file": "art_c34db5fde22143bb8a370a82.a9335844.mp3",
+  "dur": 356,
+  "ver": "V3"
+ },
+ {
+  "id": "art_0b972bbc3d7d413cbd437eb3",
+  "created_at": "2026-11-01T17:02:01.316890",
+  "file": "art_0b972bbc3d7d413cbd437eb3.039fe16e.mp3",
+  "dur": 310,
+  "ver": "V3"
+ },
+ {
+  "id": "art_4fb94614c9e84c47816bde0b",
+  "created_at": "2026-11-02T10:54:30.821018",
+  "file": "art_4fb94614c9e84c47816bde0b.b40b9963.mp3",
+  "dur": 334,
+  "ver": "V3"
+ },
+ {
+  "id": "art_81cd1828874b4de98d762e3c",
+  "created_at": "2026-11-02T12:06:49.007211",
+  "file": "art_81cd1828874b4de98d762e3c.f2a30419.mp3",
+  "dur": 421,
+  "ver": "V3"
+ },
+ {
+  "id": "art_5e01c5328da24511b012d3d4",
+  "created_at": "2026-11-02T18:31:26.739879",
+  "file": "art_5e01c5328da24511b012d3d4.754bbbab.mp3",
+  "dur": 322,
+  "ver": "V3"
+ },
+ {
+  "id": "art_01d904ea1ee6450cae1bbc07",
+  "created_at": "2026-11-03T17:53:13.789231",
+  "file": "art_01d904ea1ee6450cae1bbc07.da13033f.mp3",
+  "dur": 314,
+  "ver": "V3"
+ },
+ {
+  "id": "art_e13dc7e3bda4439fa21c1e63",
+  "created_at": "2026-11-06T18:02:07.339908",
+  "file": "art_e13dc7e3bda4439fa21c1e63.36d0c8de.mp3",
+  "dur": 384,
+  "ver": "V3"
+ },
+ {
+  "id": "art_f41aa87e42524705a4cef599",
+  "created_at": "2026-11-06T20:26:43.115809",
+  "file": "art_f41aa87e42524705a4cef599.a0018a78.mp3",
+  "dur": 310,
+  "ver": "V3"
+ },
+ {
+  "id": "art_20ec8877e428479ea51b3d7c",
+  "created_at": "2026-11-08T16:11:13.483749",
+  "file": "art_20ec8877e428479ea51b3d7c.98673bd9.mp3",
+  "dur": 384,
+  "ver": "V3"
+ },
+ {
+  "id": "art_07797861dee241578349925e",
+  "created_at": "2026-11-09T07:51:39.803200",
+  "file": "art_07797861dee241578349925e.cc8eaa2a.mp3",
+  "dur": 401,
+  "ver": "V3"
+ },
+ {
+  "id": "art_2c33ad9cfd1c420f98408f52",
+  "created_at": "2026-11-09T07:52:42.787865",
+  "file": "art_2c33ad9cfd1c420f98408f52.2f2f15cf.mp3",
+  "dur": 379,
+  "ver": "V3"
+ },
+ {
+  "id": "art_3dd88aca36f645c6aee0a5be",
+  "created_at": "2026-11-09T07:53:47.305673",
+  "file": "art_3dd88aca36f645c6aee0a5be.50967cd2.mp3",
+  "dur": 349,
+  "ver": "V3"
+ },
+ {
+  "id": "art_01289562bdef42d8a8299f49",
+  "created_at": "2026-11-09T07:55:57.290991",
+  "file": "art_01289562bdef42d8a8299f49.7970315b.mp3",
+  "dur": 333,
+  "ver": "V3"
+ },
+ {
+  "id": "art_5472215a1ca34a34ab3e63b2",
+  "created_at": "2026-11-10T07:52:54.543298",
+  "file": "art_5472215a1ca34a34ab3e63b2.87b30d75.mp3",
+  "dur": 340,
+  "ver": "V3"
+ },
+ {
+  "id": "art_af5189fb1415482dafc88f01",
+  "created_at": "2026-11-10T11:04:39.946531",
+  "file": "art_af5189fb1415482dafc88f01.d784c990.mp3",
+  "dur": 299,
+  "ver": "V3"
+ },
+ {
+  "id": "art_378f0889a77b48e7b0ff7a1d",
+  "created_at": "2026-11-11T07:03:03.515483",
+  "file": "art_378f0889a77b48e7b0ff7a1d.26cd7112.mp3",
+  "dur": 354,
+  "ver": "V3"
+ },
+ {
+  "id": "art_c75ad791676b41e7a384cc12",
+  "created_at": "2026-11-11T07:51:27.140723",
+  "file": "art_c75ad791676b41e7a384cc12.5ea47496.mp3",
+  "dur": 319,
+  "ver": "V3"
+ },
+ {
+  "id": "art_40c984f926b5442bbe930271",
+  "created_at": "2026-11-11T08:06:28.027296",
+  "file": "art_40c984f926b5442bbe930271.c5523b54.mp3",
+  "dur": 364,
+  "ver": "V3"
+ },
+ {
+  "id": "art_1d7b9a97efaf49d3b4dd4a01",
+  "created_at": "2026-11-11T17:41:01.946582",
+  "file": "art_1d7b9a97efaf49d3b4dd4a01.9458c614.mp3",
+  "dur": 351,
+  "ver": "V3"
+ },
+ {
+  "id": "art_b1ffbc656233475db0e2eb6b",
+  "created_at": "2026-11-11T17:41:47.561253",
+  "file": "art_b1ffbc656233475db0e2eb6b.62903b5b.mp3",
+  "dur": 299,
+  "ver": "V3"
+ },
+ {
+  "id": "art_db4274a8526a47419ba45c8c",
+  "created_at": "2026-11-11T17:42:44.239446",
+  "file": "art_db4274a8526a47419ba45c8c.11fad451.mp3",
+  "dur": 357,
+  "ver": "V3"
+ },
+ {
+  "id": "art_93c04ed576664366a8613c5f",
+  "created_at": "2026-11-11T21:20:15.461030",
+  "file": "art_93c04ed576664366a8613c5f.b1ab19f7.mp3",
+  "dur": 334,
+  "ver": "V3"
+ },
+ {
+  "id": "art_05ebb65861ff471cab19e139",
+  "created_at": "2026-11-11T21:21:33.365375",
+  "file": "art_05ebb65861ff471cab19e139.300e72b2.mp3",
+  "dur": 393,
+  "ver": "V3"
+ },
+ {
+  "id": "art_e5c5889d8ac544f0acaf75ca",
+  "created_at": "2026-11-12T21:19:00.497946",
+  "file": "art_e5c5889d8ac544f0acaf75ca.f93de9c8.mp3",
+  "dur": 464,
+  "ver": "V3"
+ },
+ {
+  "id": "art_8a3d09d2d66f4f3ea2c5bb94",
+  "created_at": "2026-11-12T22:02:09.917088",
+  "file": "art_8a3d09d2d66f4f3ea2c5bb94.4ae642d1.mp3",
+  "dur": 333,
+  "ver": "V3"
+ },
+ {
+  "id": "art_aaecf44a18104de0990ed6d9",
+  "created_at": "2026-11-13T07:47:23.845623",
+  "file": "art_aaecf44a18104de0990ed6d9.3db55ae0.mp3",
+  "dur": 354,
+  "ver": "V3"
+ },
+ {
+  "id": "art_c83cc90227044a3cacdb714a",
+  "created_at": "2026-11-13T07:48:12.726107",
+  "file": "art_c83cc90227044a3cacdb714a.7a58bc8d.mp3",
+  "dur": 312,
+  "ver": "V3"
+ },
+ {
+  "id": "art_c9f0249608d74f2fbd7fba9d",
+  "created_at": "2026-11-13T07:50:23.566281",
+  "file": "art_c9f0249608d74f2fbd7fba9d.8eee21e6.mp3",
+  "dur": 335,
+  "ver": "V3"
+ },
+ {
+  "id": "art_0257712c2d334d8aa951cf7f",
+  "created_at": "2026-11-24T18:31:47.510779",
+  "file": "art_0257712c2d334d8aa951cf7f.4fb46c0d.mp3",
+  "dur": 346,
+  "ver": "V3"
+ },
+ {
+  "id": "art_754977484bec42178d8c56cf",
+  "created_at": "2026-11-24T18:32:26.256889",
+  "file": "art_754977484bec42178d8c56cf.47fc7bda.mp3",
+  "dur": 305,
+  "ver": "V3"
+ },
+ {
+  "id": "art_4aee39aafb27406ca1424887",
+  "created_at": "2026-11-24T18:32:46.030087",
+  "file": "art_4aee39aafb27406ca1424887.12498db7.mp3",
+  "dur": 114,
+  "ver": "V3"
+ },
+ {
+  "id": "art_32c6abafec674d4eb90e4e69",
+  "created_at": "2026-11-24T18:33:23.818654",
+  "file": "art_32c6abafec674d4eb90e4e69.bc8a8fca.mp3",
+  "dur": 314,
+  "ver": "V3"
+ }
+]

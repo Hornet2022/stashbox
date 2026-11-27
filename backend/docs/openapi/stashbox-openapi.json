@@ -9474,6 +9474,17 @@
             "type": "string",
             "title": "Ref Text"
           },
+          "preset_voice": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preset Voice"
+          },
           "is_active": {
             "type": "boolean",
             "title": "Is Active",
@@ -10949,6 +10960,17 @@
             ],
             "title": "Description"
           },
+          "preset_voice": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preset Voice"
+          },
           "is_default": {
             "type": "boolean",
             "title": "Is Default",
@@ -11247,6 +11269,17 @@
               }
             ],
             "title": "Description"
+          },
+          "preset_voice": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preset Voice"
           },
           "is_active": {
             "anyOf": [

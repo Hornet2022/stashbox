@@ -148,23 +148,38 @@ async def tts_synthesize_tool(state: dict[str, Any], args: dict[str, Any]) -> di
     #   两者的「形态契约」不同。音色库是唯一同时表达
     #   「参考音频来源 + 参考文本」的地方，克隆走它才不会各写一套。
     resolved = await resolve_voice_for_user(state.get("user_id"))
+    client = await tts_reload()
+
+    # CP-TTS-PRESET（迁移 0042）：声明式预设音色 = **固定说话人**，优先于零样本克隆。
+    #
+    # 音色库某行声明了 preset_voice（如婷婷 → uncle_fu）⇒ 它是上游**预设音色**，
+    # 不是零样本克隆。两条路径的本质区别（2026-11-25 生产实证）：
+    #   · 克隆：逐请求概率性采样说话人，接缝处两人是否一致是概率事件（≈12% 换人）；
+    #   · 预设：固定说话人，跨请求身份稳定（8 块整段 28 对 min 0.8629，接缝 ±4s 全 ≥0.8519）。
+    # 预设模式**不传 ref_audio/ref_text**（openai._resolve_clone 见 ref 为空 ⇒ clone=None
+    # ⇒ voice 名生效）；克隆模式上游忽略 voice，音色以参考音为准。
+    #
+    # ⚠️ 只在 provider=openai 时走预设：预设是托管端点的能力，indextts 的音色由参考音
+    # 决定（voice 参数无意义），声明了 preset_voice 也回落克隆（用保留的 ref_audio）。
+    use_preset = bool(resolved.preset_voice) and client.provider_name == "openai"
+
     overrides: dict[str, Any] = {}
-    if resolved.source in ("user", "default"):
+    if not use_preset and resolved.source in ("user", "default"):
         overrides = {"ref_audio": resolved.ref_audio, "ref_text": resolved.ref_text}
     # 注意：本模块的 log 是 **stdlib logging**（见文件头 `log = logging.getLogger`），
     # 不支持 structlog 那种 `log.info(event, key=value)` —— 传额外 kwargs 会抛
     # `Logger._log() got an unexpected keyword argument`。所以用 %-格式化。
     log.info(
-        "tts_voice_resolved article=%s user=%s voice_id=%s voice=%s source=%s applied=%s",
+        "tts_voice_resolved article=%s user=%s voice_id=%s voice=%s source=%s preset=%s applied=%s",
         state.get("article_id"),
         state.get("user_id"),
         resolved.voice_id,
         resolved.display_name,
         resolved.source,
-        bool(overrides),
+        resolved.preset_voice if use_preset else None,
+        bool(overrides) or use_preset,
     )
 
-    client = await tts_reload()
     # `applied` = 用户选的音色**真的**用上了没有。它决定 tts_voice_id 能不能记，
     # 必须由「实际走了哪条调用路径」推导，不能由「解析出了什么」推导 ——
     # 这正是 BUG#8（2026-09-30 自测发现）：
@@ -176,16 +191,24 @@ async def tts_synthesize_tool(state: dict[str, Any], args: dict[str, Any]) -> di
     # 覆盖没生效时必须记 None（与 global_config 同义：来源不可溯源）。
     applied = False
     try:
-        # 不支持覆盖的 provider 没有 ref_audio/ref_text 形参，直接传会 TypeError
-        audio = await client.synthesize(
-            script,
-            voice=getattr(client, "voice", None),
-            **overrides,
-        )
-        # ⚠️ `applied` 不能只看「有没有传 overrides」：
-        # overrides 里的 ref_audio 可能是空串（音色库那行没填参考音），
-        # 那样克隆根本没发生 —— 这时记下 voice_id 就是**溯源说谎**。
-        applied = bool(overrides) and bool(resolved.ref_audio)
+        if use_preset:
+            # 预设路径：只带 voice（= 声明的预设名），**不带 ref_audio/ref_text**。
+            # 不传 ref ⇒ openai._resolve_clone 返回 None ⇒ 上游按 voice 名渲染固定说话人。
+            audio = await client.synthesize(script, voice=resolved.preset_voice)
+            # 声明的预设真被使用 ⇒ 溯源诚实：applied=True，记 voice_id（与克隆路径
+            # 「覆盖真生效才记」同口径 —— 这里预设确实生效了）。
+            applied = True
+        else:
+            # 不支持覆盖的 provider 没有 ref_audio/ref_text 形参，直接传会 TypeError
+            audio = await client.synthesize(
+                script,
+                voice=getattr(client, "voice", None),
+                **overrides,
+            )
+            # ⚠️ `applied` 不能只看「有没有传 overrides」：
+            # overrides 里的 ref_audio 可能是空串（音色库那行没填参考音），
+            # 那样克隆根本没发生 —— 这时记下 voice_id 就是**溯源说谎**。
+            applied = bool(overrides) and bool(resolved.ref_audio)
     except TypeError as exc:
         # 兜底：provider 不支持覆盖时退回原调用，不要整个任务挂掉。
         # ⚠️ 这里 TypeError 既可能是「形参不匹配」，也可能是 provider 内部真炸了
@@ -265,7 +288,7 @@ async def tts_synthesize_tool(state: dict[str, Any], args: dict[str, Any]) -> di
     return {
         "audio_path": str(out_path),
         "audio_url": audio_url,
-        "voice": voice or getattr(client, "voice", None),
+        "voice": resolved.preset_voice if use_preset else (voice or getattr(client, "voice", None)),
         "duration_sec": duration_sec,
         "bytes_len": len(audio),
         # CP-TTS-VOICE：把本次用的音色带回 state，节点据此回写
