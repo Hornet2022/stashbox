@@ -1,0 +1,131 @@
+═══ 0.5.6 内测活体验收：TTS 内容完整性 + 音色 + 播放列表闭环（2026-11-27）═══
+
+背景
+----
+内测用户更新到 App 0.5.6 后重新蒸馏了一篇文章。本轮对这一篇做**三链路独立复验**
+（字节口径 / ASR 对照 / 音色），并核对播放列表闭环的服务端条件。
+这是「内容完整性（静默截断）」修复上线后的**第一次内测用户活体样本**。
+
+样本
+----
+article_id   = art_df30fdc4aeec4752811a34e9
+标题          = 阿里把"驾驶脑"塞进 4B：Qwen-Drive
+user_id      = 23（内测用户）
+蒸馏窗口      = 2026-11-27 10:52:41 → 10:56:40（238.66s，arq distill_task）
+articles.status = ready，audio_url 已回填，updated_at = 蒸馏完成时刻
+distilled_articles.duration_sec = 573
+audio_url    = https://api.stashbox.cn/audio/audio/art_df30fdc4aeec4752811a34e9.48139786.mp3
+稿字数        = 2556（script_text）
+
+─── 链路一：字节口径（主判据，不依赖 ASR）───────────────────────────────────
+
+生产日志（journalctl -u stashbox-ai-worker 10:52:30~10:57:00）：
+
+  tts_voice_resolved article=art_df30fdc4aeec4752811a34e9 user=23
+      voice_id=ttsv_f6eeb0e6f91d4ecbb17093b0 voice=婷婷 source=default
+      preset=uncle_fu applied=True
+  OpenAITTS 分段合成: total_chars=2556 chunks=4 chunk_chars<=700 concurrency=1 clone=off
+  OpenAITTS synthesize: ... voice=uncle_fu bytes=1563 ... clone=off
+  OpenAITTS synthesized: 1013616 bytes
+  OpenAITTS synthesize: ... voice=uncle_fu bytes=1724 ... clone=off
+  OpenAITTS synthesized: 961632 bytes
+  OpenAITTS synthesize: ... voice=uncle_fu bytes=1648 ... clone=off
+  OpenAITTS synthesized: 1036248 bytes
+  OpenAITTS synthesize: ... voice=uncle_fu bytes=1479 ... clone=off
+  OpenAITTS synthesized: 810024 bytes
+  OpenAITTS 分段合成完成: chunks=4 bytes=4591533
+
+⇒ **preset=uncle_fu / clone=off** ⇒ 走的是**预设路径** ⇒ 内容完整性判据取严格档
+  （阈值 6.0）—— 这正是 0042 批次 + 提交 907f678 的防线在生产上生效的前提。
+
+块↔日志映射自校准（fail-closed 的第一道）：
+  块边界 = 仓内 split_into_chunks(script_text, 700) 复现；
+  每块 UTF-8 字节必须与日志 `bytes=` **逐条吻合**（不吻合 ⇒ 日志与块错位，后面全不可信）。
+
+  chunk   字数   请求字节  日志字节   吻合   上游响应字节    时长s    语速   阈值   判定
+  chunk0   673      1563      1563     ✓     1013616     152.21   4.42   6.0    OK
+  chunk1   676      1724      1724     ✓      961632     144.40   4.68   6.0    OK
+  chunk2   650      1648      1648     ✓     1036248     155.61   4.18   6.0    OK
+  chunk3   555      1479      1479     ✓      810024     121.64   4.56   6.0    OK
+
+  上游总字节 = 3821520；实测总时长 = 573.86s（ffprobe）⇒ 反推上游码率 6659 B/s（误差 0.00%）
+  整篇 = 2556 字 / 573.86s = 4.45 字/秒
+
+判定：✅ 全部块语速落在健康带 4.07~5.72 内，距阈值 6.0 有充分余量；**无截断**。
+
+可复验脚本（本次新入仓）：
+  backend/scripts/exp_live_acceptance_tts_verify.py <article_id>
+  —— 阈值从仓内 openai.py **import**（_TRUNCATION_CPS_PRESET_LONG /
+  _TRUNCATION_CHARS_PER_SEC / _TRUNCATION_STRICT_MIN_CHARS），不另造常量。
+
+─── 链路二：ASR 对照（内容完整性的独立口径）───────────────────────────────────
+
+分段 ASR（≤50s/段，整段 ASR 有复读幻觉 + 整块漏转写历史）：
+  12 段，9 段成功（转写 1832 字），**3 段被安全过滤按内容拒段**：
+    seg_004 (200~250s)、seg_008 (400~450s)、seg_010 (500~550s)
+  拒段原文：code=500 audio analysis failed: content was rejected by the safety filter
+  ⇒ 这是 **ASR 侧**的内容过滤，**不是**音频缺失。
+
+⚠️ **口径判别（差点误判的一条）**：字符级对齐脚本 analyze_seg.py 报
+  「缺失合计 659 字」、chunk1/2/3 覆盖只有 0.72~0.75 ⇒ 表面上像"整块丢失"。
+  但那与字节口径（全部健康）直接矛盾。判别：
+
+  1. 被拒时长 3×50s = 150s / 573.86s = **26.1%**；
+     稿 2556 字 × 26.1% = **667 字** ≈ 缺失 659 字 ✔ 数量级吻合。
+  2. 时间↔稿件位置映射（成功窗口定位 p(t)，不依赖 ASR 完整性）：
+
+       窗口            时间区间(s)   稿件位置   相似度
+       seg_000        0.0 - 50.0         0    0.957
+       seg_001       50.0 - 100.0       185    0.966
+       seg_002      100.0 - 150.0       363    0.956
+       seg_003      150.0 - 200.0       544    0.995
+       seg_005      250.0 - 300.0       944    0.934   ← 跨被拒 seg_004
+       seg_006      300.0 - 350.0      1186    0.943
+       seg_007      350.0 - 400.0      1361    0.988
+       seg_009      450.0 - 500.0      1730    0.976   ← 跨被拒 seg_008
+       seg_011      550.0 - 562.5      2142    1.000   ← 跨被拒 seg_010
+
+     跨空档的相邻窗口隐含语速：
+       seg_003 → seg_005 : Δt=50s Δ稿=207 字 ⇒ **4.14 字/秒**
+       seg_007 → seg_009 : Δt=50s Δ稿=198 字 ⇒ **3.96 字/秒**
+       seg_009 → seg_011 : Δt=50s Δ稿=206 字 ⇒ **4.12 字/秒**
+     ⇒ 三处被拒位置**全是健康语速，没有 8~10 的跳内容尖峰**。
+
+  ⇒ 结论：**「缺失 659 字」100% 是 ASR 被安全过滤拒段造成的，不是音频缺内容。**
+    这就是「先质疑评估口径」的又一次实例：ASR 的**转写完整性**不能当**内容完整性**的判据。
+
+─── 链路三：音色零换人（ECAPA）──────────────────────────────────────────────
+
+  整段 vs 克隆源婷婷 = 0.8959   （同人带 0.857~0.931 ⇒ 同一人）
+  整段 vs 预设 uncle_fu = 0.9828  （预设路径的强特征 ⇒ 确实走的是预设）
+  四分段整段互比 min = 0.9626 / med = 0.9741 / max = 0.9820（6 对）⇒ **零换人**
+
+  对比上轮重生成的两篇：a7ebe143 min 0.8724、d00811fb min 0.9361 ⇒ 本篇更高。
+  ⇒ 问题一「分段换人」在本篇上零复现。
+
+─── 播放列表闭环（服务端条件）────────────────────────────────────────────────
+
+  · articles.audio_url 已回填 = .../art_df30fdc4aeec4752811a34e9.48139786.mp3
+  · articles.status = ready，updated_at = 10:56:40（蒸馏完成时刻）
+  · GET /api/v1/articles/{id} 的 ArticleResponse 含 audio_url / duration_sec /
+    distilled_at / status / stage（content-service/schemas.py:60）
+  · 安卓侧 PlaylistSnapshotSync：Worker 判定 ready 的那一刻用 article.audioUrl +
+    article.durationSec 写回播放列表快照（问题2 的闭环修复，在 0.5.6 内）
+  · 音频本身可访问：HTTP 200，4591533 字节，与日志 totals 一致
+  ⇒ 服务端条件全部满足；App 侧「显示时长可播、点它直接播」由 0.5.6 保证，
+    仍需内测用户在真机上确认这一条的表现。
+
+─── 结论 ────────────────────────────────────────────────────────────────────
+
+  ① 内容完整性：✅ 四块语速 4.18~4.68，全部远低于阈值 6.0；块↔日志字节逐条吻合。
+  ② ASR 口径：⚠️ 报"缺失 659 字"是 ASR 被安全过滤拒 3 段所致，已用时间↔稿件位置
+     映射独立证伪（跨拒段语速 3.96~4.14，健康）。
+  ③ 音色：✅ 零换人（vs 预设 0.9828 / 四分段 min 0.9626）。
+  ④ 播放列表：服务端条件齐备，App 侧表现待用户真机确认。
+
+  ⑤ **仍未闭环**：截断**检出**在生产上至今没有真实触发过一次 ——
+     本篇全程无「语速偏高」「分块疑似被截断，同文本重渲恢复」日志。
+     ⇒ 本篇健康是**上游这次没截断**（重放实验：9 次中招 1 次），**不是**防线抓住了它。
+     防线有效性目前仍只由单元守卫（7+7）+ 变异 4/4 + 重放实验的
+     8.14/9.44/19.97 ≫ 6.0 支撑，缺一条"真在生产抓到"的现场证据。
+     要拿到它，只能等下一次上游真截断，或做一次受控注入。
